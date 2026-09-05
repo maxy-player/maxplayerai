@@ -10959,8 +10959,8 @@ mod tests {
     /// award REQ is unscoped (#456 — both kinds ride that one REQ). No award is published at all, so
     /// both seats reach `on_accept` with `job_award_time == None`: the arm that WRITES. Binding there
     /// on claim EXISTENCE alone gives the loser a phantom `awarded` job row, which `jobs_in_flight`
-    /// counts and the heartbeat then publishes as `accepting=n` — a seat stranded out of the market
-    /// by another seat's win, holding capacity for work it never had.
+    /// counts and the heartbeat then publishes as a raised `queue_depth` (`accepting` is unmoved by
+    /// held jobs) — a seat holding capacity for work it never had, by another seat's win.
     ///
     /// The WINNER leg is the anti-vacuity control and it is load-bearing: the same ACCEPT, on the
     /// seat whose claim it names, MUST still bind. Without it a handler that refused every accept
@@ -12352,8 +12352,8 @@ mod tests {
     ///
     /// It pins the self-heal that already-stranded seats depend on: a slot-occupying `awarded` row
     /// with no delivery, no receipt, no pushed commit and a PASSED offer deadline classifies as
-    /// `SkipLapsed`, and once failed it stops counting toward `jobs_in_flight` — which is what puts
-    /// the seat back to `accepting=y`. #626 closes the source of such rows; this guards the path that
+    /// `SkipLapsed`, and once failed it stops counting toward `jobs_in_flight` — which is what drops
+    /// the published `queue_depth` back down. #626 closes the source of such rows; this guards the path that
     /// clears the ones already written, so a later change cannot delete the healing silently.
     #[test]
     fn characterization_a_lapsed_awarded_row_lapses_and_stops_counting_once_failed() {
@@ -12362,11 +12362,11 @@ mod tests {
         let now = 2_000_i64;
         let (store, root) = store_with_lapsed_awarded_job(&job, &buyer, now);
 
-        // The stranded shape, asserted rather than assumed: the seat reports itself busy.
+        // The stranded shape, asserted rather than assumed: the seat reports load it is not carrying.
         assert_eq!(
             store.jobs_in_flight().expect("in flight"),
             1,
-            "precondition: the awarded row occupies a slot, so the heartbeat publishes accepting=n"
+            "precondition: the awarded row occupies a slot, so it counts toward the published queue_depth"
         );
         let state = store.job_state(&job).expect("job_state").expect("job row present");
         assert!(!store.has_delivery(&job).expect("has_delivery"), "never delivered");

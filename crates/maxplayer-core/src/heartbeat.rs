@@ -1710,6 +1710,24 @@ mod tests {
         // rule, a fully dark seat published `y` and kept drawing work it could only decline.
         assert_eq!(accepting_of(0, false), ("n".into(), "0".into()), "idle + dark");
         assert_eq!(accepting_of(1, false), ("n".into(), "1".into()), "busy + dark");
+        // The dark half at and above the default slot count, so both sides of the boundary are
+        // pinned by assertions: depth never turns a dark seat back to `y`, and `queue_depth` still
+        // carries the exact count.
+        assert_eq!(
+            accepting_of(3, false),
+            ("n".into(), "3".into()),
+            "at capacity + dark"
+        );
+        assert_eq!(
+            accepting_of(4, false),
+            ("n".into(), "4".into()),
+            "above capacity + dark"
+        );
+        assert_eq!(
+            accepting_of(17, false),
+            ("n".into(), "17".into()),
+            "far above capacity + dark"
+        );
 
         // Busy and dark are DISTINGUISHABLE, now by `accepting` itself rather than by depth.
         assert_ne!(accepting_of(1, true), accepting_of(1, false));

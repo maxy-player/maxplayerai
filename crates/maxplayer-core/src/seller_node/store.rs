@@ -1649,7 +1649,7 @@ mod tests {
         assert_eq!(
             store.jobs_in_flight().expect("count"),
             0,
-            "a seat whose jobs are all finished is FREE and must advertise accepting=y"
+            "a finished job holds no slot and must not raise the published queue_depth"
         );
         assert_eq!(
             store.health().expect("health").jobs,
