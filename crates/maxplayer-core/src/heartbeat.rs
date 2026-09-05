@@ -1641,11 +1641,14 @@ mod tests {
     /// carries the load, so the pair says "serving, holding one" rather than "closed".
     #[test]
     fn accepting_stays_y_while_busy_and_queue_depth_carries_the_load() {
-        let idle = heartbeat_for_state(0, true, 5, false, mints(), Vec::new(), SeatCapability::default(), TEST_POLICY);
-        assert!(idle.accepting);
-        assert_eq!(idle.queue_depth, 0);
+        // Depth 0 is named for what it is — no `Awarded`/`Executing` rows — not "idle" or "free":
+        // unawarded claim-time reservations are excluded from the count, so zero says nothing
+        // about spare capacity.
+        let zero_depth = heartbeat_for_state(0, true, 5, false, mints(), Vec::new(), SeatCapability::default(), TEST_POLICY);
+        assert!(zero_depth.accepting);
+        assert_eq!(zero_depth.queue_depth, 0);
         assert_eq!(
-            first_tag_value(&idle.to_event_draft().tags, "accepting"),
+            first_tag_value(&zero_depth.to_event_draft().tags, "accepting"),
             Some("y")
         );
 
@@ -1687,7 +1690,7 @@ mod tests {
             )
         };
 
-        assert_eq!(accepting_of(0, true), ("y".into(), "0".into()), "idle + serving");
+        assert_eq!(accepting_of(0, true), ("y".into(), "0".into()), "depth 0 + serving");
         assert_eq!(
             accepting_of(1, true),
             ("y".into(), "1".into()),
@@ -1708,7 +1711,7 @@ mod tests {
         );
         // Dark rows: a seat with nothing serving publishes `n` whatever it holds. Before the dark
         // rule, a fully dark seat published `y` and kept drawing work it could only decline.
-        assert_eq!(accepting_of(0, false), ("n".into(), "0".into()), "idle + dark");
+        assert_eq!(accepting_of(0, false), ("n".into(), "0".into()), "depth 0 + dark");
         assert_eq!(accepting_of(1, false), ("n".into(), "1".into()), "busy + dark");
         // The dark half at and above the default slot count, so both sides of the boundary are
         // pinned by assertions: depth never turns a dark seat back to `y`, and `queue_depth` still
@@ -1756,12 +1759,14 @@ mod tests {
             );
         }
 
-        // And the boundary that #313 got wrong in the field: nothing in flight ⇒ available, no
-        // matter how much this seat has done in the past. The store-side half of this is
+        // And the boundary that #313 got wrong in the field: nothing in flight ⇒ `queue_depth=0`,
+        // no matter how much this seat has done in the past. Zero means no `Awarded`/`Executing`
+        // rows — NOT free capacity: unawarded claim-time reservations are excluded from the count,
+        // so every slot can be spoken for while the wire says `0`. The store-side half of this is
         // `a_store_holding_only_terminal_jobs_reports_none_in_flight`.
-        let free = heartbeat_for_state(0, true, 5, false, mints(), Vec::new(), SeatCapability::default(), TEST_POLICY).to_event_draft();
-        assert_eq!(first_tag_value(&free.tags, "accepting"), Some("y"));
-        assert_eq!(first_tag_value(&free.tags, "queue_depth"), Some("0"));
+        let zero_depth = heartbeat_for_state(0, true, 5, false, mints(), Vec::new(), SeatCapability::default(), TEST_POLICY).to_event_draft();
+        assert_eq!(first_tag_value(&zero_depth.tags, "accepting"), Some("y"));
+        assert_eq!(first_tag_value(&zero_depth.tags, "queue_depth"), Some("0"));
     }
 
     /// #747 — the terminal beat says `accepting=n`, and there is no input that makes it say

@@ -4615,14 +4615,15 @@ impl SellerNodeRunner {
         match self.node.store().jobs_in_flight() {
             Ok(count) => count,
             Err(error) => {
-                // Fail toward AVAILABLE, as this path always has, but say so: a silent read failure
-                // that parked the seat would be the same invisible-refusal shape as #313 itself.
-                // On the retraction path the fallback costs nothing either way — that beat says
+                // Fall back to publishing ZERO DEPTH, as this path always has, but say so: a silent
+                // read failure that inflated the count would be the same invisible shape as #313
+                // itself. The fallback moves `queue_depth` and nothing else — `accepting` comes from
+                // `anything_serving` on the live beat, and on the retraction path that beat says
                 // `accepting=n` whatever the count is (`retraction_for_state` passes
-                // `anything_serving = false` as a literal), so only `queue_depth` is affected.
+                // `anything_serving = false` as a literal).
                 opline!(
                     "seller node {what}: in-flight count unavailable ({error}); \
-                     advertising as free this tick"
+                     publishing queue_depth=0 this tick"
                 );
                 0
             }
@@ -11105,7 +11106,7 @@ mod tests {
                 assert_eq!(
                     loser.slots.available(),
                     1,
-                    "the loser's reserved slot returns, so the seat keeps advertising capacity"
+                    "the loser's reserved permit returned, so one slot is available again"
                 );
 
                 // ANTI-VACUITY: the same ACCEPT, on the seat it names, still binds.
@@ -12390,7 +12391,7 @@ mod tests {
         assert_eq!(
             store.jobs_in_flight().expect("in flight"),
             0,
-            "the failed row no longer occupies a slot, so the seat advertises capacity again"
+            "the failed row no longer occupies a slot, so it no longer raises the published queue_depth"
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -13378,7 +13379,7 @@ mod tests {
             .run_until(async {
                 // Harness check: the seat must first be OPEN on the wire. Without this the terminal
                 // `accepting=n` would be asserted against a seat that never advertised itself as
-                // available, and the tooth would pass on a node that simply never published.
+                // serving (`accepting=y`), and the tooth would pass on a node that simply never published.
                 assert!(
                     fixture
                         .wait_until_published(FIXTURE_WAIT, |events| seat_announcements(events)
