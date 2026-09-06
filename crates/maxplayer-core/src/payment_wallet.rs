@@ -3512,8 +3512,8 @@ mod tests {
             "face is what the buyer paid; the mint fee is what the mint kept; net (1) is neither"
         );
         // The platform fee is charged on the FACE: 10% of 2 sats is 0 (rounds down), and would be
-        // 0 of the net too — so use the arithmetic on the figures this returns to show the
-        // distinction at a size where it bites: 10% of face 100 is 10, of net 99 it would be 9.
+        // 0 of the net too — so scale the figures this returns ×50 to show the distinction at a
+        // size where it bites: 10% of face 100 is 10, of the scaled net 50 it would be 5.
         let face = received.face.to_u64() * 50;
         let net = face - received.mint_fee.to_u64() * 50;
         assert_ne!(

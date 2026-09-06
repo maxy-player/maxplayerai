@@ -2,9 +2,10 @@
 //!
 //! Prints, per collected job and as a total, the four figures a seller needs to see without doing
 //! arithmetic or reading source: what the buyer paid (the offer amount), the mint's swap fee, the
-//! platform fee (rate and sats), and what the seller keeps. Read-only: it opens `seller.sqlite`,
-//! reads, prints, and exits. It moves no sats — the platform fee it shows is recorded, not paid out,
-//! because no payout destination exists in the product.
+//! platform fee (rate and sats), and what the seller keeps. Read-only as to money: it opens
+//! `seller.sqlite` (which applies the store's additive schema migration if the file predates the
+//! current version), reads, prints, and exits. It moves no sats — the platform fee it shows is
+//! recorded, not paid out, because no payout destination exists in the product.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -71,7 +72,7 @@ fn parse_home(args: &[String]) -> Result<Option<PathBuf>, String> {
 fn usage(w: &mut dyn Write) {
     let _ = writeln!(
         w,
-        "Usage:\n  maxplayer seller fees [--home <dir>]\n\nPrints, for every job this seat has collected payment on, what the buyer paid, the mint's fee,\nthe platform fee (rate and sats) and what you keep, then the totals. Read-only. The platform fee\nis recorded, not paid out: there is no payout destination yet, so nothing here is a bill due."
+        "Usage:\n  maxplayer seller fees [--home <dir>]\n\nPrints, for every job this seat has collected payment on, what the buyer paid, the mint's fee,\nthe platform fee (rate and sats) and what you keep, then the totals — the platform fee total is\nbroken out by the rate each job was recorded at. Moves no sats (it only opens, reads and prints\nthe seller store). The platform fee is recorded, not paid out: there is no payout destination\nyet, so nothing here is a bill due."
     );
 }
 
@@ -161,6 +162,19 @@ pub(crate) fn render(
         "  platform fee: {} sats — recorded, not paid out (no payout destination exists yet)\n",
         accrued.total_fee_sats
     ));
+    // The rate the total was taken at, never assumed: rows can carry different recorded rates (a
+    // store that collected before the rate was set holds 0% rows beside 10% rows), so the total is
+    // broken out by the rate each row was written at, and no single rate is invented over the mix.
+    for rate in platform_fee_by_rate(&accrued.by_job) {
+        text.push_str(&format!(
+            "    at {}: {} sats on {} sats paid, {} job{}\n",
+            bps_to_percent_label(rate.fee_bps),
+            rate.fee_sats,
+            rate.amount_sats,
+            rate.jobs,
+            if rate.jobs == 1 { "" } else { "s" }
+        ));
+    }
     match accrued.total_kept_sats() {
         Some(kept) if accrued.rows_without_mint_fee == 0 => {
             text.push_str(&format!("  you keep: {kept} sats\n"));
@@ -175,6 +189,43 @@ pub(crate) fn render(
         }
     }
     text
+}
+
+/// The platform fee total for one recorded rate: what it came to, on how much paid, over how many
+/// jobs. Produced by [`platform_fee_by_rate`].
+#[cfg(feature = "wallet")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FeeAtRate {
+    pub(crate) fee_bps: u32,
+    pub(crate) fee_sats: u64,
+    pub(crate) amount_sats: u64,
+    pub(crate) jobs: usize,
+}
+
+/// Group the journaled rows by the rate each was recorded at, ascending by rate. Pure aggregation
+/// of stored figures — the fee per row is read as written, never recomputed here.
+#[cfg(feature = "wallet")]
+pub(crate) fn platform_fee_by_rate(
+    by_job: &[maxplayer_core::seller_node::store::JobFeeAccrual],
+) -> Vec<FeeAtRate> {
+    let mut rates: Vec<FeeAtRate> = Vec::new();
+    for row in by_job {
+        match rates.iter_mut().find(|rate| rate.fee_bps == row.fee_bps) {
+            Some(rate) => {
+                rate.fee_sats = rate.fee_sats.saturating_add(row.fee_sats);
+                rate.amount_sats = rate.amount_sats.saturating_add(row.amount_sats);
+                rate.jobs += 1;
+            }
+            None => rates.push(FeeAtRate {
+                fee_bps: row.fee_bps,
+                fee_sats: row.fee_sats,
+                amount_sats: row.amount_sats,
+                jobs: 1,
+            }),
+        }
+    }
+    rates.sort_by_key(|rate| rate.fee_bps);
+    rates
 }
 
 #[cfg(all(test, feature = "wallet"))]
@@ -217,6 +268,8 @@ mod tests {
             "platform fee (10%): 10 sats",
             "you keep: 89 sats",
             "recorded, not paid out",
+            // Round 3: the total carries its rate, as the usage text promises.
+            "    at 10%: 10 sats on 100 sats paid, 1 job\n",
         ] {
             assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
         }
@@ -224,6 +277,64 @@ mod tests {
             !text.contains("you keep: 90"),
             "10% of the face (10), not of the net (9), is the platform fee:\n{text}"
         );
+    }
+
+    // Round 3: a store holding rows recorded at two rates (the first commit of this branch journaled
+    // at a placeholder 0%, later ones at 10%) breaks the platform fee total out per recorded rate and
+    // never labels the mixed total with one invented rate.
+    #[test]
+    fn totals_break_the_platform_fee_out_by_recorded_rate_and_never_invent_one() {
+        let by_job = vec![
+            row("job-at-zero", 21, Some(1), 0, 0),
+            row("job-at-ten", 100, Some(1), 1000, 10),
+            row("job-at-ten-again", 50, Some(1), 1000, 5),
+        ];
+        assert_eq!(
+            platform_fee_by_rate(&by_job),
+            vec![
+                FeeAtRate {
+                    fee_bps: 0,
+                    fee_sats: 0,
+                    amount_sats: 21,
+                    jobs: 1,
+                },
+                FeeAtRate {
+                    fee_bps: 1000,
+                    fee_sats: 15,
+                    amount_sats: 150,
+                    jobs: 2,
+                },
+            ]
+        );
+        let accrued = AccruedFees {
+            total_amount_sats: 171,
+            total_mint_fee_sats: 3,
+            rows_without_mint_fee: 0,
+            total_fee_sats: 15,
+            by_job,
+        };
+        let text = render(&accrued, "db");
+        let totals = text
+            .split_once("Totals:\n")
+            .map(|(_, totals)| totals)
+            .expect("a totals block");
+        assert!(
+            totals.contains("  platform fee: 15 sats — recorded, not paid out"),
+            "{text}"
+        );
+        assert!(
+            totals.contains("    at 0%: 0 sats on 21 sats paid, 1 job\n"),
+            "{text}"
+        );
+        assert!(
+            totals.contains("    at 10%: 15 sats on 150 sats paid, 2 jobs\n"),
+            "{text}"
+        );
+        assert!(
+            !totals.contains("platform fee (10%)") && !totals.contains("platform fee (0%)"),
+            "a mixed-rate total must not be labelled with a single rate:\n{text}"
+        );
+        assert!(platform_fee_by_rate(&[]).is_empty());
     }
 
     // A row from before the mint fee was journaled says so, and never prints a measured 0 or a
@@ -259,6 +370,15 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("platform fee (0%): 0 sats"), "{text}");
+        // Round 3: the totals name both recorded rates rather than one rate over the mix.
+        assert!(
+            text.contains("    at 0%: 0 sats on 21 sats paid, 1 job\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("    at 10%: 10 sats on 100 sats paid, 1 job\n"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -317,6 +437,7 @@ mod tests {
             "platform fee (10%): 10 sats",
             "you keep: 89 sats",
             "platform fee: 10 sats — recorded, not paid out",
+            "    at 10%: 10 sats on 100 sats paid, 1 job\n",
         ] {
             assert!(out.contains(needle), "missing {needle:?} in:\n{out}");
         }
@@ -337,6 +458,155 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&err)
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Round 3 — the case the three partial tests left uncovered: a REAL store written at schema v8
+    // (fee columns present, no `mint_fee_sats` column) holding a receipt collected under that
+    // schema; `maxplayer seller fees` opens it (the additive migration to v9 runs), and prints THAT
+    // row through the seller read-out with its mint fee "not recorded" and "you keep" unknown —
+    // never a measured 0, never a kept figure. The store is then re-read off disk at v9 to prove
+    // the row printed was the migrated one, and a row collected on the migrated store prints beside
+    // it with both figures known.
+    #[test]
+    fn run_prints_a_genuinely_migrated_v8_row_as_not_recorded_rather_than_zero() {
+        use maxplayer_core::seller_node::STATE_DB_FILE;
+        use maxplayer_core::seller_node::store::{ReceiptFees, SellerStore};
+
+        let root = std::env::temp_dir().join(format!(
+            "maxplayer-seller-fees-v8-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("temp home");
+        let db = root.join(STATE_DB_FILE);
+        {
+            // The v8 shape verbatim: `receipts` with the platform-fee columns and WITHOUT
+            // `mint_fee_sats`, schema_version 8, one receipt collected at face 100 / 10% / 10 sats.
+            let conn = rusqlite::Connection::open(&db).expect("create v8 store");
+            conn.execute_batch(
+                "CREATE TABLE seller_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO seller_meta VALUES ('schema_version', '8');
+                 CREATE TABLE receipts (
+                     receipt_id      TEXT PRIMARY KEY,
+                     job_id          TEXT NOT NULL,
+                     amount_sats     INTEGER NOT NULL CHECK (amount_sats >= 0),
+                     received_at_unix INTEGER NOT NULL,
+                     fee_bps         INTEGER NOT NULL DEFAULT 0 CHECK (fee_bps >= 0 AND fee_bps <= 10000),
+                     fee_sats        INTEGER NOT NULL DEFAULT 0 CHECK (fee_sats >= 0)
+                 );
+                 INSERT INTO receipts VALUES ('v8-receipt', 'v8-job', 100, 7, 1000, 10);",
+            )
+            .expect("v8 schema");
+            let columns: Vec<String> = conn
+                .prepare("SELECT name FROM pragma_table_info('receipts')")
+                .expect("pragma")
+                .query_map([], |row| row.get(0))
+                .expect("columns")
+                .collect::<Result<_, _>>()
+                .expect("column names");
+            assert!(
+                !columns.iter().any(|name| name == "mint_fee_sats"),
+                "fixture must predate the mint fee column: {columns:?}"
+            );
+        }
+
+        // Print the ledger straight off the v8 file: the open migrates, the read-out renders.
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run(
+            &["--home".to_owned(), root.display().to_string()],
+            &mut out,
+            &mut err,
+        );
+        let out = String::from_utf8(out).expect("utf8");
+        assert_eq!(code, SUCCESS, "stderr={}", String::from_utf8_lossy(&err));
+        for needle in [
+            "1 collected job, oldest first:",
+            "job v8-job",
+            "what the buyer paid: 100 sats",
+            "mint fee: not recorded (collected before this version tracked it)",
+            "platform fee (10%): 10 sats",
+            "you keep: unknown (mint fee not recorded)",
+            "mint fees: 0 sats across the jobs that recorded one, plus 1 job whose mint fee was not recorded",
+            "platform fee: 10 sats — recorded, not paid out",
+            "    at 10%: 10 sats on 100 sats paid, 1 job\n",
+            "you keep: unknown (no job recorded its mint fee)",
+        ] {
+            assert!(out.contains(needle), "missing {needle:?} in:\n{out}");
+        }
+        assert!(
+            !out.contains("mint fee: 0 sats"),
+            "a migrated row must not print a measured zero:\n{out}"
+        );
+        assert!(
+            !out.contains("you keep: 90 sats") && !out.contains("you keep: 100 sats"),
+            "no kept figure may be derived without the mint fee:\n{out}"
+        );
+
+        // The row that printed was the migrated one: the file now reads schema 9 with the
+        // `mint_fee_sats` column present and NULL on the v8 row.
+        {
+            let conn = rusqlite::Connection::open(&db).expect("reopen migrated store");
+            let version: String = conn
+                .query_row(
+                    "SELECT value FROM seller_meta WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("schema_version");
+            assert_eq!(version, "9", "the open migrated the v8 file to v9");
+            let mint_fee: Option<i64> = conn
+                .query_row(
+                    "SELECT mint_fee_sats FROM receipts WHERE receipt_id = 'v8-receipt'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("migrated column readable");
+            assert_eq!(mint_fee, None, "the v8 row's mint fee is NULL, not 0");
+        }
+
+        // A collection on the migrated store records its mint fee and prints beside the old row
+        // with both figures known, while the old row still says "not recorded".
+        {
+            let store = SellerStore::open(&db).expect("open migrated store");
+            store
+                .collect_receipt(
+                    "v9-receipt",
+                    "v9-job",
+                    100,
+                    ReceiptFees {
+                        mint_fee_sats: 1,
+                        fee_bps: 1000,
+                        fee_sats: 10,
+                    },
+                    8,
+                )
+                .expect("collect on migrated store");
+        }
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run(
+            &["--home".to_owned(), root.display().to_string()],
+            &mut out,
+            &mut err,
+        );
+        let out = String::from_utf8(out).expect("utf8");
+        assert_eq!(code, SUCCESS, "stderr={}", String::from_utf8_lossy(&err));
+        for needle in [
+            "2 collected jobs, oldest first:",
+            "job v8-job\n    what the buyer paid: 100 sats\n    mint fee: not recorded (collected before this version tracked it)\n    platform fee (10%): 10 sats\n    you keep: unknown (mint fee not recorded)\n",
+            "job v9-job\n    what the buyer paid: 100 sats\n    mint fee: 1 sats\n    platform fee (10%): 10 sats\n    you keep: 89 sats\n",
+            "mint fees: 1 sats across the jobs that recorded one, plus 1 job whose mint fee was not recorded",
+            "platform fee: 20 sats — recorded, not paid out",
+            "    at 10%: 20 sats on 200 sats paid, 2 jobs\n",
+            "you keep: 89 sats across the jobs that recorded a mint fee; the rest is unknown",
+        ] {
+            assert!(out.contains(needle), "missing {needle:?} in:\n{out}");
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
