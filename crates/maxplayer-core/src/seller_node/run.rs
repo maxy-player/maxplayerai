@@ -4615,14 +4615,15 @@ impl SellerNodeRunner {
         match self.node.store().jobs_in_flight() {
             Ok(count) => count,
             Err(error) => {
-                // Fail toward AVAILABLE, as this path always has, but say so: a silent read failure
-                // that parked the seat would be the same invisible-refusal shape as #313 itself.
-                // On the retraction path the fallback costs nothing either way — that beat says
+                // Fall back to publishing ZERO DEPTH, as this path always has, but say so: a silent
+                // read failure that inflated the count would be the same invisible shape as #313
+                // itself. The fallback moves `queue_depth` and nothing else — `accepting` comes from
+                // `anything_serving` on the live beat, and on the retraction path that beat says
                 // `accepting=n` whatever the count is (`retraction_for_state` passes
-                // `anything_serving = false` as a literal), so only `queue_depth` is affected.
+                // `anything_serving = false` as a literal).
                 opline!(
                     "seller node {what}: in-flight count unavailable ({error}); \
-                     advertising as free this tick"
+                     publishing queue_depth=0 this tick"
                 );
                 0
             }
@@ -10959,8 +10960,8 @@ mod tests {
     /// award REQ is unscoped (#456 — both kinds ride that one REQ). No award is published at all, so
     /// both seats reach `on_accept` with `job_award_time == None`: the arm that WRITES. Binding there
     /// on claim EXISTENCE alone gives the loser a phantom `awarded` job row, which `jobs_in_flight`
-    /// counts and the heartbeat then publishes as `accepting=n` — a seat stranded out of the market
-    /// by another seat's win, holding capacity for work it never had.
+    /// counts and the heartbeat then publishes as a raised `queue_depth` (`accepting` is unmoved by
+    /// held jobs) — a seat holding capacity for work it never had, by another seat's win.
     ///
     /// The WINNER leg is the anti-vacuity control and it is load-bearing: the same ACCEPT, on the
     /// seat whose claim it names, MUST still bind. Without it a handler that refused every accept
@@ -11105,7 +11106,7 @@ mod tests {
                 assert_eq!(
                     loser.slots.available(),
                     1,
-                    "the loser's reserved slot returns, so the seat keeps advertising capacity"
+                    "the loser's reserved permit returned, so one slot is available again"
                 );
 
                 // ANTI-VACUITY: the same ACCEPT, on the seat it names, still binds.
@@ -12352,8 +12353,8 @@ mod tests {
     ///
     /// It pins the self-heal that already-stranded seats depend on: a slot-occupying `awarded` row
     /// with no delivery, no receipt, no pushed commit and a PASSED offer deadline classifies as
-    /// `SkipLapsed`, and once failed it stops counting toward `jobs_in_flight` — which is what puts
-    /// the seat back to `accepting=y`. #626 closes the source of such rows; this guards the path that
+    /// `SkipLapsed`, and once failed it stops counting toward `jobs_in_flight` — which is what drops
+    /// the published `queue_depth` back down. #626 closes the source of such rows; this guards the path that
     /// clears the ones already written, so a later change cannot delete the healing silently.
     #[test]
     fn characterization_a_lapsed_awarded_row_lapses_and_stops_counting_once_failed() {
@@ -12362,11 +12363,11 @@ mod tests {
         let now = 2_000_i64;
         let (store, root) = store_with_lapsed_awarded_job(&job, &buyer, now);
 
-        // The stranded shape, asserted rather than assumed: the seat reports itself busy.
+        // The stranded shape, asserted rather than assumed: the seat reports load it is not carrying.
         assert_eq!(
             store.jobs_in_flight().expect("in flight"),
             1,
-            "precondition: the awarded row occupies a slot, so the heartbeat publishes accepting=n"
+            "precondition: the awarded row occupies a slot, so it counts toward the published queue_depth"
         );
         let state = store.job_state(&job).expect("job_state").expect("job row present");
         assert!(!store.has_delivery(&job).expect("has_delivery"), "never delivered");
@@ -12390,7 +12391,7 @@ mod tests {
         assert_eq!(
             store.jobs_in_flight().expect("in flight"),
             0,
-            "the failed row no longer occupies a slot, so the seat advertises capacity again"
+            "the failed row no longer occupies a slot, so it no longer raises the published queue_depth"
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -13378,7 +13379,7 @@ mod tests {
             .run_until(async {
                 // Harness check: the seat must first be OPEN on the wire. Without this the terminal
                 // `accepting=n` would be asserted against a seat that never advertised itself as
-                // available, and the tooth would pass on a node that simply never published.
+                // serving (`accepting=y`), and the tooth would pass on a node that simply never published.
                 assert!(
                     fixture
                         .wait_until_published(FIXTURE_WAIT, |events| seat_announcements(events)

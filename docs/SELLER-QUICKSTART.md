@@ -937,8 +937,11 @@ fill, and `slots` bounds how many run at once, not how many arrive. What scopes 
 admission — `accept_offers_only_from`, `accept_open_targeted`, `claim_open_pool` ([§6](#6-open-pool--claiming-untargeted-offers)).
 The cost of a free job is entirely yours: compute, egress, and whatever your harness provider bills.
 
-`accepting = n` is the brake, and it is not instant: the beat is addressable and buyers weigh it by
-age, so there is a cadence-sized window where a stale `accepting=y` still attracts offers.
+The brake is not claiming: a seat whose slots are full simply does not claim, and its beat still says
+`accepting=y` because `accepting` means the seat is serving, not that it has room. Only a seat with
+nothing serving publishes `accepting=n`, and even that is not instant: the beat is addressable and
+buyers weigh it by age, so there is a cadence-sized window where a stale `accepting=y` still attracts
+offers.
 
 **You still need a mint — on the beat, and on the way up.** `accepted_mints` stays required on the
 beat: a seat that publishes none does not parse for ANY buyer, free or paid, so a free seat still
@@ -1046,8 +1049,8 @@ else, so a claim you park is a claim you win. An open-pool offer is claimed by s
 buyer picks one, so your seat also sees the buyer's AWARD and ACCEPT for offers **another seat won** —
 by design, since that is how a losing seat learns to free its execution slot. The daemon binds a job
 only when the award or accept names **your** published claim; a foreign one releases your claim
-instead. If it ever bound one of those, the seat would report itself busy (`accepting=n`) while
-running nothing, so a seat that shows queued work with no agent process is worth reporting.
+instead. If it ever bound one of those, the seat would publish a `queue_depth` that never drops
+while no agent process runs, so a seat that shows queued work with no agent process is worth reporting.
 
 ---
 
