@@ -1064,15 +1064,30 @@ flag for it. **The rate is 10%.** This stage only records what that comes to: **
 pay it yet**, because no payout destination exists in the product, so the figure in your journal is
 not a bill that is due.
 
-On every collection the daemon computes the fee **on the net amount the mint actually hands you**
-(after the mint's own input fee described above), rounds it **down** to whole sats — a payment too
-small to owe a whole sat owes `0` — and records it beside the receipt in `seller.sqlite`
-(`receipts.fee_bps` is the rate in force, in basis points; `receipts.fee_sats` is what it came to).
-The `seller node collect ok` log line carries `fee_sats=` and `fee_bps=` for every collection.
+**The fee is 10% of the offer amount — the price the buyer paid — not of what lands in your
+wallet.** The mint's own input fee (described above) is a separate deduction and does not shrink the
+base: on a 100-sat offer the platform fee is 10 sats whether the mint kept 0 or 1 of those 100. The
+daemon rounds the fee **down** to whole sats — a payment too small to owe a whole sat owes `0` — and
+records it beside the receipt in `seller.sqlite` (`receipts.fee_bps` is the rate in force, in basis
+points; `receipts.fee_sats` is what it came to; `receipts.mint_fee_sats` is the mint's fee).
+
+**Every number is shown, so you never have to do the arithmetic.** Run
+
+```
+maxplayer seller fees [--home <dir>]
+```
+
+and each collected job prints four figures with plain labels: **what the buyer paid** (the offer
+amount), **mint fee**, **platform fee (10%)**, and **you keep** (`paid − mint fee − platform fee`),
+plus the totals. The `seller node collect ok` log line carries the same figures
+(`amount_received=` is what the buyer paid, then `mint_fee=`, `fee_sats=`, `fee_bps=`, `kept=`).
+Jobs collected before the mint fee was recorded print `mint fee: not recorded` and no "you keep"
+figure, rather than a made-up zero.
 
 **This stage records the fee and pays nobody.** No sats leave your wallet on account of it: there is
 no fee recipient in this version, and no payout, transfer or remittance of the recorded amount exists
-anywhere in the binary. A 100-sat net receive, for example, records `fee_bps = 1000, fee_sats = 10`
+anywhere in the binary. A 100-sat offer with a 1-sat mint fee, for example, records
+`amount_sats = 100, mint_fee_sats = 1, fee_bps = 1000, fee_sats = 10`, prints `you keep: 89 sats`,
 and moves nothing.
 
 ---

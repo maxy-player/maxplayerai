@@ -2129,7 +2129,9 @@ impl<'a> CdkSellerReceive<'a> {
         Self { wallet, seller_key }
     }
 
-    /// Swaps the received token at its mint before returning its redeemable amount.
+    /// Swaps the received token at its mint before returning its redeemable amount — the token's
+    /// FACE (== the offer amount), which is what the journal and daemon invariants expect. The
+    /// mint's own swap fee is reconciled but not returned here; see [`Self::receive_detailed`].
     ///
     /// `accepted_mints` is the seller's advertised mint set and `payload_mint` is
     /// the mint the buyer declared in its NUT-18 payload. The redeem guard refuses `wrong_mint`
@@ -2141,15 +2143,39 @@ impl<'a> CdkSellerReceive<'a> {
         accepted_mints: &HashSet<MintUrl>,
         payload_mint: &MintUrl,
     ) -> Result<Amount, PaymentWalletError> {
-        self.receive_with(token, terms, accepted_mints, payload_mint, |options| async move {
-            self.wallet
-                .receive(&token.to_string(), options)
-                .await
-                .map_err(wallet_error)
-        })
+        self.receive_detailed(token, terms, accepted_mints, payload_mint)
+            .await
+            .map(|received| received.face)
+    }
+
+    /// [`Self::receive`] with the mint's swap fee surfaced beside the face, so the collect seam can
+    /// journal every figure a seller needs to see: what the buyer paid, what the mint kept, and (once
+    /// the platform fee is applied) what the seller keeps. Same guards, same swap, same face.
+    pub async fn receive_detailed(
+        &self,
+        token: &Token,
+        terms: &PaymentTerms,
+        accepted_mints: &HashSet<MintUrl>,
+        payload_mint: &MintUrl,
+    ) -> Result<ReceivedPayment, PaymentWalletError> {
+        self.receive_with_detailed(
+            token,
+            terms,
+            accepted_mints,
+            payload_mint,
+            |options| async move {
+                self.wallet
+                    .receive(&token.to_string(), options)
+                    .await
+                    .map_err(wallet_error)
+            },
+        )
         .await
     }
 
+    /// Test seam: [`Self::receive_with_detailed`] reduced to the face, as the pre-existing tests read
+    /// it.
+    #[cfg(test)]
     async fn receive_with<F, Fut>(
         &self,
         token: &Token,
@@ -2158,6 +2184,23 @@ impl<'a> CdkSellerReceive<'a> {
         payload_mint: &MintUrl,
         receive: F,
     ) -> Result<Amount, PaymentWalletError>
+    where
+        F: FnOnce(ReceiveOptions) -> Fut,
+        Fut: Future<Output = Result<Amount, PaymentWalletError>>,
+    {
+        self.receive_with_detailed(token, terms, accepted_mints, payload_mint, receive)
+            .await
+            .map(|received| received.face)
+    }
+
+    async fn receive_with_detailed<F, Fut>(
+        &self,
+        token: &Token,
+        terms: &PaymentTerms,
+        accepted_mints: &HashSet<MintUrl>,
+        payload_mint: &MintUrl,
+        receive: F,
+    ) -> Result<ReceivedPayment, PaymentWalletError>
     where
         F: FnOnce(ReceiveOptions) -> Fut,
         Fut: Future<Output = Result<Amount, PaymentWalletError>>,
@@ -2207,8 +2250,24 @@ impl<'a> CdkSellerReceive<'a> {
             ..ReceiveOptions::default()
         };
         let received = receive(options).await?;
-        require_received_amount_after_fee(received, face, fee)
+        let face = require_received_amount_after_fee(received, face, fee)?;
+        Ok(ReceivedPayment {
+            face,
+            mint_fee: fee,
+        })
     }
+}
+
+/// One redeemed seller payment, with the two figures the swap establishes. `face` is the token's
+/// face (== the offer amount, what the buyer paid) — the figure the journal records and the base the
+/// platform fee is charged on. `mint_fee` is the mint's own swap fee, predicted pre-swap from the
+/// proofs and reconciled against the net credit: `face == net_credit + mint_fee` or the receive is
+/// refused as [`PaymentWalletError::FeeMismatch`]. The wallet net is therefore `face − mint_fee`;
+/// it is derived, never stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceivedPayment {
+    pub face: Amount,
+    pub mint_fee: Amount,
 }
 
 fn require_received_amount_after_fee(
@@ -3416,6 +3475,51 @@ mod tests {
             .unwrap();
 
         assert_eq!(amount, Amount::from(2));
+    }
+
+    // Round 2 of the seller fee: the detailed receive surfaces the mint's swap fee BESIDE the face,
+    // so the collect seam can journal both. With a nonzero mint fee, face (2) and wallet net (1)
+    // differ — the case that makes "what is the platform fee charged on" a distinguishable question.
+    #[tokio::test]
+    async fn seller_receive_detailed_returns_face_and_the_mint_fee_beside_it() {
+        let seller_key = secret_key(1);
+        let keyset = test_keyset_with_fee(1_000); // 1 proof → fee = 1
+        let proof = p2pk_proof_for_keyset(2, seller_key.public_key(), keyset.id);
+        let token = Token::new(mint(MINT), vec![proof], None, CurrencyUnit::Sat);
+        let wallet = seller_wallet(InflatedSwapTransport::default(), keyset).await;
+        let terms = PaymentTerms::new(
+            mint(MINT),
+            Amount::from(2),
+            CurrencyUnit::Sat,
+            nostr_key_for_p2pk(seller_key.public_key()),
+            seller_key.public_key(),
+        );
+        let adapter = CdkSellerReceive::new(&wallet, seller_key);
+
+        let received = adapter
+            .receive_with_detailed(&token, &terms, &accepted(&[MINT]), &mint(MINT), |_| async {
+                Ok(Amount::from(1))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            received,
+            ReceivedPayment {
+                face: Amount::from(2),
+                mint_fee: Amount::from(1),
+            },
+            "face is what the buyer paid; the mint fee is what the mint kept; net (1) is neither"
+        );
+        // The platform fee is charged on the FACE: 10% of 2 sats is 0 (rounds down), and would be
+        // 0 of the net too — so use the arithmetic on the figures this returns to show the
+        // distinction at a size where it bites: 10% of face 100 is 10, of net 99 it would be 9.
+        let face = received.face.to_u64() * 50;
+        let net = face - received.mint_fee.to_u64() * 50;
+        assert_ne!(
+            crate::platform_fee::fee_sats(face, crate::platform_fee::PLATFORM_FEE_BPS),
+            crate::platform_fee::fee_sats(net, crate::platform_fee::PLATFORM_FEE_BPS),
+        );
     }
 
     // Z2 (multi-mint redeem at realized mint): when the buyer pays at a NON-default accepted mint,

@@ -21,10 +21,11 @@
 /// whole payment). This constant is the whole specification of the fee:
 ///
 /// - It is set by the product, here, and not by the seller. No config surface reads or writes it.
-/// - It is applied to the **net** amount the seller actually received at the mint — the sats left
-///   after the mint's own swap fee — never to the offer's face amount.
-/// - The fee on a payment is `floor(amount_received × PLATFORM_FEE_BPS / 10_000)`; it **rounds
-///   down**, so a payment too small to earn a whole sat at this rate owes a fee of zero.
+/// - It is applied to the offer's **face** amount — the price the buyer paid, which is what the
+///   receipt journals as `amount_sats` — not to the smaller sum that lands in the seller's wallet
+///   after the mint takes its own swap fee.
+/// - The fee on a payment is `floor(face × PLATFORM_FEE_BPS / 10_000)`; it **rounds down**, so a
+///   payment too small to earn a whole sat at this rate owes a fee of zero.
 /// - The rate in force is journaled beside every receipt (`receipts.fee_bps`), so a store that
 ///   outlives a change to this number still says what each collection owed.
 ///
@@ -43,22 +44,49 @@ const _: () = assert!(
     "PLATFORM_FEE_BPS must not exceed 10_000 (100%)"
 );
 
-/// The platform fee owed on one collected payment: `floor(amount_received × fee_bps / 10_000)`.
+/// The platform fee owed on one collected payment: `floor(face_sats × fee_bps / 10_000)`.
 ///
-/// `amount_received` is the NET the seller actually got at the mint (after the mint's own swap
-/// fee), which is the base the rate applies to. `fee_bps` is the rate in basis points; the seam
-/// passes [`PLATFORM_FEE_BPS`], tests pass whatever rate they are proving. The product is taken in
-/// `u128` so it cannot overflow for any `u64` amount, and the division rounds **down**: a seller is
-/// never charged a sat the arithmetic did not earn, and a payment too small to owe a whole sat owes
-/// zero — a fee, not an error.
+/// `face_sats` is the offer's face amount — what the buyer paid, and what the seller node's
+/// collect path hands over as `amount_received` (the adapter returns the face once the mint's net
+/// credit plus the predicted mint fee reconcile to it). It is NOT the wallet net: the mint's own
+/// swap fee is a separate figure, journaled beside this one and never folded into the base.
+/// `fee_bps` is the rate in basis points; the seam passes [`PLATFORM_FEE_BPS`], tests pass whatever
+/// rate they are proving. The product is taken in `u128` so it cannot overflow for any `u64`
+/// amount, and the division rounds **down**: a seller is never charged a sat the arithmetic did not
+/// earn, and a payment too small to owe a whole sat owes zero — a fee, not an error.
 ///
 /// A rate above 100% is not a fee anyone can owe; it is clamped to the whole amount so the result
-/// always fits a `u64` and never exceeds `amount_received`.
-pub fn fee_sats(amount_received: u64, fee_bps: u32) -> u64 {
+/// always fits a `u64` and never exceeds `face_sats`.
+pub fn fee_sats(face_sats: u64, fee_bps: u32) -> u64 {
     let fee_bps = fee_bps.min(BPS_PER_WHOLE);
-    let product = u128::from(amount_received) * u128::from(fee_bps);
+    let product = u128::from(face_sats) * u128::from(fee_bps);
     let fee = product / u128::from(BPS_PER_WHOLE);
     u64::try_from(fee).expect("a fee of at most 100% of a u64 amount fits a u64")
+}
+
+/// What the seller keeps of one collected payment: `face − mint_fee − platform_fee`, saturating at
+/// zero. This is a display-time derivation from the three journaled figures — it is deliberately
+/// NOT stored, so it can never disagree with the columns it comes from. Both deductions are taken
+/// from the face: the mint's swap fee is what the mint kept before the sats reached the wallet, and
+/// the platform fee is what this stage records as owed (and does not remit).
+pub fn kept_sats(face_sats: u64, mint_fee_sats: u64, platform_fee_sats: u64) -> u64 {
+    face_sats
+        .saturating_sub(mint_fee_sats)
+        .saturating_sub(platform_fee_sats)
+}
+
+/// Render a basis-points rate as the percentage a seller reads: `1000 → "10%"`, `250 → "2.5%"`,
+/// `1 → "0.01%"`. Used by the seller-facing read-out so the label says the rate, not the unit.
+pub fn bps_to_percent_label(fee_bps: u32) -> String {
+    let whole = fee_bps / 100;
+    let fraction = fee_bps % 100;
+    if fraction == 0 {
+        format!("{whole}%")
+    } else if fraction.is_multiple_of(10) {
+        format!("{whole}.{}%", fraction / 10)
+    } else {
+        format!("{whole}.{fraction:02}%")
+    }
 }
 
 #[cfg(test)]
@@ -115,6 +143,29 @@ mod tests {
     fn a_rate_above_the_whole_is_clamped_to_the_whole_amount() {
         assert_eq!(fee_sats(100, 10_001), 100);
         assert_eq!(fee_sats(u64::MAX, u32::MAX), u64::MAX);
+    }
+
+    // ---- what the seller keeps, and the label ----
+
+    #[test]
+    fn kept_is_face_minus_mint_fee_minus_platform_fee_and_never_negative() {
+        // Face 100, mint fee 1, platform fee 10 (10% of the FACE, not of the 99 net) ⇒ 89 kept.
+        assert_eq!(kept_sats(100, 1, fee_sats(100, 1000)), 89);
+        // No mint fee: 100 − 0 − 10.
+        assert_eq!(kept_sats(100, 0, 10), 90);
+        // Deductions that would exceed the face saturate at zero rather than wrapping.
+        assert_eq!(kept_sats(5, 3, 3), 0);
+        assert_eq!(kept_sats(0, u64::MAX, u64::MAX), 0);
+    }
+
+    #[test]
+    fn bps_render_as_the_percentage_a_seller_reads() {
+        assert_eq!(bps_to_percent_label(0), "0%");
+        assert_eq!(bps_to_percent_label(1000), "10%");
+        assert_eq!(bps_to_percent_label(250), "2.5%");
+        assert_eq!(bps_to_percent_label(1), "0.01%");
+        assert_eq!(bps_to_percent_label(10_000), "100%");
+        assert_eq!(bps_to_percent_label(PLATFORM_FEE_BPS), "10%");
     }
 
     // ---- the constant ----

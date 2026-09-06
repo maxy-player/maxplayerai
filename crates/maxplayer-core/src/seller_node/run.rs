@@ -1396,9 +1396,10 @@ fn offer_parse_refusal(error: &OfferParseError) -> String {
 
 /// The seller-receive classification on the node redeem path (finding S, ported from the daemon).
 #[derive(Debug)]
-enum RedeemDecision {
-    /// Receive succeeded — finalize a receipt for this redeemed amount.
-    Finalize(u64),
+enum RedeemDecision<T = u64> {
+    /// Receive succeeded — finalize a receipt for this redeemed payment (the amount, or the amount
+    /// with the mint fee beside it — whatever the adapter established).
+    Finalize(T),
     /// Idempotent re-see: already spent AND a COMPLETED receipt exists — we already collected and
     /// receipted it. No-op; never double-collect / re-receipt.
     IdempotentNoOp,
@@ -1424,12 +1425,12 @@ fn is_already_spent(error: &str) -> bool {
 /// indistinguishable, so fail closed); has_receipt read error ⇒ refuse. Any non-already-spent error
 /// also refuses. `has_receipt` is a closure so the store is read only on the already-spent branch and
 /// the decision is unit-testable without a mint.
-fn classify_redeem_outcome(
-    receive_result: Result<u64, String>,
+fn classify_redeem_outcome<T>(
+    receive_result: Result<T, String>,
     has_receipt: impl FnOnce() -> Result<bool, String>,
-) -> RedeemDecision {
+) -> RedeemDecision<T> {
     match receive_result {
-        Ok(amount) => RedeemDecision::Finalize(amount),
+        Ok(received) => RedeemDecision::Finalize(received),
         Err(error) if !is_already_spent(&error) => RedeemDecision::Refuse(error),
         Err(error) => match has_receipt() {
             Ok(true) => RedeemDecision::IdempotentNoOp,
@@ -1442,10 +1443,12 @@ fn classify_redeem_outcome(
 }
 
 /// The platform fee (stage 1) owed on one collected payment: the product-set rate
-/// ([`crate::platform_fee::PLATFORM_FEE_BPS`]) applied to `amount_received`, the NET the mint handed
-/// over. This is the ONE place the constant is read; the arithmetic stays in the parameterised
-/// [`crate::platform_fee::fee_sats`]. Returns the rate in force and the sats it comes to, rounded
-/// down, so the caller journals both beside the receipt.
+/// ([`crate::platform_fee::PLATFORM_FEE_BPS`]) applied to `amount_received`, which on this path is
+/// the offer's FACE — what the buyer paid (the adapter returns the face once net credit + mint fee
+/// reconcile to it). The mint's swap fee is NOT subtracted first: 10% of a 100-sat offer is 10 sats
+/// whether the mint kept 0 or 1 of them. This is the ONE place the constant is read; the arithmetic
+/// stays in the parameterised [`crate::platform_fee::fee_sats`]. Returns the rate in force and the
+/// sats it comes to, rounded down, so the caller journals both beside the receipt.
 ///
 /// Called only after the redeem classified `Finalize`; nothing is computed or recorded for a payment
 /// that did not land. Accrued, never remitted: this returns numbers for the journal and moves no sat.
@@ -6716,17 +6719,25 @@ impl SellerNodeRunner {
 
         // Swap at the mint, then classify FAIL-CLOSED (never infer prior collection from the
         // breadcrumb — the only proof is a COMPLETED receipt read fail-closed).
+        // `amount_received` is the token FACE (== offer amount, what the buyer paid); the adapter
+        // returns it only once the mint's net credit plus the predicted mint fee reconcile to it.
+        // `mint_fee_sats` is that mint fee, carried beside the face so the receipt can show it.
         let receive_result = adapter
-            .receive(&token, &terms, &accepted_mints, &payload_mint)
+            .receive_detailed(&token, &terms, &accepted_mints, &payload_mint)
             .await
-            .map(|amount| amount.to_u64())
+            .map(|received| (received.face.to_u64(), received.mint_fee.to_u64()))
             .map_err(|error| error.to_string());
-        let amount_received = match classify_redeem_outcome(receive_result, || {
-            self.node.store().has_receipt(&job_id).map_err(|error| error.to_string())
+        let (amount_received, mint_fee_sats) = match classify_redeem_outcome(receive_result, || {
+            self.node
+                .store()
+                .has_receipt(&job_id)
+                .map_err(|error| error.to_string())
         }) {
-            RedeemDecision::Finalize(amount) => amount,
+            RedeemDecision::Finalize(received) => received,
             RedeemDecision::IdempotentNoOp => {
-                opline!("seller node wrap event={event_id}: idempotent no-op (already spent AND a completed receipt exists) for job {job_id}");
+                opline!(
+                    "seller node wrap event={event_id}: idempotent no-op (already spent AND a completed receipt exists) for job {job_id}"
+                );
                 return;
             }
             RedeemDecision::Refuse(reason) => {
@@ -6735,21 +6746,27 @@ impl SellerNodeRunner {
             }
         };
         // Platform fee (stage 1): computed only NOW — after the redeem classified `Finalize` — on the
-        // NET the mint handed over, at the product-set rate, and journaled in the receipt write
-        // below. Accrued, never remitted: nothing here or downstream moves a sat on its account.
+        // FACE (what the buyer paid), at the product-set rate, and journaled in the receipt write
+        // below. `kept` is what the seller keeps once the mint's fee and the platform fee are both
+        // taken from the face; it is derived for the log and never stored. Accrued, never remitted:
+        // nothing here or downstream moves a sat on its account.
         let (fee_bps, fee_sats) = platform_fee_at_collect(amount_received);
+        let kept = crate::platform_fee::kept_sats(amount_received, mint_fee_sats, fee_sats);
         opline!(
-            "seller node collect ok: job_id={job_id} amount_received={amount_received} expected={expected} mint={mint_str} fee_sats={fee_sats} fee_bps={fee_bps}"
+            "seller node collect ok: job_id={job_id} amount_received={amount_received} expected={expected} mint={mint_str} mint_fee={mint_fee_sats} fee_sats={fee_sats} fee_bps={fee_bps} kept={kept}"
         );
 
         // Record the receipt AFTER the money landed (invariant 3 order) — deduped on the wrap id, so a
-        // replayed wrap marks the job paid at most once. The fee rides in the same row.
+        // replayed wrap marks the job paid at most once. The fees ride in the same row.
         match self.node.store().collect_receipt(
             &event_id,
             &job_id,
             amount_received,
-            fee_bps,
-            fee_sats,
+            super::store::ReceiptFees {
+                mint_fee_sats,
+                fee_bps,
+                fee_sats,
+            },
             now_unix(),
         ) {
             Ok(super::store::Collected::New) => {
@@ -7334,6 +7351,16 @@ mod slot_gate_tests {
 
 #[cfg(test)]
 mod tests {
+    use crate::seller_node::store::ReceiptFees;
+
+    /// The fee triple a test journals beside a receipt: (mint fee, platform bps, platform sats).
+    fn fees(mint_fee_sats: u64, fee_bps: u32, fee_sats: u64) -> ReceiptFees {
+        ReceiptFees {
+            mint_fee_sats,
+            fee_bps,
+            fee_sats,
+        }
+    }
     use super::*;
 
     const SELLER: &str = "aa";
@@ -11654,7 +11681,7 @@ mod tests {
 
         // The payment lands ⇒ no longer unsettled, and the receipt time becomes the cursor.
         store
-            .collect_receipt(&"d".repeat(64), &job, 21, 0, 0, 10_000)
+            .collect_receipt(&"d".repeat(64), &job, 21, fees(0, 0, 0), 10_000)
             .expect("collect");
         assert_eq!(store.last_receipt_unix().expect("receipts"), Some(10_000));
         assert_eq!(
@@ -11916,7 +11943,7 @@ mod tests {
         // Pay ⇒ state Paid ⇒ likewise not re-execute-eligible (terminal never clobbered).
         assert_eq!(
             store
-                .collect_receipt(&"e".repeat(64), &job, 21, 0, 0, 6000)
+                .collect_receipt(&"e".repeat(64), &job, 21, fees(0, 0, 0), 6000)
                 .expect("collect"),
             Collected::New
         );
@@ -12713,22 +12740,27 @@ mod tests {
         ));
         // Already-spent + a COMPLETED receipt ⇒ idempotent no-op (legit backfill/restart re-see).
         assert!(matches!(
-            classify_redeem_outcome(Err("Token already spent".into()), || Ok(true)),
+            classify_redeem_outcome::<u64>(Err("Token already spent".into()), || Ok(true)),
             RedeemDecision::IdempotentNoOp
         ));
         // Already-spent + NO receipt (crash-between, or a replay/theft — indistinguishable) ⇒ refuse.
         assert!(matches!(
-            classify_redeem_outcome(Err("Token already spent".into()), || Ok(false)),
+            classify_redeem_outcome::<u64>(Err("Token already spent".into()), || Ok(false)),
             RedeemDecision::Refuse(_)
         ));
         // has_receipt READ ERROR ⇒ refuse, FAIL CLOSED (never read unreadable as "no receipt ⇒ safe").
         assert!(matches!(
-            classify_redeem_outcome(Err("already redeemed".into()), || Err("corrupt".into())),
+            classify_redeem_outcome::<u64>(
+                Err("already redeemed".into()),
+                || Err("corrupt".into())
+            ),
             RedeemDecision::Refuse(_)
         ));
         // A non-already-spent receive error refuses without consulting has_receipt.
         assert!(matches!(
-            classify_redeem_outcome(Err("mint offline".into()), || panic!("must not read has_receipt")),
+            classify_redeem_outcome::<u64>(Err("mint offline".into()), || panic!(
+                "must not read has_receipt"
+            )),
             RedeemDecision::Refuse(_)
         ));
     }
@@ -12868,12 +12900,14 @@ mod tests {
         let wrap_id = "e".repeat(64);
         assert!(!store.has_receipt(&job).expect("read"), "not paid before collect");
         assert_eq!(
-            store.collect_receipt(&wrap_id, &job, 21, 0, 0, 5000).expect("collect"),
+            store
+                .collect_receipt(&wrap_id, &job, 21, fees(0, 0, 0), 5000)
+                .expect("collect"),
             crate::seller_node::store::Collected::New
         );
         assert_eq!(
             store
-                .collect_receipt(&wrap_id, &job, 21, 0, 0, 5001)
+                .collect_receipt(&wrap_id, &job, 21, fees(0, 0, 0), 5001)
                 .expect("replay"),
             crate::seller_node::store::Collected::Duplicate,
             "a replayed wrap id never credits the job twice"
@@ -12886,12 +12920,13 @@ mod tests {
     }
 
     // Platform fee (stage 1) at the collect seam. Drives the two calls `on_gift_wrap` makes once the
-    // redeem has classified `Finalize` — `platform_fee_at_collect` on the NET amount, then
-    // `collect_receipt` with the result — against a real store, with no relay or mint.
+    // redeem has classified `Finalize` — `platform_fee_at_collect` on the FACE (what the buyer paid),
+    // then `collect_receipt` with the result and the mint fee — against a real store, with no relay
+    // or mint.
     //
     // Two things are proved. (1) The seam's rate IS `PLATFORM_FEE_BPS` — asserted directly as 1000
-    // bp (10%) — and a 100-sat NET receive journals the 10 sats that follow, per job and in total; a
-    // seam that dropped or zeroed the rate fails here. (2) The same path through the parameterised
+    // bp (10%) — and a 100-sat offer journals the 10 sats that follow, per job and in total; a seam
+    // that dropped or zeroed the rate fails here. (2) The same path through the parameterised
     // function at a different rate (2%) journals 2 sats, so the store carries whatever rate was in
     // force, not a baked-in number. What this does NOT drive: the wallet swap itself.
     #[test]
@@ -12911,8 +12946,8 @@ mod tests {
         let job = "a".repeat(64);
         let buyer = "b".repeat(64);
 
-        // (1) The seam reads the constant: 10% (1000 bp). A 100-sat NET receive is journaled with
-        // `fee_bps = 1000` and `fee_sats = 10`.
+        // (1) The seam reads the constant: 10% (1000 bp). A 100-sat offer (mint fee 1) is journaled
+        // with `fee_bps = 1000` and `fee_sats = 10`.
         let (seam_bps, seam_sats) = platform_fee_at_collect(100);
         assert_eq!(
             seam_bps, PLATFORM_FEE_BPS,
@@ -12921,7 +12956,7 @@ mod tests {
         assert_eq!(
             (seam_bps, seam_sats),
             (1000, 10),
-            "stage 1 ships at 10%: 100 sats net owes 10 sats, recorded and not remitted"
+            "stage 1 ships at 10%: a 100-sat offer owes 10 sats, recorded and not remitted"
         );
         assert_eq!(
             seam_sats,
@@ -12931,7 +12966,13 @@ mod tests {
         let (store, root) = store_with_awarded_job(&creq, &job, &buyer, 4242);
         assert_eq!(
             store
-                .collect_receipt(&"e".repeat(64), &job, 100, seam_bps, seam_sats, 5000)
+                .collect_receipt(
+                    &"e".repeat(64),
+                    &job,
+                    100,
+                    fees(1, seam_bps, seam_sats),
+                    5000
+                )
                 .expect("collect"),
             Collected::New
         );
@@ -12942,6 +12983,7 @@ mod tests {
             vec![JobFeeAccrual {
                 job_id: job.clone(),
                 amount_sats: 100,
+                mint_fee_sats: Some(1),
                 fee_bps: 1000,
                 fee_sats: 10,
                 received_at_unix: 5000
@@ -12953,7 +12995,7 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&root);
 
-        // (2) The same fee path at a different rate: 2% (200 bp) of a 100-sat NET receive is 2 sats,
+        // (2) The same fee path at a different rate: 2% (200 bp) of a 100-sat offer is 2 sats,
         // journaled in the receipt row and read back — the store records the rate in force, whatever
         // it is, so a later change to the constant leaves old rows telling the truth.
         let nonzero_bps = 200;
@@ -12962,7 +13004,13 @@ mod tests {
         let (store, root) = store_with_awarded_job(&creq, &job, &buyer, 4242);
         assert_eq!(
             store
-                .collect_receipt(&"f".repeat(64), &job, 100, nonzero_bps, nonzero_sats, 5000)
+                .collect_receipt(
+                    &"f".repeat(64),
+                    &job,
+                    100,
+                    fees(1, nonzero_bps, nonzero_sats),
+                    5000
+                )
                 .expect("collect"),
             Collected::New
         );
@@ -12973,12 +13021,87 @@ mod tests {
             vec![JobFeeAccrual {
                 job_id: job.clone(),
                 amount_sats: 100,
+                mint_fee_sats: Some(1),
                 fee_bps: 200,
                 fee_sats: 2,
                 received_at_unix: 5000
             }]
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Face-vs-net is a test, not a comment (round 2). On the collect path the adapter hands over
+    // `(face, mint_fee)`; the platform fee is 10% of the FACE. With a nonzero mint fee, face (100)
+    // and wallet net (99) differ, so "10% of face" (10) and "10% of net" (9) are distinguishable —
+    // and the row records 10, with the mint fee beside it and `kept` = 100 − 1 − 10 = 89 derived.
+    #[test]
+    fn platform_fee_is_charged_on_the_offer_face_not_the_wallet_net() {
+        use crate::platform_fee::{PLATFORM_FEE_BPS, fee_sats, kept_sats};
+        use crate::seller_node::store::Collected;
+
+        // What the adapter returns once net credit + predicted mint fee reconcile to the face —
+        // shaped exactly as the seam destructures it after `classify_redeem_outcome`.
+        let (face, mint_fee): (u64, u64) = (100, 1);
+        let wallet_net = face - mint_fee;
+        assert_eq!(wallet_net, 99, "the two candidate bases differ");
+        match classify_redeem_outcome(Ok((face, mint_fee)), || {
+            panic!("has_receipt must not be read on success")
+        }) {
+            RedeemDecision::Finalize((amount_received, mint_fee_sats)) => {
+                assert_eq!((amount_received, mint_fee_sats), (100, 1));
+                let (fee_bps, platform_fee) = platform_fee_at_collect(amount_received);
+                assert_eq!(fee_bps, PLATFORM_FEE_BPS);
+                assert_eq!(platform_fee, 10, "10% of the 100-sat FACE");
+                assert_ne!(
+                    platform_fee,
+                    fee_sats(wallet_net, PLATFORM_FEE_BPS),
+                    "and NOT 10% of the 99-sat wallet net (which would be 9)"
+                );
+                assert_eq!(kept_sats(amount_received, mint_fee_sats, platform_fee), 89);
+
+                // The row journals all three figures; the read-out derives kept = 89.
+                let seller = nostr_sdk::prelude::Keys::generate().public_key().to_hex();
+                let creq = gateway::creq::build_seller_creq(
+                    &"a".repeat(64),
+                    100,
+                    "sat",
+                    &["https://testnut.cashudevkit.org".to_owned()],
+                    &seller,
+                )
+                .expect("creq");
+                let job = "a".repeat(64);
+                let (store, root) = store_with_awarded_job(&creq, &job, &"b".repeat(64), 4242);
+                assert_eq!(
+                    store
+                        .collect_receipt(
+                            &"e".repeat(64),
+                            &job,
+                            amount_received,
+                            fees(mint_fee_sats, fee_bps, platform_fee),
+                            5000
+                        )
+                        .expect("collect"),
+                    Collected::New
+                );
+                let accrued = store.accrued_fees().expect("read-out");
+                let row = &accrued.by_job[0];
+                assert_eq!(
+                    (
+                        row.amount_sats,
+                        row.mint_fee_sats,
+                        row.fee_bps,
+                        row.fee_sats
+                    ),
+                    (100, Some(1), 1000, 10)
+                );
+                assert_eq!(row.kept_sats(), Some(89));
+                assert_eq!(accrued.total_mint_fee_sats, 1);
+                assert_eq!(accrued.rows_without_mint_fee, 0);
+                assert_eq!(accrued.total_kept_sats(), Some(89));
+                let _ = std::fs::remove_dir_all(&root);
+            }
+            other => panic!("a successful receive must finalize, got {other:?}"),
+        }
     }
 
     // ── Resume execution across a process restart (invariant 4, fallback form) ───────────────────
