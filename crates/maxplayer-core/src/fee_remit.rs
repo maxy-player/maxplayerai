@@ -658,10 +658,14 @@ struct AttemptTrace {
 ///    the second quote still fits.
 /// 5. Print the plan. A dry run stops here.
 /// 6. Journal the plan (pins the receipts, records this process as owner under [`REMIT_LEASE`];
-///    refuses a duplicate), pass the pre-spend gate (ownership re-confirmed with [`SPEND_MARGIN`] of
-///    lease left; the ceiling checked inside the melt against the quote raised at payment time),
-///    melt, settle. A melt REFUSED at the ceiling released the row (nothing was spent); a melt
-///    ERROR leaves the row `planned` for step 1 of the next run.
+///    refuses a duplicate). Then, in this order (addendum 5 §1 rule 1): raise the PAYMENT quote
+///    and check the ceiling against its amount and reserve — refused ⇒ release the row (still
+///    planned, ours, nothing spent) and journal failed; pass the fence — one compare-and-set that
+///    marks the row spending and BINDS that quote, with the clock read inside the store call and
+///    more than [`SPEND_MARGIN`] of lease left; pay that quote BY ID, re-checking the ceiling
+///    immediately before `prepare_melt`; settle. A payment ERROR after the fence leaves the row
+///    `spending`, bound to its quote, for step 1 of the next run — which asks the mint about THAT
+///    quote and never raises another for the row.
 pub fn remit(
     store: &SellerStore,
     effects: &mut dyn RemitEffects,
@@ -784,7 +788,7 @@ fn remit_inner(
         trace.remittance_id = Some(active.remittance_id.clone());
         let _ = writeln!(
             out,
-            "Reconciling in-flight remittance {} (planned at unix {} by {}, lease until unix {}: {} sats to {}, gross {} sats)",
+            "Reconciling in-flight remittance {} (planned at unix {} by {}, lease until unix {}: {} sats to {}, gross {} sats){}",
             active.remittance_id,
             active.created_at_unix,
             active.owner.as_deref().unwrap_or("nobody recorded"),
@@ -794,10 +798,31 @@ fn remit_inner(
                 .unwrap_or_else(|| "none recorded".to_owned()),
             active.net_sats,
             active.destination,
-            active.gross_sats
+            active.gross_sats,
+            match (active.state, active.spending_quote_id.as_deref()) {
+                (RemittanceState::Spending, Some(quote_id)) => format!(
+                    " — SPENDING since unix {}, bound to melt quote {quote_id}: asking the mint about that quote by id",
+                    active.spending_since_unix.unwrap_or(active.created_at_unix)
+                ),
+                (RemittanceState::Spending, None) => format!(
+                    " — SPENDING since unix {} with no quote bound (admitted before quotes were bound): asking the mint about its invoice's quotes",
+                    active.spending_since_unix.unwrap_or(active.created_at_unix)
+                ),
+                _ => String::new(),
+            }
         );
-        let status = effects.melt_status(&active.bolt11)?;
-        match reconcile_decision(&active, status.as_ref(), effects.owner(), now_unix) {
+        // A spending row bound to a quote is reconciled against THAT quote, by id — never against
+        // "the most alive quote for the invoice", which cannot see a quote nobody has raised and
+        // must not speak for the one the owner is paying (addendum 5 §1, rule 2).
+        let status = match (active.state, active.spending_quote_id.as_deref()) {
+            (RemittanceState::Spending, Some(quote_id)) => {
+                effects.melt_status_for_quote(quote_id)?
+            }
+            _ => effects.melt_status(&active.bolt11)?,
+        };
+        let decision = reconcile_decision(&active, status.as_ref(), effects.owner(), now_unix);
+        effects.after_decision(&active, &decision);
+        match decision {
             Reconcile::Settle => {
                 let status = status.expect("Settle is decided only on a PAID status");
                 let settlement = RemitSettlement {
@@ -820,15 +845,33 @@ fn remit_inner(
                     status.fee_reserve_sats
                 );
             }
-            Reconcile::Release(reason) => {
-                store
-                    .fail_remittance(&active.remittance_id, now_unix)
-                    .map_err(|error| format!("record failed remittance: {error}"))?;
-                let _ = writeln!(
-                    out,
-                    "  {reason}; released {} sats back to unremitted",
-                    active.gross_sats
-                );
+            Reconcile::Release { reason, on } => {
+                // The release is CONDITIONAL on the row still being as the decision found it. Zero
+                // rows changed ⇒ the row moved under us (its owner was admitted, or another process
+                // resolved it): HOLD — nothing written, this run refused, re-run to reconcile.
+                match store
+                    .release_remittance(&active.remittance_id, &on, now_unix)
+                    .map_err(|error| format!("record failed remittance: {error}"))?
+                {
+                    Some(_) => {
+                        let _ = writeln!(
+                            out,
+                            "  {reason}; released {} sats back to unremitted (release condition: {})",
+                            active.gross_sats,
+                            on.describe()
+                        );
+                    }
+                    None => {
+                        let _ = writeln!(
+                            out,
+                            "  {reason} — but the row changed under me between that decision and the release (condition: {}): nothing written. REFUSED — nothing moved by this run; re-run to reconcile the row as it now stands.",
+                            on.describe()
+                        );
+                        return Ok(RemitOutcome::Refused(Refusal::RowChangedUnderMe {
+                            remittance_id: active.remittance_id,
+                        }));
+                    }
+                }
             }
             Reconcile::Hold(refusal) => {
                 let _ = writeln!(
@@ -1010,40 +1053,170 @@ fn remit_inner(
     );
     effects.after_plan(&planned);
 
-    // The pre-spend gate, both conditions, before a single proof is touched (addendum 3 §2.1,
-    // addendum 4 §1):
-    // (a) the fence — ONE compare-and-set in the store advances the row planned → spending, and
-    //     only if it is still planned, still ours, and its lease ends more than SPEND_MARGIN after
-    //     the clock AS READ NOW (not the attempt's entry time: however long we paused between the
-    //     plan and this line, that time counts). Zero rows changed ⇒ refuse, no spend. Once
-    //     admitted, the row is released by nobody on time: only the mint's verdict on its quote
-    //     resolves it.
-    // (b) the ceiling — enforced INSIDE the melt against the quote raised at payment time.
-    let admit_now_unix = effects.now_unix();
-    let admitted = match store
-        .admit_remittance_spend(
-            &planned.remittance_id,
-            effects.owner(),
-            admit_now_unix,
-            lease_secs(SPEND_MARGIN),
-        )
-        .map_err(|error| format!("admit remittance {}: {error}", planned.remittance_id))?
-    {
+    // The spend, in the order addendum 5 §1 rule 1 fixes:
+    //   1. raise the PAYMENT quote Q (spends nothing) and check the ceiling against Q's amount and
+    //      reserve — before any proof is selected; refused ⇒ release our own planned row, journal
+    //      failed, nothing spent;
+    //   2. the fence — ONE compare-and-set in the store advances the row planned → spending AND
+    //      BINDS Q to it, only if it is still planned, still ours, and its lease ends more than
+    //      SPEND_MARGIN after the clock as read INSIDE the store call, after its lock (however long
+    //      we paused between the plan and this line, that time counts, and no pause between reading
+    //      the clock and the write can make it stale). Zero rows changed ⇒ refuse, no spend. Once
+    //      admitted, the row is released by nobody on time: only the mint's verdict on Q resolves it;
+    //   3. pay Q BY ID — never a second quote for a row we hold — re-checking the ceiling against
+    //      Q's stored figures immediately before `prepare_melt`.
+    let ceiling = MeltCeiling {
+        max_debit_sats: gross,
+        invoice_sats: net,
+        planned_quote_id: Some(estimate.quote_id.clone()),
+    };
+    let effects_owner_for_release = effects.owner().to_owned();
+    let release_own_planned = |store: &SellerStore, out: &mut dyn Write| -> Result<bool, String> {
+        // Nothing was spent and the row is ours and still planned: release it for the next attempt.
+        // Conditional like every release: if the row is not as we left it, hold and say so.
+        let released = store
+            .release_remittance(
+                &planned.remittance_id,
+                &ReleaseOn::OwnPlanned {
+                    owner: effects_owner_for_release.clone(),
+                },
+                now_unix,
+            )
+            .map_err(|error| format!("release remittance: {error}"))?;
+        if released.is_none() {
+            let _ = writeln!(
+                out,
+                "  (the row changed under me before it could be released — nothing written; the next attempt reconciles it)"
+            );
+        }
+        Ok(released.is_some())
+    };
+
+    // 1. The payment quote, and the ceiling against IT.
+    let quote = match effects.melt_quote(&invoice.bolt11) {
+        Ok(quote) => quote,
+        Err(error) => {
+            let released = release_own_planned(store, out)?;
+            let _ = writeln!(
+                out,
+                "payment quote failed: {error}. Nothing left the wallet{}.",
+                if released {
+                    format!(
+                        "; released {} sats back to unremitted for the next attempt",
+                        planned.gross_sats
+                    )
+                } else {
+                    String::new()
+                }
+            );
+            return Ok(RemitOutcome::QuoteFailed {
+                remittance_id: planned.remittance_id,
+                error,
+            });
+        }
+    };
+    let refuse_before_fence = |reason: String,
+                               store: &SellerStore,
+                               out: &mut dyn Write|
+     -> Result<RemitOutcome, String> {
+        let released = release_own_planned(store, out)?;
+        let _ = writeln!(
+            out,
+            "REFUSED before spending — {reason}.\n  A seller never pays more than it accrued: the ceiling is {gross} sats, enforced against the quote the mint raised for the payment. Nothing left the wallet{}. The next attempt re-quotes.",
+            if released {
+                format!("; released {gross} sats back to unremitted")
+            } else {
+                String::new()
+            }
+        );
+        Ok(RemitOutcome::MeltRefused {
+            remittance_id: planned.remittance_id.clone(),
+            reason,
+        })
+    };
+    if quote.amount_sats != net {
+        return refuse_before_fence(
+            format!(
+                "melt refused before spending: mint {} quoted {} sats for the {net}-sat invoice; nothing left the wallet",
+                quote.mint_url, quote.amount_sats
+            ),
+            store,
+            out,
+        );
+    }
+    if !ceiling.admits(quote.amount_sats, quote.fee_reserve_sats) {
+        return refuse_before_fence(
+            format!(
+                "melt refused before spending: mint {} quote {} would debit {} sats ({} sats invoice + {} sats fee reserve; planned invoice {net} sats) against a ceiling of {gross} sats; nothing left the wallet",
+                quote.mint_url,
+                quote.quote_id,
+                quote.amount_sats.saturating_add(quote.fee_reserve_sats),
+                quote.amount_sats,
+                quote.fee_reserve_sats
+            ),
+            store,
+            out,
+        );
+    }
+    let margin_secs = lease_secs(SPEND_MARGIN);
+    let quote_inside_margin = |now_unix: i64| {
+        u64::try_from(now_unix.saturating_add(margin_secs))
+            .is_ok_and(|bound| quote.expiry_unix <= bound)
+    };
+    let quote_now_unix = effects.now_unix();
+    if quote_inside_margin(quote_now_unix) {
+        return refuse_before_fence(
+            format!(
+                "melt refused before spending: mint {} quote {} expires at unix {}, within {margin_secs} s of now (unix {quote_now_unix}); a quote this close to expiry is not paid; nothing left the wallet",
+                quote.mint_url, quote.quote_id, quote.expiry_unix
+            ),
+            store,
+            out,
+        );
+    }
+    let _ = writeln!(
+        out,
+        "Payment quote {} raised at mint {} for {} sats (fee reserve {} sats, expires unix {}); fits the ceiling of {gross} sats",
+        quote.quote_id, quote.mint_url, quote.amount_sats, quote.fee_reserve_sats, quote.expiry_unix
+    );
+    effects.after_quote(&planned, &quote);
+
+    // 2. The fence: clock read inside the store call, Q bound.
+    let mut admit_now_unix: Option<i64> = None;
+    let owner = effects_owner_for_release.clone();
+    let admitted = {
+        let effects_ref: &dyn RemitEffects = &*effects;
+        store
+            .admit_remittance_spend(
+                &planned.remittance_id,
+                &owner,
+                &quote.quote_id,
+                margin_secs,
+                &mut || {
+                    let now = effects_ref.now_unix();
+                    admit_now_unix = Some(now);
+                    now
+                },
+            )
+            .map_err(|error| format!("admit remittance {}: {error}", planned.remittance_id))?
+    };
+    let admit_now_unix = admit_now_unix.unwrap_or(now_unix);
+    let admitted = match admitted {
         Ok(admitted) => admitted,
         Err(lost) => {
             // Ours, still planned, but too little lease left: nothing was spent, so release our own
-            // row. Not ours, gone, or no longer planned: another process holds or resolved it —
-            // touch nothing.
-            if matches!(lost, OwnershipLost::LeaseTooShort { .. }) {
-                store
-                    .fail_remittance(&planned.remittance_id, now_unix)
-                    .map_err(|error| format!("release remittance: {error}"))?;
-            }
+            // row (conditionally). Not ours, gone, or no longer planned: another process holds or
+            // resolved it — touch nothing.
+            let released = if matches!(lost, OwnershipLost::LeaseTooShort { .. }) {
+                release_own_planned(store, out)?
+            } else {
+                false
+            };
             let reason = lost.to_string();
             let _ = writeln!(
                 out,
                 "REFUSED before spending — {reason} (checked at unix {admit_now_unix}). Nothing moved by this run{}.",
-                if matches!(lost, OwnershipLost::LeaseTooShort { .. }) {
+                if released {
                     format!(
                         "; released {} sats back to unremitted for the next attempt",
                         planned.gross_sats
@@ -1060,16 +1233,31 @@ fn remit_inner(
     };
     let _ = writeln!(
         out,
-        "Admitted to spend at unix {admit_now_unix}: remittance {} is now spending (lease until unix {lease_until_unix}); from here only the mint's verdict on its quote resolves it",
-        admitted.remittance_id
+        "Admitted to spend at unix {admit_now_unix}: remittance {} is now spending, bound to melt quote {} (lease until unix {lease_until_unix}); from here only the mint's verdict on that quote resolves it",
+        admitted.remittance_id, quote.quote_id
     );
     effects.after_admit(&admitted);
-    let ceiling = MeltCeiling {
-        max_debit_sats: gross,
-        invoice_sats: net,
-        planned_quote_id: Some(estimate.quote_id.clone()),
-    };
-    match effects.melt(&invoice.bolt11, &ceiling) {
+
+    // 3. Pay Q by id. First the local refusal of a quote inside its margin of expiry, on a fresh
+    //    clock: the row is spending and stays so — reconciliation resolves it by Q (UNPAID past
+    //    expiry + margin is terminal), and this process never re-quotes for it.
+    let pay_now_unix = effects.now_unix();
+    if quote_inside_margin(pay_now_unix) {
+        let error = format!(
+            "bound melt quote {} expires at unix {}, within {margin_secs} s of now (unix {pay_now_unix}); not paid",
+            quote.quote_id, quote.expiry_unix
+        );
+        let _ = writeln!(
+            out,
+            "not paid: {error}.\n  remittance {} stays journaled as spending, bound to that quote; this process raises no other quote for it. The next attempt reconciles it with the mint: released once the quote is UNPAID past its expiry plus the margin (or FAILED), settled if it somehow shows PAID. Nothing else was attempted.",
+            planned.remittance_id
+        );
+        return Ok(RemitOutcome::MeltFailed {
+            remittance_id: planned.remittance_id,
+            error,
+        });
+    }
+    match effects.pay_melt_quote(&quote.quote_id, &ceiling) {
         Ok(outcome) => {
             let settlement = RemitSettlement {
                 net_paid_sats: Some(outcome.paid_sats),
@@ -1118,25 +1306,28 @@ fn remit_inner(
             })
         }
         Err(MeltFailure::RefusedBeforeSpending(reason)) => {
-            // Typed as "nothing left the wallet", and the row is ours: release it ourselves so the
-            // balance is unremitted again for the next attempt (which re-quotes).
-            store
-                .fail_remittance(&planned.remittance_id, now_unix)
-                .map_err(|error| format!("release remittance after refusal: {error}"))?;
+            // The re-check immediately before `prepare_melt` refused the bound quote's stored
+            // figures — figures this run already checked against the same ceiling before the fence,
+            // so this does not happen unless the wallet's stored quote differs from the one raised.
+            // Nothing left the wallet, but the row is SPENDING and bound: it is not released on a
+            // typed promise — reconciliation resolves it by its bound quote (UNPAID past expiry +
+            // margin is terminal) and this process never re-quotes for it.
+            let error = format!("refused before spending: {reason}");
             let _ = writeln!(
                 out,
-                "REFUSED before spending — {reason}.\n  A seller never pays more than it accrued: the ceiling is {gross} sats, enforced against the quote the mint raised for the payment. Nothing left the wallet; released {gross} sats back to unremitted. The next attempt re-quotes.",
+                "REFUSED before spending — {reason}.\n  Nothing left the wallet. remittance {} stays journaled as spending, bound to melt quote {}; the next attempt reconciles it with the mint by that quote and releases it once the quote is terminal. Nothing else was attempted.",
+                planned.remittance_id, quote.quote_id
             );
-            Ok(RemitOutcome::MeltRefused {
+            Ok(RemitOutcome::MeltFailed {
                 remittance_id: planned.remittance_id,
-                reason,
+                error,
             })
         }
         Err(MeltFailure::Failed(error)) => {
             let _ = writeln!(
                 out,
-                "melt failed: {error}\n  remittance {} stays journaled as spending: proofs may have reached the mint. The next attempt (automatic, or `maxplayer seller fees remit`) reconciles it with the mint: settled if the quote is PAID, released if the mint reports it FAILED or expired, held while it is UNPAID or PENDING. Nothing else was attempted.",
-                planned.remittance_id
+                "melt failed: {error}\n  remittance {} stays journaled as spending, bound to melt quote {}: proofs may have reached the mint. The next attempt (automatic, or `maxplayer seller fees remit`) reconciles it with the mint BY THAT QUOTE: settled if it is PAID, released if the mint reports it FAILED or it is UNPAID past its expiry plus the spending margin, held while it is UNPAID, PENDING or unknown. This process raises no other quote for the row. Nothing else was attempted.",
+                planned.remittance_id, quote.quote_id
             );
             Ok(RemitOutcome::MeltFailed {
                 remittance_id: planned.remittance_id,
