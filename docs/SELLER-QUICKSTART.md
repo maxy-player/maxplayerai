@@ -744,6 +744,11 @@ mode = "docker"
 `container_delivery = false` is the opt-out, and it keeps working. On that path the host clones the
 base, the container runs the agent, and the host commits and pushes.
 
+**Root posture.** A seat whose daemon runs as root (uid 0) runs the job as root inside the
+container, where the boundary between the job and the delivery orchestrator is weakest. Such a seat
+does not get container delivery by default. It must set `container_delivery = true` to opt in, and
+the boot line warns when it does. Run the seller as a non-root user.
+
 **A `launcher` seat is not affected, and cannot use this mode.** Launcher mode creates no container to
 move the git steps into, so such a seat always delivers from the host. Adding
 `container_delivery = false` to a launcher seat changes nothing and is accepted;
@@ -764,6 +769,8 @@ Requirements:
 
 - `mode = "docker"`. The seller refuses `container_delivery = true` and both token keys under
   `launcher` mode.
+- A non-root seller uid, or an explicit `container_delivery = true`. A root daemon (uid 0) runs the
+  job as root inside the container, so the default does not apply to it.
 - A sandbox image that contains the `maxplayer` binary at `/usr/local/bin/maxplayer`. The shipped
   image has it. A custom image must add it, or set `container_delivery = false`.
 - A relay that enforces the branch scope on push tokens (PR #929).

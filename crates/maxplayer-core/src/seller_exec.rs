@@ -374,7 +374,26 @@ impl SandboxPolicy {
     /// mode a missing (or blank) `image` DEFAULTS to [`DEFAULT_SANDBOX_IMAGE`] — the binary supplies
     /// the version-pinned GHCR ref — so a fresh seller who sets only `mode = "docker"` gets a working
     /// container without naming an image.
+    ///
+    /// The container-delivery default depends on the uid the container will run as
+    /// ([`job_identity`]): see [`Self::from_config_as`].
     pub fn from_config(config: Option<&crate::home::SandboxConfig>) -> Result<Self, ExecError> {
+        Self::from_config_as(config, job_identity().0)
+    }
+
+    /// [`Self::from_config`] for a container that will run as `container_uid` — the uid `docker run
+    /// --user` gets, which is this daemon's own ([`job_identity`]). Injected so the resolution is
+    /// testable for a root seat without being one.
+    ///
+    /// Under uid 0 the job is root INSIDE the container, and the same-uid boundary between the job
+    /// and the delivery orchestrator is at its weakest, so container delivery is NOT the default for
+    /// such a seat: an absent `container_delivery` resolves to the host path there, and only an
+    /// explicit `container_delivery = true` selects the container
+    /// ([`crate::home::SandboxConfig::container_delivery_enabled`]).
+    pub fn from_config_as(
+        config: Option<&crate::home::SandboxConfig>,
+        container_uid: u32,
+    ) -> Result<Self, ExecError> {
         use crate::home::SandboxMode;
         let Some(config) = config else {
             return Ok(Self::passthrough());
@@ -542,11 +561,11 @@ impl SandboxPolicy {
                         "[sandbox] container_delivery_token_cap_secs must be greater than zero".into(),
                     ));
                 }
-                // ON unless the operator wrote `container_delivery = false`. The absent key
-                // resolves to ON, so a docker seat adopts the container path on upgrade.
+                // ON unless the operator wrote `container_delivery = false` — or the container
+                // would run as root, where the absent key resolves to the host path instead.
                 // `container_delivery_enabled` is the one place that reads the default, and the
                 // seller boot line reports what it decided.
-                let container_delivery = config.container_delivery_enabled().then(|| {
+                let container_delivery = config.container_delivery_enabled(container_uid).then(|| {
                     ContainerDeliveryPolicy {
                         token: config.container_delivery_token.unwrap_or_default(),
                         token_cap_secs: config
@@ -3282,6 +3301,11 @@ fn short_hash(input: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The uid of an ordinary seller seat's container: the default rows resolve under it.
+    const NON_ROOT_UID: u32 = 1000;
+    /// A seat whose daemon — and so whose container — runs as root.
+    const ROOT_UID: u32 = 0;
+
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
     }
@@ -5412,13 +5436,13 @@ mod tests {
         // row that every existing docker seat lands on when it upgrades.
         let defaulted = SandboxConfig { mode: SandboxMode::Docker, ..Default::default() };
         assert_eq!(defaulted.container_delivery, None, "the fixture must not name the key");
-        let policy = SandboxPolicy::from_config(Some(&defaulted)).expect("docker policy");
+        let policy = SandboxPolicy::from_config_as(Some(&defaulted), NON_ROOT_UID).expect("docker policy");
         assert_eq!(
             policy.container_delivery(),
             fresh_default,
             "a docker seat that never named the key delivers from the container"
         );
-        assert!(defaulted.container_delivery_enabled(), "and the config helper agrees");
+        assert!(defaulted.container_delivery_enabled(NON_ROOT_UID), "and the config helper agrees");
 
         // ROW 2 — docker, `true` ⇒ the container path, said out loud. Same verdict as row 1.
         let on = SandboxConfig {
@@ -5426,13 +5450,13 @@ mod tests {
             container_delivery: Some(true),
             ..Default::default()
         };
-        let policy = SandboxPolicy::from_config(Some(&on)).expect("docker policy");
+        let policy = SandboxPolicy::from_config_as(Some(&on), NON_ROOT_UID).expect("docker policy");
         assert_eq!(
             policy.container_delivery(),
             fresh_default,
             "on ⇒ fresh-after-agent tokens and the 6 h cap"
         );
-        assert!(on.container_delivery_enabled());
+        assert!(on.container_delivery_enabled(NON_ROOT_UID));
         assert_eq!(DEFAULT_CONTAINER_DELIVERY_TOKEN_CAP_SECS, 6 * 60 * 60);
 
         // ROW 3 — docker, `false` ⇒ the HOST path. The explicit opt-out, which must keep working:
@@ -5442,21 +5466,21 @@ mod tests {
             container_delivery: Some(false),
             ..Default::default()
         };
-        let policy = SandboxPolicy::from_config(Some(&opted_out)).expect("docker policy");
+        let policy = SandboxPolicy::from_config_as(Some(&opted_out), NON_ROOT_UID).expect("docker policy");
         assert_eq!(
             policy.container_delivery(),
             None,
             "container_delivery = false keeps the host delivery path"
         );
-        assert!(!opted_out.container_delivery_enabled());
+        assert!(!opted_out.container_delivery_enabled(NON_ROOT_UID));
 
         // ROW 4 — launcher, key ABSENT ⇒ the host path, and NO refusal. The most important row of
         // the seven: this is every seat that never opted into docker.
         let launcher = SandboxConfig { mode: SandboxMode::Launcher, ..Default::default() };
-        let policy = SandboxPolicy::from_config(Some(&launcher))
+        let policy = SandboxPolicy::from_config_as(Some(&launcher), NON_ROOT_UID)
             .expect("an absent key under launcher must never refuse");
         assert_eq!(policy.container_delivery(), None);
-        assert!(!launcher.container_delivery_enabled(), "launcher mode has no container");
+        assert!(!launcher.container_delivery_enabled(NON_ROOT_UID), "launcher mode has no container");
 
         // ROW 6 — launcher, `false` ⇒ the host path, and no refusal: it names the path launcher
         // mode already takes, so it contradicts nothing.
@@ -5465,10 +5489,10 @@ mod tests {
             container_delivery: Some(false),
             ..Default::default()
         };
-        let policy = SandboxPolicy::from_config(Some(&launcher_off))
+        let policy = SandboxPolicy::from_config_as(Some(&launcher_off), NON_ROOT_UID)
             .expect("container_delivery = false under launcher must never refuse");
         assert_eq!(policy.container_delivery(), None);
-        assert!(!launcher_off.container_delivery_enabled());
+        assert!(!launcher_off.container_delivery_enabled(NON_ROOT_UID));
 
         // The companion keys resolve on top of the default, with no switch named at all.
         let long_lived = SandboxConfig {
@@ -5477,7 +5501,7 @@ mod tests {
             container_delivery_token_cap_secs: Some(3_600),
             ..Default::default()
         };
-        let policy = SandboxPolicy::from_config(Some(&long_lived)).expect("docker policy");
+        let policy = SandboxPolicy::from_config_as(Some(&long_lived), NON_ROOT_UID).expect("docker policy");
         assert_eq!(
             policy.container_delivery(),
             Some(ContainerDeliveryPolicy {
@@ -5494,15 +5518,49 @@ mod tests {
             container_delivery_token: Some(ContainerDeliveryToken::LongLived),
             ..Default::default()
         };
-        let policy = SandboxPolicy::from_config(Some(&staged)).expect("docker policy");
+        let policy = SandboxPolicy::from_config_as(Some(&staged), NON_ROOT_UID).expect("docker policy");
         assert_eq!(policy.container_delivery(), None);
 
         // A pass-through policy — no `[sandbox]` section at all — has no container to deliver from.
         assert_eq!(SandboxPolicy::passthrough().container_delivery(), None);
         assert_eq!(
-            SandboxPolicy::from_config(None).expect("no section").container_delivery(),
+            SandboxPolicy::from_config_as(None, NON_ROOT_UID).expect("no section").container_delivery(),
             None,
             "a seat with no [sandbox] section keeps the host path"
+        );
+
+        // ROWS 8-10 — the container would run as ROOT (uid 0: a seat whose daemon runs as root).
+        // The job is then root inside the container, where the same-uid boundary between it and the
+        // delivery orchestrator is weakest, so the absent key resolves to the HOST path there; the
+        // container path takes an explicit opt-in; the opt-out is unchanged. RED ON REVERT: the
+        // absent key resolved to the container under every uid.
+        let policy =
+            SandboxPolicy::from_config_as(Some(&defaulted), ROOT_UID).expect("docker policy");
+        assert_eq!(
+            policy.container_delivery(),
+            None,
+            "root + absent ⇒ the host path, not the docker default"
+        );
+        assert!(!defaulted.container_delivery_enabled(ROOT_UID));
+        let policy = SandboxPolicy::from_config_as(Some(&on), ROOT_UID).expect("docker policy");
+        assert_eq!(
+            policy.container_delivery(),
+            fresh_default,
+            "root + true ⇒ the operator chose the container"
+        );
+        assert!(on.container_delivery_enabled(ROOT_UID));
+        let policy =
+            SandboxPolicy::from_config_as(Some(&opted_out), ROOT_UID).expect("docker policy");
+        assert_eq!(policy.container_delivery(), None);
+        assert!(!opted_out.container_delivery_enabled(ROOT_UID));
+
+        // `from_config` resolves for the uid this daemon's container gets — the same read that
+        // `docker run --user` is built from — so a booting seat and this table agree.
+        let for_this_daemon = SandboxPolicy::from_config_as(Some(&defaulted), job_identity().0)
+            .expect("docker policy");
+        assert_eq!(
+            SandboxPolicy::from_config(Some(&defaulted)).expect("docker policy"),
+            for_this_daemon
         );
     }
 
@@ -5596,11 +5654,11 @@ mod tests {
         let opted_out: SandboxConfig =
             toml::from_str("mode = \"docker\"\ncontainer_delivery = false\n").expect("parses");
         assert_eq!(opted_out.container_delivery, Some(false));
-        assert!(!opted_out.container_delivery_enabled());
+        assert!(!opted_out.container_delivery_enabled(NON_ROOT_UID));
         // ...and a config that names no switch parses as absent, which resolves to ON under docker.
         let silent: SandboxConfig = toml::from_str("mode = \"docker\"\n").expect("parses");
         assert_eq!(silent.container_delivery, None);
-        assert!(silent.container_delivery_enabled());
+        assert!(silent.container_delivery_enabled(NON_ROOT_UID));
 
         let fresh: SandboxConfig =
             toml::from_str("mode = \"docker\"\ncontainer_delivery_token = \"fresh-after-agent\"\n")
@@ -5623,7 +5681,7 @@ mod tests {
         // move a seat off the container path.
         let reread: SandboxConfig = toml::from_str(&written).expect("re-parses");
         assert_eq!(reread, unset);
-        assert!(reread.container_delivery_enabled());
+        assert!(reread.container_delivery_enabled(NON_ROOT_UID));
 
         // The explicit opt-out, by contrast, MUST survive a write-back: an operator who chose the
         // host path keeps it across every save.
@@ -5639,7 +5697,7 @@ mod tests {
         );
         let reread: SandboxConfig = toml::from_str(&written).expect("re-parses");
         assert_eq!(reread, kept);
-        assert!(!reread.container_delivery_enabled());
+        assert!(!reread.container_delivery_enabled(NON_ROOT_UID));
     }
 
     // from_config threads the runtime through, and a blank string is treated as unset rather than

@@ -657,9 +657,10 @@ pub struct SandboxConfig {
     ///
     /// Three states, and the absent one is what makes the default a default:
     ///
-    /// * Absent under `docker` ⇒ **container delivery is ON**. A docker seat that never named the
-    ///   key adopts the container path on upgrade. The seller boot line says so (see
-    ///   [`Self::container_delivery_enabled`]).
+    /// * Absent under `docker` ⇒ **container delivery is ON** for a seat whose container runs as a
+    ///   non-root uid. A docker seat that never named the key adopts the container path on upgrade.
+    ///   A ROOT seat (daemon uid 0) resolves the absent key to the HOST path instead; see
+    ///   [`Self::container_delivery_enabled`]. The seller boot line says which.
     /// * `Some(true)` under `docker` ⇒ ON, said out loud.
     /// * `Some(false)` under `docker` ⇒ the HOST path: the host clones the base, the container runs
     ///   the agent, and the host commits and pushes. This is the explicit opt-out, and it keeps
@@ -702,8 +703,20 @@ impl SandboxConfig {
     /// it is always the host path here; a `Some(true)` under launcher is refused by
     /// [`crate::seller_exec::SandboxPolicy::from_config`], which is where a config contradiction
     /// belongs.
-    pub fn container_delivery_enabled(&self) -> bool {
-        matches!(self.mode, SandboxMode::Docker) && self.container_delivery.unwrap_or(true)
+    ///
+    /// `container_uid` is the uid the container will run as — the daemon's own, what `docker run
+    /// --user` gets. Under uid 0 the job is ROOT inside the container: it can unlink any file the
+    /// delivery orchestrator shares with it, and the same-uid boundary between the two is at its
+    /// weakest. Such a seat does not get the container path by default: the absent key resolves to
+    /// the HOST path there, and only an explicit `container_delivery = true` selects the container
+    /// (the operator chose it; the seller boot line still warns). A non-root uid keeps the docker
+    /// default. Injected rather than read here so the resolution is testable for a root seat.
+    pub fn container_delivery_enabled(&self, container_uid: u32) -> bool {
+        matches!(self.mode, SandboxMode::Docker)
+            && match self.container_delivery {
+                Some(explicit) => explicit,
+                None => container_uid != 0,
+            }
     }
 }
 
@@ -2840,7 +2853,7 @@ mod tests {
         let sandbox = on_disk.sandbox.expect("the [sandbox] section survived");
         assert_eq!(sandbox.container_delivery, None);
         assert!(
-            sandbox.container_delivery_enabled(),
+            sandbox.container_delivery_enabled(1000),
             "and the re-read config still resolves to the container path"
         );
 
@@ -2856,9 +2869,39 @@ mod tests {
         let on_disk = load_config(&home.root.join(CONFIG_FILE)).expect("reload file");
         let sandbox = on_disk.sandbox.expect("the [sandbox] section survived");
         assert_eq!(sandbox.container_delivery, Some(false));
-        assert!(!sandbox.container_delivery_enabled());
+        assert!(!sandbox.container_delivery_enabled(1000));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The root posture of the container-delivery default: an absent key is ON for a non-root
+    /// container uid and OFF for uid 0; an explicit value wins under either uid; launcher mode is
+    /// always off. RED ON REVERT: `unwrap_or(true)` made root + absent resolve to the container.
+    #[test]
+    fn container_delivery_default_depends_on_the_container_uid() {
+        let absent = SandboxConfig { mode: SandboxMode::Docker, ..Default::default() };
+        assert!(absent.container_delivery_enabled(1000));
+        assert!(!absent.container_delivery_enabled(0), "root + absent ⇒ the host path");
+        let on = SandboxConfig {
+            mode: SandboxMode::Docker,
+            container_delivery: Some(true),
+            ..Default::default()
+        };
+        assert!(on.container_delivery_enabled(0), "root + true ⇒ the operator chose the container");
+        assert!(on.container_delivery_enabled(1000));
+        let off = SandboxConfig {
+            mode: SandboxMode::Docker,
+            container_delivery: Some(false),
+            ..Default::default()
+        };
+        assert!(!off.container_delivery_enabled(0));
+        assert!(!off.container_delivery_enabled(1000));
+        let launcher = SandboxConfig {
+            mode: SandboxMode::Launcher,
+            container_delivery: Some(true),
+            ..Default::default()
+        };
+        assert!(!launcher.container_delivery_enabled(1000));
     }
 
     #[test]

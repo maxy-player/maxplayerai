@@ -499,13 +499,28 @@ mod checks {
     /// section all resolve to the same `None`. The operator needs the reason, so the reason has to
     /// come from the config. Mirrors the seller boot line
     /// (`maxplayer_core::seller_node::run::delivery_path_line`).
-    fn effective_delivery_path(sandbox: Option<&SandboxConfig>) -> &'static str {
+    fn effective_delivery_path(
+        sandbox: Option<&SandboxConfig>,
+        container_uid: u32,
+    ) -> &'static str {
         use maxplayer_core::home::SandboxMode;
 
         let Some(sandbox) = sandbox else {
             return "delivery path: HOST (no [sandbox] section, so this seat has no container)";
         };
+        let root = container_uid == 0;
         match (sandbox.mode, sandbox.container_delivery) {
+            (SandboxMode::Docker, None) if root => {
+                "delivery path: HOST (this seat's daemon runs as root, uid 0, so its container \
+                 would run the job as root; container delivery is not the default for a root seat — \
+                 set [sandbox] container_delivery = true to opt in, or run the seller as a non-root \
+                 user)"
+            }
+            (SandboxMode::Docker, Some(true)) if root => {
+                "delivery path: CONTAINER ([sandbox] container_delivery = true; WARNING: the daemon \
+                 runs as root, uid 0, so the job is root inside the container — run the seller as a \
+                 non-root user)"
+            }
             (SandboxMode::Docker, None) => {
                 "delivery path: CONTAINER (the default for [sandbox] mode = \"docker\"; this seat \
                  does not set container_delivery)"
@@ -547,23 +562,30 @@ mod checks {
         git_remote: Option<String>,
         sandbox: Option<SandboxConfig>,
     ) -> Check {
-        check_relay_token_policy_in(relay_url, git_remote, sandbox, |origin| {
-            match build_runtime() {
+        check_relay_token_policy_in(
+            relay_url,
+            git_remote,
+            sandbox,
+            maxplayer_core::seller_exec::job_identity().0,
+            |origin| match build_runtime() {
                 Ok(runtime) => runtime.block_on(relay_info::fetch_scoped_token_support(
                     origin,
                     NIP11_TIMEOUT,
                 )),
                 Err(error) => ScopedTokenSupport::Unknown(error),
-            }
-        })
+            },
+        )
     }
 
-    /// [`check_relay_token_policy`] over an injected NIP-11 read, so every arm — including the
-    /// unreachable-relay one — is testable with no network.
+    /// [`check_relay_token_policy`] over an injected NIP-11 read and container uid, so every arm —
+    /// including the unreachable-relay one and the root seat — is testable with no network and as any
+    /// user. `container_uid` is the uid the seat's container runs as (`job_identity`): under root the
+    /// docker default does not apply, and both the path and the policy here say so.
     pub(super) fn check_relay_token_policy_in(
         relay_url: String,
         git_remote: Option<String>,
         sandbox: Option<SandboxConfig>,
+        container_uid: u32,
         probe: impl Fn(&str) -> ScopedTokenSupport,
     ) -> Check {
         use maxplayer_core::home::ContainerDeliveryToken;
@@ -571,8 +593,8 @@ mod checks {
         // Read from the CONFIG, not from the resolved policy, because the reason is part of the
         // answer: `container_delivery = false` and a launcher seat both resolve to "no container
         // delivery", and the operator has to know which one this seat is.
-        let path = effective_delivery_path(sandbox.as_ref());
-        let policy = match SandboxPolicy::from_config(sandbox.as_ref()) {
+        let path = effective_delivery_path(sandbox.as_ref(), container_uid);
+        let policy = match SandboxPolicy::from_config_as(sandbox.as_ref(), container_uid) {
             Ok(policy) => policy,
             // An unresolvable [sandbox] is already FAILed by the launcher check; do not double-report.
             Err(_) => return Check::pass(RELAY_TOKEN_POLICY_CHECK, "no resolvable docker executor"),
@@ -2667,6 +2689,12 @@ mod tests {
 
     #[cfg(feature = "wallet")]
     const TOKEN_POLICY_RELAY: &str = "wss://relay.example";
+    /// The uid of an ordinary seller seat's container.
+    #[cfg(feature = "wallet")]
+    const NON_ROOT_UID: u32 = 1000;
+    /// A seat whose daemon — and so whose container — runs as root.
+    #[cfg(feature = "wallet")]
+    const ROOT_UID: u32 = 0;
     #[cfg(feature = "wallet")]
     const TOKEN_POLICY_REMOTE: &str = "https://relay.example/git/abc/m0123.git";
     /// The shipped `container_delivery_token_cap_secs` default (6 h).
@@ -2734,6 +2762,7 @@ mod tests {
                 TOKEN_POLICY_RELAY.into(),
                 Some(TOKEN_POLICY_REMOTE.into()),
                 sandbox,
+                NON_ROOT_UID,
                 |_| panic!("a host-path seat must not read the relay's NIP-11 document"),
             );
             assert_eq!(check.status, Status::Pass, "{}", check.detail);
@@ -2763,6 +2792,7 @@ mod tests {
             TOKEN_POLICY_RELAY.into(),
             Some(TOKEN_POLICY_REMOTE.into()),
             defaulted_docker_sandbox(),
+            NON_ROOT_UID,
             |_| ScopedTokenSupport::Advertised(TOKEN_POLICY_CAP),
         )
         .detail;
@@ -2774,6 +2804,7 @@ mod tests {
             TOKEN_POLICY_RELAY.into(),
             Some(TOKEN_POLICY_REMOTE.into()),
             token_mode_sandbox(None),
+            NON_ROOT_UID,
             |_| ScopedTokenSupport::Advertised(TOKEN_POLICY_CAP),
         )
         .detail;
@@ -2785,6 +2816,7 @@ mod tests {
             TOKEN_POLICY_RELAY.into(),
             Some(TOKEN_POLICY_REMOTE.into()),
             opted_out_docker_sandbox(),
+            NON_ROOT_UID,
             |_| ScopedTokenSupport::Advertised(TOKEN_POLICY_CAP),
         )
         .detail;
@@ -2796,6 +2828,7 @@ mod tests {
             TOKEN_POLICY_RELAY.into(),
             Some(TOKEN_POLICY_REMOTE.into()),
             Some(SandboxConfig { mode: SandboxMode::Launcher, ..Default::default() }),
+            NON_ROOT_UID,
             |_| ScopedTokenSupport::Advertised(TOKEN_POLICY_CAP),
         )
         .detail;
@@ -2807,6 +2840,7 @@ mod tests {
             TOKEN_POLICY_RELAY.into(),
             None,
             defaulted_docker_sandbox(),
+            NON_ROOT_UID,
             |_| ScopedTokenSupport::Advertised(TOKEN_POLICY_CAP),
         )
         .detail;
@@ -2833,6 +2867,7 @@ mod tests {
                 TOKEN_POLICY_RELAY.into(),
                 Some(TOKEN_POLICY_REMOTE.into()),
                 defaulted_docker_sandbox(),
+                NON_ROOT_UID,
                 |_| support.clone(),
             );
             assert_eq!(
@@ -2842,6 +2877,40 @@ mod tests {
                 check.detail
             );
         }
+    }
+
+    /// A ROOT seat (container uid 0) that never named the key is on the HOST path, the row says root
+    /// decided it, and no relay is read. With `container_delivery = true` it is on the container
+    /// path, credited to the config, with the warning. RED ON REVERT: the row called root + absent
+    /// the docker default while the policy resolved it to the host path.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn relay_token_policy_names_the_root_posture() {
+        use maxplayer_core::relay_info::ScopedTokenSupport;
+
+        let detail = checks::check_relay_token_policy_in(
+            TOKEN_POLICY_RELAY.into(),
+            Some(TOKEN_POLICY_REMOTE.into()),
+            defaulted_docker_sandbox(),
+            ROOT_UID,
+            |_| panic!("a root seat on the host path must not read the relay's NIP-11 document"),
+        )
+        .detail;
+        assert!(detail.contains("delivery path: HOST"), "{detail}");
+        assert!(detail.contains("root"), "the reason is the uid: {detail}");
+        assert!(detail.contains("container_delivery = true"), "names the opt-in: {detail}");
+
+        let detail = checks::check_relay_token_policy_in(
+            TOKEN_POLICY_RELAY.into(),
+            Some(TOKEN_POLICY_REMOTE.into()),
+            token_mode_sandbox(None),
+            ROOT_UID,
+            |_| ScopedTokenSupport::Advertised(TOKEN_POLICY_CAP),
+        )
+        .detail;
+        assert!(detail.contains("delivery path: CONTAINER"), "{detail}");
+        assert!(detail.contains("container_delivery = true"), "{detail}");
+        assert!(detail.contains("root"), "the warning stays: {detail}");
     }
 
     /// `fresh-after-agent` PASSes whatever the relay says — it needs no relay feature — and the row
@@ -2860,6 +2929,7 @@ mod tests {
                 TOKEN_POLICY_RELAY.into(),
                 Some(TOKEN_POLICY_REMOTE.into()),
                 token_mode_sandbox(None), // None ⇒ the default, `fresh-after-agent`
+                NON_ROOT_UID,
                 |_| support.clone(),
             );
             assert_eq!(
@@ -2893,6 +2963,7 @@ mod tests {
             TOKEN_POLICY_RELAY.into(),
             Some(TOKEN_POLICY_REMOTE.into()),
             token_mode_sandbox(Some(ContainerDeliveryToken::LongLived)),
+            NON_ROOT_UID,
             |_| ScopedTokenSupport::Absent,
         );
         assert_eq!(check.status, Status::Fail, "{}", check.detail);
@@ -2921,6 +2992,7 @@ mod tests {
             TOKEN_POLICY_RELAY.into(),
             Some(TOKEN_POLICY_REMOTE.into()),
             token_mode_sandbox(Some(ContainerDeliveryToken::LongLived)),
+            NON_ROOT_UID,
             |_| ScopedTokenSupport::Advertised(600),
         );
         assert_eq!(check.status, Status::Fail, "{}", check.detail);
@@ -2944,6 +3016,7 @@ mod tests {
             TOKEN_POLICY_RELAY.into(),
             Some(TOKEN_POLICY_REMOTE.into()),
             token_mode_sandbox(Some(ContainerDeliveryToken::LongLived)),
+            NON_ROOT_UID,
             |_| ScopedTokenSupport::Unknown("dns error".into()),
         );
         assert_eq!(check.status, Status::Fail, "{}", check.detail);
@@ -2961,6 +3034,7 @@ mod tests {
             TOKEN_POLICY_RELAY.into(),
             Some(TOKEN_POLICY_REMOTE.into()),
             token_mode_sandbox(Some(ContainerDeliveryToken::LongLived)),
+            NON_ROOT_UID,
             |_| ScopedTokenSupport::Advertised(TOKEN_POLICY_CAP),
         );
         assert_eq!(check.status, Status::Pass, "{}", check.detail);
@@ -2982,6 +3056,7 @@ mod tests {
             TOKEN_POLICY_RELAY.into(),
             Some("https://github.com/owner/repo.git".into()),
             token_mode_sandbox(Some(ContainerDeliveryToken::LongLived)),
+            NON_ROOT_UID,
             |_| panic!("a remote that takes no scoped token must not read the relay's document"),
         );
         assert_eq!(check.status, Status::Pass, "{}", check.detail);

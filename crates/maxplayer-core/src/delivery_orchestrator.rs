@@ -57,10 +57,12 @@
 //! provisions the workdir; DRIVES the ACP agent itself through
 //! [`crate::seller_exec::run_agent_with_retry`] under a pass-through policy (the container is the
 //! sandbox — no nested docker), with an explicit environment allowlist (C4); gates and commits; reaps
-//! every other process in the container; writes the [`AGENT_DONE_MARKER`]; obtains the push token per
-//! [`PushTokenSource`]; pushes with the gated oid as the expected oid (C6); and writes the oid and the
-//! [`Phase1Outcome`] for the host. The host runs no git and no ACP: it mints tokens (crypto), reads
-//! two small files, and publishes the kind-3403.
+//! every other process in the container (mandatory — see below); writes the [`AGENT_DONE_MARKER`];
+//! obtains the push token per [`PushTokenSource`]; pushes with the gated oid as the expected oid (C6);
+//! and writes the oid and the [`Phase1Outcome`] for the host. The host runs no git and no ACP: it
+//! mints tokens (crypto), reads two small files, and publishes the kind-3403. The entry runs only
+//! where the host set [`CONTAINER_DELIVERY_ENV`] on the `docker run`; a developer who runs it on a
+//! host by hand is refused before anything happens.
 //!
 //! ## The exchange directory
 //! The host owns a per-job directory (mode `0700`, outside the agent-writable workdir) and mounts it
@@ -68,14 +70,36 @@
 //! and, in the fresh-after-agent mode, [`PUSH_TOKEN_FILE`] (mode `0600`) after the marker appears. The
 //! container writes [`AGENT_DONE_MARKER`], [`DELIVERY_OID_FILE`] and [`OUTCOME_FILE`].
 //!
+//! Every file one side reads out of this directory goes through [`read_exchange_file`]: the open
+//! follows no symlink and never blocks, the OPENED descriptor must be a regular file, and the read
+//! stops at a small per-file cap ([`EXCHANGE_MARKER_MAX_BYTES`] and its siblings). The host polls the
+//! marker WHILE the agent lives, so without this a job could plant, under the marker's name, a FIFO
+//! (a following, blocking read parks the host past every deadline check) or a symlink to `/dev/zero`
+//! (the host reads until allocation fails) — no container escape and no nonce needed. The host's
+//! writes refuse any entry that already exists at the name, a symlink included.
+//!
 //! ⚠ Who can read what, and when. The container runs every process as ONE uid (`--user`, no
 //! capabilities), so the agent and the orchestrator share file permissions inside the container. The
 //! contract therefore rests on TIME, not on modes: the inputs file (`job_hash`, and in long-lived mode
 //! the token) is deleted BEFORE the agent is spawned, and the fresh token file is written only AFTER
 //! the agent and every other process are dead and the marker — which carries a nonce only the
-//! orchestrator learned from the deleted inputs — has been verified by the host. A job process that
-//! survives cannot forge the marker without the nonce, and the token is branch-scoped in any case, so a
-//! leak can write nothing but the seller's own delivery branch — a bounded harm, not none.
+//! orchestrator learned from the deleted inputs — has been verified by the host. Three things hold
+//! that up, and none of them is a file the job could write:
+//! - the host's reads of the exchange files are hardened ([`read_exchange_file`], above), so a live
+//!   job cannot park or exhaust the host through the channel;
+//! - the reap is MANDATORY ([`reap_other_processes`]): it always runs, and a `/proc` that cannot be
+//!   listed or a survivor that will not die fails the delivery closed. It is gated on the environment
+//!   the host set at `docker run` ([`CONTAINER_DELIVERY_ENV`]), read once before the agent exists —
+//!   never on a sentinel file, which a root job could unlink to skip it;
+//! - a seat whose daemon runs as uid 0 puts the job at root INSIDE the container, where this same-uid
+//!   boundary is weakest, so container delivery is not the default there: it takes an explicit
+//!   `[sandbox] container_delivery = true` (`SandboxConfig::container_delivery_enabled`).
+//!
+//! What is NOT bounded: the same-uid memory boundary. A job process that is alive at the same time
+//! as the orchestrator shares its uid, and until the two run as different uids (issue #980) the
+//! defence is that no such process survives the reap. The token is branch-scoped in any case, so a
+//! leak can write nothing but the seller's own delivery branch — replayable authority on one ref for
+//! the token's lifetime: a bounded harm, not none.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -242,10 +266,13 @@ pub fn write_delivery_oid(out_dir: &Path, oid: &str) -> Result<(), OrchestratorE
 
 /// Read the delivery oid the host will name in the kind-3403, validating it is a plausible git oid
 /// (40 hex chars). Fails closed on anything else, so a truncated or garbage file never becomes a
-/// published commit reference.
+/// published commit reference. Reads through [`read_exchange_file`]: the file sits on the mount the
+/// job could write, so no symlink is followed and no more than [`EXCHANGE_OID_MAX_BYTES`] is read.
 pub fn read_delivery_oid(out_dir: &Path) -> Result<String, OrchestratorError> {
-    let raw = std::fs::read_to_string(out_dir.join(DELIVERY_OID_FILE))
-        .map_err(|error| OrchestratorError::Io(format!("read delivery oid: {error}")))?;
+    let raw = read_exchange_file(out_dir, DELIVERY_OID_FILE, EXCHANGE_OID_MAX_BYTES)?
+        .ok_or_else(|| OrchestratorError::Io("read delivery oid: the file is absent".into()))?;
+    let raw = String::from_utf8(raw)
+        .map_err(|_| OrchestratorError::Io("delivery oid file is not UTF-8".into()))?;
     let oid = raw.trim().to_owned();
     if oid.len() == 40 && oid.bytes().all(|b| b.is_ascii_hexdigit()) {
         Ok(oid)
@@ -356,20 +383,43 @@ pub fn write_phase1_inputs(path: &Path, inputs: &Phase1Inputs) -> Result<(), Orc
 /// scoped token does, and it is in memory only by the time the agent exists.
 #[cfg(feature = "wallet")]
 pub fn run_phase1_entry(inputs_path: &Path) -> Result<Phase1Output, OrchestratorError> {
-    run_phase1_entry_with(inputs_path, drive_acp_agent)
+    // The reap needs `/proc` and `kill`: a Linux build. Any other build is not a supported delivery
+    // container, and the refusal comes here, before an agent runs for nothing.
+    if !cfg!(target_os = "linux") {
+        return Err(OrchestratorError::AgentUnavailable(
+            "the delivery container is a Linux build; this build cannot reap the container's \
+             processes, so it refuses to run phase1"
+                .into(),
+        ));
+    }
+    run_phase1_entry_with(
+        inputs_path,
+        |key| std::env::var(key).ok(),
+        drive_acp_agent,
+        reap_other_processes,
+    )
 }
 
-/// [`run_phase1_entry`] over an injected agent runner, so the whole contract — the fail-closed inputs
-/// delete, the marker, the token hand-off, the expected-oid push, the outcome file — is exercised
-/// without a real ACP harness. `run_agent(inputs, workdir)` runs the agent against the provisioned
-/// workdir and returns what it reported.
+/// [`run_phase1_entry`] over injected seams, so the whole contract — the container gate, the
+/// fail-closed inputs delete, the marker, the reap, the token hand-off, the expected-oid push, the
+/// outcome file — is exercised without a container or a real ACP harness:
+/// - `container_env(name)` reads the orchestrator's environment (production: `std::env::var`);
+/// - `run_agent(inputs, workdir)` runs the agent against the provisioned workdir and returns what it
+///   reported;
+/// - `reap()` kills every other process in the container and fails when it cannot prove none is
+///   left (production: [`reap_other_processes`]).
 ///
-/// The outcome file is written on EVERY exit, success or failure, so the host learns why a container
-/// exited non-zero without parsing its logs.
+/// The FIRST thing that happens is the container gate ([`assert_delivery_container`]): without it
+/// nothing is read, nothing is deleted, and no agent runs. The outcome file is written on EVERY later
+/// exit, success or failure, so the host learns why a container exited non-zero without parsing its
+/// logs.
 pub fn run_phase1_entry_with(
     inputs_path: &Path,
+    container_env: impl Fn(&str) -> Option<String>,
     run_agent: impl FnOnce(&Phase1Inputs, &Path) -> Result<AgentOutcome, OrchestratorError>,
+    reap: impl FnOnce() -> Result<(), OrchestratorError>,
 ) -> Result<Phase1Output, OrchestratorError> {
+    assert_delivery_container(container_env)?;
     let inputs = read_json::<Phase1Inputs>(inputs_path)?;
     // C3: the inputs file holds job_hash, the nonce and possibly the token. It must be gone before
     // any job code exists. A delete that fails is a refusal to run the agent, not a warning.
@@ -377,7 +427,7 @@ pub fn run_phase1_entry_with(
 
     let started = std::time::Instant::now();
     let mut agent: Option<AgentOutcome> = None;
-    let result = deliver_in_container(&inputs, &mut agent, run_agent);
+    let result = deliver_in_container(&inputs, &mut agent, run_agent, reap);
     let outcome = Phase1Outcome::from_result(&result, agent, started.elapsed());
     if let Err(error) = write_outcome(&inputs.out_dir, &outcome) {
         eprintln!("sandbox orchestrator: could not write the outcome file: {error}");
@@ -385,13 +435,33 @@ pub fn run_phase1_entry_with(
     result
 }
 
-/// The delivery proper, after the inputs are in memory and the file is gone: provision → agent →
-/// gate + commit → reap → marker → token → push → oid file. Split from [`run_phase1_entry_with`] so
-/// the outcome file can be written from the result of the whole sequence.
+/// The container gate: `phase1` runs only where the host set [`CONTAINER_DELIVERY_ENV`] on the
+/// `docker run`. Read once, before anything else — the job cannot change an environment the
+/// orchestrator already read, and nothing on the shared filesystem is consulted. A developer who runs
+/// `maxplayer __deliver phase1` on a host by hand is refused here, which is what keeps the mandatory
+/// reap from killing that host's processes.
+fn assert_delivery_container(
+    container_env: impl Fn(&str) -> Option<String>,
+) -> Result<(), OrchestratorError> {
+    match container_env(CONTAINER_DELIVERY_ENV) {
+        Some(value) if value == CONTAINER_DELIVERY_ENV_VALUE => Ok(()),
+        _ => Err(OrchestratorError::AgentUnavailable(format!(
+            "{CONTAINER_DELIVERY_ENV}={CONTAINER_DELIVERY_ENV_VALUE} is not set: `maxplayer \
+             __deliver phase1` runs only as the command of the seller's delivery container, where \
+             the host sets it; refusing to run the agent or to reap any process here"
+        ))),
+    }
+}
+
+/// The delivery proper, after the gate passed, the inputs are in memory and the file is gone:
+/// provision → agent → gate + commit → reap → marker → token → push → oid file. Split from
+/// [`run_phase1_entry_with`] so the outcome file can be written from the result of the whole
+/// sequence.
 fn deliver_in_container(
     inputs: &Phase1Inputs,
     agent: &mut Option<AgentOutcome>,
     run_agent: impl FnOnce(&Phase1Inputs, &Path) -> Result<AgentOutcome, OrchestratorError>,
+    reap: impl FnOnce() -> Result<(), OrchestratorError>,
 ) -> Result<Phase1Output, OrchestratorError> {
     let identity = DeliveryAgentIdentity::for_seller(&inputs.seller_pubkey_hex);
     let base = inputs.base.as_ref().map(|b| Phase1Base {
@@ -415,8 +485,9 @@ fn deliver_in_container(
 
     // The gate has run and the delivery commit exists. From here on nothing but this process may
     // touch the workdir: reap whatever the agent left behind BEFORE the marker invites a token in
-    // and BEFORE the push reads the branch (C6's threat is exactly a survivor re-pointing it).
-    reap_other_processes()?;
+    // and BEFORE the push reads the branch (C6's threat is exactly a survivor re-pointing it). The
+    // reap is mandatory: one that cannot prove the container empty fails the delivery closed here.
+    reap()?;
     // The agent could write into the exchange mount while it lived (same uid). Now that nothing else
     // runs, discard anything it planted there, so every file the host reads from here on is ours.
     remove_planted_exchange_files(&inputs.out_dir);
@@ -740,6 +811,14 @@ pub const CONTAINER_ORCHESTRATOR_BIN: &str = "/usr/local/bin/maxplayer";
 /// The inputs file the host writes into the exchange directory before launch (mode `0600`). Read
 /// and DELETED by the orchestrator before the agent starts.
 pub const PHASE1_INPUTS_FILE: &str = "inputs.json";
+/// The environment variable the HOST sets on the delivery container's `docker run` (`-e`), and the
+/// ONE gate that lets `maxplayer __deliver phase1` run at all. [`run_phase1_entry`] reads it once, at
+/// startup, before the agent exists; a job process cannot change an environment the orchestrator
+/// already read. Nothing on the filesystem decides this: the job can write the filesystem it shares
+/// with the orchestrator, and a root job could unlink any sentinel there.
+pub const CONTAINER_DELIVERY_ENV: &str = "MAXPLAYER_DELIVER_CONTAINER";
+/// The value the host sets [`CONTAINER_DELIVERY_ENV`] to. Any other value, or none, is a refusal.
+pub const CONTAINER_DELIVERY_ENV_VALUE: &str = "1";
 /// The marker the orchestrator writes after the agent is dead and the delivery commit is gated. Its
 /// nonce proves the orchestrator, not a job process, wrote it; its `expected_oid` is the gated commit.
 pub const AGENT_DONE_MARKER: &str = "agent-done";
@@ -748,6 +827,23 @@ pub const AGENT_DONE_MARKER: &str = "agent-done";
 pub const PUSH_TOKEN_FILE: &str = "push-token";
 /// The orchestrator's account of the run, written on every exit ([`Phase1Outcome`]).
 pub const OUTCOME_FILE: &str = "outcome.json";
+/// Size caps, in bytes, for the files one side reads out of the exchange directory
+/// ([`read_exchange_file`]). The host reads the marker WHILE the job agent lives and shares the
+/// mount, so the cap is what bounds the host's allocation for a job-controlled file. Each cap is far
+/// above the honest size: a marker is about 130 bytes, the oid file is 41.
+pub const EXCHANGE_MARKER_MAX_BYTES: usize = 4 * 1024;
+/// Cap for [`DELIVERY_OID_FILE`]: 40 hex chars and a newline.
+pub const EXCHANGE_OID_MAX_BYTES: usize = 4 * 1024;
+/// Cap for [`OUTCOME_FILE`]. The two free-text fields of a [`Phase1Outcome`] are each bounded to
+/// [`OUTCOME_TEXT_MAX_BYTES`] before the write, and JSON escaping expands a byte at most six-fold, so
+/// an honest outcome always fits.
+pub const EXCHANGE_OUTCOME_MAX_BYTES: usize = 64 * 1024;
+/// Cap for [`PUSH_TOKEN_FILE`]: one NIP-98 `Authorization` header, about 1 KiB.
+pub const EXCHANGE_TOKEN_MAX_BYTES: usize = 64 * 1024;
+/// The bound on each free-text field of a [`Phase1Outcome`] (`detail`, `agent.last_agent_message`)
+/// as written. The agent authors its last message, so without this bound a hostile agent could make
+/// its own honest outcome exceed [`EXCHANGE_OUTCOME_MAX_BYTES`] and be refused.
+pub const OUTCOME_TEXT_MAX_BYTES: usize = 4 * 1024;
 /// Seconds past the job deadline the delivery may still take (gate + push). The long-lived token
 /// expires at `deadline + PUSH_MARGIN_SECS`, and the host waits at most that long plus
 /// [`CONTAINER_EXIT_GRACE_SECS`] for the container.
@@ -825,7 +921,7 @@ impl Phase1Outcome {
         elapsed: Duration,
     ) -> Self {
         let wall_time_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
-        match result {
+        let mut outcome = match result {
             Ok(output) => Self {
                 status: Phase1Status::Delivered,
                 detail: String::new(),
@@ -858,8 +954,38 @@ impl Phase1Outcome {
                     wall_time_ms,
                 }
             }
+        };
+        outcome.bound_text();
+        outcome
+    }
+
+    /// Cap `detail` and `agent.last_agent_message` at [`OUTCOME_TEXT_MAX_BYTES`] each, on a char
+    /// boundary, so the written file always fits under [`EXCHANGE_OUTCOME_MAX_BYTES`]. The host
+    /// refuses a longer file as planted; an agent that talks too much must not make its own honest
+    /// outcome unreadable.
+    fn bound_text(&mut self) {
+        truncate_to_char_boundary(&mut self.detail, OUTCOME_TEXT_MAX_BYTES);
+        if let Some(message) = self
+            .agent
+            .as_mut()
+            .and_then(|agent| agent.last_agent_message.as_mut())
+        {
+            truncate_to_char_boundary(message, OUTCOME_TEXT_MAX_BYTES);
         }
     }
+}
+
+/// Truncate `text` to at most `max_bytes`, cutting back to a char boundary so the result is valid
+/// UTF-8. A no-op when the text already fits.
+fn truncate_to_char_boundary(text: &mut String, max_bytes: usize) {
+    if text.len() <= max_bytes {
+        return;
+    }
+    let mut cut = max_bytes;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    text.truncate(cut);
 }
 
 /// Write the outcome file (container side). Replaces any file already there: this is written on
@@ -901,19 +1027,19 @@ fn remove_planted_exchange_files(out_dir: &Path) {
     }
 }
 
-/// Read the outcome file (host side). `Ok(None)` when the container never wrote one.
+/// Read the outcome file (host side). `Ok(None)` when the container never wrote one. Reads through
+/// [`read_exchange_file`] under the [`EXCHANGE_OUTCOME_MAX_BYTES`] cap: the file sits on the mount
+/// the job could write.
 pub fn read_outcome(out_dir: &Path) -> Result<Option<Phase1Outcome>, OrchestratorError> {
-    let path = out_dir.join(OUTCOME_FILE);
-    match std::fs::read_to_string(&path) {
-        Ok(raw) => serde_json::from_str(&raw).map(Some).map_err(|error| {
-            OrchestratorError::Io(format!("parse outcome {}: {error}", path.display()))
-        }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(OrchestratorError::Io(format!(
-            "read outcome {}: {error}",
-            path.display()
-        ))),
-    }
+    let Some(raw) = read_exchange_file(out_dir, OUTCOME_FILE, EXCHANGE_OUTCOME_MAX_BYTES)? else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&raw).map(Some).map_err(|error| {
+        OrchestratorError::Io(format!(
+            "parse outcome {}: {error}",
+            out_dir.join(OUTCOME_FILE).display()
+        ))
+    })
 }
 
 /// The marker the orchestrator writes after the agent is dead and the delivery commit is gated.
@@ -943,22 +1069,19 @@ pub fn write_agent_done_marker(
 /// Read and verify the marker (host side). `Ok(None)` while it has not appeared. A marker that does
 /// not parse, carries the wrong nonce, or names a malformed oid is [`OrchestratorError::Tampered`]:
 /// only a job process could have written it, and the host must not mint a token for it.
+///
+/// The host polls this WHILE the job agent lives, on a mount the agent shares, so the read goes
+/// through [`read_exchange_file`]: a FIFO cannot park the poll loop, a symlink is not followed, and
+/// no more than [`EXCHANGE_MARKER_MAX_BYTES`] is read — all BEFORE the nonce is looked at.
 pub fn read_agent_done_marker(
     out_dir: &Path,
     expected_nonce: &str,
 ) -> Result<Option<AgentDoneMarker>, OrchestratorError> {
-    let path = out_dir.join(AGENT_DONE_MARKER);
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(raw) => raw,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(OrchestratorError::Io(format!(
-                "read marker {}: {error}",
-                path.display()
-            )));
-        }
+    let Some(raw) = read_exchange_file(out_dir, AGENT_DONE_MARKER, EXCHANGE_MARKER_MAX_BYTES)?
+    else {
+        return Ok(None);
     };
-    let marker: AgentDoneMarker = serde_json::from_str(&raw).map_err(|error| {
+    let marker: AgentDoneMarker = serde_json::from_slice(&raw).map_err(|error| {
         OrchestratorError::Tampered(format!(
             "marker does not parse ({error}); not minting a token"
         ))
@@ -980,9 +1103,10 @@ pub fn read_agent_done_marker(
 }
 
 /// Wait for the fresh push token (container side, fresh-after-agent mode): poll for
-/// [`PUSH_TOKEN_FILE`] up to `wait`, then read it and DELETE it, so the token does not stay on the
-/// shared volume. Called only after the agent and every other process are dead. The returned header
-/// goes straight into the push and is never logged.
+/// [`PUSH_TOKEN_FILE`] up to `wait`, then read it (through [`read_exchange_file`], like every other
+/// exchange file) and DELETE it, so the token does not stay on the shared volume. Called only after
+/// the agent and every other process are dead. The returned header goes straight into the push and
+/// is never logged.
 fn await_push_token(out_dir: &Path, wait: Duration) -> Result<String, OrchestratorError> {
     let path = out_dir.join(PUSH_TOKEN_FILE);
     if !wait_for_file(&path, wait, TOKEN_POLL) {
@@ -991,12 +1115,16 @@ fn await_push_token(out_dir: &Path, wait: Duration) -> Result<String, Orchestrat
             wait.as_secs()
         )));
     }
-    let raw = std::fs::read_to_string(&path).map_err(|error| {
-        OrchestratorError::TokenUnavailable(format!("read token file: {error}"))
-    })?;
+    let raw = read_exchange_file(out_dir, PUSH_TOKEN_FILE, EXCHANGE_TOKEN_MAX_BYTES)
+        .map_err(|error| OrchestratorError::TokenUnavailable(format!("read token file: {error}")))?
+        .ok_or_else(|| {
+            OrchestratorError::TokenUnavailable("token file vanished before it was read".into())
+        })?;
     if let Err(error) = std::fs::remove_file(&path) {
         eprintln!("sandbox orchestrator: could not delete the consumed token file: {error}");
     }
+    let raw = String::from_utf8(raw)
+        .map_err(|_| OrchestratorError::TokenUnavailable("token file is not UTF-8".into()))?;
     let header = raw.trim();
     if !header.starts_with("Nostr ") {
         return Err(OrchestratorError::TokenUnavailable(
@@ -1148,7 +1276,8 @@ pub fn write_secret_file(path: &Path, contents: &str) -> Result<(), Orchestrator
 
 /// Create `path` atomically: write a sibling temp file (with `mode`, when given, applied at creation),
 /// then rename it into place, so a reader on the other side of the bind mount never sees a partial
-/// file. Refuses when `path` already exists.
+/// file. Refuses when ANY entry already exists at `path` — the check does not follow a symlink, so a
+/// link a job process planted at the name is a refusal, never a write to wherever it points.
 fn write_file_atomically(
     path: &Path,
     contents: &str,
@@ -1166,11 +1295,18 @@ fn write_file_atomically(
         .ok_or_else(|| OrchestratorError::Io(format!("{} has no file name", path.display())))?;
     let tmp = path.with_file_name(format!("{name}.tmp"));
     let mut options = std::fs::OpenOptions::new();
+    // `create_new` (`O_CREAT | O_EXCL`) refuses any entry already at the temp name, a symlink
+    // included. `O_NOFOLLOW` states the same intent on the open itself.
     options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
     if let Some(mode) = mode {
         #[cfg(unix)]
         {
-            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::fs::OpenOptionsExt as _;
             options.mode(mode);
         }
         #[cfg(not(unix))]
@@ -1200,6 +1336,88 @@ fn write_file_atomically(
     Ok(())
 }
 
+/// Read `name` out of the exchange directory `dir`: the ONE reader for every file the other side of
+/// the mount wrote. `Ok(None)` when the file does not exist yet.
+///
+/// The host calls this while the job agent lives, and the agent shares the mount, so the read trusts
+/// nothing about the entry it finds:
+/// - the open does not follow a symlink at the final component (`O_NOFOLLOW`): a link to
+///   `/dev/zero`, or to any host file, is refused rather than read;
+/// - the open does not block (`O_NONBLOCK`): a FIFO with no writer returns at once instead of
+///   parking the host's poll loop past every deadline check;
+/// - the OPENED descriptor must be a regular file (`fstat`, not a stat of the path, so a swap between
+///   a check and the open cannot slip a FIFO, a device or a directory through);
+/// - at most `max_bytes` are read (`Read::take`): a longer file is refused, so the host never
+///   allocates more than the cap for a file the job controls.
+///
+/// A symlink, a non-regular file or an over-cap file is [`OrchestratorError::Tampered`] — only a job
+/// process could have planted it. Every other failure is [`OrchestratorError::Io`]. The callers treat
+/// both as a refusal; nothing is retried. Off unix the flags cannot be set, so the read is refused.
+pub fn read_exchange_file(
+    dir: &Path,
+    name: &str,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>, OrchestratorError> {
+    let path = dir.join(name);
+    #[cfg(not(unix))]
+    {
+        let _ = max_bytes;
+        Err(OrchestratorError::Io(format!(
+            "cannot open {} with O_NOFOLLOW | O_NONBLOCK on this platform; refusing to read it",
+            path.display()
+        )))
+    }
+    #[cfg(unix)]
+    {
+        use std::io::Read as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+        let file = match options.open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+                return Err(OrchestratorError::Tampered(format!(
+                    "{} is a symlink; only a job process could have planted it; not following it",
+                    path.display()
+                )));
+            }
+            Err(error) => {
+                return Err(OrchestratorError::Io(format!(
+                    "open {}: {error}",
+                    path.display()
+                )));
+            }
+        };
+        let metadata = file.metadata().map_err(|error| {
+            OrchestratorError::Io(format!("stat {}: {error}", path.display()))
+        })?;
+        if !metadata.file_type().is_file() {
+            return Err(OrchestratorError::Tampered(format!(
+                "{} is not a regular file ({:?}); only a job process could have planted it; \
+                 refusing to read it",
+                path.display(),
+                metadata.file_type()
+            )));
+        }
+        let limit = max_bytes as u64 + 1;
+        let mut bytes = Vec::with_capacity(metadata.len().min(limit) as usize);
+        file.take(limit).read_to_end(&mut bytes).map_err(|error| {
+            OrchestratorError::Io(format!("read {}: {error}", path.display()))
+        })?;
+        if bytes.len() > max_bytes {
+            return Err(OrchestratorError::Tampered(format!(
+                "{} exceeds {max_bytes} bytes; only a job process would write that; refusing to \
+                 read it",
+                path.display()
+            )));
+        }
+        Ok(Some(bytes))
+    }
+}
+
 /// Set `mode` on `path`, failing closed off unix.
 fn restrict_mode(path: &Path, mode: u32) -> Result<(), OrchestratorError> {
     #[cfg(unix)]
@@ -1223,36 +1441,62 @@ fn restrict_mode(path: &Path, mode: u32) -> Result<(), OrchestratorError> {
 }
 
 /// Kill every process in the container except PID 1 (docker-init) and this one, then confirm none
-/// is left. Runs only inside a docker container (`/.dockerenv` present), because outside one it
-/// would kill the operator's own processes; there the push relies on the expected-oid check alone.
+/// is left. MANDATORY: no file on the shared filesystem decides whether it runs. A job process can
+/// write that filesystem — `/.dockerenv` once gated this, and a root job could unlink it, double-fork
+/// a survivor out of the agent's process group, and have the survivor read the fresh token the host
+/// wrote for a marker the orchestrator itself had signed. What keeps a developer's host processes
+/// safe is the container gate in [`run_phase1_entry_with`], read from an environment the job never
+/// controlled.
 ///
 /// The agent's process group is already gone (the ACP driver reaps it), so what this catches is a
 /// double-forked survivor the agent left behind — the one thing that could re-point the delivery
-/// branch or plant a config between the gate and the push. Fails closed when anything survives.
+/// branch, plant a config, or read the fresh token between the gate and the push. Fails closed when
+/// anything survives, and when `/proc` cannot be listed at all.
 #[cfg(all(feature = "wallet", target_os = "linux"))]
 fn reap_other_processes() -> Result<(), OrchestratorError> {
-    if !Path::new("/.dockerenv").exists() {
-        eprintln!(
-            "sandbox orchestrator: not inside a docker container; skipping the process reap (the \
-             push still requires the gated oid)"
-        );
-        return Ok(());
-    }
+    reap_with(other_live_pids, kill_pid, std::thread::sleep)
+}
+
+/// The production orchestrator is a Linux container. Any other platform has no `/proc` to prove the
+/// container empty with, so the reap fails CLOSED: no marker, no token, no push. (The entry refuses
+/// before the agent runs on such a build; this is the second lock.)
+#[cfg(all(feature = "wallet", not(target_os = "linux")))]
+fn reap_other_processes() -> Result<(), OrchestratorError> {
+    reap_with(
+        || {
+            Err(OrchestratorError::Io(
+                "process reap unavailable on this build/platform: the delivery container is a \
+                 Linux build; refusing to push"
+                    .into(),
+            ))
+        },
+        |_pid| {},
+        |_wait| {},
+    )
+}
+
+/// The reap over its process-table seams — `live_pids()` lists every other live pid, `kill(pid)`
+/// sends SIGKILL — and a `sleep`, so the logic is testable on any platform without a real process
+/// table. Kills and re-lists up to 20 times, 100 ms apart. `Ok(())` only when a listing came back
+/// empty; a listing that fails is that error (fail closed: nothing proves the container empty), and
+/// survivors after the last round are [`OrchestratorError::Tampered`].
+#[cfg_attr(not(feature = "wallet"), allow(dead_code))]
+fn reap_with(
+    mut live_pids: impl FnMut() -> Result<Vec<u32>, OrchestratorError>,
+    mut kill: impl FnMut(u32),
+    mut sleep: impl FnMut(Duration),
+) -> Result<(), OrchestratorError> {
     for _attempt in 0..20 {
-        let live = other_live_pids()?;
+        let live = live_pids()?;
         if live.is_empty() {
             return Ok(());
         }
         for pid in &live {
-            // SAFETY: `kill` takes a pid and a signal and touches no memory of ours. The pid was
-            // read from /proc a moment ago; a stale pid at worst names a process that is gone.
-            unsafe {
-                libc::kill(*pid as libc::pid_t, libc::SIGKILL);
-            }
+            kill(*pid);
         }
-        std::thread::sleep(Duration::from_millis(100));
+        sleep(Duration::from_millis(100));
     }
-    let survivors = other_live_pids()?;
+    let survivors = live_pids()?;
     if survivors.is_empty() {
         Ok(())
     } else {
@@ -1264,16 +1508,14 @@ fn reap_other_processes() -> Result<(), OrchestratorError> {
     }
 }
 
-/// The production orchestrator is a `wallet` build running in a Linux container; every other build
-/// (a `git-delivery`-only test build, a macOS developer run) has no `libc` or no `/proc` to reap
-/// with. The push still requires the gated oid (C6), so this degrades to that check alone.
-#[cfg(not(all(feature = "wallet", target_os = "linux")))]
-fn reap_other_processes() -> Result<(), OrchestratorError> {
-    eprintln!(
-        "sandbox orchestrator: process reap unavailable on this build/platform; skipping (the push \
-         still requires the gated oid)"
-    );
-    Ok(())
+/// SIGKILL `pid`.
+#[cfg(all(feature = "wallet", target_os = "linux"))]
+fn kill_pid(pid: u32) {
+    // SAFETY: `kill` takes a pid and a signal and touches no memory of ours. The pid was read from
+    // /proc a moment ago; a stale pid at worst names a process that is gone.
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
 }
 
 /// Every pid in `/proc` except 1 and this process that is not already a zombie or dead.
@@ -1410,6 +1652,25 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("io")).expect("mkdir io");
         root
+    }
+
+    /// The environment the host gives the delivery container.
+    fn in_container(key: &str) -> Option<String> {
+        (key == CONTAINER_DELIVERY_ENV).then(|| CONTAINER_DELIVERY_ENV_VALUE.to_owned())
+    }
+
+    /// A reap that found the container empty.
+    fn reap_ok() -> Result<(), OrchestratorError> {
+        Ok(())
+    }
+
+    /// [`run_phase1_entry_with`] under the container's environment and a clean reap: the two seams
+    /// the hand-off tests do not vary.
+    fn entry(
+        inputs_path: &Path,
+        run_agent: impl FnOnce(&Phase1Inputs, &Path) -> Result<AgentOutcome, OrchestratorError>,
+    ) -> Result<Phase1Output, OrchestratorError> {
+        run_phase1_entry_with(inputs_path, in_container, run_agent, reap_ok)
     }
 
     // Backoff doubles from the base and caps at max_delay.
@@ -1684,7 +1945,7 @@ mod tests {
         write_phase1_inputs(&inputs_path, &inputs).expect("write inputs");
 
         let saw_inputs_at_agent_time = RefCell::new(None);
-        let result = run_phase1_entry_with(&inputs_path, |inputs, workdir| {
+        let result = entry(&inputs_path, |inputs, workdir| {
             *saw_inputs_at_agent_time.borrow_mut() =
                 Some(root.join("io").join(PHASE1_INPUTS_FILE).exists());
             assert_eq!(
@@ -1779,7 +2040,7 @@ mod tests {
         });
 
         let agent_ran_before_marker = RefCell::new(false);
-        let result = run_phase1_entry_with(&inputs_path, |_inputs, workdir| {
+        let result = entry(&inputs_path, |_inputs, workdir| {
             *agent_ran_before_marker.borrow_mut() =
                 !root.join("io").join(AGENT_DONE_MARKER).exists();
             fs::write(workdir.join("answer.txt"), "fresh agent output\n")
@@ -1828,7 +2089,7 @@ mod tests {
         let inputs_path = root.join("io").join(PHASE1_INPUTS_FILE);
         write_phase1_inputs(&inputs_path, &inputs).expect("write inputs");
         let io = root.join("io");
-        let err = run_phase1_entry_with(&inputs_path, |_inputs, workdir| {
+        let err = entry(&inputs_path, |_inputs, workdir| {
             // The "agent" plants a forged marker with a guessed nonce, a fake token and a fake outcome.
             fs::write(
                 io.join(AGENT_DONE_MARKER),
@@ -1876,7 +2137,7 @@ mod tests {
         let inputs_path = root.join("io").join(PHASE1_INPUTS_FILE);
         write_phase1_inputs(&inputs_path, &inputs).expect("write inputs");
         let started = std::time::Instant::now();
-        let err = run_phase1_entry_with(&inputs_path, |_inputs, workdir| {
+        let err = entry(&inputs_path, |_inputs, workdir| {
             fs::write(workdir.join("answer.txt"), "output\n")
                 .map_err(|e| OrchestratorError::Io(e.to_string()))?;
             Ok(AgentOutcome::default())
@@ -1916,7 +2177,7 @@ mod tests {
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).expect("chmod");
 
         let agent_ran = RefCell::new(false);
-        let err = run_phase1_entry_with(&inputs_path, |_inputs, _workdir| {
+        let err = entry(&inputs_path, |_inputs, _workdir| {
             *agent_ran.borrow_mut() = true;
             Ok(AgentOutcome::default())
         })
@@ -1940,11 +2201,7 @@ mod tests {
         let inputs = inputs_for(&root, PushTokenSource::None);
         let inputs_path = root.join("io").join(PHASE1_INPUTS_FILE);
         write_phase1_inputs(&inputs_path, &inputs).expect("write inputs");
-        let err =
-            run_phase1_entry_with(
-                &inputs_path,
-                |_inputs, _workdir| Ok(AgentOutcome::default()),
-            )
+        let err = entry(&inputs_path, |_inputs, _workdir| Ok(AgentOutcome::default()))
             .expect_err("empty tree");
         assert!(
             matches!(
@@ -2316,5 +2573,388 @@ mod tests {
         .expect("write");
         assert_eq!(read_delivery_oid(&root).expect("valid"), "a".repeat(40));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    // ─── F2: the host reads job-writable exchange files through one hardened reader ──────────────
+
+    /// Plant a FIFO with no writer at `path`. A following, blocking reader parks on it forever.
+    #[cfg(unix)]
+    fn plant_fifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt as _;
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("no NUL in path");
+        // SAFETY: `mkfifo` reads a NUL-terminated path and a mode, and touches no memory of ours.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// The three files the host reads: each with its reader and a VALID content for it, so a
+    /// symlink test can point at a valid target and prove the reader refused the LINK, not the
+    /// content behind it.
+    #[cfg(unix)]
+    fn host_readers() -> Vec<(&'static str, fn(&Path) -> Result<(), OrchestratorError>, String)> {
+        let valid_marker = serde_json::to_string(&AgentDoneMarker {
+            nonce: NONCE.to_owned(),
+            expected_oid: "c".repeat(40),
+        })
+        .expect("encode marker");
+        let valid_outcome = serde_json::to_string(&Phase1Outcome {
+            status: Phase1Status::Delivered,
+            detail: String::new(),
+            delivery_oid: Some("c".repeat(40)),
+            agent: None,
+            wall_time_ms: 1,
+        })
+        .expect("encode outcome");
+        vec![
+            (
+                AGENT_DONE_MARKER,
+                |io| read_agent_done_marker(io, NONCE).map(|_| ()),
+                valid_marker,
+            ),
+            (
+                DELIVERY_OID_FILE,
+                |io| read_delivery_oid(io).map(|_| ()),
+                format!("{}\n", "c".repeat(40)),
+            ),
+            (OUTCOME_FILE, |io| read_outcome(io).map(|_| ()), valid_outcome),
+        ]
+    }
+
+    // Attack A on the exchange channel: while it is alive, the job plants a FIFO with no writer
+    // under the marker's name. A following, blocking read parks the host's poll loop on it forever,
+    // past every deadline check. The hardened reader opens non-blocking, sees a FIFO on the OPENED
+    // descriptor, and refuses at once. The oid and outcome readers get the same attack.
+    #[cfg(unix)]
+    #[test]
+    fn readers_refuse_a_planted_fifo_without_blocking() {
+        let root = fresh_root("fifo");
+        let io = root.join("io");
+        for (name, read, _) in host_readers() {
+            plant_fifo(&io.join(name));
+            let started = std::time::Instant::now();
+            let err = read(&io).expect_err("a FIFO is never read");
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "{name}: the read took {elapsed:?}"
+            );
+            assert!(matches!(err, OrchestratorError::Tampered(_)), "{name}: {err}");
+            assert!(
+                err.to_string().contains("not a regular file"),
+                "{name}: {err}"
+            );
+            fs::remove_file(io.join(name)).expect("rm fifo");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // Attack B: the job plants a symlink under the marker's name. The target here is a VALID file
+    // of the right shape, so a reader that followed the link would return Ok — the refusal proves
+    // the link itself was refused, whatever it points at (`/dev/zero` in the real attack, which a
+    // following reader consumes until allocation fails). The same content in a regular file reads.
+    #[cfg(unix)]
+    #[test]
+    fn readers_refuse_a_planted_symlink_without_following_it() {
+        let root = fresh_root("symlink");
+        let io = root.join("io");
+        let elsewhere = root.join("elsewhere");
+        fs::create_dir_all(&elsewhere).expect("mkdir");
+        for (name, read, valid) in host_readers() {
+            let target = elsewhere.join(name);
+            fs::write(&target, &valid).expect("write target");
+            std::os::unix::fs::symlink(&target, io.join(name)).expect("symlink");
+            let started = std::time::Instant::now();
+            let err = read(&io).expect_err("a symlink is never followed");
+            assert!(started.elapsed() < Duration::from_secs(1), "{name}");
+            assert!(matches!(err, OrchestratorError::Tampered(_)), "{name}: {err}");
+            assert!(err.to_string().contains("symlink"), "{name}: {err}");
+            fs::remove_file(io.join(name)).expect("rm link");
+        }
+        for (name, read, valid) in host_readers() {
+            fs::write(io.join(name), &valid).expect("write regular");
+            read(&io).unwrap_or_else(|err| panic!("{name}: a valid regular file reads: {err}"));
+            fs::remove_file(io.join(name)).expect("rm");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // A regular file over its cap is refused before it is parsed, so the host never allocates more
+    // than the cap for a file the job wrote. One cap per file.
+    #[cfg(unix)]
+    #[test]
+    fn readers_refuse_an_oversized_regular_file() {
+        let root = fresh_root("oversize");
+        let io = root.join("io");
+        let caps = [
+            (AGENT_DONE_MARKER, EXCHANGE_MARKER_MAX_BYTES),
+            (DELIVERY_OID_FILE, EXCHANGE_OID_MAX_BYTES),
+            (OUTCOME_FILE, EXCHANGE_OUTCOME_MAX_BYTES),
+        ];
+        for (name, read, _) in host_readers() {
+            let cap = caps.iter().find(|(n, _)| *n == name).expect("a cap per file").1;
+            fs::write(io.join(name), "a".repeat(cap + 1)).expect("write");
+            let err = read(&io).expect_err("over the cap");
+            assert!(matches!(err, OrchestratorError::Tampered(_)), "{name}: {err}");
+            assert!(err.to_string().contains("exceeds"), "{name}: {err}");
+            fs::remove_file(io.join(name)).expect("rm");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // The reader's own contract: absent is `None`, exactly the cap reads, one byte more is refused,
+    // and a directory under the name is not a regular file.
+    #[cfg(unix)]
+    #[test]
+    fn exchange_reader_caps_at_exactly_max_bytes() {
+        let root = fresh_root("reader");
+        let io = root.join("io");
+        assert_eq!(read_exchange_file(&io, "f", 8).expect("absent"), None);
+        fs::write(io.join("f"), [b'x'; 8]).expect("write");
+        assert_eq!(
+            read_exchange_file(&io, "f", 8)
+                .expect("fits")
+                .expect("present")
+                .len(),
+            8
+        );
+        fs::write(io.join("f"), [b'x'; 9]).expect("write");
+        assert!(matches!(
+            read_exchange_file(&io, "f", 8),
+            Err(OrchestratorError::Tampered(_))
+        ));
+        fs::remove_file(io.join("f")).expect("rm");
+        fs::create_dir(io.join("f")).expect("mkdir");
+        let err = read_exchange_file(&io, "f", 8).expect_err("a directory is refused");
+        assert!(matches!(err, OrchestratorError::Tampered(_)), "{err}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // The host's token write never follows a link the job planted: a symlink at the token's name is
+    // a refusal, and so is one at the temp name the write goes through. Nothing is written to the
+    // link target, and no token file appears.
+    #[cfg(unix)]
+    #[test]
+    fn token_write_refuses_a_planted_symlink_at_either_name() {
+        let root = fresh_root("token-link");
+        let io = root.join("io");
+        let victim = root.join("victim");
+        fs::write(&victim, "untouched").expect("write victim");
+        for planted in [PUSH_TOKEN_FILE.to_owned(), format!("{PUSH_TOKEN_FILE}.tmp")] {
+            std::os::unix::fs::symlink(&victim, io.join(&planted)).expect("symlink");
+            let err = write_secret_file(&io.join(PUSH_TOKEN_FILE), "Nostr secret")
+                .expect_err("a planted link refuses the write");
+            assert!(matches!(err, OrchestratorError::Io(_)), "{planted}: {err}");
+            assert_eq!(
+                fs::read_to_string(&victim).expect("read victim"),
+                "untouched",
+                "{planted}: the link target must not be written through"
+            );
+            let at_name = io.join(PUSH_TOKEN_FILE).symlink_metadata();
+            assert!(
+                at_name.map(|m| m.file_type().is_symlink()).unwrap_or(true),
+                "{planted}: no token file may appear at the token's name"
+            );
+            // The writer's own cleanup may already have unlinked the link at the temp name (an
+            // `unlink`, which never follows it); the target above is the proof that matters.
+            let _ = fs::remove_file(io.join(&planted));
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // The outcome's free text is bounded at the write, on a char boundary, so an agent that says
+    // too much cannot make its own honest outcome exceed the host's read cap.
+    #[test]
+    fn outcome_text_is_bounded_so_the_file_fits_the_read_cap() {
+        let root = fresh_root("outcome-bound");
+        let io = root.join("io");
+        let agent = Some(AgentOutcome {
+            usage: None,
+            last_agent_message: Some("é".repeat(EXCHANGE_OUTCOME_MAX_BYTES)),
+        });
+        let failed: Result<Phase1Output, OrchestratorError> =
+            Err(OrchestratorError::Agent("x".repeat(EXCHANGE_OUTCOME_MAX_BYTES)));
+        let outcome = Phase1Outcome::from_result(&failed, agent, Duration::from_secs(1));
+        assert!(outcome.detail.len() <= OUTCOME_TEXT_MAX_BYTES);
+        let message = outcome
+            .agent
+            .as_ref()
+            .and_then(|a| a.last_agent_message.as_deref())
+            .expect("the message is kept, shortened");
+        assert!(message.len() <= OUTCOME_TEXT_MAX_BYTES);
+        assert!(!message.is_empty());
+        assert!(message.chars().all(|c| c == 'é'), "cut on a char boundary");
+        write_outcome(&io, &outcome).expect("write");
+        assert_eq!(
+            read_outcome(&io).expect("under the cap").as_ref(),
+            Some(&outcome)
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // ─── F3: the reap is mandatory, and the gate that protects a developer is not a file ───────────
+
+    // Without the host's environment variable — absent, or set to anything but its value — the
+    // entry refuses before it reads the inputs, deletes them, or starts the agent. A developer who
+    // runs `__deliver phase1` on a host by hand hits this, and their processes are never reaped.
+    #[test]
+    fn entry_refuses_outside_the_delivery_container_before_touching_anything() {
+        let root = fresh_root("entry-gate");
+        let inputs = inputs_for(&root, PushTokenSource::None);
+        let inputs_path = root.join("io").join(PHASE1_INPUTS_FILE);
+        write_phase1_inputs(&inputs_path, &inputs).expect("write inputs");
+        let absent: fn(&str) -> Option<String> = |_| None;
+        let zero: fn(&str) -> Option<String> =
+            |key| (key == CONTAINER_DELIVERY_ENV).then(|| "0".to_owned());
+        let word: fn(&str) -> Option<String> =
+            |key| (key == CONTAINER_DELIVERY_ENV).then(|| "true".to_owned());
+        for env in [absent, zero, word] {
+            let agent_ran = RefCell::new(false);
+            let reaped = RefCell::new(false);
+            let err = run_phase1_entry_with(
+                &inputs_path,
+                env,
+                |_, _| {
+                    *agent_ran.borrow_mut() = true;
+                    Ok(AgentOutcome::default())
+                },
+                || {
+                    *reaped.borrow_mut() = true;
+                    Ok(())
+                },
+            )
+            .expect_err("refused outside the container");
+            assert!(
+                matches!(err, OrchestratorError::AgentUnavailable(_)),
+                "{err}"
+            );
+            assert!(err.to_string().contains(CONTAINER_DELIVERY_ENV), "{err}");
+            assert!(!*agent_ran.borrow(), "the agent must not start");
+            assert!(!*reaped.borrow(), "nothing is reaped outside the container");
+            assert!(inputs_path.exists(), "the inputs are not even read");
+            assert!(
+                !root.join("io").join(OUTCOME_FILE).exists(),
+                "no outcome is written"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // The reap runs after the gate and BEFORE the marker exists, and a reap that fails — `/proc`
+    // unreadable, or a survivor that will not die — fails the delivery closed: no marker, so no
+    // token is ever minted, no push, and the outcome says why.
+    #[test]
+    fn entry_fails_closed_when_the_reap_cannot_prove_the_container_empty() {
+        let root = fresh_root("entry-reap");
+        let inputs = inputs_for(&root, PushTokenSource::FreshAfterAgent { wait_secs: 10 });
+        let inputs_path = root.join("io").join(PHASE1_INPUTS_FILE);
+        write_phase1_inputs(&inputs_path, &inputs).expect("write inputs");
+        let io = root.join("io");
+        let marker_seen_at_reap = RefCell::new(None);
+        let started = std::time::Instant::now();
+        let err = run_phase1_entry_with(
+            &inputs_path,
+            in_container,
+            |_, workdir| {
+                fs::write(workdir.join("answer.txt"), "output\n")
+                    .map_err(|e| OrchestratorError::Io(e.to_string()))?;
+                Ok(AgentOutcome::default())
+            },
+            || {
+                *marker_seen_at_reap.borrow_mut() = Some(io.join(AGENT_DONE_MARKER).exists());
+                Err(OrchestratorError::Tampered(
+                    "1 process(es) survived the agent (pids [42]); refusing to push".into(),
+                ))
+            },
+        )
+        .expect_err("a failed reap fails the delivery");
+        assert!(matches!(err, OrchestratorError::Tampered(_)), "{err}");
+        assert_eq!(
+            marker_seen_at_reap.into_inner(),
+            Some(false),
+            "the reap runs before the marker is written"
+        );
+        assert!(
+            !io.join(AGENT_DONE_MARKER).exists(),
+            "no marker invites a token after a failed reap"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "no token wait happened"
+        );
+        let outcome = read_outcome(&io).expect("parses").expect("written");
+        assert_eq!(outcome.status, Phase1Status::Tampered);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // The reap logic over an injected process table: empty ⇒ Ok with nothing killed; a listing that
+    // fails ⇒ that error (fail closed: nothing proves the container empty); survivors are killed and
+    // re-listed until gone; a survivor that will not die is tamper evidence after a bounded number
+    // of rounds.
+    #[test]
+    fn reap_kills_and_relists_and_fails_closed_when_it_cannot_prove_the_container_empty() {
+        let killed = RefCell::new(Vec::new());
+        reap_with(|| Ok(vec![]), |pid| killed.borrow_mut().push(pid), |_| {})
+            .expect("an empty container is fine");
+        assert!(killed.borrow().is_empty());
+
+        let err = reap_with(
+            || Err(OrchestratorError::Io("list /proc: denied".into())),
+            |pid| killed.borrow_mut().push(pid),
+            |_| {},
+        )
+        .expect_err("an unlistable process table fails closed");
+        assert!(matches!(err, OrchestratorError::Io(_)), "{err}");
+        assert!(killed.borrow().is_empty(), "nothing is killed blind");
+
+        let listings = RefCell::new(vec![vec![], vec![42, 43]]);
+        let slept = RefCell::new(0u32);
+        reap_with(
+            || Ok(listings.borrow_mut().pop().unwrap_or_default()),
+            |pid| killed.borrow_mut().push(pid),
+            |_| *slept.borrow_mut() += 1,
+        )
+        .expect("the survivors died");
+        assert_eq!(*killed.borrow(), vec![42, 43]);
+        assert_eq!(*slept.borrow(), 1);
+
+        killed.borrow_mut().clear();
+        let err = reap_with(|| Ok(vec![7]), |pid| killed.borrow_mut().push(pid), |_| {})
+            .expect_err("an immortal survivor is tamper evidence");
+        assert!(matches!(err, OrchestratorError::Tampered(_)), "{err}");
+        assert!(err.to_string().contains("[7]"), "{err}");
+        assert_eq!(killed.borrow().len(), 20, "one kill per round, bounded");
+    }
+
+    // Off Linux the production reap has no process table to prove the container empty with, so it
+    // fails closed rather than silently skipping. RED ON REVERT: the old stub returned `Ok(())`.
+    #[cfg(all(feature = "wallet", not(target_os = "linux")))]
+    #[test]
+    fn production_reap_fails_closed_off_linux() {
+        let err = reap_other_processes().expect_err("no /proc here");
+        assert!(matches!(err, OrchestratorError::Io(_)), "{err}");
+        assert!(err.to_string().contains("unavailable"), "{err}");
+    }
+
+    // No file on the shared filesystem decides the reap. The job can write that filesystem, and a
+    // root job can unlink any sentinel on it, so the code must not name one. RED ON REVERT: the reap
+    // once returned early when `/.dockerenv` was absent.
+    #[test]
+    fn the_reap_consults_no_sentinel_file() {
+        let source = include_str!("delivery_orchestrator.rs");
+        let code: String = source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect();
+        let sentinel = concat!("docker", "env");
+        assert!(
+            !code.contains(sentinel),
+            "the reap must not be gated on a file a job could unlink"
+        );
     }
 }
