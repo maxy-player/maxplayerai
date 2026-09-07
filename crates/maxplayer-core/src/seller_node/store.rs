@@ -23,8 +23,90 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use crate::checks::EnvKind;
 use crate::gateway::EventDraft;
 
-/// Current on-disk schema version.
-pub const SCHEMA_VERSION: i64 = 7;
+/// Current on-disk schema version. v8 added `receipts.fee_bps` / `receipts.fee_sats` (the platform
+/// fee, stage 1 — journaled, not remitted). v9 added `receipts.mint_fee_sats` (the mint's own swap
+/// fee, so a receipt shows every figure between what the buyer paid and what the seller keeps).
+pub const SCHEMA_VERSION: i64 = 9;
+
+/// The platform fee (stage 1) as journaled so far: what is owed on paper, and the figures around
+/// it. Returned by [`SellerStore::accrued_fees`]. Nothing in this stage moves the balance it
+/// reports.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AccruedFees {
+    /// Sum of `amount_sats` (the offer face — what buyers paid) over every receipt ever collected.
+    pub total_amount_sats: u64,
+    /// Sum of `mint_fee_sats` over the receipts that RECORDED one. Rows from before v9 carry no mint
+    /// fee and contribute nothing here; `rows_without_mint_fee` counts them so a read-out can say
+    /// "plus N collections whose mint fee was not recorded" instead of presenting this as complete.
+    pub total_mint_fee_sats: u64,
+    /// Receipts collected before the mint fee was journaled (schema < v9). Their mint fee is
+    /// unknown — not zero — and so is what the seller kept of them.
+    pub rows_without_mint_fee: usize,
+    /// Sum of `fee_sats` (the platform fee) over every receipt ever collected.
+    pub total_fee_sats: u64,
+    /// One entry per receipt row, oldest collection first — in practice one per paid job.
+    pub by_job: Vec<JobFeeAccrual>,
+}
+
+impl AccruedFees {
+    /// What the seller kept across the receipts whose mint fee is known:
+    /// `Σ(face − mint_fee − platform_fee)` over those rows only. `None` when there are rows but
+    /// none of them recorded a mint fee, so a read-out never prints a kept total it could not have
+    /// measured.
+    pub fn total_kept_sats(&self) -> Option<u64> {
+        let known: Vec<u64> = self
+            .by_job
+            .iter()
+            .filter_map(JobFeeAccrual::kept_sats)
+            .collect();
+        if known.is_empty() && !self.by_job.is_empty() {
+            return None;
+        }
+        Some(known.into_iter().fold(0u64, u64::saturating_add))
+    }
+}
+
+/// The fee figures journaled beside a receipt in the same insert as the receipt itself — the input
+/// half of [`JobFeeAccrual`]. All three are known at the collect seam only after the redeem has
+/// classified `Finalize`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceiptFees {
+    /// The mint's own swap fee on this payment, in sats.
+    pub mint_fee_sats: u64,
+    /// The platform rate in force at collection, in basis points (10% = 1000).
+    pub fee_bps: u32,
+    /// `floor(face × fee_bps / 10_000)` — the platform fee, in sats.
+    pub fee_sats: u64,
+}
+
+/// One receipt's figures: what the buyer paid, what the mint kept, what the platform fee came to.
+/// What the seller keeps is derived by [`Self::kept_sats`], never stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobFeeAccrual {
+    pub job_id: String,
+    /// The offer's FACE amount — the price the buyer paid. This is the base the platform fee was
+    /// taken on. It is NOT the wallet net; the mint's swap fee is `mint_fee_sats`.
+    pub amount_sats: u64,
+    /// The mint's own swap fee, deducted by the mint before the sats reached the wallet. `None` on a
+    /// row collected before schema v9: the fee was not recorded then, which is a different fact
+    /// from a recorded fee of zero, and a read-out must say so rather than print `0`.
+    pub mint_fee_sats: Option<u64>,
+    /// The platform rate in force at collection, in basis points (10% = 1000).
+    pub fee_bps: u32,
+    /// `floor(amount_sats × fee_bps / 10_000)`, as written at collection.
+    pub fee_sats: u64,
+    pub received_at_unix: i64,
+}
+
+impl JobFeeAccrual {
+    /// `face − mint_fee − platform_fee`, saturating — what the seller keeps of this payment. `None`
+    /// when the mint fee was not recorded, because the answer is then unknown, not zero.
+    pub fn kept_sats(&self) -> Option<u64> {
+        self.mint_fee_sats.map(|mint_fee| {
+            crate::platform_fee::kept_sats(self.amount_sats, mint_fee, self.fee_sats)
+        })
+    }
+}
 
 /// Resolve a nullable `payment` column into a [`crate::gateway::PaymentMode`].
 ///
@@ -364,7 +446,22 @@ impl SellerStore {
                  receipt_id      TEXT PRIMARY KEY,
                  job_id          TEXT NOT NULL,
                  amount_sats     INTEGER NOT NULL CHECK (amount_sats >= 0),
-                 received_at_unix INTEGER NOT NULL
+                 received_at_unix INTEGER NOT NULL,
+                 -- `amount_sats` above is the offer FACE — what the buyer paid — not the wallet net.
+                 -- Platform fee (stage 1), written in the SAME insert as the receipt so no row can
+                 -- exist without its fee. `fee_bps` is the rate in force at collection, in basis
+                 -- points (10% = 1000); `fee_sats` is floor(amount_sats × fee_bps / 10_000), i.e.
+                 -- charged on the FACE. ACCRUED, NOT REMITTED: these columns record what the fee
+                 -- came to; nothing reads them to move money. A row from before v8 reads 0/0 — no
+                 -- fee was configured when it was collected, so 0 is the fact, not a guess.
+                 fee_bps         INTEGER NOT NULL DEFAULT 0 CHECK (fee_bps >= 0 AND fee_bps <= 10000),
+                 fee_sats        INTEGER NOT NULL DEFAULT 0 CHECK (fee_sats >= 0),
+                 -- The mint's own swap fee (v9), taken by the mint before the sats reached the
+                 -- wallet: wallet net = amount_sats − mint_fee_sats. NULLABLE ON PURPOSE with no
+                 -- default: a row from before v9 reads NULL, meaning NOT RECORDED — never a
+                 -- measured 0. What the seller keeps (face − mint fee − platform fee) is derived at
+                 -- read time from these three columns and is deliberately not a fourth column.
+                 mint_fee_sats   INTEGER CHECK (mint_fee_sats IS NULL OR mint_fee_sats >= 0)
              );
              -- Intent-to-receive breadcrumbs, written BEFORE the mint swap (payment ordering,
              -- invariant 3). A breadcrumb records ONLY that a swap was attempted for a token — it is
@@ -432,8 +529,9 @@ impl SellerStore {
     /// EXISTS` never alters a table that already exists, so a column added to the schema above
     /// reaches existing stores only through here.
     ///
-    /// Every step is ADDITIVE and idempotent — a nullable column whose absence reads the same as
-    /// its default. Nothing here rewrites or drops a row: this store holds live trade state.
+    /// Every step is ADDITIVE and idempotent — a nullable or DEFAULT-valued column whose absence
+    /// reads the same as its default. Nothing here rewrites or drops a row: this store holds live
+    /// trade state.
     fn migrate(conn: &Connection) -> Result<(), StoreError> {
         if !Self::column_exists(conn, "offers", "requested_agent")? {
             conn.execute_batch("ALTER TABLE offers ADD COLUMN requested_agent TEXT;")?;
@@ -466,6 +564,32 @@ impl SellerStore {
         }
         if !Self::column_exists(conn, "deliveries", "payment")? {
             conn.execute_batch("ALTER TABLE deliveries ADD COLUMN payment TEXT;")?;
+        }
+        // v8 — the platform fee (stage 1) journaled beside each receipt. A store from an earlier
+        // binary reads 0 for both on every existing row, which is the truth of those rows: no fee was
+        // configured when they were collected. `NOT NULL DEFAULT 0` is still additive — SQLite serves
+        // the default for pre-existing rows without rewriting them. Additive + idempotent, exactly
+        // like the columns above.
+        if !Self::column_exists(conn, "receipts", "fee_bps")? {
+            conn.execute_batch(
+                "ALTER TABLE receipts ADD COLUMN fee_bps INTEGER NOT NULL DEFAULT 0
+                     CHECK (fee_bps >= 0 AND fee_bps <= 10000);",
+            )?;
+        }
+        if !Self::column_exists(conn, "receipts", "fee_sats")? {
+            conn.execute_batch(
+                "ALTER TABLE receipts ADD COLUMN fee_sats INTEGER NOT NULL DEFAULT 0
+                     CHECK (fee_sats >= 0);",
+            )?;
+        }
+        // v9 — the mint's swap fee beside each receipt. Nullable with NO default: every pre-existing
+        // row reads NULL, which the read path reports as "mint fee not recorded". A default of 0
+        // would invent a measurement for a collection nobody measured. Additive + idempotent.
+        if !Self::column_exists(conn, "receipts", "mint_fee_sats")? {
+            conn.execute_batch(
+                "ALTER TABLE receipts ADD COLUMN mint_fee_sats INTEGER
+                     CHECK (mint_fee_sats IS NULL OR mint_fee_sats >= 0);",
+            )?;
         }
         Ok(())
     }
@@ -1038,19 +1162,42 @@ impl SellerStore {
     /// sighting credits the job (`New`); a replay is a [`Collected::Duplicate`] no-op that never
     /// marks paid a second time. This is the money-safe boundary — a job is only ever `paid` once,
     /// keyed on the unique receipt id.
+    ///
+    /// `amount_sats` is the offer FACE — what the buyer paid — as the daemon invariants have always
+    /// had it. The fees ([`ReceiptFees`]) ride in the SAME insert: `fee_bps` is the platform rate in
+    /// force and `fee_sats` what it came to on that face; `mint_fee_sats` is the mint's own swap fee,
+    /// so the row carries every figure between the face and what the seller keeps (derived on read,
+    /// never stored). One row, one write — a receipt can never exist without its fees, and nothing is
+    /// recorded for a payment that did not land. The caller has all three only after the redeem
+    /// classified `Finalize`. Journaled, not remitted: nothing reads these columns to move money.
     pub fn collect_receipt(
         &self,
         receipt_id: &str,
         job_id: &str,
         amount_sats: u64,
+        fees: ReceiptFees,
         now_unix: i64,
     ) -> Result<Collected, StoreError> {
+        let ReceiptFees {
+            mint_fee_sats,
+            fee_bps,
+            fee_sats,
+        } = fees;
         let mut conn = self.lock()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let inserted = tx.execute(
-            "INSERT OR IGNORE INTO receipts (receipt_id, job_id, amount_sats, received_at_unix)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![receipt_id, job_id, amount_sats as i64, now_unix],
+            "INSERT OR IGNORE INTO receipts
+                 (receipt_id, job_id, amount_sats, received_at_unix, fee_bps, fee_sats, mint_fee_sats)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                receipt_id,
+                job_id,
+                amount_sats as i64,
+                now_unix,
+                i64::from(fee_bps),
+                fee_sats as i64,
+                mint_fee_sats as i64
+            ],
         )?;
         if inserted == 0 {
             tx.commit()?;
@@ -1127,6 +1274,52 @@ impl SellerStore {
             .optional()?
             .is_some();
         Ok(found)
+    }
+
+    /// What the platform fee (stage 1) has come to: the all-time total and the receipt rows behind
+    /// it, oldest collection first. This is the read-out a later remit stage settles against; it is
+    /// a query and nothing more — no call here or anywhere in this stage moves the balance it reports.
+    ///
+    /// Rows collected before the fee existed report `fee_bps = 0, fee_sats = 0` (the migration
+    /// default), which is what they owed. Rows collected before v9 report `mint_fee_sats = None`:
+    /// the mint fee was not recorded, and the totals say how many such rows there are rather than
+    /// counting them as zero. `by_job` carries one entry per receipt row; the collect path receipts
+    /// a job at most once (`has_receipt` guards the redeem), so that is one per job.
+    pub fn accrued_fees(&self) -> Result<AccruedFees, StoreError> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT job_id, amount_sats, mint_fee_sats, fee_bps, fee_sats, received_at_unix
+             FROM receipts
+             ORDER BY received_at_unix ASC, receipt_id ASC",
+        )?;
+        let by_job = statement
+            .query_map([], |row| {
+                Ok(JobFeeAccrual {
+                    job_id: row.get(0)?,
+                    amount_sats: u64::try_from(row.get::<_, i64>(1)?).unwrap_or(0),
+                    mint_fee_sats: row
+                        .get::<_, Option<i64>>(2)?
+                        .map(|fee| u64::try_from(fee).unwrap_or(0)),
+                    fee_bps: u32::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
+                    fee_sats: u64::try_from(row.get::<_, i64>(4)?).unwrap_or(0),
+                    received_at_unix: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut totals = AccruedFees::default();
+        for row in &by_job {
+            totals.total_amount_sats = totals.total_amount_sats.saturating_add(row.amount_sats);
+            totals.total_fee_sats = totals.total_fee_sats.saturating_add(row.fee_sats);
+            match row.mint_fee_sats {
+                Some(mint_fee) => {
+                    totals.total_mint_fee_sats =
+                        totals.total_mint_fee_sats.saturating_add(mint_fee);
+                }
+                None => totals.rows_without_mint_fee += 1,
+            }
+        }
+        totals.by_job = by_job;
+        Ok(totals)
     }
 
     /// Whether a delivery has been journaled for `job_id` (#552). A delivery row is written only by
@@ -1509,6 +1702,15 @@ fn read_meta_i64(conn: &Connection, key: &str) -> Result<Option<i64>, StoreError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fee triple a test journals beside a receipt: (mint fee, platform bps, platform sats).
+    fn fees(mint_fee_sats: u64, fee_bps: u32, fee_sats: u64) -> ReceiptFees {
+        ReceiptFees {
+            mint_fee_sats,
+            fee_bps,
+            fee_sats,
+        }
+    }
     use crate::gateway::TagSpec;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -2264,15 +2466,273 @@ mod tests {
         store.record_award(&"w".repeat(64), &job, &"b".repeat(64), 2).expect("award");
 
         assert_eq!(
-            store.collect_receipt(&receipt, &job, 100, 3).expect("collect"),
+            store
+                .collect_receipt(&receipt, &job, 100, fees(0, 0, 0), 3)
+                .expect("collect"),
             Collected::New
         );
         assert_eq!(store.job_state(&job).expect("state"), Some(JobState::Paid));
         assert_eq!(
-            store.collect_receipt(&receipt, &job, 100, 4).expect("replay"),
+            store
+                .collect_receipt(&receipt, &job, 100, fees(0, 0, 0), 4)
+                .expect("replay"),
             Collected::Duplicate,
             "a replayed receipt must not credit twice"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Platform fee (stage 1) — the fee is journaled in the SAME row as the receipt and the read-out
+    // sums exactly what was written: per job and all-time. A replay adds nothing to either.
+    #[test]
+    fn collect_receipt_journals_the_fee_in_the_same_row_and_accrued_fees_sums_it() {
+        let (store, path) = fresh_store("fee-journal");
+        assert_eq!(
+            store.accrued_fees().expect("empty read-out"),
+            AccruedFees::default(),
+            "nothing collected ⇒ nothing accrued"
+        );
+
+        // Job A: 100-sat offer (mint fee 1) at 2% (200 bp) ⇒ 2 sats. Job B: 1_000-sat offer (mint
+        // fee 3) at 2.5% (250 bp) ⇒ 25. The platform fee is on the FACE; the mint fee rides beside it.
+        let job_a = "a".repeat(64);
+        let job_b = "b".repeat(64);
+        store
+            .claim_and_enqueue(&job_a, &"o".repeat(64), Some("creqA"), &claim(), 1, 999, 1)
+            .expect("claim a");
+        store
+            .record_award(&"w".repeat(64), &job_a, &"b".repeat(64), 2)
+            .expect("award a");
+        assert_eq!(
+            store
+                .collect_receipt(&"r".repeat(64), &job_a, 100, fees(1, 200, 2), 3)
+                .expect("collect a"),
+            Collected::New
+        );
+        assert_eq!(
+            store.job_state(&job_a).expect("state"),
+            Some(JobState::Paid),
+            "the receipt still marks paid"
+        );
+        assert_eq!(
+            store
+                .collect_receipt(&"s".repeat(64), &job_b, 1_000, fees(3, 250, 25), 4)
+                .expect("collect b"),
+            Collected::New
+        );
+
+        let accrued = store.accrued_fees().expect("read-out");
+        assert_eq!(
+            accrued.total_fee_sats, 27,
+            "all-time total is the sum of the rows"
+        );
+        assert_eq!(
+            accrued.by_job,
+            vec![
+                JobFeeAccrual {
+                    job_id: job_a.clone(),
+                    amount_sats: 100,
+                    mint_fee_sats: Some(1),
+                    fee_bps: 200,
+                    fee_sats: 2,
+                    received_at_unix: 3
+                },
+                JobFeeAccrual {
+                    job_id: job_b.clone(),
+                    amount_sats: 1_000,
+                    mint_fee_sats: Some(3),
+                    fee_bps: 250,
+                    fee_sats: 25,
+                    received_at_unix: 4
+                },
+            ],
+            "one row per receipt, oldest first, each carrying the rate in force and what it came to"
+        );
+
+        // A replayed wrap — even one claiming a different fee — is a dedup no-op and accrues nothing.
+        assert_eq!(
+            store
+                .collect_receipt(&"r".repeat(64), &job_a, 100, fees(99, 10_000, 100), 5)
+                .expect("replay"),
+            Collected::Duplicate
+        );
+        assert_eq!(
+            store.accrued_fees().expect("read-out").total_fee_sats,
+            27,
+            "a replay accrues nothing"
+        );
+
+        // The row survives a close/reopen: read back off disk, not from memory.
+        drop(store);
+        let store = SellerStore::open(&path).expect("reopen");
+        assert_eq!(store.accrued_fees().expect("read-out").total_fee_sats, 27);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Platform fee (stage 1) — a store written by a pre-v8 binary (a receipts table WITHOUT the fee
+    // columns) opens, migrates additively, and reads 0 for every existing receipt: no fee was
+    // configured when those payments were collected. The migrated store then journals a fee on its
+    // next collection, and a second open is a no-op.
+    #[test]
+    fn a_store_from_before_the_fee_columns_migrates_and_reads_zero() {
+        let path = temp_db("pre-fee-columns");
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).expect("create old store");
+            conn.execute_batch(
+                "CREATE TABLE seller_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO seller_meta VALUES ('schema_version', '7');
+                 CREATE TABLE receipts (
+                     receipt_id      TEXT PRIMARY KEY,
+                     job_id          TEXT NOT NULL,
+                     amount_sats     INTEGER NOT NULL CHECK (amount_sats >= 0),
+                     received_at_unix INTEGER NOT NULL
+                 );
+                 INSERT INTO receipts VALUES ('old-receipt', 'old-job', 21, 7);",
+            )
+            .expect("v7 schema");
+        }
+
+        let store =
+            SellerStore::open(&path).expect("a v7 store opens clean under the current schema");
+        assert_eq!(
+            store.health().expect("health").schema_version,
+            SCHEMA_VERSION
+        );
+        let accrued = store.accrued_fees().expect("read-out on a migrated store");
+        assert_eq!(
+            accrued.total_fee_sats, 0,
+            "nothing accrued before the fee existed"
+        );
+        assert_eq!(
+            accrued.by_job,
+            vec![JobFeeAccrual {
+                job_id: "old-job".to_owned(),
+                amount_sats: 21,
+                mint_fee_sats: None,
+                fee_bps: 0,
+                fee_sats: 0,
+                received_at_unix: 7,
+            }],
+            "the pre-existing receipt is untouched, reads a fee of 0/0, and has NO mint fee (not a zero one)"
+        );
+        assert_eq!(
+            accrued.by_job[0].kept_sats(),
+            None,
+            "what the seller kept of a row with no recorded mint fee is unknown, never 21"
+        );
+        assert_eq!(accrued.rows_without_mint_fee, 1);
+        assert_eq!(accrued.total_mint_fee_sats, 0);
+        assert_eq!(
+            accrued.total_kept_sats(),
+            None,
+            "no row recorded a mint fee ⇒ no kept total is claimed"
+        );
+        assert!(
+            store.has_receipt("old-job").expect("read"),
+            "the legacy receipt still counts as paid"
+        );
+
+        // The migrated columns are writable: the next collection journals its fee.
+        assert_eq!(
+            store
+                .collect_receipt("new-receipt", "new-job", 100, fees(1, 200, 2), 8)
+                .expect("collect on migrated store"),
+            Collected::New
+        );
+        assert_eq!(store.accrued_fees().expect("read-out").total_fee_sats, 2);
+
+        // RE-ENTRANT: opening again neither errors nor double-adds.
+        drop(store);
+        let store = SellerStore::open(&path).expect("second open is a no-op");
+        assert_eq!(
+            store.health().expect("health").schema_version,
+            SCHEMA_VERSION
+        );
+        assert_eq!(store.accrued_fees().expect("read-out").by_job.len(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Round 2 — a store written by a v8 binary (fee columns present, NO mint_fee_sats column) opens,
+    // migrates additively to v9, and reads its existing receipt with `mint_fee_sats = None`: the
+    // mint fee was not recorded, and neither the row nor the totals may present that as a measured
+    // 0. The next collection on the migrated store records its mint fee; a second open is a no-op.
+    #[test]
+    fn a_v8_store_migrates_to_v9_and_reads_no_mint_fee_rather_than_zero() {
+        let path = temp_db("pre-mint-fee-column");
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).expect("create v8 store");
+            conn.execute_batch(
+                "CREATE TABLE seller_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO seller_meta VALUES ('schema_version', '8');
+                 CREATE TABLE receipts (
+                     receipt_id      TEXT PRIMARY KEY,
+                     job_id          TEXT NOT NULL,
+                     amount_sats     INTEGER NOT NULL CHECK (amount_sats >= 0),
+                     received_at_unix INTEGER NOT NULL,
+                     fee_bps         INTEGER NOT NULL DEFAULT 0 CHECK (fee_bps >= 0 AND fee_bps <= 10000),
+                     fee_sats        INTEGER NOT NULL DEFAULT 0 CHECK (fee_sats >= 0)
+                 );
+                 INSERT INTO receipts VALUES ('v8-receipt', 'v8-job', 100, 7, 1000, 10);",
+            )
+            .expect("v8 schema");
+        }
+
+        let store = SellerStore::open(&path).expect("a v8 store opens clean under v9");
+        assert_eq!(
+            store.health().expect("health").schema_version,
+            SCHEMA_VERSION
+        );
+        let accrued = store.accrued_fees().expect("read-out on a migrated store");
+        assert_eq!(
+            accrued.by_job,
+            vec![JobFeeAccrual {
+                job_id: "v8-job".to_owned(),
+                amount_sats: 100,
+                mint_fee_sats: None,
+                fee_bps: 1000,
+                fee_sats: 10,
+                received_at_unix: 7,
+            }],
+            "the v8 row keeps its fee and carries NO mint fee"
+        );
+        assert_eq!(
+            accrued.by_job[0].kept_sats(),
+            None,
+            "kept is unknown, not 90"
+        );
+        assert_eq!(accrued.rows_without_mint_fee, 1);
+        assert_eq!(accrued.total_mint_fee_sats, 0);
+        assert_eq!(accrued.total_fee_sats, 10);
+        assert_eq!(accrued.total_kept_sats(), None);
+
+        // The migrated column is writable: the next collection records its mint fee, and the totals
+        // separate what was measured from what was not.
+        assert_eq!(
+            store
+                .collect_receipt("v9-receipt", "v9-job", 100, fees(1, 1000, 10), 8)
+                .expect("collect on migrated store"),
+            Collected::New
+        );
+        let accrued = store.accrued_fees().expect("read-out");
+        assert_eq!(accrued.by_job[1].mint_fee_sats, Some(1));
+        assert_eq!(accrued.by_job[1].kept_sats(), Some(89));
+        assert_eq!(accrued.rows_without_mint_fee, 1);
+        assert_eq!(accrued.total_mint_fee_sats, 1);
+        assert_eq!(
+            accrued.total_kept_sats(),
+            Some(89),
+            "kept total covers only the row that recorded a mint fee"
+        );
+
+        drop(store);
+        let store = SellerStore::open(&path).expect("second open is a no-op");
+        assert_eq!(
+            store.health().expect("health").schema_version,
+            SCHEMA_VERSION
+        );
+        assert_eq!(store.accrued_fees().expect("read-out").by_job.len(), 2);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2435,14 +2895,27 @@ mod free_lane_tests {
             .expect("v6 schema");
         }
 
-        let store = SellerStore::open(&path).expect("a v6 store opens clean under v7");
-        assert_eq!(store.health().expect("health").schema_version, SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 7, "the free lane's schema version");
+        let store =
+            SellerStore::open(&path).expect("a v6 store opens clean under the current schema");
+        assert_eq!(
+            store.health().expect("health").schema_version,
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            SCHEMA_VERSION, 9,
+            "v7 was the free lane; v8 added the receipt fee columns; v9 the mint fee"
+        );
 
         // The legacy rows SURVIVE and read as PAID — correct by construction, because every job
         // recorded before this column existed was priced.
-        let legacy = store.offer_row("legacy-job").expect("read").expect("the v6 offer survives");
-        assert_eq!(legacy.amount_sats, 21, "the pre-existing money-path row is untouched");
+        let legacy = store
+            .offer_row("legacy-job")
+            .expect("read")
+            .expect("the v6 offer survives");
+        assert_eq!(
+            legacy.amount_sats, 21,
+            "the pre-existing money-path row is untouched"
+        );
         assert_eq!(
             legacy.payment_mode,
             PaymentMode::Sat,

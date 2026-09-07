@@ -20,6 +20,10 @@ mod profile_cli;
 // at award (#360). Gate the whole surface on `acp` so a buyer-only build cannot advertise at all.
 #[cfg(feature = "acp")]
 mod sell;
+// `maxplayer seller fees` — the seller-facing read-out of the platform fee journal. Same gate as
+// `sell`: it is reached only through the `seller` arm and reads the seller node's store.
+#[cfg(feature = "acp")]
+mod seller_fees;
 // The containment probe is compiled on every build, not only the seller one: the payload half runs
 // INSIDE the launcher, and a seat may reasonably run the probe from a binary it already trusts.
 #[cfg(feature = "wallet")]

@@ -2572,6 +2572,7 @@ dependencies = [
  "git2",
  "maxplayer-core",
  "nostr-sdk",
+ "rusqlite",
  "serde",
  "serde_json",
  "tokio",

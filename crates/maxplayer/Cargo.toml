@@ -105,3 +105,7 @@ required-features = ["acp"]
 cashu = "=0.17.2"
 cdk = { version = "=0.17.2", default-features = false, features = ["wallet"] }
 cdk-sqlite = "=0.17.2"
+# `seller fees` test fixture: writes a seller store at an OLDER schema (v8, no `mint_fee_sats`) so
+# the read-out is proven against a genuinely migrated row. Same version and feature the core crate
+# already resolves: no new crate or version enters the lockfile, only this dependency edge.
+rusqlite = { version = "0.31", features = ["bundled"] }
