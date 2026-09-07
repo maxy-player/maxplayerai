@@ -238,6 +238,11 @@ pub struct MeltEstimate {
     /// The mint's fee RESERVE for this melt — the ceiling on the fee it will take; the actual fee is
     /// at most this, and the difference returns as change.
     pub fee_reserve_sats: u64,
+    /// When the quote expires at the mint (unix seconds), as the quote states it. A quote is paid
+    /// by id ([`pay_melt_quote_async`]) only while it is live; the seller fee remittance binds its
+    /// admission to this quote and refuses to pay it inside its spending margin of expiry
+    /// (addendum 5 §1, rule 1).
+    pub expiry_unix: u64,
 }
 
 /// The mint's melt-quote lifecycle, re-exported so a CLI caller can match on it without depending
@@ -866,10 +871,63 @@ pub async fn melt_within_async(
         return Err(WalletOpsError::RealMintDisallowed { mint_url });
     }
     let wallet = open_wallet_async(home, &mint_url).await?;
+    // The quote step: raise the payment quote (spends nothing) …
     let quote = wallet
         .melt_quote(PaymentMethod::BOLT11, bolt11, None, None)
         .await
         .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+    // … then the pay step, on THAT quote by id, under the ceiling. The two steps are one call here
+    // (the operator's melt has nothing to fence between them); the seller fee remittance calls them
+    // separately — [`melt_quote_async`] then [`pay_melt_quote_async`] — with its store fence in
+    // between, so that it only ever pays the quote its admission bound (addendum 5 §1, rule 1).
+    pay_quote_on_wallet(&wallet, mint_url, &quote, ceiling).await
+}
+
+/// **Pay a melt quote the wallet already holds, by id, and never raise another.** The seller fee
+/// remittance's spending call (addendum 5 §1, rule 1): the quote was raised by [`melt_quote_async`]
+/// before the plan, its id was bound to the row by the store fence, and this pays exactly that
+/// quote — `prepare_melt(quote_id)` / `confirm` — after re-checking the ceiling against the quote's
+/// STORED amount and fee reserve immediately before `prepare_melt`. An unknown quote id is refused
+/// before the wallet touches a proof; a quote the mint no longer accepts (expired, failed) fails in
+/// `prepare_melt`/`confirm` and is reported as the wallet's error — the caller never re-quotes.
+/// Same mint resolution and `allow_real_mints` gate as every melt here.
+pub async fn pay_melt_quote_async(
+    home: &MaxplayerHome,
+    quote_id: &str,
+    mint_override: Option<&str>,
+    ceiling: &MeltCeiling,
+) -> Result<MeltOutcome, WalletOpsError> {
+    let quote_id = quote_id.trim();
+    if quote_id.is_empty() {
+        return Err(WalletOpsError::Wallet("melt quote id is empty".into()));
+    }
+    let mint_url = resolve_mint(home, mint_override)?;
+    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+        return Err(WalletOpsError::RealMintDisallowed { mint_url });
+    }
+    let wallet = open_wallet_async(home, &mint_url).await?;
+    let quote = wallet
+        .localstore
+        .get_melt_quote(quote_id)
+        .await
+        .map_err(|error| WalletOpsError::Wallet(error.to_string()))?
+        .ok_or_else(|| {
+            WalletOpsError::Wallet(format!(
+                "melt quote {quote_id} is not in this wallet; refusing to pay a quote this wallet did not raise"
+            ))
+        })?;
+    pay_quote_on_wallet(&wallet, mint_url, &quote, Some(ceiling)).await
+}
+
+/// The pay step shared by [`melt_within_async`] (quote raised a moment ago) and
+/// [`pay_melt_quote_async`] (quote bound earlier): ceiling check against THIS quote's amount and
+/// reserve, balance check, `prepare_melt` on this quote's id, `confirm`.
+async fn pay_quote_on_wallet(
+    wallet: &Wallet,
+    mint_url: String,
+    quote: &cdk::wallet::MeltQuote,
+    ceiling: Option<&MeltCeiling>,
+) -> Result<MeltOutcome, WalletOpsError> {
     let invoice_sats = quote.amount.to_u64();
     let fee_reserve_sats = quote.fee_reserve.to_u64();
     // The money hold, at the moment of spending: THIS quote — not the plan's estimate — is what the
@@ -881,7 +939,7 @@ pub async fn melt_within_async(
     {
         return Err(WalletOpsError::MeltExceedsCeiling {
             mint_url,
-            quote_id: quote.id,
+            quote_id: quote.id.clone(),
             invoice_sats,
             fee_reserve_sats,
             planned_invoice_sats: ceiling.invoice_sats,
@@ -923,7 +981,7 @@ pub async fn melt_within_async(
         paid_sats,
         fee_sats,
         balance_sats,
-        quote_id: quote.id,
+        quote_id: quote.id.clone(),
         fee_reserve_sats,
     })
 }
@@ -954,7 +1012,48 @@ pub async fn melt_quote_async(
         quote_id: quote.id,
         amount_sats: quote.amount.to_u64(),
         fee_reserve_sats: quote.fee_reserve.to_u64(),
+        expiry_unix: quote.expiry,
     })
+}
+
+/// What the mint says about ONE melt quote this wallet raised, by id, refreshed from the mint.
+/// `None` when this wallet never raised a quote with that id. The seller fee remittance reconciles a
+/// SPENDING row against the quote its admission bound — this call — never against "some quote for
+/// the invoice" (addendum 5 §1, rule 2). Read-only: nothing here spends.
+pub async fn melt_status_for_quote_async(
+    home: &MaxplayerHome,
+    quote_id: &str,
+    mint_override: Option<&str>,
+) -> Result<Option<MeltQuoteStatus>, WalletOpsError> {
+    let quote_id = quote_id.trim();
+    if quote_id.is_empty() {
+        return Ok(None);
+    }
+    let mint_url = resolve_mint(home, mint_override)?;
+    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+        return Err(WalletOpsError::RealMintDisallowed { mint_url });
+    }
+    let wallet = open_wallet_async(home, &mint_url).await?;
+    let known = wallet
+        .localstore
+        .get_melt_quote(quote_id)
+        .await
+        .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+    if known.is_none() {
+        return Ok(None);
+    }
+    let quote = wallet
+        .check_melt_quote_status(quote_id)
+        .await
+        .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+    Ok(Some(MeltQuoteStatus {
+        mint_url,
+        quote_id: quote.id,
+        state: quote.state,
+        amount_sats: quote.amount.to_u64(),
+        fee_reserve_sats: quote.fee_reserve.to_u64(),
+        expiry_unix: quote.expiry,
+    }))
 }
 
 /// What the mint says about the melt quote(s) this wallet raised for `bolt11`, refreshed from the
@@ -1225,6 +1324,38 @@ pub fn melt_status_for_invoice_blocking(
         .build()
         .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
     runtime.block_on(melt_status_for_invoice_async(home, bolt11, mint_override))
+}
+
+/// [`melt_status_for_quote_async`] on a runtime of its own.
+pub fn melt_status_for_quote_blocking(
+    home: &MaxplayerHome,
+    quote_id: &str,
+    mint_override: Option<&str>,
+) -> Result<Option<MeltQuoteStatus>, WalletOpsError> {
+    crate::runtime_guard::refuse_nested_block_on("melt_status_for_quote_blocking")
+        .map_err(WalletOpsError::Wallet)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+    runtime.block_on(melt_status_for_quote_async(home, quote_id, mint_override))
+}
+
+/// [`pay_melt_quote_async`] on a runtime of its own — the seller fee remittance's spending call
+/// (addendum 5 §1, rule 1: pay the bound quote by id, never re-quote).
+pub fn pay_melt_quote_blocking(
+    home: &MaxplayerHome,
+    quote_id: &str,
+    mint_override: Option<&str>,
+    ceiling: &MeltCeiling,
+) -> Result<MeltOutcome, WalletOpsError> {
+    crate::runtime_guard::refuse_nested_block_on("pay_melt_quote_blocking")
+        .map_err(WalletOpsError::Wallet)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+    runtime.block_on(pay_melt_quote_async(home, quote_id, mint_override, ceiling))
 }
 
 pub fn invoice_blocking(
