@@ -14697,7 +14697,8 @@ mod tests {
         assert_eq!(report.outcome, Err("agi.cash: dns failure".to_owned()));
         assert!(fake.melts.is_empty());
 
-        // Attempt 2: the mint refuses the melt after the plan is journaled. The row stays planned.
+        // Attempt 2: the mint refuses the melt after the plan is journaled and the fence admitted
+        // it. The row stays SPENDING (addendum 4 §1) until the mint's verdict on its quote.
         let mut fake = Fake::new(|_| 1);
         fake.melt_results = vec![Err("insufficient funds for melt".to_owned())];
         let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 5002);

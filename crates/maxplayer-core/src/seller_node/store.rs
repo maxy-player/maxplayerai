@@ -4206,8 +4206,12 @@ mod tests {
         );
         assert!(!planned.lease_holds("anyone", 0, 0));
         assert_eq!(
+            planned.spending_since_unix, None,
+            "a v10 row's melt was never admitted by a fence: PLANNED, not spending"
+        );
+        assert_eq!(
             store
-                .confirm_remittance_ownership("v10-planned", "anyone", 6, 60)
+                .admit_remittance_spend("v10-planned", "anyone", 6, 60)
                 .expect("query"),
             Err(OwnershipLost::OtherOwner { owner: None }),
             "nobody may PAY a pre-v11 planned row; reconciliation releases or settles it"
@@ -4239,11 +4243,13 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    // Addendum 3 §2.1: the pre-spend ownership check. Only the owner, only while the row is planned,
-    // and only with the spending margin still inside the lease.
+    // Addendum 4 §1.1: the pre-spend fence is ONE compare-and-set in the store — planned → spending
+    // only for the owner, only while the row is planned, and only while the lease ends MORE than the
+    // margin after the clock the caller reads at that instant. Zero rows changed is diagnosed from
+    // the row as it stands; a row admitted once is not admitted twice.
     #[test]
-    fn ownership_is_confirmed_only_for_the_owner_of_a_planned_row_with_lease_to_spare() {
-        let (store, path) = fresh_store("remit-ownership");
+    fn the_spend_fence_admits_only_the_owner_of_a_planned_row_with_lease_to_spare_and_only_once() {
+        let (store, path) = fresh_store("remit-fence");
         store
             .collect_receipt("r1", "job-1", 100, fees(1, 1000, 10), 1)
             .expect("collect");
@@ -4259,45 +4265,74 @@ mod tests {
             .expect("plan");
         assert_eq!(planned.owner.as_deref(), Some("proc-a"));
         assert_eq!(planned.lease_until_unix, Some(500));
+        assert_eq!(planned.state, RemittanceState::Planned);
+        assert_eq!(planned.spending_since_unix, None);
 
-        // The owner, with 60 s to spare inside the lease: confirmed, and the row comes back.
+        // Another process, however early: zero rows — even a live lease is not ITS lease.
         assert_eq!(
             store
-                .confirm_remittance_ownership("h1", "proc-a", 400, 60)
-                .expect("query"),
-            Ok(planned.clone())
-        );
-        // Exactly the margin left is still enough; one second less is not.
-        assert!(
-            store
-                .confirm_remittance_ownership("h1", "proc-a", 440, 60)
-                .expect("query")
-                .is_ok()
-        );
-        assert_eq!(
-            store
-                .confirm_remittance_ownership("h1", "proc-a", 441, 60)
-                .expect("query"),
-            Err(OwnershipLost::LeaseTooShort {
-                lease_until_unix: Some(500),
-                now_unix: 441,
-                margin_secs: 60,
-            })
-        );
-        // Another process, however early: refused — even a live lease is not ITS lease.
-        assert_eq!(
-            store
-                .confirm_remittance_ownership("h1", "proc-b", 3, 60)
+                .admit_remittance_spend("h1", "proc-b", 3, 60)
                 .expect("query"),
             Err(OwnershipLost::OtherOwner {
                 owner: Some("proc-a".to_owned()),
             })
         );
-        // A row that is no longer planned: refused, whoever asks.
+        // The owner with EXACTLY the margin left: zero rows — `lease_until > now + margin` is
+        // strict (500 > 440 + 60 is false). The row is untouched: still planned.
+        assert_eq!(
+            store
+                .admit_remittance_spend("h1", "proc-a", 440, 60)
+                .expect("query"),
+            Err(OwnershipLost::LeaseTooShort {
+                lease_until_unix: Some(500),
+                now_unix: 440,
+                margin_secs: 60,
+            })
+        );
+        assert_eq!(
+            store
+                .in_flight_remittance()
+                .expect("row")
+                .expect("planned")
+                .state,
+            RemittanceState::Planned
+        );
+        // One second more to spare: admitted — the row is now SPENDING, stamped with the clock
+        // the caller read, and it is still the one row in flight.
+        let admitted = store
+            .admit_remittance_spend("h1", "proc-a", 439, 60)
+            .expect("query")
+            .expect("admitted");
+        assert_eq!(admitted.state, RemittanceState::Spending);
+        assert_eq!(admitted.spending_since_unix, Some(439));
+        assert!(admitted.state.is_in_flight());
+        assert_eq!(
+            store
+                .in_flight_remittance()
+                .expect("row")
+                .expect("spending")
+                .state,
+            RemittanceState::Spending
+        );
+        assert_eq!(
+            store.accrued_fees().expect("read-out").in_flight_fee_sats,
+            10,
+            "a spending row's fee is in flight, not unremitted and not remitted"
+        );
+        // Admitted once is admitted once: the same owner, the same instant, zero rows.
+        assert_eq!(
+            store
+                .admit_remittance_spend("h1", "proc-a", 439, 60)
+                .expect("query"),
+            Err(OwnershipLost::NotPlanned {
+                state: RemittanceState::Spending,
+            })
+        );
+        // A row that is no longer in flight: zero rows, whoever asks; a missing row says so.
         store.fail_remittance("h1", 10).expect("release");
         assert_eq!(
             store
-                .confirm_remittance_ownership("h1", "proc-a", 11, 60)
+                .admit_remittance_spend("h1", "proc-a", 11, 60)
                 .expect("query"),
             Err(OwnershipLost::NotPlanned {
                 state: RemittanceState::Failed,
@@ -4305,16 +4340,114 @@ mod tests {
         );
         assert_eq!(
             store
-                .confirm_remittance_ownership("nope", "proc-a", 11, 60)
+                .admit_remittance_spend("nope", "proc-a", 11, 60)
                 .expect("query"),
             Err(OwnershipLost::Missing)
         );
-        // The pure helpers agree with the store.
-        assert!(planned.lease_holds("proc-a", 440, 60));
-        assert!(!planned.lease_holds("proc-a", 441, 60));
+        // The pure helper states the same strict predicate the SQL evaluates.
+        assert!(planned.lease_holds("proc-a", 439, 60));
+        assert!(!planned.lease_holds("proc-a", 440, 60));
         assert!(!planned.lease_holds("proc-b", 3, 60));
         assert!(!planned.lease_expired(499));
         assert!(planned.lease_expired(500));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Addendum 4 §1 (ledger): a store written by a v11 binary — the remittance table WITH owner /
+    // lease / reserve / settled_by but WITHOUT `spending_since_unix` — opens under v12 additively:
+    // the one column is added, its planned row survives and reads PLANNED (its melt was never
+    // admitted by a fence, which is the truth of a row written before the fence existed), its owner
+    // and lease are exactly as written, the fence then works on it, and a second open is a no-op.
+    #[test]
+    fn a_v11_store_migrates_to_v12_additively_and_its_planned_row_reads_as_not_spending() {
+        let path = temp_db("v11-to-v12");
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).expect("create v11 store");
+            conn.execute_batch(
+                "CREATE TABLE seller_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO seller_meta VALUES ('schema_version', '11');
+                 CREATE TABLE receipts (
+                     receipt_id      TEXT PRIMARY KEY,
+                     job_id          TEXT NOT NULL,
+                     amount_sats     INTEGER NOT NULL CHECK (amount_sats >= 0),
+                     received_at_unix INTEGER NOT NULL,
+                     fee_bps         INTEGER NOT NULL DEFAULT 0,
+                     fee_sats        INTEGER NOT NULL DEFAULT 0,
+                     mint_fee_sats   INTEGER,
+                     remittance_id   TEXT
+                 );
+                 INSERT INTO receipts VALUES ('r-planned', 'job-p', 50, 2, 1000, 5, 1, 'v11-planned');
+                 CREATE TABLE fee_remittances (
+                     remittance_id   TEXT PRIMARY KEY,
+                     gross_sats      INTEGER NOT NULL CHECK (gross_sats >= 0),
+                     melt_fee_sats   INTEGER,
+                     net_sats        INTEGER NOT NULL CHECK (net_sats >= 0 AND net_sats <= gross_sats),
+                     destination     TEXT NOT NULL,
+                     melt_quote_id   TEXT,
+                     payment_hash    TEXT NOT NULL UNIQUE,
+                     bolt11          TEXT NOT NULL,
+                     state           TEXT NOT NULL CHECK (state IN ('planned','settled','failed')),
+                     created_at_unix INTEGER NOT NULL,
+                     settled_at_unix INTEGER,
+                     owner           TEXT,
+                     lease_until_unix INTEGER,
+                     melt_fee_reserve_sats INTEGER,
+                     settled_by      TEXT
+                 );
+                 CREATE UNIQUE INDEX fee_remittances_one_planned ON fee_remittances (state) WHERE state = 'planned';
+                 INSERT INTO fee_remittances VALUES ('v11-planned', 5, NULL, 4, 'maxplayer@agi.cash', 'q2', 'v11-planned', 'ln2', 'planned', 100, NULL, 'proc-old', 400, 1, NULL);",
+            )
+            .expect("v11 schema");
+        }
+
+        let store = SellerStore::open(&path).expect("a v11 store opens clean under v12");
+        assert_eq!(
+            store.health().expect("health").schema_version,
+            SCHEMA_VERSION
+        );
+        let planned = store
+            .in_flight_remittance()
+            .expect("row")
+            .expect("the v11 planned row is the row in flight");
+        assert_eq!(planned.state, RemittanceState::Planned);
+        assert_eq!(planned.spending_since_unix, None);
+        assert_eq!(planned.owner.as_deref(), Some("proc-old"));
+        assert_eq!(planned.lease_until_unix, Some(400));
+        assert_eq!(planned.melt_fee_reserve_sats, Some(1));
+        // The fence works on the migrated row: its owner, inside the lease, is admitted; the state
+        // CHECK is untouched because SPENDING lives in the new column, not in `state`.
+        let admitted = store
+            .admit_remittance_spend("v11-planned", "proc-old", 300, 60)
+            .expect("query")
+            .expect("admitted");
+        assert_eq!(admitted.state, RemittanceState::Spending);
+        assert_eq!(admitted.spending_since_unix, Some(300));
+        let raw_state: String = {
+            let conn = store.lock().expect("lock");
+            conn.query_row(
+                "SELECT state FROM fee_remittances WHERE remittance_id = 'v11-planned'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("raw state")
+        };
+        assert_eq!(
+            raw_state, "planned",
+            "on disk a spending row is a planned row with a mark"
+        );
+
+        drop(store);
+        let store = SellerStore::open(&path).expect("second open is a no-op");
+        assert_eq!(
+            store.health().expect("health").schema_version,
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            store.remittances().expect("rows")[0].state,
+            RemittanceState::Spending,
+            "the mark survives a reopen"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

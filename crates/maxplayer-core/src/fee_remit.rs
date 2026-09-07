@@ -936,7 +936,7 @@ fn remit_inner(
                 .map_err(|error| {
                     format!(
                         "PAID {} sats (melt fee {} sats, quote {}) but could not record the settlement: {error}. \
-                         Remittance {} stays planned; the next attempt reconciles it with the mint before paying anything else.",
+                         Remittance {} stays spending; the next attempt reconciles it with the mint before paying anything else.",
                         outcome.paid_sats, outcome.fee_sats, outcome.quote_id, planned.remittance_id
                     )
                 })?;
@@ -1074,7 +1074,7 @@ impl RemitReport {
                 remittance_id,
                 error,
             }) => format!(
-                "melt FAILED ({error}); remittance {remittance_id} stays planned and is reconciled on the next attempt"
+                "melt FAILED ({error}); remittance {remittance_id} stays spending and is reconciled against the mint on the next attempt"
             ),
             Ok(RemitOutcome::MeltRefused {
                 remittance_id,
@@ -1556,6 +1556,12 @@ pub(crate) mod test_support {
 
         fn after_plan(&mut self, planned: &FeeRemittance) {
             self.planned_seen.push(planned.clone());
+            // A Fake nobody set a clock on reads the plan's own timestamp — the run's entry time —
+            // so the single-process tests that pass a literal `now` keep their arithmetic. A test
+            // that moves time sets the clock (before the run, or while the run is paused here).
+            if self.clock.load(Ordering::SeqCst) == i64::MIN {
+                self.set_clock(planned.created_at_unix);
+            }
             if let Some(gate) = &self.plan_gate {
                 gate.arrive_and_wait();
             }
@@ -1570,6 +1576,8 @@ pub(crate) mod test_support {
 
         fn now_unix(&self) -> i64 {
             match self.clock.load(Ordering::SeqCst) {
+                // Never set and no plan seen yet (the fence always follows a plan, so this is
+                // unreachable on the paying path): the host clock, like the live effects.
                 i64::MIN => host_now_unix(),
                 set => set,
             }
@@ -2113,8 +2121,9 @@ mod tests {
     }
 
     // §3.4: an interrupted remittance is RECOVERABLE, not repeatable. The melt errors after the plan
-    // was journaled: the row stays planned and the attempt is journaled FAILED naming it. The next
-    // run asks the mint — PAID ⇒ settled with no second melt; the receipts stay discharged.
+    // was journaled and the fence admitted it: the row stays SPENDING (addendum 4 §1) and the
+    // attempt is journaled FAILED naming it. The next run asks the mint — PAID ⇒ settled with no
+    // second melt; the receipts stay discharged.
     #[test]
     fn interrupted_after_the_plan_is_reconciled_as_paid_without_a_second_melt() {
         let (store, root) = store_with_fees("interrupted-paid", &[10]);
@@ -2134,7 +2143,11 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains("remittance hash-9-2 stays journaled as planned"),
+            out.contains("Admitted to spend at unix 100: remittance hash-9-2 is now spending"),
+            "{out}"
+        );
+        assert!(
+            out.contains("remittance hash-9-2 stays journaled as spending: proofs may have reached the mint"),
             "{out}"
         );
         assert!(
@@ -2144,9 +2157,12 @@ mod tests {
         let in_flight = store
             .in_flight_remittance()
             .expect("query")
-            .expect("a planned row");
-        assert_eq!(in_flight.state, RemittanceState::Planned);
+            .expect("a spending row");
+        assert_eq!(in_flight.state, RemittanceState::Spending);
+        assert_eq!(in_flight.spending_since_unix, Some(100));
         assert_eq!(in_flight.bolt11, "lnbc-fake-9-2");
+        assert_eq!(fake.admitted_seen.len(), 1);
+        assert_eq!(fake.admitted_seen[0].state, RemittanceState::Spending);
         assert_eq!(store.accrued_fees().expect("read").in_flight_fee_sats, 10);
         assert_eq!(fake.melts.len(), 1);
         let attempts = store.recent_remit_attempts(10).expect("attempts");
@@ -2233,9 +2249,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // The other reconciliation outcomes: UNPAID/FAILED or no quote at all ⇒ the row fails, the
-    // receipts are released and the SAME run proceeds to a fresh plan (so a dry run prints it and a
-    // confirm pays it once, on a NEW invoice); PENDING ⇒ refuse this run, keep the row, melt nothing.
+    // The other reconciliation outcomes for a SPENDING row (the melt was admitted, then errored):
+    // PENDING ⇒ refuse this run, keep the row, melt nothing; UNPAID with a LIVE quote ⇒ HOLD too —
+    // even our own row, even long after the lease: the melt that errored may have reached the mint
+    // (addendum 4 §1.2), so only the mint's verdict resolves a spending row; UNPAID with the quote
+    // EXPIRED (or FAILED) ⇒ terminal: the row fails, the receipts are released and the SAME run
+    // proceeds to a fresh plan (a dry run prints it, a confirm pays it once, on a NEW invoice).
     #[test]
     fn an_unpaid_or_pending_interrupted_attempt_is_reconciled_without_paying_twice() {
         let (store, root) = store_with_fees("interrupted-unpaid", &[10]);
@@ -2269,9 +2288,13 @@ mod tests {
             ),
             "{out}"
         );
-        assert!(
-            store.in_flight_remittance().expect("query").is_some(),
-            "the row stays planned"
+        assert_eq!(
+            store
+                .in_flight_remittance()
+                .expect("query")
+                .expect("the row stays in flight")
+                .state,
+            RemittanceState::Spending
         );
         assert_eq!(fake.melts.len(), 1);
         assert_eq!(
@@ -2288,18 +2311,44 @@ mod tests {
             "remittance hash-9-2 is still settling at the mint"
         );
 
-        // UNPAID: fail, release, and continue into a fresh DRY RUN on a new invoice.
+        // UNPAID with a LIVE quote (expires at unix 2000): HOLD — our own row, and the lease (until
+        // 400) is long gone at 1000, and neither matters: the row is SPENDING. Nothing released, no
+        // new invoice, journaled as a refusal naming the row.
         fake.status = Ok(Some(MeltQuoteStatus {
             mint_url: "https://mint.example".to_owned(),
             quote_id: "q-unpaid".to_owned(),
             state: MeltQuoteState::Unpaid,
             amount_sats: 9,
             fee_reserve_sats: 1,
-            expiry_unix: u64::MAX,
+            expiry_unix: 2000,
         }));
-        let (outcome, out) = run_remit(&store, &mut fake, RemitTrigger::DryRun, 102);
+        let (outcome, out) = run_remit(&store, &mut fake, RemitTrigger::Command, 1000);
+        assert_eq!(
+            outcome,
+            RemitOutcome::Refused(Refusal::SpendingHeld {
+                remittance_id: "hash-9-2".to_owned(),
+                owner: "fake-owner".to_owned(),
+                spending_since_unix: 100,
+            }),
+            "{out}"
+        );
+        assert!(
+            out.contains("remittance hash-9-2 is SPENDING (its melt was admitted by fake-owner at unix 100) and its quote is not terminal; a spending row is never released on time"),
+            "{out}"
+        );
+        assert_eq!(fake.melts.len(), 1);
+        assert_eq!(fake.invoices.len(), invoices_before, "no new invoice on a held row");
+        assert_eq!(
+            store.in_flight_remittance().expect("query").expect("held").state,
+            RemittanceState::Spending
+        );
+        assert_eq!(store.accrued_fees().expect("read").in_flight_fee_sats, 10);
+
+        // UNPAID and the quote has EXPIRED at the mint (2000 < 2001): terminal — fail, release, and
+        // continue into a fresh DRY RUN on a new invoice.
+        let (outcome, out) = run_remit(&store, &mut fake, RemitTrigger::DryRun, 2001);
         assert_eq!(outcome, RemitOutcome::DryRun, "{out}");
-        assert!(out.contains("reports melt quote q-unpaid UNPAID — no sats left the wallet; the row is this process's own earlier attempt, which is over; released 10 sats back to unremitted"), "{out}");
+        assert!(out.contains("reports melt quote q-unpaid UNPAID — no sats left the wallet; the quote expired at unix 2000 and the mint will never pay it — terminal whoever owns the row; released 10 sats back to unremitted"), "{out}");
         assert!(out.contains("10 sats unremitted"), "{out}");
         assert!(out.contains("DRY RUN — nothing moved."), "{out}");
         assert_eq!(fake.melts.len(), 1);
@@ -2312,7 +2361,7 @@ mod tests {
         // Now a confirm pays ONCE on a fresh invoice; the failed row's invoice is never reused.
         fake.status = Ok(None);
         fake.melt_results = vec![Ok((9, 1))];
-        let (outcome, out) = run_remit(&store, &mut fake, RemitTrigger::Command, 103);
+        let (outcome, out) = run_remit(&store, &mut fake, RemitTrigger::Command, 2002);
         assert!(is_paid(&outcome), "{out}");
         assert_eq!(fake.melts.len(), 2);
         assert_ne!(
@@ -2324,7 +2373,9 @@ mod tests {
         assert_eq!(rows[1].state, RemittanceState::Settled);
         assert_eq!(store.accrued_fees().expect("read").remitted_fee_sats, 10);
 
-        // No quote ever raised (the melt died before quoting): fail and release on the next run.
+        // No quote at all for a SPENDING row's invoice (the wallet has no record — the live wallet
+        // always holds at least the estimate quote, so this is an anomaly, not a normal failure):
+        // HOLD, fail-closed — "no quote" is not the mint saying terminal. FAILED then releases.
         let (store2, root2) = store_with_fees("interrupted-noquote", &[10]);
         let mut fake2 = Fake::new(|_| 1);
         fake2.melt_results = vec![Err("mint unreachable".to_owned())];
@@ -2334,8 +2385,18 @@ mod tests {
         ));
         fake2.status = Ok(None);
         let (outcome, out) = run_remit(&store2, &mut fake2, RemitTrigger::DryRun, 101);
+        assert!(
+            matches!(outcome, RemitOutcome::Refused(Refusal::SpendingHeld { .. })),
+            "{out}"
+        );
+        assert_eq!(
+            store2.remittances().expect("rows")[0].state,
+            RemittanceState::Spending
+        );
+        fake2.status = Ok(Some(status(MeltQuoteState::Failed, "paid-quote-lnbc-fake-9-2")));
+        let (outcome, out) = run_remit(&store2, &mut fake2, RemitTrigger::DryRun, 102);
         assert_eq!(outcome, RemitOutcome::DryRun, "{out}");
-        assert!(out.contains("the wallet never raised a melt quote for its invoice — no sats left the wallet; the row is this process's own earlier attempt, which is over; released 10 sats back to unremitted"), "{out}");
+        assert!(out.contains("FAILED is terminal at the mint whoever owns the row; released 10 sats back to unremitted"), "{out}");
         assert_eq!(
             store2.remittances().expect("rows")[0].state,
             RemittanceState::Failed
@@ -2814,6 +2875,93 @@ mod tests {
             }
             .is_threshold()
         );
+        // An UNPAID quote whose expiry is behind the clock is terminal for a PLANNED row too.
+        let mut unpaid_expired = status(MeltQuoteState::Unpaid, "q-expired");
+        unpaid_expired.expiry_unix = 150;
+        assert!(matches!(
+            reconcile_decision(&theirs, Some(&unpaid_expired), "proc-a", 151),
+            Reconcile::Release(reason) if reason.contains("the quote expired at unix 150")
+        ));
+        assert_eq!(
+            reconcile_decision(&theirs, Some(&unpaid_expired), "proc-a", 150),
+            Reconcile::Hold(Refusal::HeldByOwner {
+                remittance_id: "x".to_owned(),
+                owner: "proc-b".to_owned(),
+                lease_until_unix: 400,
+            }),
+            "at the expiry second the quote is still live"
+        );
+    }
+
+    // Gate 2g (d), addendum 4 §1.2 — the SPENDING row as a table: PAID settles; FAILED releases;
+    // UNPAID with the quote EXPIRED releases; UNPAID with a live quote HOLDS — whoever owns it, and
+    // however long ago the lease ran out (lease expiry alone never touches a spending row); no quote
+    // at all HOLDS; PENDING / UNKNOWN hold as for any row.
+    #[test]
+    fn a_spending_row_is_released_only_on_a_terminal_quote_never_on_time() {
+        let theirs = spending_row("proc-b", 400, 150);
+        let mine = spending_row("proc-a", 400, 150);
+        let paid = status(MeltQuoteState::Paid, "q-paid");
+        let pending = status(MeltQuoteState::Pending, "q-pending");
+        let failed = status(MeltQuoteState::Failed, "q-failed");
+        let unpaid_live = status(MeltQuoteState::Unpaid, "q-unpaid");
+        let mut unpaid_expired = status(MeltQuoteState::Unpaid, "q-unpaid");
+        unpaid_expired.expiry_unix = 900;
+
+        assert_eq!(
+            reconcile_decision(&theirs, Some(&paid), "proc-a", 10_000),
+            Reconcile::Settle
+        );
+        assert!(matches!(
+            reconcile_decision(&theirs, Some(&failed), "proc-a", 10_000),
+            Reconcile::Release(reason) if reason.contains("FAILED is terminal")
+        ));
+        assert!(matches!(
+            reconcile_decision(&mine, Some(&unpaid_expired), "proc-a", 901),
+            Reconcile::Release(reason) if reason.contains("the quote expired at unix 900 and the mint will never pay it")
+        ));
+        // UNPAID, live quote, lease long expired (400 ≪ 10 000): HOLD — theirs AND ours.
+        let held = |row: &FeeRemittance, owner: &str| {
+            Reconcile::Hold(Refusal::SpendingHeld {
+                remittance_id: row.remittance_id.clone(),
+                owner: owner.to_owned(),
+                spending_since_unix: 150,
+            })
+        };
+        assert_eq!(
+            reconcile_decision(&theirs, Some(&unpaid_live), "proc-a", 10_000),
+            held(&theirs, "proc-b")
+        );
+        assert_eq!(
+            reconcile_decision(&mine, Some(&unpaid_live), "proc-a", 10_000),
+            held(&mine, "proc-a"),
+            "our own spending row: the melt that errored may have reached the mint"
+        );
+        assert_eq!(
+            reconcile_decision(&mine, Some(&unpaid_expired), "proc-a", 900),
+            held(&mine, "proc-a"),
+            "at the expiry second the quote is still live"
+        );
+        assert_eq!(
+            reconcile_decision(&theirs, None, "proc-a", 10_000),
+            held(&theirs, "proc-b"),
+            "no quote is not the mint saying terminal"
+        );
+        assert_eq!(
+            reconcile_decision(&theirs, Some(&pending), "proc-a", 10_000),
+            Reconcile::Hold(Refusal::Settling {
+                remittance_id: "x".to_owned()
+            })
+        );
+        assert!(
+            !Refusal::SpendingHeld {
+                remittance_id: "x".to_owned(),
+                owner: "proc-b".to_owned(),
+                spending_since_unix: 150,
+            }
+            .is_threshold(),
+            "a held spending row is a refusal an operator should see, and a failure for pacing"
+        );
     }
 
     /// The paused side's (outcome, output) and every `meanwhile` run's (outcome, output).
@@ -2822,18 +2970,33 @@ mod tests {
         Vec<(RemitOutcome, String)>,
     );
 
-    /// Two processes against one store: `first` is paused at `gate` (after its plan is journaled),
-    /// `second` runs whatever the test scripts meanwhile. Returns each side's outcome and output.
+    /// Where the paused side stops (addendum 4 §1 tests): after its plan is journaled and BEFORE the
+    /// fence, or after the fence admitted it (the row is `spending`) and BEFORE the melt.
+    #[derive(Clone, Copy)]
+    enum PauseAt {
+        AfterPlan,
+        AfterAdmit,
+    }
+
+    /// Two processes against one store: `first` is paused at `gate` (at `pause`), `second` runs
+    /// whatever the test scripts meanwhile — including moving the clock `first` will read FRESH at
+    /// its fence when it resumes (`first.clock`, cloned by the test before `first` is moved in).
+    /// Returns each side's outcome and output.
     fn run_paused(
         db: &PathBuf,
         mut first: Fake,
         first_now: i64,
+        pause: PauseAt,
         gate: Arc<super::test_support::Gate>,
         melts: Arc<AtomicUsize>,
         meanwhile: impl FnOnce(&SellerStore) -> Vec<(RemitOutcome, String)>,
     ) -> PausedRun {
-        first.plan_gate = Some(Arc::clone(&gate));
+        match pause {
+            PauseAt::AfterPlan => first.plan_gate = Some(Arc::clone(&gate)),
+            PauseAt::AfterAdmit => first.admit_gate = Some(Arc::clone(&gate)),
+        }
         first.melt_counter = Some(Arc::clone(&melts));
+        first.set_clock(first_now);
         let db_a = db.clone();
         let a = std::thread::spawn(move || {
             let store = SellerStore::open(&db_a).expect("open A");
@@ -2874,6 +3037,7 @@ mod tests {
             &db,
             a,
             100,
+            PauseAt::AfterPlan,
             super::test_support::Gate::new(),
             Arc::clone(&melts),
             |store_b| {
@@ -2946,12 +3110,124 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // Gate 2g, the gone owner: A journals X and pauses; B runs AFTER A's lease has run out, with the
-    // mint saying UNPAID — B may release X (the owner is provably not spending: it refuses to start
-    // inside the margin), plans a DISTINCT invoice Y and pays it. A then resumes: its pre-spend gate
-    // finds X no longer planned and REFUSES without touching the wallet. Exactly one debit — B's.
+    // Gate 2g (b), addendum 4 §1 — the dangerous ordering the verdict traced: A journals X, its
+    // fence ADMITS the melt (X is spending) and A pauses BEFORE the spend. The clock then moves past
+    // A's lease (100 + 300 = 400 → 400 and beyond) while A is paused. B — another owner, another
+    // connection, distinct invoices — runs `--dry-run` reconciliation and then `--confirm`, with the
+    // mint saying UNPAID: B must HOLD on X (a spending row is never released on time) and therefore
+    // NOT plan or pay Y. A resumes and pays X exactly once. One melt, one settled row.
     #[test]
-    fn an_owner_that_outlives_its_lease_is_released_and_then_refuses_to_spend() {
+    fn a_spending_row_is_not_released_when_its_lease_expires_and_its_owner_pays_exactly_once() {
+        let (store, root) = store_with_fees("spending-held", &[10, 5]);
+        drop(store);
+        let db = root.join(STATE_DB_FILE);
+        let melts = Arc::new(AtomicUsize::new(0));
+        let mut a = Fake::new(|_| 2);
+        a.owner = "proc-a".to_owned();
+        a.invoice_tag = "-a".to_owned();
+        a.melt_results = vec![Ok((13, 1))];
+        let clock = Arc::clone(&a.clock);
+        let (a_result, b_results) = run_paused(
+            &db,
+            a,
+            100,
+            PauseAt::AfterAdmit,
+            super::test_support::Gate::new(),
+            Arc::clone(&melts),
+            |store_b| {
+                // A is paused after admission: X is SPENDING in the store, stamped 100.
+                let x = store_b
+                    .in_flight_remittance()
+                    .expect("query")
+                    .expect("A's row");
+                assert_eq!(x.state, RemittanceState::Spending);
+                assert_eq!(x.spending_since_unix, Some(100));
+                assert_eq!(x.lease_until_unix, Some(400));
+                // The clock A will read when it resumes moves PAST its lease.
+                clock.store(450, Ordering::SeqCst);
+                let mut results = Vec::new();
+                for (trigger, now) in [(RemitTrigger::DryRun, 450), (RemitTrigger::Command, 451)] {
+                    let mut b = Fake::new(|_| 2);
+                    b.owner = "proc-b".to_owned();
+                    b.invoice_tag = "-b".to_owned();
+                    b.melt_results = vec![Ok((13, 1))];
+                    b.melt_counter = Some(Arc::clone(&melts));
+                    b.status = Ok(Some(status(
+                        MeltQuoteState::Unpaid,
+                        "quote-lnbc-fake-13-2-a",
+                    )));
+                    let (outcome, out) = run_remit(store_b, &mut b, trigger, now);
+                    assert!(b.melts.is_empty(), "B must not pay: {out}");
+                    assert!(
+                        b.invoices.is_empty(),
+                        "B must not even plan on top of a spending row: {out}"
+                    );
+                    assert_eq!(
+                        outcome,
+                        RemitOutcome::Refused(Refusal::SpendingHeld {
+                            remittance_id: "hash-13-2-a".to_owned(),
+                            owner: "proc-a".to_owned(),
+                            spending_since_unix: 100,
+                        }),
+                        "{out}"
+                    );
+                    assert!(
+                        out.contains("remittance hash-13-2-a is SPENDING (its melt was admitted by proc-a at unix 100) and its quote is not terminal; a spending row is never released on time"),
+                        "{out}"
+                    );
+                    results.push((outcome, out));
+                }
+                assert_eq!(
+                    store_b
+                        .in_flight_remittance()
+                        .expect("query")
+                        .expect("still A's row")
+                        .state,
+                    RemittanceState::Spending,
+                    "B changed nothing"
+                );
+                results
+            },
+        );
+        let (a_outcome, a_out) = a_result;
+        assert!(
+            matches!(a_outcome, Ok(RemitOutcome::Paid { .. })),
+            "A pays X once it resumes — it was admitted before the clock moved: {a_outcome:?}\n{a_out}"
+        );
+        assert_eq!(melts.load(Ordering::SeqCst), 1, "exactly one actual debit");
+        assert_eq!(b_results.len(), 2);
+        let store = SellerStore::open(&db).expect("open");
+        let rows = store.remittances().expect("rows");
+        assert_eq!(rows.len(), 1, "one row, A's: {rows:?}");
+        assert_eq!(rows[0].remittance_id, "hash-13-2-a");
+        assert_eq!(rows[0].state, RemittanceState::Settled);
+        assert_eq!(rows[0].spending_since_unix, Some(100));
+        let accrued = store.accrued_fees().expect("read");
+        assert_eq!(
+            (
+                accrued.remitted_fee_sats,
+                accrued.in_flight_fee_sats,
+                accrued.unremitted_fee_sats
+            ),
+            (15, 0, 0)
+        );
+        let attempts = store.recent_remit_attempts(10).expect("attempts");
+        assert_eq!(attempts.len(), 2, "A's payment and B's refused --confirm: {attempts:?}");
+        assert_eq!(attempts[0].outcome, RemitAttemptOutcome::Paid);
+        assert_eq!(attempts[1].trigger, RemitAttemptTrigger::Command);
+        assert_eq!(attempts[1].outcome, RemitAttemptOutcome::Refused);
+        assert_eq!(attempts[1].remittance_id.as_deref(), Some("hash-13-2-a"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Gate 2g (c), addendum 4 §1 — the gone owner: A journals X and pauses BEFORE its fence; the
+    // clock moves past A's lease while it is paused. B runs `--dry-run` reconciliation (which
+    // releases X: planned, UNPAID, lease run out) and then `--confirm`, planning a DISTINCT invoice
+    // Y and paying it. A resumes, reads the clock FRESH at its fence, and its compare-and-set
+    // changes zero rows (X is no longer planned): A REFUSES without touching the wallet. Exactly
+    // one debit — B's.
+    #[test]
+    fn an_owner_that_outlives_its_lease_is_released_and_its_fence_then_changes_zero_rows() {
         let (store, root) = store_with_fees("expired-owner", &[10, 5]);
         drop(store);
         let db = root.join(STATE_DB_FILE);
@@ -2960,31 +3236,55 @@ mod tests {
         a.owner = "proc-a".to_owned();
         a.invoice_tag = "-a".to_owned();
         a.melt_results = vec![Ok((13, 1))];
+        let clock = Arc::clone(&a.clock);
         let (a_result, b_results) = run_paused(
             &db,
             a,
             100,
+            PauseAt::AfterPlan,
             super::test_support::Gate::new(),
             Arc::clone(&melts),
             |store_b| {
+                assert_eq!(
+                    store_b
+                        .in_flight_remittance()
+                        .expect("query")
+                        .expect("A's row")
+                        .state,
+                    RemittanceState::Planned,
+                    "A is paused BEFORE its fence"
+                );
+                // 100 + REMIT_LEASE (300) = 400: the lease has run out — for B's reconciliation and
+                // for the clock A reads fresh when it resumes.
+                clock.store(400, Ordering::SeqCst);
+                let mut results = Vec::new();
+                // B's dry run reconciles: X released. B's confirm then plans and pays Y.
+                let mut b = Fake::new(|_| 2);
+                b.owner = "proc-b".to_owned();
+                b.invoice_tag = "-b".to_owned();
+                b.status = Ok(Some(status(
+                    MeltQuoteState::Unpaid,
+                    "quote-lnbc-fake-13-2-a",
+                )));
+                let (outcome, out) = run_remit(store_b, &mut b, RemitTrigger::DryRun, 400);
+                assert_eq!(outcome, RemitOutcome::DryRun, "{out}");
+                assert!(
+                    out.contains("its owner's lease ran out at unix 400 (owner proc-a); released 15 sats back to unremitted"),
+                    "{out}"
+                );
+                assert!(b.melts.is_empty());
+                results.push((outcome, out));
                 let mut b = Fake::new(|_| 2);
                 b.owner = "proc-b".to_owned();
                 b.invoice_tag = "-b".to_owned();
                 b.melt_results = vec![Ok((13, 1))];
                 b.melt_counter = Some(Arc::clone(&melts));
-                b.status = Ok(Some(status(
-                    MeltQuoteState::Unpaid,
-                    "quote-lnbc-fake-13-2-a",
-                )));
-                // 100 + REMIT_LEASE (300) = 400: the lease has run out.
-                let (outcome, out) = run_remit(store_b, &mut b, RemitTrigger::Command, 400);
+                b.status = Ok(None);
+                let (outcome, out) = run_remit(store_b, &mut b, RemitTrigger::Command, 401);
                 assert!(is_paid(&outcome), "B pays Y once X is released: {out}");
                 assert_eq!(b.melts, vec!["lnbc-fake-13-2-b".to_owned()]);
-                assert!(
-                    out.contains("its owner's lease ran out at unix 400 (owner proc-a); released 15 sats back to unremitted"),
-                    "{out}"
-                );
-                vec![(outcome, out)]
+                results.push((outcome, out));
+                results
             },
         );
         let (a_outcome, a_out) = a_result;
@@ -3001,10 +3301,10 @@ mod tests {
                     "{reason}"
                 );
             }
-            other => panic!("A must refuse at the pre-spend gate, got {other:?}\n{a_out}"),
+            other => panic!("A must refuse at the fence, got {other:?}\n{a_out}"),
         }
         assert!(
-            a_out.contains("REFUSED before spending — the row is no longer planned (now failed)"),
+            a_out.contains("REFUSED before spending — the row is no longer planned (now failed): another process reconciled it (checked at unix 400)"),
             "{a_out}"
         );
         assert_eq!(
@@ -3012,17 +3312,18 @@ mod tests {
             1,
             "exactly one actual debit — B's"
         );
-        assert_eq!(b_results.len(), 1);
+        assert_eq!(b_results.len(), 2);
         let store = SellerStore::open(&db).expect("open");
         let rows = store.remittances().expect("rows");
         assert_eq!(
             rows.iter()
-                .map(|r| (r.remittance_id.as_str(), r.state))
+                .map(|r| (r.remittance_id.as_str(), r.state, r.spending_since_unix))
                 .collect::<Vec<_>>(),
             vec![
-                ("hash-13-2-a", RemittanceState::Failed),
-                ("hash-13-2-b", RemittanceState::Settled)
-            ]
+                ("hash-13-2-a", RemittanceState::Failed, None),
+                ("hash-13-2-b", RemittanceState::Settled, Some(401))
+            ],
+            "X was never admitted; Y was admitted at B's clock"
         );
         let accrued = store.accrued_fees().expect("read");
         assert_eq!(
@@ -3033,7 +3334,7 @@ mod tests {
             ),
             (15, 0, 0)
         );
-        // A's refusal at the gate is journaled as a refused attempt naming X.
+        // A's refusal at the fence is journaled as a refused attempt naming X.
         let attempts = store.recent_remit_attempts(10).expect("attempts");
         let a_attempt = attempts
             .iter()
@@ -3044,41 +3345,63 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // The owner's own margin at the store boundary: with less than SPEND_MARGIN of lease left, the
-    // ownership check refuses (the remit path then releases its own row rather than spend).
+    // Addendum 4 §1.1, the time condition alone: A journals X at 100 (lease until 400) and pauses
+    // before its fence; NOBODY else runs, but the clock moves to 340 — exactly SPEND_MARGIN left.
+    // A resumes, reads the clock fresh, and its compare-and-set changes zero rows (`400 > 340 + 60`
+    // is false): A refuses, spends nothing, and — the row being still planned and its own — releases
+    // it for the next attempt. The stale entry time (100) is not what the fence compares.
     #[test]
-    fn an_owner_with_too_little_lease_left_is_refused_at_the_gate() {
+    fn an_owner_whose_lease_ran_down_while_it_paused_is_refused_by_its_own_fence() {
         let (store, root) = store_with_fees("lease-margin", &[10, 5]);
-        // Plan at 100 ⇒ lease until 400. At 341 there are 59 s left: under the 60 s margin.
-        let plan = RemittancePlan {
-            payment_hash: "manual".to_owned(),
-            gross_sats: 15,
-            net_sats: 13,
-            melt_fee_reserve_sats: 2,
-            destination: PLATFORM_FEE_ADDRESS.to_owned(),
-            bolt11: "ln-manual".to_owned(),
-            melt_quote_id: None,
-        };
-        store
-            .plan_remittance(&plan, "fake-owner", 400, 100)
-            .expect("plan");
-        assert_eq!(
-            store
-                .confirm_remittance_ownership("manual", "fake-owner", 341, lease_secs(SPEND_MARGIN))
-                .expect("query"),
-            Err(OwnershipLost::LeaseTooShort {
-                lease_until_unix: Some(400),
-                now_unix: 341,
-                margin_secs: 60,
-            })
+        drop(store);
+        let db = root.join(STATE_DB_FILE);
+        let melts = Arc::new(AtomicUsize::new(0));
+        let mut a = Fake::new(|_| 2);
+        a.owner = "proc-a".to_owned();
+        a.melt_results = vec![Ok((13, 1))];
+        let clock = Arc::clone(&a.clock);
+        let (a_result, _) = run_paused(
+            &db,
+            a,
+            100,
+            PauseAt::AfterPlan,
+            super::test_support::Gate::new(),
+            Arc::clone(&melts),
+            |_| {
+                clock.store(340, Ordering::SeqCst);
+                Vec::new()
+            },
         );
+        let (a_outcome, a_out) = a_result;
+        match a_outcome {
+            Ok(RemitOutcome::Refused(Refusal::OwnershipLost {
+                remittance_id,
+                reason,
+            })) => {
+                assert_eq!(remittance_id, "hash-13-2");
+                assert_eq!(
+                    reason,
+                    OwnershipLost::LeaseTooShort {
+                        lease_until_unix: Some(400),
+                        now_unix: 340,
+                        margin_secs: 60,
+                    }
+                    .to_string()
+                );
+            }
+            other => panic!("A must refuse at the fence, got {other:?}\n{a_out}"),
+        }
         assert!(
-            store
-                .confirm_remittance_ownership("manual", "fake-owner", 340, lease_secs(SPEND_MARGIN))
-                .expect("query")
-                .is_ok(),
-            "exactly the margin left is enough"
+            a_out.contains("(checked at unix 340). Nothing moved by this run; released 15 sats back to unremitted"),
+            "{a_out}"
         );
+        assert_eq!(melts.load(Ordering::SeqCst), 0, "no debit");
+        let store = SellerStore::open(&db).expect("open");
+        let rows = store.remittances().expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, RemittanceState::Failed);
+        assert_eq!(rows[0].spending_since_unix, None, "never admitted");
+        assert_eq!(store.accrued_fees().expect("read").unremitted_fee_sats, 15);
         assert_eq!(lease_secs(REMIT_LEASE), 300);
         assert_eq!(lease_secs(SPEND_MARGIN), 60);
         let _ = std::fs::remove_dir_all(&root);
