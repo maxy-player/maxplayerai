@@ -115,7 +115,7 @@ fn the_header_never_follows_a_config_rewrite_to_another_host() {
     plant_insteadof(&workdir, &evil_url, intended);
 
     // The push through the production transport, with the rewrite in place and no scrub.
-    let result = push_branch_with_header(&workdir, intended, branch, Some(header));
+    let result = push_branch_with_header(&workdir, intended, branch, &oid, Some(header));
 
     // The observation comes first: nothing reached the evil endpoint — no request, so no header.
     let requests = evil.requests();
@@ -147,9 +147,9 @@ fn the_header_never_follows_a_config_rewrite_to_another_host() {
 }
 
 /// Positive control: the same transport and the same fixture, no rewrite. The push reaches the
-/// endpoint the caller named, WITH the header, and succeeds against a real smart-HTTP server. This
-/// proves the fixture records headers, so the empty recording above is evidence and not a broken
-/// fixture.
+/// endpoint the caller named, WITH the header, and the object-sourced push plus the remote read-back
+/// succeed against a real smart-HTTP server. This proves the fixture records headers, so the empty
+/// recording above is evidence and not a broken fixture.
 #[test]
 fn the_intended_destination_receives_the_header_and_the_gated_object() {
     init_test_env();
@@ -166,8 +166,9 @@ fn the_intended_destination_receives_the_header_and_the_gated_object() {
         nip98_authorization_header_with_keys(&url, &keys, Some(&delivery_ref(branch)), None)
             .expect("header");
 
-    let pushed = push_branch_with_header(&workdir, &url, branch, Some(header)).expect("push");
-    assert_eq!(pushed, oid, "the pushed oid is the committed one");
+    let pushed =
+        push_branch_with_header(&workdir, &url, branch, &oid, Some(header)).expect("push");
+    assert_eq!(pushed, oid, "the attested oid is the gated one");
 
     let requests = relay.requests();
     assert!(!requests.is_empty(), "the relay saw the push");
@@ -181,11 +182,13 @@ fn the_intended_destination_receives_the_header_and_the_gated_object() {
         "every leg carried the NIP-98 header: {requests:?}"
     );
     let advertisement = "/git/seller/r.git/info/refs?service=git-receive-pack";
-    assert!(
+    assert_eq!(
         requests
             .iter()
-            .any(|request| request.target == advertisement),
-        "the push advertisement: {requests:?}"
+            .filter(|request| request.target == advertisement)
+            .count(),
+        2,
+        "the push advertisement and the read-back: {requests:?}"
     );
     assert!(
         requests
@@ -200,7 +203,7 @@ fn the_intended_destination_receives_the_header_and_the_gated_object() {
             .expect("delivered ref")
             .to_string(),
         oid,
-        "the relay holds the commit at the delivery ref"
+        "the relay holds the gated object at the delivery ref"
     );
     drop(relay);
     let _ = std::fs::remove_dir_all(&root);

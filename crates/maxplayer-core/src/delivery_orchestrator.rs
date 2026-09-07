@@ -38,6 +38,14 @@
 //! hits a process that is already the sandbox, not the host. The caller reaps the agent's process
 //! group before the push, so nothing can re-plant the config in the window.
 //!
+//! ## What the push sends (C6)
+//! The push source is the gated commit OBJECT, not the local branch name: the refspec is
+//! `<gated oid>:refs/heads/<branch>`. A survivor that moves the local branch under the push changes
+//! nothing about the bytes sent. The remote's status report must name exactly that ref, and the
+//! remote's advertisement is then read back over a new connection and must show the ref at the gated
+//! oid. The local ref is never re-resolved after the push. See
+//! [`crate::git_transport::push_branch_with_header`].
+//!
 //! The completion gate and the execution sentinel are NOT re-implemented here: the delivery commit is
 //! produced by [`crate::seller_git::snapshot_delivery_at`], which runs the §19 gate (refusing an empty
 //! tree) and force-stages the sentinel. This module provisions, runs the agent, gates, and pushes.
@@ -130,8 +138,8 @@ impl std::fmt::Display for OrchestratorError {
 impl std::error::Error for OrchestratorError {}
 
 // The push-side hardening lives in `crate::seller_git` (layout gate + config replacement) and
-// `crate::git_transport` (destination binding). The container push below reuses it — one
-// definition, shared with the host path.
+// `crate::git_transport` (destination binding, object-sourced push, remote read-back). The container
+// push below reuses it — one definition, shared with the host path.
 
 /// The pinned base a contribution delivery forks from. `None` at the [`run_phase1`] call site means a
 /// from-scratch delivery (a root commit whose tree is the whole workdir).
@@ -152,8 +160,8 @@ pub struct Phase1Output {
     pub delivery_oid: String,
     /// The committed repo phase 2 pushes from. This is the agent's workdir: the delivery branch
     /// points at the gated commit here. Phase 2 refuses an unexpected repository layout, replaces
-    /// the config, binds every leg to the relay URL, and pushes with a branch-scoped token. A token
-    /// that leaks anyway is bounded to that one ref (Track A).
+    /// the config, binds every leg to the relay URL, and pushes `delivery_oid` as an object with a
+    /// branch-scoped token. A token that leaks anyway is bounded to that one ref (Track A).
     pub delivery_repo_dir: PathBuf,
 }
 
@@ -164,7 +172,7 @@ pub struct Phase1Output {
 ///
 /// This does not push. The push ([`push_delivery`]) gates the workdir layout, replaces its config
 /// ([`crate::seller_git::neutralize_push_config`]), binds the transport to the relay URL, and pushes
-/// from the same workdir — no separate clean repo needed.
+/// the gated object from the same workdir — no separate clean repo needed.
 ///
 /// `spawn_agent(workdir)` runs the agent against the freshly-provisioned workdir and returns when it
 /// exits. It is a seam: production inherits the container's stdin/stdout to the agent child (so the
@@ -428,7 +436,7 @@ fn deliver_in_container(
         &inputs.delivery_branch,
         header,
         &PushRetryPolicy::default(),
-        Some(&output.delivery_oid),
+        &output.delivery_oid,
     )?;
     write_delivery_oid(&inputs.out_dir, &pushed)?;
     Ok(output)
@@ -630,44 +638,50 @@ fn full_jitter(backoff: Duration) -> Duration {
 /// `.git`, a `.git/commondir`, a symlinked config) is refused before any network. The caller MUST
 /// have reaped the agent's process group already (see that function's docs).
 ///
-/// `expected_oid` (C6): when `Some`, the delivery branch must point at exactly this commit — the one
-/// the gate produced — both BEFORE the push and as the oid the push reports. A process that survived
-/// the agent could otherwise re-point the branch between the gate and the push and have the seller
-/// sign a kind-3403 for a commit the gate never saw. Any mismatch is [`OrchestratorError::Tampered`],
-/// and no push happens on a pre-push mismatch.
+/// `gated_oid` (C6) is the commit the gate produced. It is checked and used three ways:
+/// 1. Before the push, the local delivery branch must point at it. A survivor that re-pointed the
+///    branch between the gate and the push is tamper evidence: [`OrchestratorError::Tampered`], and
+///    no push happens.
+/// 2. It is the push SOURCE on every attempt (`<gated_oid>:refs/heads/<branch>`), so what the wire
+///    carries does not depend on the local branch at push time.
+/// 3. After each attempt the remote's advertisement must show the branch at it, and the returned
+///    oid is that attested value — the local ref is never re-resolved.
 pub fn push_delivery(
     repo_dir: &Path,
     relay_url: &str,
     branch: &str,
     header: Option<String>,
     policy: &PushRetryPolicy,
-    expected_oid: Option<&str>,
+    gated_oid: &str,
 ) -> Result<String, OrchestratorError> {
-    if let Some(expected) = expected_oid {
-        let tip = local_branch_tip(repo_dir, branch)?;
-        if tip != expected {
-            return Err(OrchestratorError::Tampered(format!(
-                "delivery branch {branch} points at {tip}, not at the gated commit {expected}; \
-                 refusing to push"
-            )));
-        }
+    let tip = local_branch_tip(repo_dir, branch)?;
+    if tip != gated_oid {
+        return Err(OrchestratorError::Tampered(format!(
+            "delivery branch {branch} points at {tip}, not at the gated commit {gated_oid}; \
+             refusing to push"
+        )));
     }
     seller_git::neutralize_push_config(repo_dir)
         .map_err(|error| OrchestratorError::Io(error.to_string()))?;
+    // Every attempt pushes the same gated object: the closure captures `gated_oid` by reference.
     let pushed = push_with_retry(
         policy,
         |_attempt| {
-            git_transport::push_branch_with_header(repo_dir, relay_url, branch, header.clone())
+            git_transport::push_branch_with_header(
+                repo_dir,
+                relay_url,
+                branch,
+                gated_oid,
+                header.clone(),
+            )
         },
         default_is_retryable,
         |wait| std::thread::sleep(wait),
         full_jitter,
     )?;
-    if let Some(expected) = expected_oid
-        && pushed != expected
-    {
+    if pushed != gated_oid {
         return Err(OrchestratorError::Tampered(format!(
-            "pushed {pushed} for {branch}, not the gated commit {expected}"
+            "pushed {pushed} for {branch}, not the gated commit {gated_oid}"
         )));
     }
     Ok(pushed)
@@ -686,8 +700,8 @@ fn local_branch_tip(repo_dir: &Path, branch: &str) -> Result<String, Orchestrato
         })
 }
 
-/// Off-runtime [`push_delivery`]: gate the layout, replace `workdir`'s config, and push from it, on
-/// a blocking thread. Returns the pushed oid.
+/// Off-runtime [`push_delivery`]: gate the layout, replace `workdir`'s config, and push the gated
+/// object from it, on a blocking thread. Returns the attested oid.
 ///
 /// Safe on the host interim path because the container that ran the agent has already exited: no agent
 /// process is alive to re-plant the config between the neutralise and the push.
@@ -697,7 +711,7 @@ pub async fn push_delivery_off_runtime(
     branch: String,
     header: Option<String>,
     policy: PushRetryPolicy,
-    expected_oid: Option<String>,
+    gated_oid: String,
 ) -> Result<String, OrchestratorError> {
     tokio::task::spawn_blocking(move || {
         push_delivery(
@@ -706,7 +720,7 @@ pub async fn push_delivery_off_runtime(
             &branch,
             header,
             &policy,
-            expected_oid.as_deref(),
+            &gated_oid,
         )
     })
     .await
@@ -1358,7 +1372,8 @@ mod tests {
 
     // (The config-rewrite security property is proven by tests/hostile_local_git_config.rs against
     // seller_git::neutralize_push_config, which push_delivery reuses. The layout gate has its tests
-    // in seller_git; the destination binding in git_transport and tests/push_destination_binding.rs.)
+    // in seller_git; the destination binding in git_transport and tests/push_destination_binding.rs;
+    // the object-sourced push and the remote read-back in git_transport.)
 
     const NONCE: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -1980,7 +1995,7 @@ mod tests {
             &branch,
             None,
             &PushRetryPolicy::default(),
-            Some(&gated),
+            &gated,
         )
         .expect_err("a moved branch is tamper evidence");
         assert!(matches!(err, OrchestratorError::Tampered(_)), "{err}");
@@ -2008,7 +2023,7 @@ mod tests {
             &branch,
             None,
             &PushRetryPolicy::default(),
-            Some(&gated),
+            &gated,
         )
         .expect_err("refused remote");
         assert!(

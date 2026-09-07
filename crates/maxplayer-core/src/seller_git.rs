@@ -464,15 +464,17 @@ pub struct PushAuth {
     pub secret_key_hex: String,
 }
 
-/// Push `branch` from `workdir` to `remote_url` (allowlisted https / relay-git only), with
-/// optional NIP-98 auth for relay-git. Always in-process libgit2 — there is no system-git fallback.
-/// The workdir passes the layout gate and every leg is bound to `remote_url`; see
-/// [`git_transport::push_branch_with_header`]. Returns the pushed commit OID (full hex).
+/// Push the gated commit `gated_oid` from `workdir` to `refs/heads/<branch>` at `remote_url`
+/// (allowlisted https / relay-git only), with optional NIP-98 auth for relay-git. Always in-process
+/// libgit2 — there is no system-git fallback. The push source is the commit object, never the local
+/// branch name, and the remote's advertisement is read back after the push; see
+/// [`git_transport::push_branch_with_header`]. Returns the attested `gated_oid` (full hex).
 /// Unauthenticated / prompt-needing remotes fail closed.
 pub fn push_branch_with_auth(
     workdir: &Path,
     remote_url: &str,
     branch: &str,
+    gated_oid: &str,
     auth: Option<&PushAuth>,
 ) -> Result<String, SellerGitError> {
     assert_allowed_repo_locator(remote_url)?;
@@ -483,27 +485,31 @@ pub fn push_branch_with_auth(
         workdir,
         remote_url,
         branch,
+        gated_oid,
         auth.map(|a| a.secret_key_hex.as_str()),
     )?;
     eprintln!("seller push path=inprocess remote={remote_url} branch={branch} ok");
     Ok(oid)
 }
 
-/// Push `branch` with an already-resolved NIP-98 `Authorization` header instead of a raw secret. The
-/// durable seller node builds the header through its signer actor (which owns the seller key), so the
-/// push path never re-reads the secret — the key stays confined to the actor + the authenticated
-/// relay client. `header` is `None` for a public/anonymous https remote. Returns the pushed OID.
+/// Push the gated commit `gated_oid` to `refs/heads/<branch>` with an already-resolved NIP-98
+/// `Authorization` header instead of a raw secret. The durable seller node builds the header through
+/// its signer actor (which owns the seller key), so the push path never re-reads the secret — the key
+/// stays confined to the actor + the authenticated relay client. `header` is `None` for a
+/// public/anonymous https remote. Returns the attested `gated_oid`.
 pub fn push_branch_with_header(
     workdir: &Path,
     remote_url: &str,
     branch: &str,
+    gated_oid: &str,
     header: Option<String>,
 ) -> Result<String, SellerGitError> {
     assert_allowed_repo_locator(remote_url)?;
     if branch.trim().is_empty() {
         return Err(SellerGitError::Io("branch must be non-empty".into()));
     }
-    let oid = git_transport::push_branch_with_header(workdir, remote_url, branch, header)?;
+    let oid =
+        git_transport::push_branch_with_header(workdir, remote_url, branch, gated_oid, header)?;
     eprintln!("seller push path=inprocess remote={remote_url} branch={branch} ok");
     Ok(oid)
 }
@@ -630,9 +636,13 @@ pub async fn push_branch_with_header_off_runtime(
     workdir: PathBuf,
     remote_url: String,
     branch: String,
+    gated_oid: String,
     header: Option<String>,
 ) -> Result<String, SellerGitError> {
-    off_runtime(move || push_branch_with_header(&workdir, &remote_url, &branch, header)).await
+    off_runtime(move || {
+        push_branch_with_header(&workdir, &remote_url, &branch, &gated_oid, header)
+    })
+    .await
 }
 
 /// Refuse a job workdir whose repository layout would make libgit2 read state from outside
@@ -795,9 +805,9 @@ pub fn open_plain_workdir_repo(workdir: &Path) -> Result<Repository, SellerGitEr
 /// secondary config file is gone at once. A push needs nothing from the config (explicit URL,
 /// explicit object, explicit refspec), so a minimal file suffices.
 ///
-/// This is one of two layers. The transport ([`crate::git_transport`]) also binds every leg to
+/// This is one of three layers. The transport ([`crate::git_transport`]) also binds every leg to
 /// the URL the caller named, so a rewrite that reaches libgit2 by any other route fails before a
-/// request is built.
+/// request is built; and the push sends the gated commit object with a remote read-back afterwards.
 ///
 /// ⚠ Call this only when no agent process can still rewrite the file before the push. On the delivery
 /// path the job container has already exited, so no agent process is alive to re-plant the redirect.
@@ -853,20 +863,21 @@ pub fn neutralize_push_config(workdir: &Path) -> Result<(), SellerGitError> {
     Ok(())
 }
 
-/// Off-runtime: neutralise `workdir`'s config, THEN push. This is the host-path delivery push. The
-/// layout gate and the whole-file config replacement run first, so an
+/// Off-runtime: neutralise `workdir`'s config, THEN push the gated commit. This is the host-path
+/// delivery push. The layout gate and the whole-file config replacement run first, so an
 /// `insteadOf`/`pushInsteadOf`/`include` the agent planted is gone before libgit2 reads the config;
-/// the push then binds every leg to `remote_url`. Both run in one blocking op, so nothing runs
-/// between them.
+/// the push then sends the object `gated_oid`, binds every leg to `remote_url`, and reads the
+/// remote's advertisement back. Both run in one blocking op, so nothing runs between them.
 pub async fn neutralize_then_push_off_runtime(
     workdir: PathBuf,
     remote_url: String,
     branch: String,
+    gated_oid: String,
     header: Option<String>,
 ) -> Result<String, SellerGitError> {
     off_runtime(move || {
         neutralize_push_config(&workdir)?;
-        push_branch_with_header(&workdir, &remote_url, &branch, header)
+        push_branch_with_header(&workdir, &remote_url, &branch, &gated_oid, header)
     })
     .await
 }
@@ -939,16 +950,17 @@ mod tests {
         let root = temp("refuse");
         let _ = fs::remove_dir_all(&root);
         init_repo(&root);
+        let oid = "a".repeat(40);
         assert!(matches!(
-            push_branch_with_auth(&root, "git@example.invalid:repo.git", "main", None),
+            push_branch_with_auth(&root, "git@example.invalid:repo.git", "main", &oid, None),
             Err(SellerGitError::Transport(_))
         ));
         assert!(matches!(
-            push_branch_with_auth(&root, "/tmp/local.git", "main", None),
+            push_branch_with_auth(&root, "/tmp/local.git", "main", &oid, None),
             Err(SellerGitError::Transport(_))
         ));
         assert!(matches!(
-            push_branch_with_auth(&root, "ssh://example.invalid/repo.git", "main", None),
+            push_branch_with_auth(&root, "ssh://example.invalid/repo.git", "main", &oid, None),
             Err(SellerGitError::Transport(_))
         ));
         let _ = fs::remove_dir_all(&root);
@@ -963,6 +975,7 @@ mod tests {
             &root,
             &format!("file://{}/remote.git", root.display()),
             "main",
+            &"a".repeat(40),
             None,
         )
         .expect_err("file refused");
@@ -1087,8 +1100,14 @@ mod tests {
             Err(SellerGitError::Layout(_))
         ));
         // The push refuses through the same gate, before it names a remote.
-        let err = push_branch_with_header(&workdir, "https://relay.example/git/o/r.git", "job", None)
-            .expect_err("the push refuses");
+        let err = push_branch_with_header(
+            &workdir,
+            "https://relay.example/git/o/r.git",
+            "job",
+            &"a".repeat(40),
+            None,
+        )
+        .expect_err("the push refuses");
         assert!(
             matches!(&err, SellerGitError::Transport(m) if m.contains("commondir")),
             "{err}"
@@ -1118,7 +1137,13 @@ mod tests {
             Err(SellerGitError::Layout(_))
         ));
         assert!(matches!(
-            push_branch_with_header(&workdir, "https://relay.example/git/o/r.git", "job", None),
+            push_branch_with_header(
+                &workdir,
+                "https://relay.example/git/o/r.git",
+                "job",
+                &"a".repeat(40),
+                None
+            ),
             Err(SellerGitError::Transport(_))
         ));
         let _ = fs::remove_dir_all(&root);

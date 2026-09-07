@@ -157,9 +157,13 @@ would stay either way — the container push reuses it via `delivery_orchestrato
   mount.
 - **C4** — add a defensive env allowlist at `spawn_agent_child` (the token/`job_hash` must never be in
   the agent's env even by accident).
-- **C6** — carry the gated `expected_oid` into the push and fail closed on mismatch
-  (`OrchestratorError` already has the shape) — a background process surviving the agent could
-  otherwise re-point the branch between gate and push.
+- **C6** — the push sends the gated commit OBJECT: the refspec is `<gated oid>:refs/heads/<branch>`,
+  never a local ref name a surviving process could move under the push. Before the push the local
+  branch must still point at the gated oid (a move is tamper evidence, fail closed). After it the
+  remote's status report must name exactly the delivery ref, and the remote's advertisement is read
+  back over a new connection and must show the ref at the gated oid. The local ref is never
+  re-resolved. Every retry attempt pushes the same object. (`git_transport::push_branch_with_header`,
+  `delivery_orchestrator::push_delivery`.)
 - **F1** — before any push-side repository open, the workdir must have a plain layout
   (`seller_git::assert_plain_repo_layout`): `.git` a real directory, no `.git/commondir`,
   `.git/config` a regular file or absent. The config replacement then unlinks and re-creates the

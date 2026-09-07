@@ -27,6 +27,11 @@
 //!   intended URL ([`same_destination`]) and builds NO request on a mismatch. The header can only
 //!   ever travel to the intended destination. The push side additionally opens the workdir through
 //!   the layout gate ([`crate::seller_git::open_plain_workdir_repo`]).
+//! - **Object-sourced push with remote read-back (C6):** [`push_branch_with_header`] pushes the
+//!   gated commit OBJECT (`<oid>:refs/heads/<branch>`), never a local ref name a surviving job
+//!   process could move under the push, requires the remote's status report to name exactly that
+//!   ref, and then reads the remote's advertisement over a new connection and requires the ref to
+//!   point at the gated oid. It never re-resolves the local branch.
 //! - **Key hygiene:** the seller/buyer secret is used ONLY in-process to sign the NIP-98 event.
 //!   It is never placed on argv, never in child env, and never spawns a subprocess.
 //!
@@ -41,7 +46,7 @@ use std::time::Duration;
 
 use git2::transport::{Service, SmartSubtransport, SmartSubtransportStream, Transport};
 use git2::{
-    AutotagOption, ConfigLevel, Direction, FetchOptions, PushOptions, Remote, RemoteCallbacks,
+    AutotagOption, ConfigLevel, Direction, FetchOptions, Oid, PushOptions, Remote, RemoteCallbacks,
     Repository,
 };
 
@@ -390,17 +395,18 @@ fn header_for(remote_url: &str, auth: Option<&str>) -> Result<Option<String>, Tr
     }
 }
 
-/// Push `refs/heads/<branch>:refs/heads/<branch>` to `remote_url` in-process, returning the pushed
-/// commit OID (full hex). `auth` is the seller secret hex (NIP-98 for relay-git; `None`/public https
-/// pushes unauthenticated and fail closed at the remote).
+/// Push the gated commit `gated_oid` to `refs/heads/<branch>` at `remote_url` in-process, returning
+/// the attested oid (full hex, equal to `gated_oid`). `auth` is the seller secret hex (NIP-98 for
+/// relay-git; `None`/public https pushes unauthenticated and fail closed at the remote).
 pub fn push_branch(
     workdir: &Path,
     remote_url: &str,
     branch: &str,
+    gated_oid: &str,
     auth: Option<&str>,
 ) -> Result<String, TransportError> {
     let header = header_for(remote_url, auth)?;
-    push_branch_with_header(workdir, remote_url, branch, header)
+    push_branch_with_header(workdir, remote_url, branch, gated_oid, header)
 }
 
 /// Like [`push_branch`] but takes an already-resolved NIP-98 `Authorization` header instead of the
@@ -409,28 +415,85 @@ pub fn push_branch(
 /// layer. `None` = no auth (public/anonymous https). The header is bound to the repo-root URL and
 /// reused for both the info/refs advertisement and the service POST, exactly as `push_branch` does.
 ///
-/// The workdir is opened through the layout gate ([`crate::seller_git::open_plain_workdir_repo`])
-/// and every leg is bound to `remote_url` ([`bound_remote`], [`NostrHttp::action`]).
+/// `gated_oid` is the commit the gate produced. It is the push SOURCE: the refspec is
+/// `<gated_oid>:refs/heads/<branch>`, so the bytes on the wire are that object's graph no matter
+/// where the local branch points during the push (C6). After the push:
+/// 1. the remote's status report must name exactly `refs/heads/<branch>` with no error message;
+/// 2. the remote's advertisement is read over a new connection (same header context) and
+///    `refs/heads/<branch>` must point at `gated_oid`.
+///
+/// The local branch is never re-resolved. The workdir is opened through the layout gate
+/// ([`crate::seller_git::open_plain_workdir_repo`]) and every leg is bound to `remote_url`.
 pub fn push_branch_with_header(
     workdir: &Path,
     remote_url: &str,
     branch: &str,
+    gated_oid: &str,
     header: Option<String>,
 ) -> Result<String, TransportError> {
     assert_allowed_repo_locator(remote_url)?;
     ensure_registered()?;
     let repo = open_delivery_repo(workdir)?;
-    let mut remote = bound_remote(&repo, remote_url)?;
+    push_gated_object(&repo, remote_url, branch, gated_oid, header)
+}
 
-    let refspec = format!("{src}:{dst}", src = delivery_ref(branch), dst = delivery_ref(branch));
-    let rejection: std::rc::Rc<RefCell<Option<String>>> = std::rc::Rc::new(RefCell::new(None));
+/// Open the committed workdir a delivery is pushed from, through the layout gate. A layout refusal
+/// is a [`TransportError::Transport`]: fail closed, never retried, no network.
+fn open_delivery_repo(workdir: &Path) -> Result<Repository, TransportError> {
+    use crate::seller_git::SellerGitError;
+    crate::seller_git::open_plain_workdir_repo(workdir).map_err(|error| match error {
+        SellerGitError::Layout(message) => TransportError::Transport(message),
+        other => TransportError::Io(format!("open workdir repo: {other}")),
+    })
+}
+
+/// Parse a full 40-hex commit oid and require that the commit exists in `repo`.
+fn gated_commit(repo: &Repository, gated_oid: &str) -> Result<Oid, TransportError> {
+    let is_full_hex = gated_oid.len() == 40 && gated_oid.bytes().all(|b| b.is_ascii_hexdigit());
+    if !is_full_hex {
+        return Err(TransportError::Io(format!(
+            "gated oid {gated_oid:?} is not a full commit oid"
+        )));
+    }
+    let oid = Oid::from_str(gated_oid)
+        .map_err(|error| TransportError::Io(format!("gated oid {gated_oid:?}: {error}")))?;
+    repo.find_commit(oid).map_err(|error| {
+        TransportError::Io(format!(
+            "gated commit {gated_oid} is not a commit in the workdir: {error}"
+        ))
+    })?;
+    Ok(oid)
+}
+
+/// The push proper, on an already-opened repository: bind the remote, push the OBJECT `gated_oid`
+/// to `refs/heads/<branch>`, check the status report, then read the remote back. Split from
+/// [`push_branch_with_header`] so the object-sourced push can be exercised against a local bare
+/// repository, which the transport allowlist refuses on the public entry point.
+fn push_gated_object(
+    repo: &Repository,
+    remote_url: &str,
+    branch: &str,
+    gated_oid: &str,
+    header: Option<String>,
+) -> Result<String, TransportError> {
+    let gated = gated_commit(repo, gated_oid)?.to_string();
+    let target_ref = delivery_ref(branch);
+    let mut remote = bound_remote(repo, remote_url)?;
+
+    // The source is the object, not `refs/heads/<branch>`: libgit2 resolves a push source with
+    // revparse (`push.c`, `check_lref` / `calculate_work`), and a full hex oid resolves to the object
+    // itself before any ref is consulted (`revparse.c`, `maybe_sha`). A local ref a survivor moves
+    // during the push changes nothing about what is sent.
+    let refspec = format!("{gated}:{target_ref}");
+    let reports: std::rc::Rc<RefCell<Vec<(String, Option<String>)>>> =
+        std::rc::Rc::new(RefCell::new(Vec::new()));
     let mut callbacks = RemoteCallbacks::new();
     {
-        let rejection = rejection.clone();
+        let reports = reports.clone();
         callbacks.push_update_reference(move |refname, status| {
-            if let Some(message) = status {
-                *rejection.borrow_mut() = Some(format!("{refname}: {message}"));
-            }
+            reports
+                .borrow_mut()
+                .push((refname.to_owned(), status.map(str::to_owned)));
             Ok(())
         });
     }
@@ -442,34 +505,77 @@ pub fn push_branch_with_header(
         short: false,
         intended_url: remote_url.to_owned(),
     };
-    with_context(context, || {
+    with_context(context.clone(), || {
         remote.push(&[refspec.as_str()], Some(&mut options))
     })?;
     drop(options);
-
-    if let Some(message) = rejection.borrow().clone() {
-        return Err(TransportError::Rejected(message));
-    }
-
-    let oid = repo
-        .revparse_single(&format!("refs/heads/{branch}"))
-        .and_then(|object| object.peel_to_commit())
-        .map(|commit| commit.id().to_string())
-        .map_err(|error| TransportError::Io(format!("resolve pushed oid: {error}")))?;
-    if oid.len() < 40 || !oid.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(TransportError::Io(format!("unexpected commit oid {oid:?}")));
-    }
-    Ok(oid)
+    require_status_report(&reports.borrow(), &target_ref)?;
+    attest_remote_branch(&mut remote, context, &target_ref, &gated)?;
+    Ok(gated)
 }
 
-/// Open the committed workdir a delivery is pushed from, through the layout gate. A layout refusal
-/// is a [`TransportError::Transport`]: fail closed, never retried, no network.
-fn open_delivery_repo(workdir: &Path) -> Result<Repository, TransportError> {
-    use crate::seller_git::SellerGitError;
-    crate::seller_git::open_plain_workdir_repo(workdir).map_err(|error| match error {
-        SellerGitError::Layout(message) => TransportError::Transport(message),
-        other => TransportError::Io(format!("open workdir repo: {other}")),
-    })
+/// Require that the remote's status report names exactly `target_ref`, with no error message. The
+/// smart protocol (`report-status`) and the local transport both report one status per refspec sent.
+/// A message is a rejection (retryable: the relay's per-repo push lock surfaces this way). A report
+/// for another ref, or no report at all, means the push did not do what was asked: refuse, no retry.
+fn require_status_report(
+    reports: &[(String, Option<String>)],
+    target_ref: &str,
+) -> Result<(), TransportError> {
+    if let Some((refname, Some(message))) = reports.iter().find(|(_, status)| status.is_some()) {
+        return Err(TransportError::Rejected(format!("{refname}: {message}")));
+    }
+    match reports {
+        [(refname, None)] if refname == target_ref => Ok(()),
+        [] => Err(TransportError::Transport(format!(
+            "remote reported no status for {target_ref}; refusing to trust the push"
+        ))),
+        other => {
+            let names: Vec<&str> = other.iter().map(|(name, _)| name.as_str()).collect();
+            Err(TransportError::Transport(format!(
+                "remote reported status for {names:?}; expected exactly {target_ref}"
+            )))
+        }
+    }
+}
+
+/// Remote attestation: open a NEW connection to the remote under the same header context, read its
+/// current ref advertisement, and require `target_ref` to point at `gated_oid`. One scoped token
+/// serves both the push and this read-back (the relay is method-agnostic and does not dedup the
+/// event id). The local branch is not consulted.
+fn attest_remote_branch(
+    remote: &mut Remote<'_>,
+    context: LegContext,
+    target_ref: &str,
+    gated_oid: &str,
+) -> Result<(), TransportError> {
+    let heads = with_context(context, || {
+        let connection = remote.connect_auth(Direction::Push, None, None)?;
+        let heads = connection
+            .list()?
+            .iter()
+            .map(|head| (head.name().to_owned(), head.oid().to_string()))
+            .collect::<Vec<_>>();
+        Ok(heads)
+    })?;
+    check_remote_attestation(&heads, target_ref, gated_oid)
+}
+
+/// The attestation comparison on an advertisement: `target_ref` present and equal to `gated_oid`.
+fn check_remote_attestation(
+    heads: &[(String, String)],
+    target_ref: &str,
+    gated_oid: &str,
+) -> Result<(), TransportError> {
+    match heads.iter().find(|(name, _)| name == target_ref) {
+        Some((_, oid)) if oid == gated_oid => Ok(()),
+        Some((_, oid)) => Err(TransportError::Rejected(format!(
+            "remote attestation failed: {target_ref} is at {oid}, not at the pushed {gated_oid}"
+        ))),
+        None => Err(TransportError::Rejected(format!(
+            "remote attestation failed: {target_ref} is absent from the remote after the push"
+        ))),
+    }
 }
 
 /// Fetch `refspecs` from `remote_url` into `repo` in-process. `auth` supplies NIP-98 for relay-git
@@ -962,6 +1068,7 @@ mod tests {
                 std::path::Path::new("/nonexistent"),
                 "ext::sh -c evil",
                 "main",
+                &"a".repeat(40),
                 None
             ),
             Err(TransportError::Transport(_))
@@ -1077,12 +1184,7 @@ mod tests {
     }
 
     // Commit `content` at `name` on top of `parent`; returns the commit oid. No ref is updated.
-    fn commit_file(
-        repo: &Repository,
-        name: &str,
-        content: &str,
-        parent: Option<git2::Oid>,
-    ) -> git2::Oid {
+    fn commit_file(repo: &Repository, name: &str, content: &str, parent: Option<Oid>) -> Oid {
         let workdir = repo.workdir().expect("workdir");
         std::fs::write(workdir.join(name), content).expect("write file");
         let mut index = repo.index().expect("index");
@@ -1108,7 +1210,7 @@ mod tests {
 
     // A workdir with commits A (the gated one, a root) and B (a child of A). `refs/heads/job`
     // points at B: a survivor moved the branch off the gated commit.
-    fn workdir_with_moved_branch(root: &Path) -> (std::path::PathBuf, git2::Oid, git2::Oid) {
+    fn workdir_with_moved_branch(root: &Path) -> (std::path::PathBuf, Oid, Oid) {
         let workdir = root.join("workdir");
         let repo = Repository::init(&workdir).expect("init");
         let a = commit_file(&repo, "a.txt", "gated\n", None);
@@ -1116,6 +1218,169 @@ mod tests {
         repo.reference("refs/heads/job", b, true, "branch at B")
             .expect("branch");
         (workdir, a, b)
+    }
+
+    // ── C6: the push sends the gated OBJECT ──────────────────────────────────────────────────
+
+    // The local branch points at B; the push is told to deliver A. The remote must end at A and the
+    // returned oid must be A. This also verifies empirically that libgit2 accepts a raw hex oid as
+    // the push source (`push.c` resolves it with revparse).
+    // Red-on-revert: build the refspec from `refs/heads/job` instead of the oid and the remote gets B.
+    #[test]
+    fn push_sends_the_gated_object_not_the_branch_tip() {
+        let root = temp_root("c6-object");
+        let (workdir, a, b) = workdir_with_moved_branch(&root);
+        let bare = root.join("remote.git");
+        Repository::init_bare(&bare).expect("bare remote");
+        let remote_url = bare.to_str().expect("utf8").to_owned();
+
+        let repo = crate::seller_git::open_plain_workdir_repo(&workdir).expect("open workdir");
+        let pushed = push_gated_object(&repo, &remote_url, "job", &a.to_string(), None)
+            .expect("push the gated object");
+        assert_eq!(pushed, a.to_string(), "the returned oid is the gated one");
+
+        let remote_repo = Repository::open_bare(&bare).expect("open bare");
+        let remote_tip = remote_repo
+            .refname_to_id("refs/heads/job")
+            .expect("remote ref");
+        assert_eq!(remote_tip, a, "the remote got the gated object A, not the branch tip B");
+        assert_ne!(remote_tip, b);
+        // The local branch was neither consulted nor touched.
+        assert_eq!(repo.refname_to_id("refs/heads/job").expect("local ref"), b);
+
+        // A repeat push of the same object (the resume path) is accepted and attested again.
+        let again = push_gated_object(&repo, &remote_url, "job", &a.to_string(), None)
+            .expect("re-push the gated object");
+        assert_eq!(again, a.to_string());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The push refuses a gated oid that is not a full hex oid or not a commit in the workdir, before
+    // it names a remote.
+    #[test]
+    fn push_refuses_a_gated_oid_that_is_not_a_local_commit() {
+        let root = temp_root("c6-bad-oid");
+        let (workdir, a, _b) = workdir_with_moved_branch(&root);
+        let repo = crate::seller_git::open_plain_workdir_repo(&workdir).expect("open workdir");
+        let bare = root.join("remote.git");
+        Repository::init_bare(&bare).expect("bare remote");
+        let remote_url = bare.to_str().expect("utf8").to_owned();
+        for bad in ["", "abc", &a.to_string()[..39], &"f".repeat(40)] {
+            let err = push_gated_object(&repo, &remote_url, "job", bad, None)
+                .expect_err("refused");
+            assert!(matches!(err, TransportError::Io(_)), "{bad:?}: {err}");
+        }
+        assert!(
+            Repository::open_bare(&bare)
+                .expect("bare")
+                .refname_to_id("refs/heads/job")
+                .is_err(),
+            "nothing was pushed"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The remote read-back refuses when the remote's ref disagrees with what was pushed: here a
+    // second client moves the remote ref to B after our push of A completed.
+    // Red-on-revert: make `check_remote_attestation` return Ok and this passes vacuously.
+    #[test]
+    fn attestation_refuses_a_remote_whose_ref_moved_after_the_push() {
+        let root = temp_root("c6-attest");
+        let (workdir, a, b) = workdir_with_moved_branch(&root);
+        let bare = root.join("remote.git");
+        Repository::init_bare(&bare).expect("bare remote");
+        let remote_url = bare.to_str().expect("utf8").to_owned();
+        let repo = crate::seller_git::open_plain_workdir_repo(&workdir).expect("open workdir");
+        push_gated_object(&repo, &remote_url, "job", &a.to_string(), None).expect("push A");
+
+        // A second client moves the remote ref to B.
+        {
+            let other = Repository::open(&workdir).expect("second client");
+            let mut other_remote = other.remote_anonymous(&remote_url).expect("remote");
+            other_remote
+                .push(&["+refs/heads/job:refs/heads/job"], None)
+                .expect("move the remote ref to B");
+        }
+        assert_eq!(
+            Repository::open_bare(&bare)
+                .expect("bare")
+                .refname_to_id("refs/heads/job")
+                .expect("remote ref"),
+            b
+        );
+
+        // The read-back that follows a push of A must refuse: the remote disagrees with the push.
+        let mut remote = bound_remote(&repo, &remote_url).expect("bound remote");
+        let context = LegContext {
+            header: None,
+            short: false,
+            intended_url: remote_url.clone(),
+        };
+        let err = attest_remote_branch(&mut remote, context, "refs/heads/job", &a.to_string())
+            .expect_err("the remote disagrees");
+        assert!(
+            matches!(&err, TransportError::Rejected(m) if m.contains("remote attestation failed")),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains(&b.to_string()),
+            "names the oid the remote holds: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn attestation_comparison_requires_the_ref_at_the_gated_oid() {
+        let a = "a".repeat(40);
+        let b = "b".repeat(40);
+        let agrees = vec![
+            ("HEAD".to_owned(), a.clone()),
+            ("refs/heads/job".to_owned(), a.clone()),
+        ];
+        check_remote_attestation(&agrees, "refs/heads/job", &a).expect("agrees");
+        let moved = vec![("refs/heads/job".to_owned(), b.clone())];
+        assert!(matches!(
+            check_remote_attestation(&moved, "refs/heads/job", &a),
+            Err(TransportError::Rejected(_))
+        ));
+        let absent = vec![("refs/heads/other".to_owned(), a.clone())];
+        assert!(matches!(
+            check_remote_attestation(&absent, "refs/heads/job", &a),
+            Err(TransportError::Rejected(_))
+        ));
+        assert!(matches!(
+            check_remote_attestation(&[], "refs/heads/job", &a),
+            Err(TransportError::Rejected(_))
+        ));
+    }
+
+    #[test]
+    fn status_report_must_name_exactly_the_delivery_ref() {
+        let target = "refs/heads/job";
+        require_status_report(&[(target.to_owned(), None)], target).expect("exact report");
+        assert!(matches!(
+            require_status_report(&[], target),
+            Err(TransportError::Transport(_))
+        ));
+        assert!(matches!(
+            require_status_report(&[("refs/heads/other".to_owned(), None)], target),
+            Err(TransportError::Transport(_))
+        ));
+        assert!(matches!(
+            require_status_report(
+                &[(target.to_owned(), None), ("refs/heads/other".to_owned(), None)],
+                target
+            ),
+            Err(TransportError::Transport(_))
+        ));
+        // A message is the remote's rejection: retryable, as before.
+        assert!(matches!(
+            require_status_report(
+                &[(target.to_owned(), Some("pre-receive hook declined".to_owned()))],
+                target
+            ),
+            Err(TransportError::Rejected(_))
+        ));
     }
 
     // ── F1 layer (a): the layout gate runs before the push names a remote ────────────────────
@@ -1127,7 +1392,7 @@ mod tests {
     #[test]
     fn push_refuses_a_commondir_layout_before_any_network() {
         let root = temp_root("layout-commondir");
-        let (workdir, _a, _b) = workdir_with_moved_branch(&root);
+        let (workdir, a, _b) = workdir_with_moved_branch(&root);
         // A second, valid git dir the job prepared, and a commondir pointer at it.
         let other = root.join("other.git");
         Repository::init_bare(&other).expect("other git dir");
@@ -1141,8 +1406,14 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         let url = format!("https://127.0.0.1:{port}/git/o/r.git");
 
-        let err = push_branch_with_header(&workdir, &url, "job", Some("Nostr token".to_owned()))
-            .expect_err("the layout is refused");
+        let err = push_branch_with_header(
+            &workdir,
+            &url,
+            "job",
+            &a.to_string(),
+            Some("Nostr token".to_owned()),
+        )
+        .expect_err("the layout is refused");
         assert!(
             matches!(&err, TransportError::Transport(m) if m.contains("commondir")),
             "{err}"

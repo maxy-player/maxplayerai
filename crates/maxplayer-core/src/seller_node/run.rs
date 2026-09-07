@@ -6687,13 +6687,16 @@ impl SellerNodeRunner {
             let branch = format!("maxplayer/{}", &job_id[..8.min(job_id.len())]);
             // Single source for the delivery ref. The branch-scoped push token (below) is minted for
             // THIS refname, and the push refspec `push_branch_with_header` builds is
-            // `refs/heads/{branch}:refs/heads/{branch}` — both derive from `branch`, so the token scope
-            // and the ref actually pushed cannot drift apart. The relay (PR #929) demands the scope be
-            // fully qualified (`refs/heads/…`); a bare branch name is rejected.
+            // `<gated oid>:refs/heads/{branch}` — the destination derives from `branch`, so the token
+            // scope and the ref actually pushed cannot drift apart. The relay (PR #929) demands the
+            // scope be fully qualified (`refs/heads/…`); a bare branch name is rejected.
             let push_ref = crate::git_transport::delivery_ref(&branch);
             let message = delivery_message(&offer.task);
             let job_hash = job_hash_for_offer(job_id, &offer.task, offer.amount_sats);
-            if let Err(error) = seller_git::snapshot_delivery_at_off_runtime(
+            // The gated commit. The push below sends THIS object and reads the remote back against
+            // it, so the delivered commit is the one the gate produced, whatever the local branch
+            // says at push time (C6).
+            let gated_oid = match seller_git::snapshot_delivery_at_off_runtime(
                 workdir.clone(),
                 identity.clone(),
                 // #616: parent the delivery commit on the base the workdir was provisioned at. A
@@ -6707,31 +6710,35 @@ impl SellerNodeRunner {
             )
             .await
             {
-                // Harness-attributable: the agent returned success having left nothing to deliver. This
-                // is the site that fires on a quota-dead harness — its turn "completes", so the agent-run
-                // arm above sees no error at all — which is why the trigger cannot live at one site.
-                self.drop_harness(
-                    harness,
-                    Some(ExecutionFailure::Harness(Fault::Unproven)),
-                );
-                let (reason_code, feedback) = match error {
-                    seller_git::SellerGitError::NoExecutionObserved(_) => {
-                        opline!(
-                            "seller node execute fail job_id={job_id}: delivery refused no_sentinel — {error}"
-                        );
-                        (ReasonCode::NoSentinel, NO_SENTINEL_FEEDBACK)
-                    }
-                    _ => {
-                        opline!(
-                            "seller node execute fail job_id={job_id}: delivery snapshot failed ({error})"
-                        );
-                        (ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK)
-                    }
-                };
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, reason_code, feedback, None)
-                    .await;
-                return;
-            }
+                Ok(oid) => oid,
+                Err(error) => {
+                    // Harness-attributable: the agent returned success having left nothing to deliver.
+                    // This is the site that fires on a quota-dead harness — its turn "completes", so the
+                    // agent-run arm above sees no error at all — which is why the trigger cannot live at
+                    // one site.
+                    self.drop_harness(
+                        harness,
+                        Some(ExecutionFailure::Harness(Fault::Unproven)),
+                    );
+                    let (reason_code, feedback) = match error {
+                        seller_git::SellerGitError::NoExecutionObserved(_) => {
+                            opline!(
+                                "seller node execute fail job_id={job_id}: delivery refused no_sentinel — {error}"
+                            );
+                            (ReasonCode::NoSentinel, NO_SENTINEL_FEEDBACK)
+                        }
+                        _ => {
+                            opline!(
+                                "seller node execute fail job_id={job_id}: delivery snapshot failed ({error})"
+                            );
+                            (ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK)
+                        }
+                    };
+                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, reason_code, feedback, None)
+                        .await;
+                    return;
+                }
+            };
 
             // Push under the seller's NIP-98 auth. The push authorization is signed THROUGH the signer
             // actor (which owns the seller key), so the push path is NOT a third custody site — the key
@@ -6759,11 +6766,13 @@ impl SellerNodeRunner {
             // per-job branches to the same repo, and concurrent git-receive-pack to one repo is what the
             // relay 409s (surfaced as terminal delivery_failed before this). Serializing removes the race;
             // the push oid is stable (invariant 2), so ordering never duplicates a delivery.
-            // Harden the workdir's `.git/config` (a whole-file replacement) BEFORE pushing, so an
-            // `insteadOf` the agent planted cannot redirect the seller's token to a host it chose
-            // (tests/hostile_local_git_config.rs). Safe here: the job container has already exited, so no
-            // agent process is alive to re-plant the redirect between the rewrite and the push. Both run
-            // in one blocking op inside `neutralize_then_push_off_runtime`.
+            // Gate the workdir layout and REPLACE its `.git/config` BEFORE pushing, so an `insteadOf`
+            // the agent planted cannot redirect the seller's token to a host it chose
+            // (tests/hostile_local_git_config.rs); the transport also binds every leg to
+            // `seller.git_remote`. Safe here: the job container has already exited, so no agent
+            // process is alive to re-plant the redirect between the rewrite and the push. Both run in
+            // one blocking op inside `neutralize_then_push_off_runtime`, which pushes the gated object
+            // and returns the oid the remote attests.
             let commit = match serialized_bounded_push(
                 &self.delivery_push_lock,
                 DELIVERY_PUSH_TIMEOUT,
@@ -6772,6 +6781,7 @@ impl SellerNodeRunner {
                         workdir.clone(),
                         seller.git_remote.clone(),
                         branch.clone(),
+                        gated_oid.clone(),
                         push_header,
                     )
                 },
