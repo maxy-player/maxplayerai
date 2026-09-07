@@ -17,10 +17,11 @@
 //! **Without `--confirm` that is all it does** (a dry run is the default). With `--confirm` it forces
 //! an attempt now — for an operator whose automatic path has been failing, or who has turned it off
 //! with `[platform_fee] auto_remit = false` — paying the invoice from the seller's ecash through
-//! `wallet_ops::melt_within_blocking`, the bounded form of the same gated melt `maxplayer wallet
-//! melt` uses (it honours `allow_real_mints`, and refuses before spending if the quote raised at
-//! payment time would take more than the accrued gross), and recording the settlement so the same
-//! sats are never paid twice. Running it again after a payment pays nothing.
+//! `wallet_ops::pay_melt_quote_blocking`: the payment quote is raised first and checked against the
+//! accrued gross, the store fence binds it to the row, and then exactly that quote is paid by id
+//! (the same gated melt `maxplayer wallet melt` uses underneath — it honours `allow_real_mints` —
+//! split into its quote step and its pay step), and recording the settlement so the same sats are
+//! never paid twice. Running it again after a payment pays nothing.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -300,14 +301,20 @@ pub(crate) fn render(
             (None, _, _) => "not observed".to_owned(),
         };
         let state = match row.state {
-            RemittanceState::Planned => "PLANNED (settling — re-run remit to reconcile)",
-            // Addendum 4 §1: the owner's compare-and-set admitted the melt. Never released on time;
-            // reconciliation settles it on PAID and releases it on FAILED/expired, else holds.
-            RemittanceState::Spending => {
-                "SPENDING (melt admitted; resolved only by the mint's verdict on its quote — re-run remit to reconcile)"
+            RemittanceState::Planned => {
+                "PLANNED (settling — re-run remit to reconcile)".to_owned()
             }
-            RemittanceState::Settled => "settled",
-            RemittanceState::Failed => "failed (no sats left; receipts released)",
+            // Addendum 4 §1 / addendum 5 §1: the owner's compare-and-set admitted the melt and bound
+            // the quote it pays. Never released on time; reconciliation asks the mint about THAT
+            // quote — settles on PAID, releases on FAILED or UNPAID past expiry + margin, else holds.
+            RemittanceState::Spending => format!(
+                "SPENDING (melt admitted, bound to melt quote {}; resolved only by the mint's verdict on that quote — re-run remit to reconcile)",
+                row.spending_quote_id
+                    .as_deref()
+                    .unwrap_or("none recorded — admitted before quotes were bound")
+            ),
+            RemittanceState::Settled => "settled".to_owned(),
+            RemittanceState::Failed => "failed (no sats left; receipts released)".to_owned(),
         };
         text.push_str(&format!(
             "  {}: {} sats to {} — gross {} sats, melt fee {}, invoice {}, {} receipt{}, planned at unix {}{}\n",
@@ -412,6 +419,9 @@ fn remit_live(home: Option<PathBuf>, confirm: bool, out: &mut dyn Write) -> Resu
         // A melt refused at the ceiling (addendum 3 §1) spent nothing and needs no operator action
         // beyond a later retry: it exits like any other refusal, not like a failed payment.
         RemitOutcome::MeltRefused { .. } => REFUSED,
+        // The payment quote could not be raised (addendum 5 §1): nothing spent, the planned row
+        // released — a failed effect the operator should see, like a failed payment.
+        RemitOutcome::QuoteFailed { .. } => RUNTIME_ERROR,
         RemitOutcome::MeltFailed { .. } => RUNTIME_ERROR,
     })
 }
@@ -748,7 +758,7 @@ mod tests {
             "  failed (no sats left; receipts released): 6 sats to maxplayer@agi.cash — gross 7 sats, melt fee not observed, invoice old, 0 receipts, planned at unix 5, resolved at unix 6\n",
             "  settled: 9 sats to maxplayer@agi.cash — gross 10 sats, melt fee 1 sats, invoice abc123, 1 receipt, planned at unix 7, resolved at unix 8\n",
             "  settled: 17 sats to maxplayer@agi.cash — gross 20 sats, melt fee not observed (settled by reconciliation against the mint, which reports the quote paid but not the fee it kept; at most 3 sats, the quote's reserve), invoice rec, 2 receipts, planned at unix 9, resolved at unix 10\n",
-            "  SPENDING (melt admitted; resolved only by the mint's verdict on its quote — re-run remit to reconcile): 3 sats to maxplayer@agi.cash — gross 4 sats, melt fee not observed, invoice mid, 1 receipt, planned at unix 11\n",
+            "  SPENDING (melt admitted, bound to melt quote q-mid-pay; resolved only by the mint's verdict on that quote — re-run remit to reconcile): 3 sats to maxplayer@agi.cash — gross 4 sats, melt fee not observed, invoice mid, 1 receipt, planned at unix 11\n",
         ] {
             assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
         }
@@ -1003,7 +1013,7 @@ mod tests {
     }
 
     // §4 gate 1 in code: the live path builds its effects on the packaged wallet through
-    // `wallet_ops::melt_within_blocking` — but `run remit` on a store with NOTHING unremitted returns before
+    // `wallet_ops::pay_melt_quote_blocking` — but `run remit` on a store with NOTHING unremitted returns before
     // any network or wallet call, so this exercises the real CLI entry point offline, including the
     // line that tells the operator whether the automatic remittance is on.
     #[test]

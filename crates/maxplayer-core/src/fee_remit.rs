@@ -36,15 +36,17 @@
 //! minimum — the expected steady state for small sellers, not an error; probe the mint's melt fee
 //! reserve on the gross and invoice the **net**, so the fee comes OUT of the accrued amount; journal
 //! the plan (which pins the receipts, records this process as the row's owner under a lease, and
-//! refuses a duplicate — the idempotency that makes two concurrent collects pay at most once); pass
-//! the **pre-spend gate** — ONE compare-and-set in the store advances the row `planned → spending`
-//! (only if still planned, still ours, with more than [`SPEND_MARGIN`] of lease left at the clock
-//! read at that instant; zero rows changed is a refusal), then melt under a hard [`MeltCeiling`]
-//! through [`crate::wallet_ops::melt_within_blocking`], the same gated melt `maxplayer wallet melt`
-//! uses (it honours `allow_real_mints`), which refuses BEFORE any proof is spent if the quote raised
-//! at payment time would take more than the accrued gross; settle. Every attempt that meant to pay
-//! is journaled with its outcome (`fee_remit_attempts`), so a payout that keeps failing is visible
-//! in the read-out rather than silent.
+//! refuses a duplicate — the idempotency that makes two concurrent collects pay at most once); raise
+//! the **payment quote** and check it against the hard [`MeltCeiling`] (refused ⇒ the planned row is
+//! released, nothing spent); pass the **pre-spend gate** — ONE compare-and-set in the store advances
+//! the row `planned → spending` and BINDS that quote to it (only if still planned, still ours, with
+//! more than [`SPEND_MARGIN`] of lease left at the clock read INSIDE the store call; zero rows
+//! changed is a refusal); then pay exactly that quote, by id, through
+//! [`crate::wallet_ops::pay_melt_quote_blocking`] — the same gated melt `maxplayer wallet melt`
+//! uses (it honours `allow_real_mints`), split into its quote step and its pay step, which re-checks
+//! the ceiling BEFORE any proof is spent and never raises a second quote; settle. Every attempt that
+//! meant to pay is journaled with its outcome (`fee_remit_attempts`), so a payout that keeps failing
+//! is visible in the read-out rather than silent.
 //!
 //! ## The two invariants (stage 2a, addendum 3; the fence of addendum 4)
 //!
