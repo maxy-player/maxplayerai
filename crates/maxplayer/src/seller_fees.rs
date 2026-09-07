@@ -1,5 +1,6 @@
 //! `maxplayer seller fees` — the seller-facing read-out of the platform fee journal — and
-//! `maxplayer seller fees remit`, the ONE command in this product that pays the accrued fee out.
+//! `maxplayer seller fees remit`, the operator's inspection and recovery path over the platform fee
+//! remittance the seller node performs automatically after each collected payment.
 //!
 //! `seller fees` prints, per collected job and as a total, the four figures a seller needs to see
 //! without doing arithmetic or reading source: what the buyer paid (the offer amount), the mint's
@@ -8,15 +9,16 @@
 //! to money: it opens `seller.sqlite` (applying the store's additive schema migration if the file
 //! predates the current version), reads, prints, and exits.
 //!
-//! `seller fees remit` resolves the platform's Lightning address over LNURL-pay, takes a melt quote
-//! for the unremitted balance, and prints the plan. **Without `--confirm` that is all it does** (a
-//! dry run is the default). With `--confirm` it journals the attempt, pays the invoice from the
-//! seller's ecash through `wallet_ops::melt_blocking` — the same gated melt `maxplayer wallet melt`
-//! uses, honouring `allow_real_mints` — and records the settlement so the same sats are never paid
-//! twice. The command is idempotent: a second `--confirm` after a settled remittance finds nothing
-//! unremitted and pays nothing; an interrupted one is reconciled with the mint on the next run, never
-//! repeated. **Nothing else in this binary calls the remit path** — no timer, no startup sweep,
-//! nothing on the payment path.
+//! `seller fees remit` is the second of the two callers of `maxplayer_core::fee_remit::remit` (the
+//! first is the seller node's collect path). It prints the recent remittance attempts and their
+//! outcomes, reconciles an attempt interrupted mid-payment, resolves the platform's Lightning
+//! address over LNURL-pay, takes a melt quote for the unremitted balance, and prints the plan.
+//! **Without `--confirm` that is all it does** (a dry run is the default). With `--confirm` it forces
+//! an attempt now — for an operator whose automatic path has been failing, or who has turned it off
+//! with `[platform_fee] auto_remit = false` — paying the invoice from the seller's ecash through
+//! `wallet_ops::melt_blocking`, the same gated melt `maxplayer wallet melt` uses (it honours
+//! `allow_real_mints`), and recording the settlement so the same sats are never paid twice. Running
+//! it again after a payment pays nothing.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -123,7 +125,7 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
 fn usage(w: &mut dyn Write) {
     let _ = writeln!(
         w,
-        "Usage:\n  maxplayer seller fees [--home <dir>]\n  maxplayer seller fees remit [--home <dir>] [--dry-run | --confirm]\n\n`seller fees` prints, for every job this seat has collected payment on, what the buyer paid, the\nmint's fee, the platform fee (rate and sats) and what you keep, then the totals — the platform fee\nbroken out by the rate each job was recorded at and split into remitted / unremitted — and every\nremittance so far. Moves no sats (it only opens, reads and prints the seller store).\n\n`seller fees remit` pays the UNREMITTED platform fee to the platform's Lightning address\n(fixed in the product; not configurable). The default is a DRY RUN: it resolves the address,\nquotes the mint's melt fee, prints the plan and moves nothing. Only `--confirm` pays, and it\npays at most the unremitted total — the mint's melt fee comes out of that amount, never on top.\nIt refuses (exit 3, nothing moved) when nothing is unremitted, when the balance is below the\ndestination's minimum (small balances accumulate until they clear it), or when an earlier\nattempt is still settling. Running it again after a payment pays nothing: the receipts it\ndischarged are recorded, and an interrupted attempt is reconciled with the mint, not repeated.\nExit 0 = dry run printed or payment made; 1 = usage; 2 = error; 3 = refused, nothing moved."
+        "Usage:\n  maxplayer seller fees [--home <dir>]\n  maxplayer seller fees remit [--home <dir>] [--dry-run | --confirm]\n\n`seller fees` prints, for every job this seat has collected payment on, what the buyer paid, the\nmint's fee, the platform fee (rate and sats) and what you keep, then the totals — the platform fee\nbroken out by the rate each job was recorded at and split into remitted / unremitted — and every\nremittance so far. Moves no sats (it only opens, reads and prints the seller store).\n\nThe seller node pays the platform fee AUTOMATICALLY: after each payment it collects, it remits the\nunremitted balance to the platform's Lightning address (fixed in the product; not configurable),\nbest-effort — a failed attempt is logged and tried again after the next payment. Set\n`[platform_fee] auto_remit = false` in config.toml to stop the automatic attempt; the fee still\naccrues and is still owed.\n\n`seller fees remit` is inspection and recovery. The default is a DRY RUN: it prints the recent\nattempts and their outcomes, resolves the address, quotes the mint's melt fee, prints the plan and\nmoves nothing. `--confirm` pays NOW (whether or not auto_remit is on), at most the unremitted total —\nthe mint's melt fee comes out of that amount, never on top. It refuses (exit 3, nothing moved) when\nnothing is unremitted, when the balance is below the destination's minimum (small balances\naccumulate until they clear it), or when an earlier attempt is still settling. Running it again\nafter a payment pays nothing: the receipts it discharged are recorded, and an interrupted attempt\nis reconciled with the mint, not repeated.\nExit 0 = dry run printed or payment made; 1 = usage; 2 = error; 3 = refused, nothing moved."
     );
 }
 
@@ -348,96 +350,24 @@ pub(crate) fn platform_fee_by_rate(
     rates.sort_by_key(|rate| rate.fee_bps);
     rates
 }
-
 // ---- remit ------------------------------------------------------------------------------------
 
-/// The remit command's effects on the world, behind a trait so the decision logic — what is paid,
-/// when, and what is refused — is tested without a network or a mint. Exactly one method moves
-/// money: [`Self::melt`]. Everything else reads.
-#[cfg(feature = "wallet")]
-pub(crate) trait RemitEffects {
-    /// LNURL step 1–2: the destination's payRequest (callback + sendable bounds).
-    fn pay_request(
-        &mut self,
-        address: &maxplayer_core::lnurl_pay::LightningAddress,
-    ) -> Result<maxplayer_core::lnurl_pay::PayRequest, String>;
-    /// LNURL step 3–4: an invoice for exactly `amount_sats`.
-    fn invoice(
-        &mut self,
-        pay: &maxplayer_core::lnurl_pay::PayRequest,
-        amount_sats: u64,
-    ) -> Result<maxplayer_core::lnurl_pay::ResolvedInvoice, String>;
-    /// A melt quote for the invoice — the mint's fee reserve — WITHOUT paying.
-    fn melt_estimate(
-        &mut self,
-        bolt11: &str,
-    ) -> Result<maxplayer_core::wallet_ops::MeltEstimate, String>;
-    /// **The payment.** Pays the invoice from the seller's ecash. The only method here that spends.
-    fn melt(&mut self, bolt11: &str) -> Result<maxplayer_core::wallet_ops::MeltOutcome, String>;
-    /// What the mint says about the melt quote(s) this wallet raised for the invoice, if any —
-    /// used to reconcile an interrupted attempt.
-    fn melt_status(
-        &mut self,
-        bolt11: &str,
-    ) -> Result<Option<maxplayer_core::wallet_ops::MeltQuoteStatus>, String>;
-}
-
-/// The shipped effects: LNURL over https, the packaged CDK wallet at `home`, the home's default
-/// mint (the first accepted mint — where a seller's receipts land).
-#[cfg(feature = "wallet")]
-struct LiveEffects {
-    home: maxplayer_core::home::MaxplayerHome,
-    fetch: maxplayer_core::lnurl_pay::HttpsFetch,
-}
-
-#[cfg(feature = "wallet")]
-impl RemitEffects for LiveEffects {
-    fn pay_request(
-        &mut self,
-        address: &maxplayer_core::lnurl_pay::LightningAddress,
-    ) -> Result<maxplayer_core::lnurl_pay::PayRequest, String> {
-        maxplayer_core::lnurl_pay::fetch_pay_request(&self.fetch, address)
-            .map_err(|error| error.to_string())
-    }
-
-    fn invoice(
-        &mut self,
-        pay: &maxplayer_core::lnurl_pay::PayRequest,
-        amount_sats: u64,
-    ) -> Result<maxplayer_core::lnurl_pay::ResolvedInvoice, String> {
-        maxplayer_core::lnurl_pay::request_invoice(&self.fetch, pay, amount_sats)
-            .map_err(|error| error.to_string())
-    }
-
-    fn melt_estimate(
-        &mut self,
-        bolt11: &str,
-    ) -> Result<maxplayer_core::wallet_ops::MeltEstimate, String> {
-        maxplayer_core::wallet_ops::melt_quote_blocking(&self.home, bolt11, None)
-            .map_err(|error| error.to_string())
-    }
-
-    fn melt(&mut self, bolt11: &str) -> Result<maxplayer_core::wallet_ops::MeltOutcome, String> {
-        maxplayer_core::wallet_ops::melt_blocking(&self.home, bolt11, None)
-            .map_err(|error| error.to_string())
-    }
-
-    fn melt_status(
-        &mut self,
-        bolt11: &str,
-    ) -> Result<Option<maxplayer_core::wallet_ops::MeltQuoteStatus>, String> {
-        maxplayer_core::wallet_ops::melt_status_for_invoice_blocking(&self.home, bolt11, None)
-            .map_err(|error| error.to_string())
-    }
-}
-
+/// `maxplayer seller fees remit`: the operator's inspection and recovery path over the ONE remit
+/// entry point in the product, [`maxplayer_core::fee_remit::remit`] — the same function the seller
+/// node calls automatically after every collected payment. Here it runs against the shipped effects
+/// (LNURL over https, the packaged wallet at `home`, the home's default mint), as a dry run unless
+/// `--confirm` was passed, and maps the outcome to an exit code so a script cannot read a refusal
+/// as a payment. Note that `--confirm` pays regardless of `[platform_fee] auto_remit`: that switch
+/// governs the automatic attempt only, and this command is how an operator pays when it is off.
 #[cfg(feature = "wallet")]
 fn remit_live(home: Option<PathBuf>, confirm: bool, out: &mut dyn Write) -> Result<i32, String> {
+    use maxplayer_core::fee_remit::{LiveEffects, RemitOutcome, RemitTrigger, remit};
+
     let (store, root, db) = open_store(&home)?;
     let home = maxplayer_core::home::bootstrap(&root)
         .map_err(|error| format!("open home {}: {error}", root.display()))?;
-    let fetch = maxplayer_core::lnurl_pay::HttpsFetch::new().map_err(|error| error.to_string())?;
-    let mut effects = LiveEffects { home, fetch };
+    let auto_remit = home.config.platform_fee.auto_remit;
+    let mut effects = LiveEffects::new(home)?;
     let now_unix = i64::try_from(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -446,279 +376,26 @@ fn remit_live(home: Option<PathBuf>, confirm: bool, out: &mut dyn Write) -> Resu
     )
     .map_err(|error| format!("clock: {error}"))?;
     let _ = writeln!(out, "Platform fee remittance — {}", db.display());
-    remit(&store, &mut effects, confirm, now_unix, out)
-}
-
-/// The remit decision logic. Returns the exit code; `Err` is a runtime error that is printed by the
-/// caller. Every refusal prints its reason and returns [`REFUSED`] having moved nothing.
-///
-/// Order of operations, and why:
-/// 1. Reconcile any `planned` row first — a payment may be in flight from an interrupted run, and
-///    nothing may be planned on top of it. PAID ⇒ settle; UNPAID/FAILED/no quote ⇒ fail and release;
-///    PENDING ⇒ refuse this run.
-/// 2. Read the unremitted total. Zero ⇒ refuse (nothing to do), before any network.
-/// 3. Resolve the destination; refuse below its minimum with the shortfall (expected for small
-///    sellers, not an error).
-/// 4. Probe the melt fee reserve on an invoice for the GROSS, then invoice for `gross − reserve` so
-///    the fee comes out of the accrued amount — a seller never pays more than it accrued — and check
-///    the second quote still fits.
-/// 5. Print the plan. Without `--confirm`, stop.
-/// 6. Journal the plan (pins the receipts; refuses a duplicate), then melt, then settle. A melt
-///    error leaves the row `planned` for step 1 of the next run.
-#[cfg(feature = "wallet")]
-pub(crate) fn remit(
-    store: &maxplayer_core::seller_node::store::SellerStore,
-    effects: &mut dyn RemitEffects,
-    confirm: bool,
-    now_unix: i64,
-    out: &mut dyn Write,
-) -> Result<i32, String> {
-    use maxplayer_core::lnurl_pay::LightningAddress;
-    use maxplayer_core::platform_fee::PLATFORM_FEE_ADDRESS;
-    use maxplayer_core::seller_node::store::{PlanRefused, RemittancePlan};
-    use maxplayer_core::wallet_ops::MeltQuoteState;
-
-    // 1. Reconcile an in-flight attempt before anything else.
-    if let Some(active) = store
-        .in_flight_remittance()
-        .map_err(|error| format!("read remittances: {error}"))?
-    {
-        let _ = writeln!(
-            out,
-            "Reconciling in-flight remittance {} (planned at unix {}: {} sats to {}, gross {} sats)",
-            active.remittance_id,
-            active.created_at_unix,
-            active.net_sats,
-            active.destination,
-            active.gross_sats
-        );
-        match effects.melt_status(&active.bolt11)? {
-            None => {
-                store
-                    .fail_remittance(&active.remittance_id, now_unix)
-                    .map_err(|error| format!("record failed remittance: {error}"))?;
-                let _ = writeln!(
-                    out,
-                    "  the wallet never raised a melt quote for its invoice — no sats left the wallet; released {} sats back to unremitted",
-                    active.gross_sats
-                );
-            }
-            Some(status) => match status.state {
-                MeltQuoteState::Paid => {
-                    store
-                        .settle_remittance(
-                            &active.remittance_id,
-                            None,
-                            None,
-                            Some(&status.quote_id),
-                            now_unix,
-                        )
-                        .map_err(|error| format!("record settled remittance: {error}"))?;
-                    let _ = writeln!(
-                        out,
-                        "  mint {} reports melt quote {} PAID — recorded as settled: {} sats reached {} (melt fee not observed by this run)",
-                        status.mint_url, status.quote_id, active.net_sats, active.destination
-                    );
-                }
-                MeltQuoteState::Unpaid | MeltQuoteState::Failed => {
-                    store
-                        .fail_remittance(&active.remittance_id, now_unix)
-                        .map_err(|error| format!("record failed remittance: {error}"))?;
-                    let _ = writeln!(
-                        out,
-                        "  mint {} reports melt quote {} {} — no sats left the wallet; released {} sats back to unremitted",
-                        status.mint_url, status.quote_id, status.state, active.gross_sats
-                    );
-                }
-                MeltQuoteState::Pending | MeltQuoteState::Unknown => {
-                    let _ = writeln!(
-                        out,
-                        "  mint {} reports melt quote {} {}: the payment is still settling. REFUSED — nothing moved by this run; re-run later to reconcile.",
-                        status.mint_url, status.quote_id, status.state
-                    );
-                    return Ok(REFUSED);
-                }
-            },
+    let _ = writeln!(
+        out,
+        "Automatic remittance after each collected payment: {}",
+        if auto_remit {
+            "ON ([platform_fee] auto_remit = true, the default)"
+        } else {
+            "OFF ([platform_fee] auto_remit = false) — the fee still accrues and is owed; this command pays it"
         }
-    }
-
-    // 2. What is owed.
-    let accrued = store
-        .accrued_fees()
-        .map_err(|error| format!("read receipts: {error}"))?;
-    let gross = accrued.unremitted_fee_sats;
-    let _ = writeln!(
-        out,
-        "Accrued platform fee: {} sats all-time — {} sats remitted, {} sats unremitted",
-        accrued.total_fee_sats, accrued.remitted_fee_sats, gross
     );
-    if gross == 0 {
-        let _ = writeln!(out, "Nothing to remit. REFUSED — nothing moved.");
-        return Ok(REFUSED);
-    }
-
-    // 3. The destination and its bounds.
-    let address =
-        LightningAddress::parse(PLATFORM_FEE_ADDRESS).map_err(|error| error.to_string())?;
-    let pay = effects.pay_request(&address)?;
-    let min_sats = pay.min_sendable_sats();
-    let max_sats = pay.max_sendable_sats();
-    let _ = writeln!(
-        out,
-        "Destination: {address} (LNURL-pay; accepts {min_sats} to {max_sats} sats)"
-    );
-    if gross < min_sats {
-        let _ = writeln!(
-            out,
-            "REFUSED — unremitted {gross} sats is below the destination's minimum of {min_sats} sats ({} sats short). The balance accumulates until it clears the minimum. Nothing moved.",
-            min_sats - gross
-        );
-        return Ok(REFUSED);
-    }
-    if gross > max_sats {
-        let _ = writeln!(
-            out,
-            "REFUSED — unremitted {gross} sats exceeds the destination's maximum of {max_sats} sats; this command remits the whole balance or nothing. Nothing moved."
-        );
-        return Ok(REFUSED);
-    }
-
-    // 4. The melt fee comes OUT of the gross. Probe the reserve on the gross, then invoice the net.
-    let probe = effects.invoice(&pay, gross)?;
-    let probe_estimate = effects.melt_estimate(&probe.bolt11)?;
-    if probe_estimate.amount_sats != gross {
-        return Err(format!(
-            "mint {} quoted {} sats for a {gross}-sat invoice; refusing",
-            probe_estimate.mint_url, probe_estimate.amount_sats
-        ));
-    }
-    let reserve = probe_estimate.fee_reserve_sats;
-    if reserve >= gross {
-        let _ = writeln!(
-            out,
-            "REFUSED — mint {} needs a melt fee reserve of {reserve} sats to pay {gross} sats, which leaves nothing for the destination. The balance accumulates. Nothing moved.",
-            probe_estimate.mint_url
-        );
-        return Ok(REFUSED);
-    }
-    let net = gross - reserve;
-    if net < min_sats {
-        let _ = writeln!(
-            out,
-            "REFUSED — after the mint's melt fee reserve ({reserve} sats) the {gross} sats unremitted leaves {net} sats, below the destination's minimum of {min_sats} sats ({} sats short). The balance accumulates. Nothing moved.",
-            min_sats - net
-        );
-        return Ok(REFUSED);
-    }
-    let (invoice, estimate) = if reserve == 0 {
-        (probe, probe_estimate)
+    let trigger = if confirm {
+        RemitTrigger::Command
     } else {
-        let invoice = effects.invoice(&pay, net)?;
-        let estimate = effects.melt_estimate(&invoice.bolt11)?;
-        if estimate.amount_sats != net {
-            return Err(format!(
-                "mint {} quoted {} sats for a {net}-sat invoice; refusing",
-                estimate.mint_url, estimate.amount_sats
-            ));
-        }
-        (invoice, estimate)
+        RemitTrigger::DryRun
     };
-    let debit_ceiling = net.saturating_add(estimate.fee_reserve_sats);
-    if debit_ceiling > gross {
-        let _ = writeln!(
-            out,
-            "REFUSED — mint {} quotes a {} sats fee reserve on {net} sats, so up to {debit_ceiling} sats would leave the wallet against {gross} sats accrued. A seller never pays more than it accrued. Nothing moved.",
-            estimate.mint_url, estimate.fee_reserve_sats
-        );
-        return Ok(REFUSED);
-    }
-
-    // 5. The plan, in the seller's words.
-    let _ = writeln!(
-        out,
-        "Plan:\n  unremitted platform fee (gross): {gross} sats\n  mint melt fee reserve (ceiling): {} sats — taken out of the gross, never on top\n  invoice amount ({address} receives): {net} sats\n  leaves your wallet: at most {debit_ceiling} sats (≤ {gross}); unused reserve returns as change\n  mint: {} (melt quote {})\n  invoice payment hash: {}",
-        estimate.fee_reserve_sats, estimate.mint_url, estimate.quote_id, invoice.payment_hash
-    );
-    if !confirm {
-        let _ = writeln!(
-            out,
-            "DRY RUN — nothing moved. Re-run with --confirm to pay {net} sats to {address}."
-        );
-        return Ok(SUCCESS);
-    }
-
-    // 6. Journal, pay, settle.
-    let plan = RemittancePlan {
-        payment_hash: invoice.payment_hash.clone(),
-        gross_sats: gross,
-        net_sats: net,
-        destination: address.to_string(),
-        bolt11: invoice.bolt11.clone(),
-        melt_quote_id: Some(estimate.quote_id.clone()),
-    };
-    let planned = match store.plan_remittance(&plan, now_unix) {
-        Ok(planned) => planned,
-        Err(PlanRefused::Store(error)) => return Err(format!("journal remittance: {error}")),
-        Err(refused) => {
-            let _ = writeln!(out, "REFUSED — {refused}. Nothing moved.");
-            return Ok(REFUSED);
-        }
-    };
-    let _ = writeln!(
-        out,
-        "Journaled remittance {} covering {} receipt{}; paying...",
-        planned.remittance_id,
-        planned.receipts,
-        if planned.receipts == 1 { "" } else { "s" }
-    );
-    match effects.melt(&invoice.bolt11) {
-        Ok(outcome) => {
-            let settled = store
-                .settle_remittance(
-                    &planned.remittance_id,
-                    Some(outcome.paid_sats),
-                    Some(outcome.fee_sats),
-                    Some(&outcome.quote_id),
-                    now_unix,
-                )
-                .map_err(|error| {
-                    format!(
-                        "PAID {} sats (melt fee {} sats, quote {}) but could not record the settlement: {error}. \
-                         Remittance {} stays planned; re-run to reconcile with the mint before paying anything else.",
-                        outcome.paid_sats, outcome.fee_sats, outcome.quote_id, planned.remittance_id
-                    )
-                })?;
-            let debit = outcome.paid_sats.saturating_add(outcome.fee_sats);
-            let _ = writeln!(
-                out,
-                "PAID — remittance {} settled\n  gross discharged: {} sats\n  melt fee taken by the mint: {} sats\n  net paid to {}: {} sats\n  stays in your wallet (unused reserve): {} sats\n  wallet balance now: {} sats at {}\n  receipts discharged: {}",
-                settled.remittance_id,
-                settled.gross_sats,
-                outcome.fee_sats,
-                settled.destination,
-                outcome.paid_sats,
-                gross.saturating_sub(debit),
-                outcome.balance_sats,
-                outcome.mint_url,
-                settled.receipts
-            );
-            if debit > gross {
-                let _ = writeln!(
-                    out,
-                    "WARNING: the mint debited {debit} sats against {gross} sats accrued — more than the quoted ceiling. Recorded as settled; report this."
-                );
-            }
-            Ok(SUCCESS)
-        }
-        Err(error) => {
-            let _ = writeln!(
-                out,
-                "melt failed: {error}\n  remittance {} stays journaled as planned. The next `maxplayer seller fees remit` reconciles it with the mint: settled if the payment landed, released if it did not. Nothing else was attempted.",
-                planned.remittance_id
-            );
-            Ok(RUNTIME_ERROR)
-        }
-    }
+    let outcome = remit(&store, &mut effects, trigger, now_unix, out)?;
+    Ok(match outcome {
+        RemitOutcome::DryRun | RemitOutcome::Paid { .. } => SUCCESS,
+        RemitOutcome::Refused(_) => REFUSED,
+        RemitOutcome::MeltFailed { .. } => RUNTIME_ERROR,
+    })
 }
 
 #[cfg(test)]
@@ -779,11 +456,9 @@ mod parse_tests {
 #[cfg(all(test, feature = "wallet"))]
 mod tests {
     use super::*;
-    use maxplayer_core::lnurl_pay::{LightningAddress, PayRequest, ResolvedInvoice, Url};
     use maxplayer_core::seller_node::store::{
         AccruedFees, FeeRemittance, JobFeeAccrual, ReceiptFees, RemittanceState, SellerStore,
     };
-    use maxplayer_core::wallet_ops::{MeltEstimate, MeltOutcome, MeltQuoteState, MeltQuoteStatus};
 
     fn row(
         job: &str,
@@ -1250,587 +925,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // ---- remit: the decision logic over scripted effects ----
-
-    /// Scripted effects. `reserve_for(amount)` is the mint's fee reserve policy; `melt_results` are
-    /// consumed in order; `status` answers the reconciliation query. Every call is logged so a test
-    /// can assert what was — and was not — touched.
-    struct Fake {
-        min_msat: u64,
-        max_msat: u64,
-        reserve_for: Box<dyn Fn(u64) -> u64>,
-        melt_results: Vec<Result<(u64, u64), String>>,
-        status: Result<Option<MeltQuoteStatus>, String>,
-        pay_requests: usize,
-        invoices: Vec<u64>,
-        estimates: Vec<String>,
-        melts: Vec<String>,
-        status_calls: Vec<String>,
-    }
-
-    impl Fake {
-        fn new(reserve_for: impl Fn(u64) -> u64 + 'static) -> Self {
-            Self {
-                min_msat: 1000,
-                max_msat: 1_000_000_000,
-                reserve_for: Box::new(reserve_for),
-                melt_results: Vec::new(),
-                status: Ok(None),
-                pay_requests: 0,
-                invoices: Vec::new(),
-                estimates: Vec::new(),
-                melts: Vec::new(),
-                status_calls: Vec::new(),
-            }
-        }
-
-        fn bolt11_for(amount_sats: u64, sequence: usize) -> String {
-            format!("lnbc-fake-{amount_sats}-{sequence}")
-        }
-
-        fn hash_for(amount_sats: u64, sequence: usize) -> String {
-            format!("hash-{amount_sats}-{sequence}")
-        }
-    }
-
-    impl RemitEffects for Fake {
-        fn pay_request(&mut self, address: &LightningAddress) -> Result<PayRequest, String> {
-            assert_eq!(address.to_string(), "maxplayer@agi.cash");
-            self.pay_requests += 1;
-            Ok(PayRequest {
-                callback: Url::parse("https://agi.cash/cb").unwrap(),
-                min_sendable_msat: self.min_msat,
-                max_sendable_msat: self.max_msat,
-            })
-        }
-
-        fn invoice(
-            &mut self,
-            pay: &PayRequest,
-            amount_sats: u64,
-        ) -> Result<ResolvedInvoice, String> {
-            pay.invoice_url(amount_sats)
-                .map_err(|error| error.to_string())?;
-            self.invoices.push(amount_sats);
-            let sequence = self.invoices.len();
-            Ok(ResolvedInvoice {
-                bolt11: Self::bolt11_for(amount_sats, sequence),
-                payment_hash: Self::hash_for(amount_sats, sequence),
-                amount_sats,
-                amount_msat: amount_sats * 1000,
-            })
-        }
-
-        fn melt_estimate(&mut self, bolt11: &str) -> Result<MeltEstimate, String> {
-            self.estimates.push(bolt11.to_owned());
-            let amount_sats: u64 = bolt11
-                .split('-')
-                .nth(2)
-                .and_then(|raw| raw.parse().ok())
-                .expect("fake bolt11 carries its amount");
-            Ok(MeltEstimate {
-                mint_url: "https://mint.example".to_owned(),
-                quote_id: format!("quote-{bolt11}"),
-                amount_sats,
-                fee_reserve_sats: (self.reserve_for)(amount_sats),
-            })
-        }
-
-        fn melt(&mut self, bolt11: &str) -> Result<MeltOutcome, String> {
-            self.melts.push(bolt11.to_owned());
-            let (paid, fee) = self.melt_results.remove(0)?;
-            Ok(MeltOutcome {
-                mint_url: "https://mint.example".to_owned(),
-                paid_sats: paid,
-                fee_sats: fee,
-                balance_sats: 1_000,
-                quote_id: format!("paid-quote-{bolt11}"),
-            })
-        }
-
-        fn melt_status(&mut self, bolt11: &str) -> Result<Option<MeltQuoteStatus>, String> {
-            self.status_calls.push(bolt11.to_owned());
-            self.status.clone()
-        }
-    }
-
-    fn store_with_fees(label: &str, fees: &[u64]) -> (SellerStore, PathBuf) {
-        use maxplayer_core::seller_node::STATE_DB_FILE;
-        let root = temp_home(label);
-        let store = SellerStore::open(root.join(STATE_DB_FILE)).expect("open store");
-        for (index, fee) in fees.iter().enumerate() {
-            store
-                .collect_receipt(
-                    &format!("receipt-{index}"),
-                    &format!("job-{index}"),
-                    fee * 10,
-                    ReceiptFees {
-                        mint_fee_sats: 1,
-                        fee_bps: 1000,
-                        fee_sats: *fee,
-                    },
-                    index as i64 + 1,
-                )
-                .expect("collect");
-        }
-        (store, root)
-    }
-
-    fn run_remit(store: &SellerStore, fake: &mut Fake, confirm: bool, now: i64) -> (i32, String) {
-        let mut out = Vec::new();
-        let code = remit(store, fake, confirm, now, &mut out).expect("remit runs");
-        (code, String::from_utf8(out).expect("utf8"))
-    }
-
-    // §3.2: no flag ⇒ dry run. It resolves, quotes, prints every figure, and MOVES NOTHING: no melt,
-    // no journal row, the unremitted balance untouched.
-    #[test]
-    fn remit_without_confirm_is_a_dry_run_that_prints_the_plan_and_moves_nothing() {
-        let (store, root) = store_with_fees("dry-run", &[10, 5]);
-        let mut fake = Fake::new(|_| 2);
-        let (code, out) = run_remit(&store, &mut fake, false, 100);
-        assert_eq!(code, SUCCESS, "{out}");
-        for needle in [
-            "Accrued platform fee: 15 sats all-time — 0 sats remitted, 15 sats unremitted",
-            "Destination: maxplayer@agi.cash (LNURL-pay; accepts 1 to 1000000 sats)",
-            "unremitted platform fee (gross): 15 sats",
-            "mint melt fee reserve (ceiling): 2 sats — taken out of the gross, never on top",
-            "invoice amount (maxplayer@agi.cash receives): 13 sats",
-            "leaves your wallet: at most 15 sats (≤ 15)",
-            "mint: https://mint.example (melt quote quote-lnbc-fake-13-2)",
-            "invoice payment hash: hash-13-2",
-            "DRY RUN — nothing moved. Re-run with --confirm to pay 13 sats to maxplayer@agi.cash.",
-        ] {
-            assert!(out.contains(needle), "missing {needle:?} in:\n{out}");
-        }
-        assert!(fake.melts.is_empty(), "a dry run never melts");
-        assert_eq!(
-            fake.invoices,
-            vec![15, 13],
-            "probe on the gross, then invoice the net"
-        );
-        assert_eq!(fake.estimates.len(), 2);
-        assert!(
-            store.remittances().expect("rows").is_empty(),
-            "a dry run journals nothing"
-        );
-        assert_eq!(store.accrued_fees().expect("read").unremitted_fee_sats, 15);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    // §3.2 + §3.3 + §3.4: `--confirm` pays ONCE, the fee comes out of the gross, the settlement is
-    // journaled with gross / melt fee / net / destination literal / payment hash / quote id, the
-    // receipts are discharged — and a second `--confirm` pays nothing.
-    #[test]
-    fn remit_confirm_pays_once_takes_the_fee_out_of_the_gross_and_is_idempotent() {
-        let (store, root) = store_with_fees("confirm", &[10, 5]);
-        let mut fake = Fake::new(|_| 2);
-        fake.melt_results = vec![Ok((13, 1))];
-        let (code, out) = run_remit(&store, &mut fake, true, 100);
-        assert_eq!(code, SUCCESS, "{out}");
-        assert_eq!(
-            fake.melts,
-            vec!["lnbc-fake-13-2".to_owned()],
-            "exactly one melt, of the NET invoice"
-        );
-        for needle in [
-            "Journaled remittance hash-13-2 covering 2 receipts; paying...",
-            "PAID — remittance hash-13-2 settled",
-            "gross discharged: 15 sats",
-            "melt fee taken by the mint: 1 sats",
-            "net paid to maxplayer@agi.cash: 13 sats",
-            "stays in your wallet (unused reserve): 1 sats",
-            "wallet balance now: 1000 sats at https://mint.example",
-            "receipts discharged: 2",
-        ] {
-            assert!(out.contains(needle), "missing {needle:?} in:\n{out}");
-        }
-        assert!(!out.contains("WARNING"), "{out}");
-        let rows = store.remittances().expect("rows");
-        assert_eq!(rows.len(), 1);
-        let row = &rows[0];
-        assert_eq!(row.state, RemittanceState::Settled);
-        assert_eq!(row.remittance_id, "hash-13-2");
-        assert_eq!(row.payment_hash, "hash-13-2");
-        assert_eq!(row.bolt11, "lnbc-fake-13-2");
-        assert_eq!(
-            (row.gross_sats, row.melt_fee_sats, row.net_sats),
-            (15, Some(1), 13)
-        );
-        assert_eq!(
-            row.destination, "maxplayer@agi.cash",
-            "the literal paid is journaled"
-        );
-        assert_eq!(
-            row.melt_quote_id,
-            Some("paid-quote-lnbc-fake-13-2".to_owned())
-        );
-        assert_eq!((row.created_at_unix, row.settled_at_unix), (100, Some(100)));
-        assert_eq!(row.receipts, 2);
-        let accrued = store.accrued_fees().expect("read");
-        assert_eq!(accrued.unremitted_fee_sats, 0);
-        assert_eq!(accrued.remitted_fee_sats, 15);
-        assert!(
-            accrued
-                .by_job
-                .iter()
-                .all(|r| r.remittance_id.as_deref() == Some("hash-13-2"))
-        );
-
-        // Idempotent: a second --confirm finds nothing unremitted, touches no network, pays nothing.
-        let pay_requests_before = fake.pay_requests;
-        let (code, out) = run_remit(&store, &mut fake, true, 101);
-        assert_eq!(code, REFUSED, "{out}");
-        assert!(
-            out.contains("Nothing to remit. REFUSED — nothing moved."),
-            "{out}"
-        );
-        assert_eq!(
-            fake.pay_requests, pay_requests_before,
-            "no LNURL round trip"
-        );
-        assert_eq!(fake.melts.len(), 1, "still exactly one melt, ever");
-        assert_eq!(store.remittances().expect("rows").len(), 1);
-
-        // A new receipt after the settlement is the only thing the next remittance covers.
-        store
-            .collect_receipt(
-                "receipt-late",
-                "job-late",
-                200,
-                ReceiptFees {
-                    mint_fee_sats: 2,
-                    fee_bps: 1000,
-                    fee_sats: 20,
-                },
-                102,
-            )
-            .expect("collect late");
-        fake.melt_results = vec![Ok((18, 2))];
-        let (code, out) = run_remit(&store, &mut fake, true, 103);
-        assert_eq!(code, SUCCESS, "{out}");
-        assert!(out.contains("gross discharged: 20 sats"), "{out}");
-        assert_eq!(fake.melts.len(), 2);
-        assert_eq!(store.accrued_fees().expect("read").remitted_fee_sats, 35);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    // The mint's melt fee is zero (some mints charge none): one invoice, one quote, the whole gross
-    // goes to the destination.
-    #[test]
-    fn remit_with_a_zero_fee_reserve_invoices_the_gross_once() {
-        let (store, root) = store_with_fees("zero-reserve", &[10]);
-        let mut fake = Fake::new(|_| 0);
-        fake.melt_results = vec![Ok((10, 0))];
-        let (code, out) = run_remit(&store, &mut fake, true, 100);
-        assert_eq!(code, SUCCESS, "{out}");
-        assert_eq!(
-            fake.invoices,
-            vec![10],
-            "no second invoice when the reserve is zero"
-        );
-        assert_eq!(fake.melts, vec!["lnbc-fake-10-1".to_owned()]);
-        assert!(
-            out.contains("net paid to maxplayer@agi.cash: 10 sats"),
-            "{out}"
-        );
-        assert!(
-            out.contains("stays in your wallet (unused reserve): 0 sats"),
-            "{out}"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    // §3.2: below the resolved minSendable ⇒ refuse with the shortfall printed, no invoice requested,
-    // nothing journaled. This is the steady state for small sellers, not an error.
-    #[test]
-    fn remit_refuses_below_the_resolved_minimum_with_the_shortfall_and_requests_no_invoice() {
-        // Two 10-sat jobs at 10% owe 1 sat each ⇒ gross 2; the destination wants 5000 msat = 5 sats.
-        let (store, root) = store_with_fees("below-min", &[1, 1]);
-        let mut fake = Fake::new(|_| 0);
-        fake.min_msat = 5000;
-        for confirm in [false, true] {
-            let (code, out) = run_remit(&store, &mut fake, confirm, 100);
-            assert_eq!(code, REFUSED, "{out}");
-            assert!(
-                out.contains("REFUSED — unremitted 2 sats is below the destination's minimum of 5 sats (3 sats short)."),
-                "{out}"
-            );
-            assert!(
-                out.contains("accumulates until it clears the minimum"),
-                "{out}"
-            );
-        }
-        assert!(
-            fake.invoices.is_empty(),
-            "no invoice is requested below the minimum"
-        );
-        assert!(fake.melts.is_empty());
-        assert!(store.remittances().expect("rows").is_empty());
-        assert_eq!(store.accrued_fees().expect("read").unremitted_fee_sats, 2);
-
-        // A minimum that is not a whole sat rounds UP: 1500 msat ⇒ 2 sats; gross 2 clears it, gross 1 does not.
-        fake.min_msat = 1500;
-        fake.melt_results = vec![Ok((2, 0))];
-        let (code, out) = run_remit(&store, &mut fake, true, 101);
-        assert_eq!(code, SUCCESS, "{out}");
-        let (store1, root1) = store_with_fees("below-min-1", &[1]);
-        let (code, out) = run_remit(&store1, &mut fake, true, 102);
-        assert_eq!(code, REFUSED, "{out}");
-        assert!(
-            out.contains("below the destination's minimum of 2 sats (1 sats short)"),
-            "{out}"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&root1);
-    }
-
-    // §3.3: the fee reserve is taken OUT of the gross — and when what is left is below the minimum,
-    // or nothing at all, the command refuses rather than paying more than the seller accrued.
-    #[test]
-    fn remit_refuses_when_the_fee_reserve_leaves_too_little_or_nothing() {
-        // Gross 3, reserve 2 ⇒ net 1, below a 2-sat minimum.
-        let (store, root) = store_with_fees("reserve-below-min", &[3]);
-        let mut fake = Fake::new(|_| 2);
-        fake.min_msat = 2000;
-        let (code, out) = run_remit(&store, &mut fake, true, 100);
-        assert_eq!(code, REFUSED, "{out}");
-        assert!(
-            out.contains("REFUSED — after the mint's melt fee reserve (2 sats) the 3 sats unremitted leaves 1 sats, below the destination's minimum of 2 sats (1 sats short)."),
-            "{out}"
-        );
-        assert_eq!(fake.invoices, vec![3], "only the probe was requested");
-        assert!(fake.melts.is_empty());
-        assert!(store.remittances().expect("rows").is_empty());
-
-        // Gross 2, reserve 2 ⇒ nothing left.
-        let (store2, root2) = store_with_fees("reserve-eats-all", &[2]);
-        let mut fake = Fake::new(|_| 2);
-        let (code, out) = run_remit(&store2, &mut fake, true, 100);
-        assert_eq!(code, REFUSED, "{out}");
-        assert!(
-            out.contains("needs a melt fee reserve of 2 sats to pay 2 sats, which leaves nothing for the destination"),
-            "{out}"
-        );
-        assert!(fake.melts.is_empty());
-
-        // A reserve that GROWS on the smaller invoice (non-monotone mint) so net + reserve > gross
-        // is refused: the seller would pay more than it accrued.
-        let (store3, root3) = store_with_fees("reserve-non-monotone", &[15]);
-        let mut fake = Fake::new(|amount| if amount == 15 { 2 } else { 3 });
-        let (code, out) = run_remit(&store3, &mut fake, true, 100);
-        assert_eq!(code, REFUSED, "{out}");
-        assert!(
-            out.contains("quotes a 3 sats fee reserve on 13 sats, so up to 16 sats would leave the wallet against 15 sats accrued"),
-            "{out}"
-        );
-        assert_eq!(fake.invoices, vec![15, 13]);
-        assert!(fake.melts.is_empty());
-        assert!(store3.remittances().expect("rows").is_empty());
-        for root in [root, root2, root3] {
-            let _ = std::fs::remove_dir_all(&root);
-        }
-    }
-
-    // Above the resolved maxSendable: refuse (whole balance or nothing), name the bound.
-    #[test]
-    fn remit_refuses_above_the_resolved_maximum() {
-        let (store, root) = store_with_fees("above-max", &[50]);
-        let mut fake = Fake::new(|_| 0);
-        fake.max_msat = 20_000;
-        let (code, out) = run_remit(&store, &mut fake, true, 100);
-        assert_eq!(code, REFUSED, "{out}");
-        assert!(
-            out.contains("exceeds the destination's maximum of 20 sats"),
-            "{out}"
-        );
-        assert!(fake.invoices.is_empty() && fake.melts.is_empty());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    // §3.4: an interrupted remittance is RECOVERABLE, not repeatable. The melt errors after the plan
-    // was journaled: the row stays planned. The next run asks the mint — PAID ⇒ settled with no second
-    // melt; the receipts stay discharged.
-    #[test]
-    fn remit_interrupted_after_the_plan_is_reconciled_as_paid_without_a_second_melt() {
-        let (store, root) = store_with_fees("interrupted-paid", &[10]);
-        let mut fake = Fake::new(|_| 1);
-        fake.melt_results = vec![Err("connection reset during confirm".to_owned())];
-        let (code, out) = run_remit(&store, &mut fake, true, 100);
-        assert_eq!(code, RUNTIME_ERROR, "{out}");
-        assert!(
-            out.contains("melt failed: connection reset during confirm"),
-            "{out}"
-        );
-        assert!(
-            out.contains("remittance hash-9-2 stays journaled as planned"),
-            "{out}"
-        );
-        let in_flight = store
-            .in_flight_remittance()
-            .expect("query")
-            .expect("a planned row");
-        assert_eq!(in_flight.state, RemittanceState::Planned);
-        assert_eq!(in_flight.bolt11, "lnbc-fake-9-2");
-        assert_eq!(store.accrued_fees().expect("read").in_flight_fee_sats, 10);
-        assert_eq!(fake.melts.len(), 1);
-
-        // Next run, the mint says PAID: settle, keep the receipts discharged, then find nothing left.
-        fake.status = Ok(Some(MeltQuoteStatus {
-            mint_url: "https://mint.example".to_owned(),
-            quote_id: "paid-quote-lnbc-fake-9-2".to_owned(),
-            state: MeltQuoteState::Paid,
-            amount_sats: 9,
-            fee_reserve_sats: 1,
-        }));
-        let (code, out) = run_remit(&store, &mut fake, true, 101);
-        assert_eq!(code, REFUSED, "{out}");
-        assert!(
-            out.contains("Reconciling in-flight remittance hash-9-2 (planned at unix 100: 9 sats to maxplayer@agi.cash, gross 10 sats)"),
-            "{out}"
-        );
-        assert!(
-            out.contains("reports melt quote paid-quote-lnbc-fake-9-2 PAID — recorded as settled: 9 sats reached maxplayer@agi.cash (melt fee not observed by this run)"),
-            "{out}"
-        );
-        assert!(out.contains("Nothing to remit."), "{out}");
-        assert_eq!(fake.status_calls, vec!["lnbc-fake-9-2".to_owned()]);
-        assert_eq!(fake.melts.len(), 1, "reconciliation never melts");
-        let rows = store.remittances().expect("rows");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].state, RemittanceState::Settled);
-        assert_eq!(rows[0].melt_fee_sats, None, "unobserved, not invented");
-        assert_eq!(rows[0].net_sats, 9);
-        assert_eq!(
-            rows[0].melt_quote_id,
-            Some("paid-quote-lnbc-fake-9-2".to_owned())
-        );
-        assert_eq!(rows[0].settled_at_unix, Some(101));
-        let accrued = store.accrued_fees().expect("read");
-        assert_eq!(
-            (
-                accrued.remitted_fee_sats,
-                accrued.unremitted_fee_sats,
-                accrued.in_flight_fee_sats
-            ),
-            (10, 0, 0)
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    // The other reconciliation outcomes: UNPAID/FAILED or no quote at all ⇒ the row fails, the
-    // receipts are released and the SAME run proceeds to a fresh plan (so a dry run prints it and a
-    // confirm pays it once, on a NEW invoice); PENDING ⇒ refuse this run, keep the row, melt nothing.
-    #[test]
-    fn remit_reconciles_an_unpaid_or_pending_interrupted_attempt_without_paying_twice() {
-        let (store, root) = store_with_fees("interrupted-unpaid", &[10]);
-        let mut fake = Fake::new(|_| 1);
-        fake.melt_results = vec![Err("insufficient funds for melt".to_owned())];
-        let (code, _) = run_remit(&store, &mut fake, true, 100);
-        assert_eq!(code, RUNTIME_ERROR);
-
-        // PENDING: refuse, keep the planned row, no melt, no new invoice.
-        fake.status = Ok(Some(MeltQuoteStatus {
-            mint_url: "https://mint.example".to_owned(),
-            quote_id: "q-pending".to_owned(),
-            state: MeltQuoteState::Pending,
-            amount_sats: 9,
-            fee_reserve_sats: 1,
-        }));
-        let invoices_before = fake.invoices.len();
-        let (code, out) = run_remit(&store, &mut fake, true, 101);
-        assert_eq!(code, REFUSED, "{out}");
-        assert!(
-            out.contains(
-                "reports melt quote q-pending PENDING: the payment is still settling. REFUSED"
-            ),
-            "{out}"
-        );
-        assert!(
-            store.in_flight_remittance().expect("query").is_some(),
-            "the row stays planned"
-        );
-        assert_eq!(fake.melts.len(), 1);
-        assert_eq!(
-            fake.invoices.len(),
-            invoices_before,
-            "no new invoice while pending"
-        );
-
-        // UNPAID: fail, release, and continue into a fresh DRY RUN on a new invoice.
-        fake.status = Ok(Some(MeltQuoteStatus {
-            mint_url: "https://mint.example".to_owned(),
-            quote_id: "q-unpaid".to_owned(),
-            state: MeltQuoteState::Unpaid,
-            amount_sats: 9,
-            fee_reserve_sats: 1,
-        }));
-        let (code, out) = run_remit(&store, &mut fake, false, 102);
-        assert_eq!(code, SUCCESS, "{out}");
-        assert!(out.contains("reports melt quote q-unpaid UNPAID — no sats left the wallet; released 10 sats back to unremitted"), "{out}");
-        assert!(out.contains("10 sats unremitted"), "{out}");
-        assert!(out.contains("DRY RUN — nothing moved."), "{out}");
-        assert_eq!(fake.melts.len(), 1);
-        let rows = store.remittances().expect("rows");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].state, RemittanceState::Failed);
-        assert_eq!(rows[0].receipts, 0);
-        assert_eq!(store.accrued_fees().expect("read").unremitted_fee_sats, 10);
-
-        // Now a confirm pays ONCE on a fresh invoice; the failed row's invoice is never reused.
-        fake.status = Ok(None);
-        fake.melt_results = vec![Ok((9, 1))];
-        let (code, out) = run_remit(&store, &mut fake, true, 103);
-        assert_eq!(code, SUCCESS, "{out}");
-        assert_eq!(fake.melts.len(), 2);
-        assert_ne!(
-            fake.melts[0], fake.melts[1],
-            "a fresh invoice, not the failed one"
-        );
-        let rows = store.remittances().expect("rows");
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[1].state, RemittanceState::Settled);
-        assert_eq!(store.accrued_fees().expect("read").remitted_fee_sats, 10);
-
-        // No quote ever raised (the melt died before quoting): fail and release on the next run.
-        let (store2, root2) = store_with_fees("interrupted-noquote", &[10]);
-        let mut fake2 = Fake::new(|_| 1);
-        fake2.melt_results = vec![Err("mint unreachable".to_owned())];
-        assert_eq!(run_remit(&store2, &mut fake2, true, 100).0, RUNTIME_ERROR);
-        fake2.status = Ok(None);
-        let (code, out) = run_remit(&store2, &mut fake2, false, 101);
-        assert_eq!(code, SUCCESS, "{out}");
-        assert!(out.contains("the wallet never raised a melt quote for its invoice — no sats left the wallet; released 10 sats back to unremitted"), "{out}");
-        assert_eq!(
-            store2.remittances().expect("rows")[0].state,
-            RemittanceState::Failed
-        );
-        assert_eq!(fake2.melts.len(), 1);
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&root2);
-    }
-
-    // A status query that itself fails is a runtime error that changes nothing: the row stays
-    // planned and no melt is attempted.
-    #[test]
-    fn remit_leaves_the_row_planned_when_reconciliation_cannot_reach_the_mint() {
-        let (store, root) = store_with_fees("reconcile-error", &[10]);
-        let mut fake = Fake::new(|_| 1);
-        fake.melt_results = vec![Err("boom".to_owned())];
-        assert_eq!(run_remit(&store, &mut fake, true, 100).0, RUNTIME_ERROR);
-        fake.status = Err("mint unreachable".to_owned());
-        let mut out = Vec::new();
-        let error =
-            remit(&store, &mut fake, true, 101, &mut out).expect_err("status failure surfaces");
-        assert_eq!(error, "mint unreachable");
-        assert!(store.in_flight_remittance().expect("query").is_some());
-        assert_eq!(fake.melts.len(), 1);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
     // §4 gate 1 in code: the live path builds its effects on the packaged wallet through
     // `wallet_ops::melt_blocking` — but `run remit` on a store with NOTHING unremitted returns before
-    // any network or wallet call, so this exercises the real entry point offline.
+    // any network or wallet call, so this exercises the real CLI entry point offline, including the
+    // line that tells the operator whether the automatic remittance is on.
     #[test]
     fn run_remit_on_an_empty_store_refuses_before_any_network_or_wallet_call() {
         use maxplayer_core::seller_node::STATE_DB_FILE;
@@ -1860,6 +958,11 @@ mod tests {
                 String::from_utf8_lossy(&err)
             );
             assert!(out.contains("Platform fee remittance — "), "{out}");
+            assert!(
+                out.contains("Automatic remittance after each collected payment: ON ([platform_fee] auto_remit = true, the default)"),
+                "{out}"
+            );
+            assert!(out.contains("Recent attempts: none journaled yet"), "{out}");
             assert!(out.contains("0 sats unremitted"), "{out}");
             assert!(
                 out.contains("Nothing to remit. REFUSED — nothing moved."),

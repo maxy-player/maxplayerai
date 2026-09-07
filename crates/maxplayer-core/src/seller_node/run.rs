@@ -1453,13 +1453,24 @@ fn classify_redeem_outcome<T>(
 /// sats it comes to, rounded down, so the caller journals both beside the receipt.
 ///
 /// Called only after the redeem classified `Finalize`; nothing is computed or recorded for a payment
-/// that did not land. Accrued, never remitted: this returns numbers for the journal and moves no sat.
+/// that did not land. This returns numbers for the journal and moves no sat itself; what pays the
+/// accrued balance is the best-effort remittance the collect path starts AFTER the receipt is
+/// journaled `New` ([`SellerNodeRunner::remit_platform_fee_after_collect`]).
 fn platform_fee_at_collect(amount_received: u64) -> (u32, u64) {
     let fee_bps = crate::platform_fee::PLATFORM_FEE_BPS;
     (
         fee_bps,
         crate::platform_fee::fee_sats(amount_received, fee_bps),
     )
+}
+
+/// The rule for when a collect starts a remittance attempt (stage 2a, addendum 1 rule 1): only a
+/// receipt journaled **New**. A replayed wrap (`Duplicate`) already paid the job once and must not
+/// pay the fee a second time; a failed write journaled nothing, so there is nothing new to remit.
+fn remit_follows_collect(
+    collected: &Result<super::store::Collected, super::store::StoreError>,
+) -> bool {
+    matches!(collected, Ok(super::store::Collected::New))
 }
 
 /// The seal-sender guard: a payment settles a job ONLY when the authenticated NIP-17 seal sender is
@@ -7747,11 +7758,16 @@ impl SellerNodeRunner {
                 return;
             }
         };
-        // Platform fee (stage 1): computed only NOW — after the redeem classified `Finalize` — on the
-        // FACE (what the buyer paid), at the product-set rate, and journaled in the receipt write
-        // below. `kept` is what the seller keeps once the mint's fee and the platform fee are both
-        // taken from the face; it is derived for the log and never stored. Accrued, never remitted:
-        // nothing here or downstream moves a sat on its account.
+        // Platform fee: computed only NOW — after the redeem classified `Finalize` — on the FACE
+        // (what the buyer paid), at the product-set rate, and journaled in the receipt write below.
+        // `kept` is what the seller keeps once the mint's fee and the platform fee are both taken
+        // from the face; it is derived for the log and never stored. Accrued here; REMITTED
+        // automatically (stage 2a) — once the receipt is journaled `New` below, and only then, the
+        // node starts a best-effort attempt to pay the whole unremitted balance to the platform's
+        // Lightning address (`remit_platform_fee_after_collect`). That attempt runs on a thread of
+        // its own and cannot affect this collect: the receipt is written and the job marked paid
+        // before it starts, and a remittance that fails is logged and journaled, leaving the balance
+        // unremitted for the next collect to try again.
         let (fee_bps, fee_sats) = platform_fee_at_collect(amount_received);
         let kept = crate::platform_fee::kept_sats(amount_received, mint_fee_sats, fee_sats);
         opline!(
@@ -7760,7 +7776,7 @@ impl SellerNodeRunner {
 
         // Record the receipt AFTER the money landed (invariant 3 order) — deduped on the wrap id, so a
         // replayed wrap marks the job paid at most once. The fees ride in the same row.
-        match self.node.store().collect_receipt(
+        let collected = self.node.store().collect_receipt(
             &event_id,
             &job_id,
             amount_received,
@@ -7770,7 +7786,8 @@ impl SellerNodeRunner {
                 fee_sats,
             },
             now_unix(),
-        ) {
+        );
+        match &collected {
             Ok(super::store::Collected::New) => {
                 // `event_id` is the kind-1059 payment gift-wrap — the id this collection is
                 // journaled and deduped under. It is NOT the co-signed kind-3400 receipt (the buyer
@@ -7787,6 +7804,59 @@ impl SellerNodeRunner {
             Err(error) => {
                 opline!("seller node wrap event={event_id}: receipt write failed for job {job_id} ({error})")
             }
+        }
+        // The automatic remittance (stage 2a): after a receipt journaled NEW, and only then — never
+        // on a replayed wrap, never on a failed write — so a duplicate wrap can never trigger a
+        // second payment. Best-effort and off this task: the job is already paid above.
+        if remit_follows_collect(&collected) {
+            self.remit_platform_fee_after_collect(&job_id);
+        }
+    }
+
+    /// Start the best-effort remittance of the accrued platform fee after a collect journaled a NEW
+    /// receipt — the mechanism that makes the fee a fee (stage 2a, addendum 1). Everything about it
+    /// is arranged so it cannot touch the collect that triggered it:
+    ///
+    /// - It runs AFTER the receipt is written and the job is marked paid, on a plain OS thread of
+    ///   its own (the wallet's `*_blocking` wrappers refuse to run inside the Tokio runtime, and a
+    ///   20-second LNURL timeout must not stall the wrap loop). This method returns at once.
+    /// - It never propagates: `fee_remit::remit_after_collect_live` returns a report, not an error,
+    ///   and every line of it goes to the operator log. The house pattern is `fail_job`'s — a
+    ///   failure here is logged and journaled, never raised — the loop keeps serving.
+    /// - A failure leaves the balance unremitted, so the next collect tries again; two collects
+    ///   landing together are serialized by the store's plan (one `planned` row at a time), so at
+    ///   most one pays.
+    /// - `[platform_fee] auto_remit = false` turns this attempt off and nothing else: the fee still
+    ///   accrues and stays owed; `maxplayer seller fees remit --confirm` pays it by hand.
+    fn remit_platform_fee_after_collect(&self, job_id: &str) {
+        if !self.node.home().config.platform_fee.auto_remit {
+            opline!(
+                "seller node platform fee (job_id={job_id}): automatic remittance is OFF ([platform_fee] auto_remit = false); the fee stays accrued and owed — `maxplayer seller fees remit --confirm` pays it by hand"
+            );
+            return;
+        }
+        let store = self.node.store().clone();
+        let home = self.node.home().clone();
+        let owned_job_id = job_id.to_owned();
+        let spawned = std::thread::Builder::new()
+            .name("platform-fee-remit".to_owned())
+            .spawn(move || {
+                let job_id = owned_job_id;
+                let report = crate::fee_remit::remit_after_collect_live(&store, home, now_unix());
+                if !report.is_quiet() {
+                    for line in &report.lines {
+                        opline!("seller node platform fee remit (after job_id={job_id}): {line}");
+                    }
+                }
+                opline!(
+                    "seller node platform fee remit (after job_id={job_id}): {}",
+                    report.summary()
+                );
+            });
+        if let Err(error) = spawned {
+            opline!(
+                "seller node platform fee remit (after job_id={job_id}): could not start the remittance thread ({error}); the fee stays accrued for the next collect to try"
+            );
         }
     }
 
@@ -14106,6 +14176,135 @@ mod tests {
             }
             other => panic!("a successful receive must finalize, got {other:?}"),
         }
+    }
+
+    // Stage 2a, addendum 1 rule 1: the remittance follows a receipt journaled NEW and nothing else.
+    // A replayed wrap (`Duplicate`) already paid the job once and must not pay the fee twice; a
+    // failed write journaled nothing. Checked against every outcome the collect write can produce.
+    #[test]
+    fn remittance_follows_only_a_new_receipt_never_a_duplicate_or_an_error() {
+        use crate::seller_node::store::{Collected, StoreError};
+        assert!(remit_follows_collect(&Ok(Collected::New)));
+        assert!(!remit_follows_collect(&Ok(Collected::Duplicate)));
+        assert!(!remit_follows_collect(&Err(StoreError(
+            "disk full".to_owned()
+        ))));
+    }
+
+    // Stage 2a, addendum 1 gate 2b — on the REAL collect write against an awarded job: the
+    // remittance fails (the LNURL host is unreachable, then the mint refuses the melt), and the
+    // collect still journaled the receipt, the job is still PAID, and the unremitted balance is
+    // intact — every failure journaled as an attempt, none of it propagated. This is the property
+    // that keeps a broken payout from breaking a seller's business.
+    #[test]
+    fn a_failed_remittance_leaves_the_receipt_journaled_the_job_paid_and_the_balance_intact() {
+        use crate::fee_remit::test_support::Fake;
+        use crate::fee_remit::{RemitOutcome, remit_best_effort};
+        use crate::seller_node::store::{
+            Collected, JobState, RemitAttemptOutcome, RemitAttemptTrigger, RemittanceState,
+        };
+
+        let seller = nostr_sdk::prelude::Keys::generate().public_key().to_hex();
+        let creq = gateway::creq::build_seller_creq(
+            &"a".repeat(64),
+            100,
+            "sat",
+            &["https://testnut.cashudevkit.org".to_owned()],
+            &seller,
+        )
+        .expect("creq");
+        let job = "c".repeat(64);
+        let (store, root) = store_with_awarded_job(&creq, &job, &"b".repeat(64), 4242);
+        let (fee_bps, platform_fee) = platform_fee_at_collect(100);
+        let collected = store.collect_receipt(
+            &"e".repeat(64),
+            &job,
+            100,
+            fees(1, fee_bps, platform_fee),
+            5000,
+        );
+        assert_eq!(collected, Ok(Collected::New));
+        assert!(
+            remit_follows_collect(&collected),
+            "a NEW receipt starts the attempt"
+        );
+        assert_eq!(
+            store.job_state(&job).expect("state"),
+            Some(JobState::Paid),
+            "paid BEFORE any remittance runs"
+        );
+
+        // Attempt 1: the LNURL host is down. Nothing propagates; nothing moves.
+        let mut fake = Fake::new(|_| 1);
+        fake.pay_request_error = Some("agi.cash: dns failure".to_owned());
+        let report = remit_best_effort(&store, &mut fake, 5001);
+        assert_eq!(report.outcome, Err("agi.cash: dns failure".to_owned()));
+        assert!(fake.melts.is_empty());
+
+        // Attempt 2: the mint refuses the melt after the plan is journaled. The row stays planned.
+        let mut fake = Fake::new(|_| 1);
+        fake.melt_results = vec![Err("insufficient funds for melt".to_owned())];
+        let report = remit_best_effort(&store, &mut fake, 5002);
+        assert!(
+            matches!(report.outcome, Ok(RemitOutcome::MeltFailed { .. })),
+            "{report:?}"
+        );
+        assert_eq!(fake.melts.len(), 1);
+
+        // The collect is untouched by either failure: receipt present, job paid, fee still owed.
+        assert!(store.has_receipt(&job).expect("has_receipt"));
+        assert_eq!(store.job_state(&job).expect("state"), Some(JobState::Paid));
+        let accrued = store.accrued_fees().expect("read");
+        assert_eq!(accrued.total_fee_sats, 10);
+        assert_eq!(accrued.remitted_fee_sats, 0, "nothing was paid");
+        assert_eq!(
+            accrued.unremitted_fee_sats + accrued.in_flight_fee_sats,
+            10,
+            "the fee is still owed — pinned to the planned row until the next attempt reconciles it"
+        );
+        assert_eq!(
+            store
+                .in_flight_remittance()
+                .expect("query")
+                .map(|row| row.state),
+            Some(RemittanceState::Planned)
+        );
+
+        // Both failures are journaled as attempts, newest first, for the operator to read.
+        let attempts = store.recent_remit_attempts(10).expect("attempts");
+        assert_eq!(attempts.len(), 2);
+        assert!(
+            attempts
+                .iter()
+                .all(|a| a.trigger == RemitAttemptTrigger::Collect)
+        );
+        assert!(
+            attempts
+                .iter()
+                .all(|a| a.outcome == RemitAttemptOutcome::Failed)
+        );
+        assert_eq!(attempts[1].detail, "agi.cash: dns failure");
+        assert!(
+            attempts[0]
+                .detail
+                .starts_with("melt failed: insufficient funds for melt")
+        );
+
+        // The next attempt (the next collect, or the operator) reconciles the planned row (the
+        // wallet never raised a quote ⇒ released) and pays once, on a FRESH invoice — the same
+        // scripted effects continue their invoice sequence, as a real LNURL host would never hand
+        // out the failed invoice twice; the receipt and the job are still exactly as the collect
+        // left them.
+        fake.status = Ok(None);
+        fake.melt_results = vec![Ok((9, 1))];
+        let report = remit_best_effort(&store, &mut fake, 5003);
+        assert!(
+            matches!(report.outcome, Ok(RemitOutcome::Paid { .. })),
+            "{report:?}"
+        );
+        assert_eq!(store.job_state(&job).expect("state"), Some(JobState::Paid));
+        assert_eq!(store.accrued_fees().expect("read").remitted_fee_sats, 10);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // ── Resume execution across a process restart (invariant 4, fallback form) ───────────────────

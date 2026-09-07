@@ -1200,14 +1200,14 @@ On a typical keyset the fee is **1 sat** for small amounts:
 - **The setup default is `100`, and that is the number to start from.** Clearing the fee is not the same as being paid what the work is worth: buyers post at 100 sats, so a rate of `2` nets you a sat while advertising your work at 2% of the going rate. Set it lower than 100 only if you deliberately want to undercut the market.
 - The **receipt / journal records the FACE (offer) amount**, not your wallet net. The face is the accounting figure; the **sats you receive are `face − fee`**. Do not read the receipt's face number as "sats pocketed."
 
-### Platform fee (recorded at collect; paid only by an explicit command)
+### Platform fee (recorded at collect; paid automatically by your node)
 
 The product charges a platform fee on each payment you collect. **The rate is set by the product,
 in the binary, and you cannot change it** — there is no config key, no environment variable and no
-flag for it. **The rate is 10%.** Collection only records what that comes to. **Nothing pays it
-automatically**: the accrued balance leaves your wallet only when you run
-`maxplayer seller fees remit --confirm` (see below); until then the figure in your journal is what
-you owe, not a payment in progress.
+flag for it. **The rate is 10%.** Collection records what that comes to, and **your node then pays it
+automatically**: once a payment has landed and its receipt is journaled, the node makes a best-effort
+attempt to remit the whole unremitted balance to the platform's Lightning address. You do not have to
+remember to pay; there is nothing to run.
 
 **The fee is 10% of the offer amount — the price the buyer paid — not of what lands in your
 wallet.** The mint's own input fee (described above) is a separate deduction and does not shrink the
@@ -1230,34 +1230,60 @@ carries the same figures (`amount_received=` is what the buyer paid, then `mint_
 `fee_bps=`, `kept=`). Jobs collected before the mint fee was recorded print `mint fee: not recorded`
 and no "you keep" figure, rather than a made-up zero.
 
-**Collecting a payment moves nothing on account of the fee.** A 100-sat offer with a 1-sat mint fee,
-for example, records `amount_sats = 100, mint_fee_sats = 1, fee_bps = 1000, fee_sats = 10`, prints
-`you keep: 89 sats`, and the 10 sats stay in your wallet as **unremitted** platform fee.
+**How the automatic remittance behaves.** A 100-sat offer with a 1-sat mint fee, for example, records
+`amount_sats = 100, mint_fee_sats = 1, fee_bps = 1000, fee_sats = 10`, prints `you keep: 89 sats`, and
+the 10 sats are now **unremitted** platform fee. Right after that receipt is written — and only after
+a *new* receipt, never on a replayed payment — the node starts one remittance attempt on a thread of
+its own:
 
-**Paying the fee is one explicit command, and it is a dry run unless you say otherwise.**
+- It resolves the platform's Lightning address over LNURL-pay (the address is fixed in the binary,
+  not configurable — a seller-editable address would let a seller pay the fee to itself), reads the
+  destination's minimum, and **if the unremitted balance is below that minimum it does nothing**: a
+  10% fee on payments under 10 sats owes under 1 sat, and small balances simply accumulate until they
+  clear the minimum. That is the expected steady state for small jobs, not an error.
+- Otherwise it takes a melt quote from your default mint, invoices the balance **minus** the mint's
+  melt fee reserve — **you never pay more than the fee you accrued; the melt fee comes out of that
+  amount, not on top of it** — journals the attempt in `seller.sqlite` (`fee_remittances`: gross,
+  melt fee, net, the address literal, melt quote id, payment hash, state), pays the invoice from your
+  ecash through the same gated melt `maxplayer wallet melt` uses (it honours `allow_real_mints`), and
+  marks the receipts it covered as discharged.
+- **It cannot affect the payment it followed.** Your receipt is written and the job is marked paid
+  before the attempt starts. If the attempt fails — the mint is down, the payout host is unreachable,
+  the wallet is short, no route — the failure is written to the node log and journaled
+  (`fee_remit_attempts`), and the balance stays unremitted, so the next collected payment simply
+  tries again with the whole accumulated balance. An attempt interrupted mid-payment is reconciled with
+  the mint on the next attempt (settled if the payment landed, released if it did not), never repeated.
+  Two payments landing at the same moment cannot pay the fee twice: at most one remittance can be in
+  flight, and the receipts it covers are pinned to it.
+
+**The off switch.** If you need to stop the automatic payout — a misbehaving mint, an incident — set
+
+```toml
+[platform_fee]
+auto_remit = false      # or MAXPLAYER_PLATFORM_FEE__AUTO_REMIT=false
+```
+
+and restart the node. This is an **operational valve, not a waiver**: the fee keeps accruing on every
+payment, stays owed, and stays visible in `maxplayer seller fees`; when you turn the switch back on
+the next collect remits the whole accumulated balance. The switch cannot change the rate or the
+address — the `[platform_fee]` table has no key for either.
+
+**Inspecting and forcing a remittance by hand.** `maxplayer seller fees remit` is the operator's
+window onto the automatic path, and its recovery lever:
 
 ```
-maxplayer seller fees remit [--home <dir>]              # dry run: resolve, quote, print the plan, move nothing
-maxplayer seller fees remit --confirm [--home <dir>]    # pay the unremitted balance
+maxplayer seller fees remit [--home <dir>]              # dry run: recent attempts, resolve, quote, print the plan, move nothing
+maxplayer seller fees remit --confirm [--home <dir>]    # pay the unremitted balance NOW (also with auto_remit = false)
 ```
 
-The destination is the platform's Lightning address, fixed in the binary (not configurable — a
-seller-editable address would let a seller pay the fee to itself). `remit` resolves it over
-LNURL-pay, takes a melt quote from your default mint for the unremitted total, and prints: the gross
-unremitted fee, the mint's melt fee reserve, the invoice amount the platform receives, and the most
-that can leave your wallet — **which is never more than the fee you accrued: the melt fee comes out
-of that amount, not on top of it.** With `--confirm` it journals the attempt in `seller.sqlite`
-(`fee_remittances`: gross, melt fee, net, the address literal, melt quote id, payment hash, state),
-pays the invoice from your ecash through the same gated melt `maxplayer wallet melt` uses (it honours
-`allow_real_mints`), and marks the receipts it covered as discharged.
-
-It refuses, moving nothing (exit 3), when nothing is unremitted; when the balance is below the
-destination's minimum (a 10% fee on payments under 10 sats owes under 1 sat — small balances
-accumulate until they clear the minimum, and the command prints how far short you are); or when an
-earlier attempt is still settling at the mint. **Running it again after a payment pays nothing** — the
-receipts it discharged are recorded — and an attempt interrupted mid-payment is reconciled with the
-mint on the next run (settled if the payment landed, released if it did not), never repeated. There is
-no timer and no automatic sweep: if you never run `remit --confirm`, no sats ever leave for the fee.
+The dry run prints whether the automatic remittance is on, the recent attempts with their outcomes
+(paid / refused / failed and why), any attempt still in flight, the gross unremitted fee, the mint's
+melt fee reserve, the invoice amount the platform receives, and the most that can leave your wallet —
+and moves nothing. `--confirm` forces one attempt now, under exactly the same rules as the automatic
+path. It refuses, moving nothing (exit 3), when nothing is unremitted; when the balance is below the
+destination's minimum (the command prints how far short you are); or when an earlier attempt is still
+settling at the mint. **Running it again after a payment pays nothing** — the receipts it discharged
+are recorded.
 
 ---
 

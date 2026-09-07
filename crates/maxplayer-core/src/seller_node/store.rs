@@ -28,13 +28,16 @@ use crate::gateway::EventDraft;
 /// fee, so a receipt shows every figure between what the buyer paid and what the seller keeps).
 /// v10 (stage 2a) added the `fee_remittances` table and `receipts.remittance_id` — which
 /// remittance, if any, discharged each receipt's platform fee — so the unremitted balance is a
-/// query and a paid fee can never be paid twice.
+/// query and a paid fee can never be paid twice; and `fee_remit_attempts`, the journal of every
+/// attempt to pay (automatic or by command) with its outcome, so a failing payout is visible.
 pub const SCHEMA_VERSION: i64 = 10;
 
 /// The platform fee as journaled so far: what is owed on paper, what has been remitted, and the
 /// figures around them. Returned by [`SellerStore::accrued_fees`]. A query and nothing more — the
-/// only thing that moves the unremitted balance is the explicit remit command, through
-/// [`SellerStore::plan_remittance`] / [`SellerStore::settle_remittance`].
+/// only things that move the unremitted balance are the remittance writes
+/// [`SellerStore::plan_remittance`] / [`SellerStore::settle_remittance`] /
+/// [`SellerStore::fail_remittance`], driven by `crate::fee_remit` (automatically after a collect,
+/// or by `maxplayer seller fees remit --confirm`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AccruedFees {
     /// Sum of `amount_sats` (the offer face — what buyers paid) over every receipt ever collected.
@@ -195,6 +198,84 @@ pub struct FeeRemittance {
     pub settled_at_unix: Option<i64>,
     /// How many receipt rows are pinned to this remittance.
     pub receipts: usize,
+}
+
+/// Who attempted a remittance — the two callers of `crate::fee_remit::remit` that pay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemitAttemptTrigger {
+    /// The seller node, after a receipt was journaled `Collected::New`.
+    Collect,
+    /// `maxplayer seller fees remit --confirm`, run by an operator.
+    Command,
+}
+
+impl RemitAttemptTrigger {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Collect => "collect",
+            Self::Command => "command",
+        }
+    }
+
+    fn parse(raw: &str) -> Result<Self, StoreError> {
+        match raw {
+            "collect" => Ok(Self::Collect),
+            "command" => Ok(Self::Command),
+            other => Err(StoreError(format!(
+                "unknown remit attempt trigger {other:?}"
+            ))),
+        }
+    }
+}
+
+/// How a remittance attempt ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemitAttemptOutcome {
+    /// The melt settled; `remittance_id` names the settled row.
+    Paid,
+    /// Declined and moved nothing, for a reason other than the threshold (an attempt still in
+    /// flight, a fee reserve that does not fit, a balance above the destination's maximum).
+    Refused,
+    /// An error: the LNURL host, the mint quote, the reconciliation query or the melt itself failed.
+    /// If a `remittance_id` is named, that row stays `planned` for the next attempt to reconcile.
+    Failed,
+}
+
+impl RemitAttemptOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Paid => "paid",
+            Self::Refused => "refused",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn parse(raw: &str) -> Result<Self, StoreError> {
+        match raw {
+            "paid" => Ok(Self::Paid),
+            "refused" => Ok(Self::Refused),
+            "failed" => Ok(Self::Failed),
+            other => Err(StoreError(format!(
+                "unknown remit attempt outcome {other:?}"
+            ))),
+        }
+    }
+}
+
+/// One row of `fee_remit_attempts` — one attempt to pay the accrued platform fee and how it ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemitAttempt {
+    /// Assigned by the store; `0` on a record that has not been written yet.
+    pub attempt_id: i64,
+    pub started_at_unix: i64,
+    pub trigger: RemitAttemptTrigger,
+    /// The unremitted balance the attempt saw when it read the ledger.
+    pub unremitted_sats: u64,
+    pub outcome: RemitAttemptOutcome,
+    /// The sentence the attempt printed for its outcome (the error text on `Failed`).
+    pub detail: String,
+    /// The `fee_remittances` row this attempt planned, if it got as far as journaling one.
+    pub remittance_id: Option<String>,
 }
 
 /// Why a plan was refused. Typed so the command can print the right sentence.
@@ -695,7 +776,24 @@ impl SellerStore {
                  settled_at_unix INTEGER
              );
              CREATE UNIQUE INDEX IF NOT EXISTS fee_remittances_one_planned
-                 ON fee_remittances (state) WHERE state = 'planned';",
+                 ON fee_remittances (state) WHERE state = 'planned';
+             -- v10 (stage 2a, addendum 1): every ATTEMPT to pay the accrued platform fee, whether it
+             -- paid, was refused, or failed — the record an operator reads when the automatic payout
+             -- is not landing. `trigger` says who attempted ('collect' = the seller node after a
+             -- receipt was journaled New; 'command' = `maxplayer seller fees remit --confirm`);
+             -- `unremitted_sats` is the balance the attempt saw; `remittance_id` names the
+             -- fee_remittances row it planned, if it got that far. Attempts that stop at the threshold
+             -- (nothing unremitted, or below the destination's minimum) are the expected steady state
+             -- for small sellers and are NOT journaled here. Additive: older stores simply have no rows.
+             CREATE TABLE IF NOT EXISTS fee_remit_attempts (
+                 attempt_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                 started_at_unix  INTEGER NOT NULL,
+                 trigger          TEXT NOT NULL CHECK (trigger IN ('collect','command')),
+                 unremitted_sats  INTEGER NOT NULL CHECK (unremitted_sats >= 0),
+                 outcome          TEXT NOT NULL CHECK (outcome IN ('paid','refused','failed')),
+                 detail           TEXT NOT NULL,
+                 remittance_id    TEXT
+             );",
         )?;
         Self::migrate(conn)?;
         conn.execute(
@@ -1778,6 +1876,69 @@ impl SellerStore {
         )?;
         tx.commit()?;
         Ok(row)
+    }
+
+    /// Journal one remittance attempt and its outcome (see `fee_remit_attempts`). Returns the
+    /// assigned `attempt_id`. Append-only: nothing here is ever updated or deleted.
+    pub fn record_remit_attempt(&self, attempt: &RemitAttempt) -> Result<i64, StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO fee_remit_attempts
+                 (started_at_unix, trigger, unremitted_sats, outcome, detail, remittance_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                attempt.started_at_unix,
+                attempt.trigger.as_str(),
+                attempt.unremitted_sats as i64,
+                attempt.outcome.as_str(),
+                attempt.detail,
+                attempt.remittance_id,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// The most recent `limit` remittance attempts, NEWEST first — what `maxplayer seller fees
+    /// remit` prints so an operator can see whether the automatic payout has been landing.
+    pub fn recent_remit_attempts(&self, limit: usize) -> Result<Vec<RemitAttempt>, StoreError> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT attempt_id, started_at_unix, trigger, unremitted_sats, outcome, detail,
+                    remittance_id
+             FROM fee_remit_attempts
+             ORDER BY attempt_id DESC
+             LIMIT ?1",
+        )?;
+        let rows = statement
+            .query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
+                let trigger_raw: String = row.get(2)?;
+                let outcome_raw: String = row.get(4)?;
+                let trigger = RemitAttemptTrigger::parse(&trigger_raw).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+                let outcome = RemitAttemptOutcome::parse(&outcome_raw).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        4,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+                Ok(RemitAttempt {
+                    attempt_id: row.get(0)?,
+                    started_at_unix: row.get(1)?,
+                    trigger,
+                    unremitted_sats: u64::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
+                    outcome,
+                    detail: row.get(5)?,
+                    remittance_id: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Whether a delivery has been journaled for `job_id` (#552). A delivery row is written only by

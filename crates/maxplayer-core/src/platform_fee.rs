@@ -1,20 +1,25 @@
 //! Seller-side platform fee: a product-set rate, computed and journaled when a payment is collected
-//! (stage 1), and a product-set payout destination the accrued balance is remitted to by one
-//! explicit command (stage 2a).
+//! (stage 1), and a product-set payout destination the accrued balance is remitted to — automatically,
+//! by the seller node, as a consequence of collecting (stage 2a).
 //!
 //! Three pieces live here — the rate ([`PLATFORM_FEE_BPS`]), the arithmetic ([`fee_sats`]) and the
-//! destination ([`PLATFORM_FEE_ADDRESS`]) — so the collect seam and the remit command read them
-//! instead of reimplementing any. Ungated on purpose: the arithmetic is worth compiling and testing
-//! on every build, not only the money-path one.
+//! destination ([`PLATFORM_FEE_ADDRESS`]) — so the collect seam and the remit path read them instead
+//! of reimplementing any. Ungated on purpose: the arithmetic is worth compiling and testing on every
+//! build, not only the money-path one.
 //!
 //! ## What is accrued, and what pays it
 //!
 //! The fee is **accrued and recorded** at collect time: every collected payment journals the rate in
-//! force and the sats it comes to, against the job that earned it. **Nothing on the payment path
-//! remits it.** The only code that moves the accrued balance is `maxplayer seller fees remit
-//! --confirm` — an explicit, operator-run, idempotent command that pays the unremitted total to
-//! [`PLATFORM_FEE_ADDRESS`] from the seller's ecash and journals the remittance. Without `--confirm`
-//! it is a dry run. There is no timer, no sweep at startup and no automatic remittance of any kind.
+//! force and the sats it comes to, against the job that earned it. **The seller node then remits it
+//! automatically**: once the receipt is journaled new, the node makes a best-effort attempt to pay
+//! the whole unremitted balance to [`PLATFORM_FEE_ADDRESS`] from the seller's ecash (`fee_remit`,
+//! reached from `seller_node::run`). That attempt cannot affect the collect — the job is already
+//! paid — and a failed attempt leaves the balance unremitted for the next collect to try again;
+//! balances below the destination's minimum accrue until they clear it. `maxplayer seller fees
+//! remit` is the operator's inspection and recovery path (dry run by default, `--confirm` to pay
+//! now), not the mechanism. The one operational switch, `[platform_fee] auto_remit`, stops the
+//! automatic attempt and nothing else: it cannot touch the rate or the destination, and the fee stays
+//! owed and visible.
 //!
 //! ## Who sets the rate and the destination
 //!
@@ -35,9 +40,10 @@
 ///   outlives a change to this number still says what each collection owed.
 ///
 /// **Currently `1000` — ten percent.** Collection accrues and records what this rate comes to on
-/// each payment; the accrued balance is paid to [`PLATFORM_FEE_ADDRESS`] only when the operator runs
-/// `maxplayer seller fees remit --confirm`. The receipt rows are the journal that command settles
-/// against; nothing on the collect path pays anyone.
+/// each payment, and the seller node then remits the accrued balance to [`PLATFORM_FEE_ADDRESS`]
+/// automatically, best-effort, after the receipt is journaled (`fee_remit`); `maxplayer seller fees
+/// remit --confirm` pays it by hand. The receipt rows are the journal every remittance settles
+/// against. Nothing about this rate is read from config or environment.
 pub const PLATFORM_FEE_BPS: u32 = 1000;
 
 /// The Lightning address (LUD-16, `user@host`) the accrued platform fee is remitted to. Ordered by
@@ -50,7 +56,9 @@ pub const PLATFORM_FEE_BPS: u32 = 1000;
 ///   platform's fee at themselves. A compiled-in constant costs a release to change; a seller-editable
 ///   one costs the whole fee. The release is the cheaper defect.
 /// - It is resolved at remit time over LNURL-pay (`https://host/.well-known/lnurlp/user`), fail
-///   closed, by [`crate::lnurl_pay`]. Nothing here or in the collect path contacts it.
+///   closed, by [`crate::lnurl_pay`] — by the seller node's automatic attempt after a collect and by
+///   `maxplayer seller fees remit`, and by nothing else. Nothing in this module contacts it.
+/// - The `[platform_fee] auto_remit` switch cannot change it: that table has no key for an address.
 /// - **Every remittance journals the literal it paid** (`fee_remittances.destination`), so a later
 ///   change to this constant leaves a readable history rather than an ambiguous one.
 ///
@@ -197,8 +205,8 @@ mod tests {
 
     #[test]
     fn the_shipped_rate_is_ten_percent_and_within_the_whole() {
-        // Collection accrues at 10%; only the explicit remit command pays it out. The `<= 10_000`
-        // bound is enforced at compile time by the `const _` assertion in the module body.
+        // Collection accrues at 10%; the seller node remits it after the collect (`fee_remit`). The
+        // `<= 10_000` bound is enforced at compile time by the `const _` assertion in the module body.
         assert_eq!(PLATFORM_FEE_BPS, 1000);
         assert_eq!(fee_sats(100, PLATFORM_FEE_BPS), 10);
         assert_eq!(fee_sats(9, PLATFORM_FEE_BPS), 0);

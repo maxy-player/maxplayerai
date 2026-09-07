@@ -23,7 +23,8 @@
 //! functions — [`sats_to_msat`], [`msat_to_sats_ceil`], [`msat_to_sats_floor`] — and nowhere else.
 //! A minimum rounds UP to sats (1500 msat means you need 2 whole sats), a maximum rounds DOWN.
 //!
-//! This module moves no money. It produces an invoice; paying it is the caller's explicit act.
+//! This module moves no money. It produces an invoice; paying it is the caller's act
+//! ([`crate::fee_remit`], through `wallet_ops::melt_blocking`).
 
 use std::fmt;
 use std::str::FromStr;

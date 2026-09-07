@@ -42,6 +42,7 @@
 //! | `telemetry.mirror_file` | `MAXPLAYER_TELEMETRY__MIRROR_FILE` |
 //! | `seller_heartbeat.interval_secs` | `MAXPLAYER_SELLER_HEARTBEAT__INTERVAL_SECS` |
 //! | `seller_preflight.boot_push_preflight` | `MAXPLAYER_SELLER_PREFLIGHT__BOOT_PUSH_PREFLIGHT` |
+//! | `platform_fee.auto_remit` | `MAXPLAYER_PLATFORM_FEE__AUTO_REMIT` |
 //! | `buyer.hop_fee_buffer_multiplier` | `MAXPLAYER_BUYER__HOP_FEE_BUFFER_MULTIPLIER` |
 //! | `contribution.allowed_paths` (list) | `MAXPLAYER_CONTRIBUTION__ALLOWED_PATHS=…` |
 //!
@@ -1182,6 +1183,63 @@ pub fn default_boot_push_preflight() -> bool {
     true
 }
 
+/// `[platform_fee]` — the ONE operational switch on the seller node's automatic platform fee
+/// remittance (seller fee stage 2a, addendum 1). Top-level rather than inside `[seller]` for the
+/// same structural reason as [`SellerPreflightConfig`]: a serde default on a nested table reaches
+/// every existing `config.toml` without a rewrite.
+///
+/// ## What this is
+///
+/// An **operational safety valve**. Money leaves the seller's wallet with no human in the loop once
+/// a payment is collected (see `seller_node::run` and `fee_remit`), so an operator needs a way to
+/// stop those outbound payments without patching a binary — a mint that is misbehaving, a payout
+/// host that is down, an incident. `auto_remit = false` (or `MAXPLAYER_PLATFORM_FEE__AUTO_REMIT=false`)
+/// does exactly one thing: the collect path stops ATTEMPTING a remittance.
+///
+/// ## What this is NOT
+///
+/// - **Not an authorization boundary.** The fee is owed whether or not this is on; the switch does not
+///   forgive it. Accrual is untouched: every collected payment still journals its platform fee, the
+///   unremitted balance keeps growing and stays visible in `maxplayer seller fees`, and the next
+///   remittance — automatic once the switch is back on, or `maxplayer seller fees remit --confirm`
+///   run by hand — pays the whole accumulated balance.
+/// - **Not a way to change where or how much.** It cannot touch the destination
+///   ([`crate::platform_fee::PLATFORM_FEE_ADDRESS`]) or the rate
+///   ([`crate::platform_fee::PLATFORM_FEE_BPS`]); both are compiled in, and this table
+///   (`deny_unknown_fields`) has no key for either.
+/// - **Not a gate on the manual command.** `maxplayer seller fees remit --confirm` is the operator's
+///   recovery path and pays regardless of this switch; the switch governs the automatic attempt only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlatformFeeConfig {
+    /// Attempt to remit the accrued platform fee automatically after each collected payment.
+    /// Default **true**. Set false (or the env override `MAXPLAYER_PLATFORM_FEE__AUTO_REMIT=false`)
+    /// to stop the automatic attempt; the fee keeps accruing and the balance stays owed and visible.
+    #[serde(default = "default_auto_remit")]
+    pub auto_remit: bool,
+}
+
+impl Default for PlatformFeeConfig {
+    fn default() -> Self {
+        Self {
+            auto_remit: default_auto_remit(),
+        }
+    }
+}
+
+impl PlatformFeeConfig {
+    /// True when every field is at its shipped default (so config.toml stays clean — the section is
+    /// only serialized once an operator sets a non-default knob).
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// serde default for [`PlatformFeeConfig::auto_remit`] — automatic remittance ON.
+pub fn default_auto_remit() -> bool {
+    true
+}
+
 impl SellerMemoryConfig {
     /// True when every field is at its shipped default (so config.toml stays clean — the section
     /// is only serialized once an operator sets a non-default knob).
@@ -1470,6 +1528,10 @@ pub struct MaxplayerConfig {
     /// `[seller_preflight]` boot push-probe config. Defaults (probe ON) when absent.
     #[serde(default, skip_serializing_if = "SellerPreflightConfig::is_default")]
     pub seller_preflight: SellerPreflightConfig,
+    /// `[platform_fee]` — the off switch on the seller node's automatic platform fee remittance.
+    /// Defaults (automatic remittance ON) when absent. See [`PlatformFeeConfig`] for what it is not.
+    #[serde(default, skip_serializing_if = "PlatformFeeConfig::is_default")]
+    pub platform_fee: PlatformFeeConfig,
     /// `[buyer_reservation_floor]` local-clock release of an unattempted reservation.
     /// Defaults (feature OFF) when absent.
     #[serde(default, skip_serializing_if = "BuyerReservationFloorConfig::is_default")]
@@ -1622,6 +1684,7 @@ impl Default for MaxplayerConfig {
             telemetry: TelemetryConfig::default(),
             seller_heartbeat: SellerHeartbeatConfig::default(),
             seller_preflight: SellerPreflightConfig::default(),
+            platform_fee: PlatformFeeConfig::default(),
             buyer_reservation_floor: BuyerReservationFloorConfig::default(),
             buyer: BuyerConfig::default(),
             contribution: None,
@@ -2051,6 +2114,15 @@ fn documented_config_toml(config: &MaxplayerConfig) -> Result<String, HomeError>
             &[
                 "Real-money switch — TRUE by default so the fence admits the real default mint above.",
                 "Set false to force testnut/dev-only (any real mint is then refused fail-closed).",
+            ],
+        ),
+        (
+            "auto_remit",
+            &[
+                "Seller platform fee auto-remittance: after each collected payment the node pays the",
+                "accrued platform fee to the platform's fixed Lightning address. Set false to STOP the",
+                "automatic attempt — an operational valve, not a waiver: the fee keeps accruing and stays",
+                "owed (`maxplayer seller fees remit --confirm` pays it by hand). Cannot change rate/address.",
             ],
         ),
     ];
@@ -2722,6 +2794,76 @@ mod tests {
             rendered.contains("docs/SELLER-QUICKSTART.md"),
             "the template must name the file that section lives in"
         );
+    }
+
+    // Seller fee stage 2a, addendum 1 §4: the automatic remittance's off switch. ON by default and
+    // absent from a clean config; `false` in the file or via env turns the automatic attempt off; the
+    // table has no key for the destination or the rate, so neither can be moved through it.
+    #[test]
+    fn platform_fee_auto_remit_defaults_on_and_the_switch_cannot_touch_rate_or_address() {
+        assert!(default_auto_remit());
+        let defaults = MaxplayerConfig::default();
+        assert!(
+            defaults.platform_fee.auto_remit,
+            "automatic remittance is ON by default"
+        );
+        assert!(
+            !toml::to_string_pretty(&defaults)
+                .expect("ser")
+                .contains("[platform_fee]"),
+            "a default config carries no [platform_fee] section"
+        );
+
+        let absent = parse_config_toml("relay_url = 'r'\nper_job_budget_sats = 1\n")
+            .expect("absent [platform_fee] parses");
+        assert!(
+            absent.platform_fee.auto_remit,
+            "absent ⇒ ON: existing homes keep remitting"
+        );
+
+        let off = parse_config_toml(
+            "relay_url = 'r'\nper_job_budget_sats = 1\n[platform_fee]\nauto_remit = false\n",
+        )
+        .expect("explicit off parses");
+        assert!(!off.platform_fee.auto_remit);
+        assert!(
+            toml::to_string_pretty(&off)
+                .expect("ser")
+                .contains("[platform_fee]\nauto_remit = false"),
+            "a non-default switch is serialized so it survives a rewrite"
+        );
+
+        let via_env = apply_env_layer(
+            &MaxplayerConfig::default(),
+            env(&[("MAXPLAYER_PLATFORM_FEE__AUTO_REMIT", "false")]),
+        )
+        .expect("env override parses");
+        assert!(
+            !via_env.platform_fee.auto_remit,
+            "the env override turns it off"
+        );
+        let back_on = apply_env_layer(&off, env(&[("MAXPLAYER_PLATFORM_FEE__AUTO_REMIT", "true")]))
+            .expect("env override parses");
+        assert!(
+            back_on.platform_fee.auto_remit,
+            "and back on over a file that says off"
+        );
+
+        // No key for the destination or the rate: the switch cannot be turned into a redirect.
+        for key in ["address", "destination", "fee_bps", "rate"] {
+            let refused = parse_config_toml(&format!(
+                "relay_url = 'r'\nper_job_budget_sats = 1\n[platform_fee]\n{key} = 1\n"
+            ));
+            assert!(
+                refused.is_err(),
+                "[platform_fee] {key} must be refused (deny_unknown_fields)"
+            );
+        }
+        let malformed = apply_env_layer(
+            &MaxplayerConfig::default(),
+            env(&[("MAXPLAYER_PLATFORM_FEE__AUTO_REMIT", "sometimes")]),
+        );
+        assert!(malformed.is_err(), "a non-boolean refuses, never defaults");
     }
 
     #[test]
