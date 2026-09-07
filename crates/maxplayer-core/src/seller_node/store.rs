@@ -349,6 +349,11 @@ pub enum ReleaseOn<'a> {
     /// or UNPAID and expired past the spending margin. Names the quote observed, so the release
     /// lands only if that is still the row's bound quote.
     TerminalBoundQuote { quote_id: &'a str },
+    /// A SPENDING row admitted by a v12 binary — before admissions bound a quote — whose invoice's
+    /// quote(s) the mint reports terminal: the release v12 had, kept only for rows v12 wrote
+    /// (`spending_quote_id IS NULL`). A v13 admission always binds, so this never applies to a row
+    /// this binary admitted.
+    TerminalUnboundSpending,
     /// A PLANNED row (never admitted: nothing spent against it) whose invoice's quote the mint
     /// reports terminal.
     TerminalQuotePlanned,
@@ -367,6 +372,10 @@ impl ReleaseOn<'_> {
         match self {
             Self::TerminalBoundQuote { quote_id } => {
                 format!("its bound melt quote {quote_id} is terminal at the mint")
+            }
+            Self::TerminalUnboundSpending => {
+                "spending without a bound quote (admitted before v13) and its invoice's quote is terminal at the mint"
+                    .to_owned()
             }
             Self::TerminalQuotePlanned => {
                 "planned, never admitted, and its quote is terminal at the mint".to_owned()
@@ -2303,6 +2312,8 @@ impl SellerStore {
     ///   terminal: `AND spending_since_unix IS NOT NULL AND spending_quote_id = :quote`. The only
     ///   release a spending row has, and it names the quote observed terminal, so a release decided
     ///   on some other quote's state changes nothing.
+    /// - [`ReleaseOn::TerminalUnboundSpending`] — a spending row a v12 binary admitted without
+    ///   binding a quote: `AND spending_since_unix IS NOT NULL AND spending_quote_id IS NULL`.
     /// - [`ReleaseOn::TerminalQuotePlanned`] — a PLANNED row (never admitted) whose invoice's quote
     ///   the mint reports terminal: `AND spending_since_unix IS NULL`.
     /// - [`ReleaseOn::LeaseExpired`] — a PLANNED row whose owner's lease has run out:
@@ -2331,6 +2342,12 @@ impl SellerStore {
                  WHERE remittance_id = ?1 AND state = ?4
                    AND spending_since_unix IS NOT NULL AND spending_quote_id = ?5",
                 params![remittance_id, now_unix, failed, planned, quote_id],
+            )?,
+            ReleaseOn::TerminalUnboundSpending => tx.execute(
+                "UPDATE fee_remittances SET state = ?3, settled_at_unix = ?2
+                 WHERE remittance_id = ?1 AND state = ?4
+                   AND spending_since_unix IS NOT NULL AND spending_quote_id IS NULL",
+                params![remittance_id, now_unix, failed, planned],
             )?,
             ReleaseOn::TerminalQuotePlanned => tx.execute(
                 "UPDATE fee_remittances SET state = ?3, settled_at_unix = ?2
@@ -4074,7 +4091,13 @@ mod tests {
                 .settle_remittance("h1", &by_reconciliation(None, None), 13)
                 .is_err()
         );
-        assert!(store.fail_remittance("h1", 13).is_err());
+        assert_eq!(
+            store
+                .release_remittance("h1", ReleaseOn::OwnPlanned { owner: OWNER }, 13)
+                .expect("query"),
+            None,
+            "a settled row is not released: zero rows, hold"
+        );
 
         // The next plan covers exactly the new receipt; planning the OLD figure is a mismatch.
         assert_eq!(
@@ -4166,7 +4189,43 @@ mod tests {
         store
             .plan_remittance(&plan("h1", 10, 9), OWNER, LEASE, 2)
             .expect("plan");
-        let failed = store.fail_remittance("h1", 3).expect("fail");
+        // A planned row is released on the reasons that apply to a PLANNED row — and each release
+        // is conditional: the wrong reason (this row is not spending, has no bound quote, its lease
+        // stands, and it is OWNER's) changes zero rows and touches nothing.
+        assert_eq!(
+            store
+                .release_remittance(
+                    "h1",
+                    ReleaseOn::TerminalBoundQuote { quote_id: "q-any" },
+                    3
+                )
+                .expect("query"),
+            None,
+            "a planned row has no bound quote: the spending release changes zero rows"
+        );
+        assert_eq!(
+            store
+                .release_remittance("h1", ReleaseOn::LeaseExpired { now_unix: LEASE - 1 }, 3)
+                .expect("query"),
+            None,
+            "the lease stands: zero rows"
+        );
+        assert_eq!(
+            store
+                .release_remittance("h1", ReleaseOn::OwnPlanned { owner: "someone-else" }, 3)
+                .expect("query"),
+            None,
+            "not that process's row: zero rows"
+        );
+        assert_eq!(
+            store.accrued_fees().expect("read-out").in_flight_fee_sats,
+            10,
+            "three held releases touched nothing"
+        );
+        let failed = store
+            .release_remittance("h1", ReleaseOn::OwnPlanned { owner: OWNER }, 3)
+            .expect("query")
+            .expect("released");
         assert_eq!(failed.state, RemittanceState::Failed);
         assert_eq!(failed.settled_at_unix, Some(3));
         assert_eq!(failed.receipts, 0, "its receipts were released");
@@ -4181,7 +4240,12 @@ mod tests {
                 .settle_remittance("h1", &by_reconciliation(None, None), 4)
                 .is_err()
         );
-        assert!(store.fail_remittance("h1", 4).is_err());
+        assert_eq!(
+            store
+                .release_remittance("h1", ReleaseOn::OwnPlanned { owner: OWNER }, 4)
+                .expect("query"),
+            None
+        );
         // The same invoice cannot be re-planned; a fresh one can.
         assert_eq!(
             store.plan_remittance(&plan("h1", 10, 9), OWNER, LEASE, 5),
@@ -4345,7 +4409,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .admit_remittance_spend("v10-planned", "anyone", 6, 60)
+                .admit_remittance_spend("v10-planned", "anyone", "q-any", 60, &mut || 6)
                 .expect("query"),
             Err(OwnershipLost::OtherOwner { owner: None }),
             "nobody may PAY a pre-v11 planned row; reconciliation releases or settles it"
@@ -4360,7 +4424,11 @@ mod tests {
             (10, 5, 0)
         );
         // Reconciliation can still release it, and the release reads back through the new columns.
-        let released = store.fail_remittance("v10-planned", 7).expect("release");
+        // Its missing lease reads as run out, so the lease-expiry release applies to it.
+        let released = store
+            .release_remittance("v10-planned", ReleaseOn::LeaseExpired { now_unix: 7 }, 7)
+            .expect("query")
+            .expect("released");
         assert_eq!(released.state, RemittanceState::Failed);
         assert_eq!(
             store.accrued_fees().expect("read-out").unremitted_fee_sats,
@@ -4405,7 +4473,7 @@ mod tests {
         // Another process, however early: zero rows — even a live lease is not ITS lease.
         assert_eq!(
             store
-                .admit_remittance_spend("h1", "proc-b", 3, 60)
+                .admit_remittance_spend("h1", "proc-b", "q-b", 60, &mut || 3)
                 .expect("query"),
             Err(OwnershipLost::OtherOwner {
                 owner: Some("proc-a".to_owned()),
@@ -4415,7 +4483,7 @@ mod tests {
         // strict (500 > 440 + 60 is false). The row is untouched: still planned.
         assert_eq!(
             store
-                .admit_remittance_spend("h1", "proc-a", 440, 60)
+                .admit_remittance_spend("h1", "proc-a", "q-a", 60, &mut || 440)
                 .expect("query"),
             Err(OwnershipLost::LeaseTooShort {
                 lease_until_unix: Some(500),
@@ -4431,14 +4499,30 @@ mod tests {
                 .state,
             RemittanceState::Planned
         );
+        assert_eq!(
+            store
+                .in_flight_remittance()
+                .expect("row")
+                .expect("planned")
+                .spending_quote_id,
+            None,
+            "a refused admission binds no quote"
+        );
         // One second more to spare: admitted — the row is now SPENDING, stamped with the clock
-        // the caller read, and it is still the one row in flight.
+        // read INSIDE the call (the closure runs once, after the lock), bound to the quote named,
+        // and it is still the one row in flight.
+        let mut clock_reads = 0;
         let admitted = store
-            .admit_remittance_spend("h1", "proc-a", 439, 60)
+            .admit_remittance_spend("h1", "proc-a", "q-a", 60, &mut || {
+                clock_reads += 1;
+                439
+            })
             .expect("query")
             .expect("admitted");
+        assert_eq!(clock_reads, 1, "the clock is read exactly once, inside the fence");
         assert_eq!(admitted.state, RemittanceState::Spending);
         assert_eq!(admitted.spending_since_unix, Some(439));
+        assert_eq!(admitted.spending_quote_id.as_deref(), Some("q-a"));
         assert!(admitted.state.is_in_flight());
         assert_eq!(
             store
@@ -4453,20 +4537,66 @@ mod tests {
             10,
             "a spending row's fee is in flight, not unremitted and not remitted"
         );
-        // Admitted once is admitted once: the same owner, the same instant, zero rows.
+        // Admitted once is admitted once: the same owner, the same instant, zero rows — and the
+        // bound quote is not rebound.
         assert_eq!(
             store
-                .admit_remittance_spend("h1", "proc-a", 439, 60)
+                .admit_remittance_spend("h1", "proc-a", "q-a2", 60, &mut || 439)
                 .expect("query"),
             Err(OwnershipLost::NotPlanned {
                 state: RemittanceState::Spending,
             })
         );
-        // A row that is no longer in flight: zero rows, whoever asks; a missing row says so.
-        store.fail_remittance("h1", 10).expect("release");
         assert_eq!(
             store
-                .admit_remittance_spend("h1", "proc-a", 11, 60)
+                .in_flight_remittance()
+                .expect("row")
+                .expect("spending")
+                .spending_quote_id
+                .as_deref(),
+            Some("q-a")
+        );
+        // A SPENDING row is released by exactly one transition: its BOUND quote terminal. Not on
+        // its lease (however far past), not as "planned" (it is not), not on some other quote.
+        for (wrong, why) in [
+            (
+                ReleaseOn::LeaseExpired { now_unix: 10_000 },
+                "lease expiry never touches a spending row",
+            ),
+            (
+                ReleaseOn::TerminalQuotePlanned,
+                "the planned-row release requires no admission mark",
+            ),
+            (
+                ReleaseOn::OwnPlanned { owner: "proc-a" },
+                "even the owner's own planned-row release: the row is spending",
+            ),
+            (
+                ReleaseOn::TerminalBoundQuote { quote_id: "q-a2" },
+                "a terminal verdict on a quote that is not the bound one",
+            ),
+        ] {
+            assert_eq!(
+                store.release_remittance("h1", wrong, 10).expect("query"),
+                None,
+                "{why}"
+            );
+        }
+        assert_eq!(
+            store.accrued_fees().expect("read-out").in_flight_fee_sats,
+            10,
+            "four held releases touched nothing"
+        );
+        let released = store
+            .release_remittance("h1", ReleaseOn::TerminalBoundQuote { quote_id: "q-a" }, 10)
+            .expect("query")
+            .expect("released on the bound quote");
+        assert_eq!(released.state, RemittanceState::Failed);
+        assert_eq!(released.spending_quote_id.as_deref(), Some("q-a"), "history kept");
+        // A row that is no longer in flight: zero rows, whoever asks; a missing row says so.
+        assert_eq!(
+            store
+                .admit_remittance_spend("h1", "proc-a", "q-a", 60, &mut || 11)
                 .expect("query"),
             Err(OwnershipLost::NotPlanned {
                 state: RemittanceState::Failed,
@@ -4474,9 +4604,15 @@ mod tests {
         );
         assert_eq!(
             store
-                .admit_remittance_spend("nope", "proc-a", 11, 60)
+                .admit_remittance_spend("nope", "proc-a", "q-a", 60, &mut || 11)
                 .expect("query"),
             Err(OwnershipLost::Missing)
+        );
+        assert!(
+            store
+                .admit_remittance_spend("h1", "proc-a", "  ", 60, &mut || 11)
+                .is_err(),
+            "no admission without a named quote"
         );
         // The pure helper states the same strict predicate the SQL evaluates.
         assert!(planned.lease_holds("proc-a", 439, 60));
@@ -4552,11 +4688,12 @@ mod tests {
         // The fence works on the migrated row: its owner, inside the lease, is admitted; the state
         // CHECK is untouched because SPENDING lives in the new column, not in `state`.
         let admitted = store
-            .admit_remittance_spend("v11-planned", "proc-old", 300, 60)
+            .admit_remittance_spend("v11-planned", "proc-old", "q-pay", 60, &mut || 300)
             .expect("query")
             .expect("admitted");
         assert_eq!(admitted.state, RemittanceState::Spending);
         assert_eq!(admitted.spending_since_unix, Some(300));
+        assert_eq!(admitted.spending_quote_id.as_deref(), Some("q-pay"));
         let raw_state: String = {
             let conn = store.lock().expect("lock");
             conn.query_row(
@@ -4582,6 +4719,154 @@ mod tests {
             RemittanceState::Spending,
             "the mark survives a reopen"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Addendum 5 §1 (ledger): a store written by a v12 binary — the remittance table WITH
+    // `spending_since_unix` but WITHOUT `spending_quote_id` — opens under v13 additively: the one
+    // column is added, its SPENDING row survives and reads SPENDING with NO bound quote (the truth of
+    // a row admitted before admissions bound a quote), its owner / lease / mark are exactly as
+    // written, and its release goes the way v12's did — on its invoice's quote being terminal,
+    // never on time, and never through the bound-quote release (it has none). A second open is a
+    // no-op, and a row THIS binary admits on the migrated store is bound.
+    #[test]
+    fn a_v12_store_migrates_to_v13_additively_and_its_spending_row_reads_as_unbound() {
+        let path = temp_db("v12-to-v13");
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).expect("create v12 store");
+            conn.execute_batch(
+                "CREATE TABLE seller_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO seller_meta VALUES ('schema_version', '12');
+                 CREATE TABLE receipts (
+                     receipt_id      TEXT PRIMARY KEY,
+                     job_id          TEXT NOT NULL,
+                     amount_sats     INTEGER NOT NULL CHECK (amount_sats >= 0),
+                     received_at_unix INTEGER NOT NULL,
+                     fee_bps         INTEGER NOT NULL DEFAULT 0,
+                     fee_sats        INTEGER NOT NULL DEFAULT 0,
+                     mint_fee_sats   INTEGER,
+                     remittance_id   TEXT
+                 );
+                 INSERT INTO receipts VALUES ('r-spending', 'job-s', 50, 2, 1000, 5, 1, 'v12-spending');
+                 INSERT INTO receipts VALUES ('r-free', 'job-f', 30, 3, 1000, 3, 1, NULL);
+                 CREATE TABLE fee_remittances (
+                     remittance_id   TEXT PRIMARY KEY,
+                     gross_sats      INTEGER NOT NULL CHECK (gross_sats >= 0),
+                     melt_fee_sats   INTEGER,
+                     net_sats        INTEGER NOT NULL CHECK (net_sats >= 0 AND net_sats <= gross_sats),
+                     destination     TEXT NOT NULL,
+                     melt_quote_id   TEXT,
+                     payment_hash    TEXT NOT NULL UNIQUE,
+                     bolt11          TEXT NOT NULL,
+                     state           TEXT NOT NULL CHECK (state IN ('planned','settled','failed')),
+                     created_at_unix INTEGER NOT NULL,
+                     settled_at_unix INTEGER,
+                     owner           TEXT,
+                     lease_until_unix INTEGER,
+                     melt_fee_reserve_sats INTEGER,
+                     settled_by      TEXT,
+                     spending_since_unix INTEGER
+                 );
+                 CREATE UNIQUE INDEX fee_remittances_one_planned ON fee_remittances (state) WHERE state = 'planned';
+                 INSERT INTO fee_remittances VALUES ('v12-spending', 5, NULL, 4, 'maxplayer@agi.cash', 'q-est', 'v12-spending', 'ln3', 'planned', 100, NULL, 'proc-v12', 400, 1, NULL, 150);",
+            )
+            .expect("v12 schema");
+        }
+
+        let store = SellerStore::open(&path).expect("a v12 store opens clean under v13");
+        assert_eq!(
+            store.health().expect("health").schema_version,
+            SCHEMA_VERSION
+        );
+        assert_eq!(SCHEMA_VERSION, 13);
+        let spending = store
+            .in_flight_remittance()
+            .expect("row")
+            .expect("the v12 spending row is the row in flight");
+        assert_eq!(spending.state, RemittanceState::Spending);
+        assert_eq!(spending.spending_since_unix, Some(150));
+        assert_eq!(spending.spending_quote_id, None, "admitted before quotes were bound");
+        assert_eq!(spending.owner.as_deref(), Some("proc-v12"));
+        assert_eq!(spending.lease_until_unix, Some(400));
+        assert_eq!(spending.melt_quote_id.as_deref(), Some("q-est"));
+        assert_eq!(
+            store.accrued_fees().expect("read-out").in_flight_fee_sats,
+            5
+        );
+        // No release on time, and none through the bound-quote transition (nothing is bound).
+        for (wrong, why) in [
+            (
+                ReleaseOn::LeaseExpired { now_unix: 10_000 },
+                "lease expiry never touches a spending row, migrated or not",
+            ),
+            (
+                ReleaseOn::TerminalBoundQuote { quote_id: "q-est" },
+                "the estimate quote was never BOUND: the bound-quote release changes zero rows",
+            ),
+            (
+                ReleaseOn::OwnPlanned { owner: "proc-v12" },
+                "not a planned row",
+            ),
+        ] {
+            assert_eq!(
+                store.release_remittance("v12-spending", wrong, 500).expect("query"),
+                None,
+                "{why}"
+            );
+        }
+        // The one release an unbound spending row has: its invoice's quote terminal, as v12 did it.
+        let released = store
+            .release_remittance("v12-spending", ReleaseOn::TerminalUnboundSpending, 500)
+            .expect("query")
+            .expect("released");
+        assert_eq!(released.state, RemittanceState::Failed);
+        assert_eq!(released.receipts, 0);
+        assert_eq!(
+            store.accrued_fees().expect("read-out").unremitted_fee_sats,
+            8
+        );
+        // A row THIS binary admits on the migrated store is bound, and its unbound release then
+        // changes zero rows: the v12 path is for v12 rows only.
+        let planned = store
+            .plan_remittance(&plan("h-new", 8, 7), "proc-new", 900, 501)
+            .expect("plan");
+        assert_eq!(planned.spending_quote_id, None);
+        let admitted = store
+            .admit_remittance_spend("h-new", "proc-new", "q-bound", 60, &mut || 502)
+            .expect("query")
+            .expect("admitted");
+        assert_eq!(admitted.spending_quote_id.as_deref(), Some("q-bound"));
+        assert_eq!(
+            store
+                .release_remittance("h-new", ReleaseOn::TerminalUnboundSpending, 503)
+                .expect("query"),
+            None
+        );
+        let raw: (String, Option<i64>, Option<String>) = {
+            let conn = store.lock().expect("lock");
+            conn.query_row(
+                "SELECT state, spending_since_unix, spending_quote_id FROM fee_remittances WHERE remittance_id = 'h-new'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("raw")
+        };
+        assert_eq!(
+            raw,
+            ("planned".to_owned(), Some(502), Some("q-bound".to_owned())),
+            "on disk a bound spending row is a planned row with a mark and a quote"
+        );
+
+        drop(store);
+        let store = SellerStore::open(&path).expect("second open is a no-op");
+        assert_eq!(
+            store.health().expect("health").schema_version,
+            SCHEMA_VERSION
+        );
+        let rows = store.remittances().expect("rows");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].spending_quote_id.as_deref(), Some("q-bound"), "the binding survives a reopen");
         let _ = std::fs::remove_file(&path);
     }
 
