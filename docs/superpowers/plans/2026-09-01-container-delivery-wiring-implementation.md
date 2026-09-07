@@ -1,10 +1,11 @@
 # Container-delivery wiring — implementation spec (the go-live work)
 
-> **Status: BUILT, behind a switch that defaults to off.** The wiring is on branch
-> `feat/container-delivery-golive`, behind `[sandbox] container_delivery`. This document is the design
-> reference for the wiring that moves git delivery into the sandbox container. The code follows the
-> sections below. The sections "Live validation record" and "Follow-ups" record the status on
-> 2026-09-03.
+> **Status: BUILT and DEFAULT ON for a docker seat.** The wiring merged in PR #963. `[sandbox]
+> container_delivery` is now `Option<bool>`: absent under `mode = "docker"` means the container path,
+> `false` is the opt-out back to the host path, and a `launcher` seat is unaffected and cannot use the
+> mode. This document is the design reference for the wiring that moves git delivery into the sandbox
+> container. The code follows the sections below. The sections "Live validation record" and
+> "Follow-ups" record the status on 2026-09-03, when the switch still defaulted to off.
 >
 > **Gates:**
 > 1. Relay — **partly met.** Requirement A (#929, ref-scope enforcement) is deployed, and the canary
@@ -27,12 +28,13 @@
 | #950 (`cb26141`) | on this branch | this spec. |
 | `15b6e7b` | on this branch | Task B7: the sandbox image carries the `maxplayer` binary. The image build context is the repo root. |
 | `b090bd3` | on this branch | the relay canary test, `crates/maxplayer-core/tests/relay_canary.rs`. It is `#[ignore]`; a person runs it against a live relay. |
-| `92a4c80` | on this branch | the `[sandbox]` switch: `container_delivery`, `container_delivery_token`, `container_delivery_token_cap_secs`. Default off. |
+| `92a4c80` | on this branch | the `[sandbox]` switch: `container_delivery`, `container_delivery_token`, `container_delivery_token_cap_secs`. Default off at the time; the switch later became `Option<bool>` and defaults ON under `mode = "docker"`. |
 | `e00be26` | on this branch | Task B9: the ACP agent runs inside the delivery container. The host no longer drives ACP. |
 | `008e464` | on this branch | Task B2: the host launches one container, hands off the token in one of two modes, and reads back the OID. C3/C4/C6 land here. |
 | `1258772` | on this branch | docs for the switch: `SELLER-QUICKSTART.md` section 3c and `DOCKER.md`. |
 
-**With the switch off (the default), git is 100% host-side.** Only the agent runs in the container.
+**With the switch off, git is 100% host-side.** That is a `launcher` seat, or a docker seat with
+`container_delivery = false`; it is no longer the default. Only the agent runs in the container.
 Clone (`init_*_workdir`), commit (`snapshot_delivery_at`), and push (`neutralize_then_push_off_runtime`)
 all run on the host in `SellerNodeRunner::execute_job` (`run.rs:6299`). **With the switch on,**
 `execute_job` calls `deliver_via_container` (`run.rs:6473`), and the wiring below runs them in the

@@ -723,27 +723,49 @@ hardening flags every docker job gets and `SANDBOXING.md` for the architecture.
 An existing seat on `launcher` is never moved by an upgrade — see *Moving an existing seat from
 `launcher` to `docker`* at the end of this section.
 
-#### Container-side delivery (opt-in, experimental)
+#### Container-side delivery (the default under `mode = "docker"`)
 
-By default the seller host runs the git steps of a delivery. The host clones the base, the container
-runs the agent, and the host commits and pushes. With `container_delivery = true`, ONE sandbox
-container runs the agent and every git step: clone, completion gate, commit, and push. The host runs
-no git for the job. It writes the job inputs into a per-job directory, starts the container, hands
-over a push token, and reads back the commit id. Then it publishes the result as before.
+**A docker seat delivers from inside its container.** ONE sandbox container runs the agent and every
+git step: clone, completion gate, commit, and push. The host runs no git for the job. It writes the
+job inputs into a per-job directory, starts the container, hands over a push token, and reads back the
+commit id. Then it publishes the result as before. The host never opens a git repository the job agent
+can write.
+
+This is the default. A seat with `mode = "docker"` that does not name `container_delivery` gets it.
 
 ```toml
 [sandbox]
 mode = "docker"
-container_delivery = true
+# container_delivery = false                       # opt back into the host delivery path
 # container_delivery_token = "fresh-after-agent"   # default; the other value is "long-lived"
 # container_delivery_token_cap_secs = 21600        # "long-lived" only; the relay's cap, 6 h
 ```
 
+`container_delivery = false` is the opt-out, and it keeps working. On that path the host clones the
+base, the container runs the agent, and the host commits and pushes.
+
+**A `launcher` seat is not affected, and cannot use this mode.** Launcher mode creates no container to
+move the git steps into, so such a seat always delivers from the host. Adding
+`container_delivery = false` to a launcher seat changes nothing and is accepted;
+`container_delivery = true` under `launcher` is REFUSED at boot, and so is either token key. An
+upgrade never moves a launcher seat.
+
+The seller prints the effective path at boot, on one line, so you can read it off a boot scroll:
+
+```text
+seller node delivery path: CONTAINER — one container runs the agent and every git step. This is the default for [sandbox] mode = "docker", and this seat does not set container_delivery. Set container_delivery = false for the host path.
+```
+
+The line names the path in capitals (`CONTAINER` or `HOST`) and the reason: the docker default, an
+explicit `container_delivery` value, or `mode = "launcher"`. The `relay token policy` row of
+`maxplayer doctor` reports the same answer.
+
 Requirements:
 
-- `mode = "docker"`. The seller refuses the three keys under `launcher` mode.
-- A sandbox image that contains the `maxplayer` binary at `/usr/local/bin/maxplayer`. A custom image
-  must add it.
+- `mode = "docker"`. The seller refuses `container_delivery = true` and both token keys under
+  `launcher` mode.
+- A sandbox image that contains the `maxplayer` binary at `/usr/local/bin/maxplayer`. The shipped
+  image has it. A custom image must add it, or set `container_delivery = false`.
 - A relay that enforces the branch scope on push tokens (PR #929).
 
 The token mode selects when the host mints the branch-scoped push token:
@@ -776,8 +798,9 @@ to `long-lived` caused an HTTP 401 on the push. The push is the last step of a j
 the agent ran and after the buyer paid.
 
 The `relay token policy` row of `maxplayer doctor` reports the same answer. The row is information
-under `fresh-after-agent`, and it FAILs under `long-lived`. Turn `container_delivery = true` on
-first. With the switch off, the row reads the config only and asks no relay.
+under `fresh-after-agent`, and it FAILs under `long-lived`. A docker seat reaches the row by default.
+A seat on the host delivery path — a `launcher` seat, or `container_delivery = false` — reads the
+config only and asks no relay.
 
 To measure a relay yourself, run the canary test. It pushes with the production push path and prints
 what the relay did with a scoped token that carries an `expiration` tag:
