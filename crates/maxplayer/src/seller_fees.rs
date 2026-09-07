@@ -301,6 +301,11 @@ pub(crate) fn render(
         };
         let state = match row.state {
             RemittanceState::Planned => "PLANNED (settling — re-run remit to reconcile)",
+            // Addendum 4 §1: the owner's compare-and-set admitted the melt. Never released on time;
+            // reconciliation settles it on PAID and releases it on FAILED/expired, else holds.
+            RemittanceState::Spending => {
+                "SPENDING (melt admitted; resolved only by the mint's verdict on its quote — re-run remit to reconcile)"
+            }
             RemittanceState::Settled => "settled",
             RemittanceState::Failed => "failed (no sats left; receipts released)",
         };
@@ -665,6 +670,7 @@ mod tests {
                 settled_by: None,
                 owner: Some("pid1-a".to_owned()),
                 lease_until_unix: Some(305),
+                spending_since_unix: None,
                 receipts: 0,
             },
             FeeRemittance {
@@ -683,6 +689,7 @@ mod tests {
                 settled_by: Some(SettledBy::Melt),
                 owner: Some("pid1-a".to_owned()),
                 lease_until_unix: Some(307),
+                spending_since_unix: None,
                 receipts: 1,
             },
             // Settled by reconciliation: the fee is unobserved and the row SAYS why, with the
@@ -703,7 +710,29 @@ mod tests {
                 settled_by: Some(SettledBy::Reconciliation),
                 owner: Some("pid2-b".to_owned()),
                 lease_until_unix: Some(309),
+                spending_since_unix: None,
                 receipts: 2,
+            },
+            // Addendum 4 §1: a SPENDING row (melt admitted, mint not yet heard) is named as such,
+            // never as planned — the operator must know it will not be released on time.
+            FeeRemittance {
+                remittance_id: "mid".to_owned(),
+                gross_sats: 4,
+                melt_fee_sats: None,
+                melt_fee_reserve_sats: Some(1),
+                net_sats: 3,
+                destination: "maxplayer@agi.cash".to_owned(),
+                melt_quote_id: Some("q-mid".to_owned()),
+                payment_hash: "mid".to_owned(),
+                bolt11: "ln-mid".to_owned(),
+                state: RemittanceState::Spending,
+                created_at_unix: 11,
+                settled_at_unix: None,
+                settled_by: None,
+                owner: Some("pid3-c".to_owned()),
+                lease_until_unix: Some(311),
+                spending_since_unix: Some(12),
+                receipts: 1,
             },
         ];
         let text = render(&accrued, &remittances, "db");
@@ -715,6 +744,7 @@ mod tests {
             "  failed (no sats left; receipts released): 6 sats to maxplayer@agi.cash — gross 7 sats, melt fee not observed, invoice old, 0 receipts, planned at unix 5, resolved at unix 6\n",
             "  settled: 9 sats to maxplayer@agi.cash — gross 10 sats, melt fee 1 sats, invoice abc123, 1 receipt, planned at unix 7, resolved at unix 8\n",
             "  settled: 17 sats to maxplayer@agi.cash — gross 20 sats, melt fee not observed (settled by reconciliation against the mint, which reports the quote paid but not the fee it kept; at most 3 sats, the quote's reserve), invoice rec, 2 receipts, planned at unix 9, resolved at unix 10\n",
+            "  SPENDING (melt admitted; resolved only by the mint's verdict on its quote — re-run remit to reconcile): 3 sats to maxplayer@agi.cash — gross 4 sats, melt fee not observed, invoice mid, 1 receipt, planned at unix 11\n",
         ] {
             assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
         }
