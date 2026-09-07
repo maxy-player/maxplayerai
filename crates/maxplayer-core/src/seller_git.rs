@@ -10,21 +10,26 @@
 //! The previous implementation shelled out to `git` and had to defend against ambient config: empty
 //! `GIT_CONFIG_GLOBAL`/`XDG_CONFIG_HOME`, `GIT_CONFIG_NOSYSTEM`, `protocol.*.allow=never`, scrubbed
 //! `GIT_SSH*`/`insteadOf`. In-process git2 needs NONE of that:
-//! - **`insteadOf` / ambient-config immunity:** the transport layer ([`crate::git_transport`])
-//!   empties libgit2's global/XDG/system config search path at first use, so no ambient git config is
-//!   consulted on any leg. `url.*.insteadOf` is applied by libgit2 at CONNECT time and
-//!   [`Repository::remote_anonymous`] does NOT prevent it — only clearing the search path does — so an
-//!   agent-planted `.git/config` (or poisoned `$HOME`/XDG/system config) can never redirect an
-//!   allowlisted `https` push onto `ssh`/`file`/`ext`.
+//! - **Ambient-config immunity:** the transport layer ([`crate::git_transport`]) empties libgit2's
+//!   global/XDG/system config search path at first use, so no ambient git config is consulted on
+//!   any leg. Only a repository-local config is read at all.
+//! - **Repository-local config, in a workdir the job wrote:** libgit2 applies `url.*.insteadOf` from
+//!   the config of the repository that runs the operation, and it finds that config through
+//!   `.git/commondir` when that file exists. Three layers close this, in order:
+//!   [`assert_plain_repo_layout`] refuses a `.git` that is a gitfile or a symlink, a `.git/commondir`
+//!   entry, and a `.git/config` that is not a regular file; [`neutralize_push_config`] then replaces
+//!   `.git/config` with a fixed minimal file; and [`crate::git_transport`] binds every leg to the
+//!   URL the caller named, so a rewrite from any remaining source fails before a request exists.
 //! - **Transport allowlist:** every entry asserts [`assert_allowed_repo_locator`] and only `https`
 //!   is registered as a subtransport — `ext:`/`file:`/`ssh:` are refused before any remote exists.
 //! - **Key hygiene:** the seller secret signs the NIP-98 event in-process only — never on argv,
 //!   never in child env, no subprocess.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use git2::build::CheckoutBuilder;
-use git2::{Commit, Direction, IndexAddOption, Oid, Repository, Signature};
+use git2::{Commit, Direction, IndexAddOption, Oid, Repository, RepositoryOpenFlags, Signature};
 
 use crate::delivery_sentinel::{self, DeliveryMode};
 use crate::delivery_transport::{assert_allowed_repo_locator, TransportRefuse};
@@ -45,6 +50,12 @@ pub enum SellerGitError {
     /// work it never saw happen. An unconditional sentinel write would make this state deliver a
     /// passing sentinel and prove nothing, so the gate — not the write — is the check.
     NoExecutionObserved(String),
+    /// The job workdir does not have the plain repository layout the push path requires: its `.git`
+    /// is a gitfile or a symlink, a `.git/commondir` entry exists, or `.git/config` is not a regular
+    /// file. Under such a layout libgit2 reads config, objects or refs from a directory the job
+    /// chose, so the push path refuses before it opens the repository. See
+    /// [`assert_plain_repo_layout`].
+    Layout(String),
 }
 
 impl std::fmt::Display for SellerGitError {
@@ -58,6 +69,7 @@ impl std::fmt::Display for SellerGitError {
             Self::NoExecutionObserved(message) => {
                 write!(f, "seller git no execution observed: {message}")
             }
+            Self::Layout(message) => write!(f, "seller git refused the workdir layout: {message}"),
         }
     }
 }
@@ -454,8 +466,9 @@ pub struct PushAuth {
 
 /// Push `branch` from `workdir` to `remote_url` (allowlisted https / relay-git only), with
 /// optional NIP-98 auth for relay-git. Always in-process libgit2 — there is no system-git fallback.
-/// Returns the pushed commit OID (full hex). Unauthenticated / prompt-needing remotes
-/// fail closed.
+/// The workdir passes the layout gate and every leg is bound to `remote_url`; see
+/// [`git_transport::push_branch_with_header`]. Returns the pushed commit OID (full hex).
+/// Unauthenticated / prompt-needing remotes fail closed.
 pub fn push_branch_with_auth(
     workdir: &Path,
     remote_url: &str,
@@ -466,8 +479,12 @@ pub fn push_branch_with_auth(
     if branch.trim().is_empty() {
         return Err(SellerGitError::Io("branch must be non-empty".into()));
     }
-    let oid =
-        git_transport::push_branch(workdir, remote_url, branch, auth.map(|a| a.secret_key_hex.as_str()))?;
+    let oid = git_transport::push_branch(
+        workdir,
+        remote_url,
+        branch,
+        auth.map(|a| a.secret_key_hex.as_str()),
+    )?;
     eprintln!("seller push path=inprocess remote={remote_url} branch={branch} ok");
     Ok(oid)
 }
@@ -618,23 +635,169 @@ pub async fn push_branch_with_header_off_runtime(
     off_runtime(move || push_branch_with_header(&workdir, &remote_url, &branch, header)).await
 }
 
-/// Overwrite `workdir`'s repo-local git config with a fixed, minimal, redirect-free config, so a push
-/// from `workdir` cannot be hijacked by anything the agent planted in `.git/config`.
+/// Refuse a job workdir whose repository layout would make libgit2 read state from outside
+/// `workdir/.git`. Returns the `.git` directory path when the layout is plain.
+///
+/// The job agent writes the whole workdir, `.git` included, and exits. libgit2 then opens the
+/// repository from what the job left behind. Three layout mechanisms let a file the job wrote point
+/// libgit2 at a directory the job prepared:
+/// - a **gitfile**: `.git` as a regular FILE whose `gitdir:` line names another directory;
+/// - a **symlink** at `.git` (or at `.git/config`);
+/// - **`.git/commondir`**: libgit2 reads this file and resolves CONFIG, `objects` and `refs` through
+///   the directory it names (`repository.c`, `lookup_commondir`; the item table lists `config`
+///   under the common dir). A config rewrite of `.git/config` then edits the wrong file.
+///
+/// The rules, all fail-closed as [`SellerGitError::Layout`]:
+/// 1. `workdir/.git` is a directory — not a symlink, not a file.
+/// 2. No `workdir/.git/commondir` entry exists, of any kind.
+/// 3. `workdir/.git/config` is a regular file or absent — not a symlink, not a directory.
+///
+/// Use [`open_plain_workdir_repo`] to open the repository; it runs this gate first and checks the
+/// opened repository against it.
+pub fn assert_plain_repo_layout(workdir: &Path) -> Result<PathBuf, SellerGitError> {
+    let git_dir = workdir.join(".git");
+    let git_dir_meta = std::fs::symlink_metadata(&git_dir).map_err(|error| {
+        SellerGitError::Layout(format!("{} is not readable: {error}", git_dir.display()))
+    })?;
+    if git_dir_meta.file_type().is_symlink() {
+        return Err(SellerGitError::Layout(format!(
+            "{} is a symlink; a plain .git directory is required",
+            git_dir.display()
+        )));
+    }
+    if git_dir_meta.is_file() {
+        return Err(SellerGitError::Layout(format!(
+            "{} is a file (a gitfile that points at another git dir); a plain .git directory is \
+             required",
+            git_dir.display()
+        )));
+    }
+    if !git_dir_meta.is_dir() {
+        return Err(SellerGitError::Layout(format!(
+            "{} is not a directory",
+            git_dir.display()
+        )));
+    }
+
+    let commondir = git_dir.join("commondir");
+    match std::fs::symlink_metadata(&commondir) {
+        Ok(_) => {
+            return Err(SellerGitError::Layout(format!(
+                "{} is present; libgit2 would read config, objects and refs through the directory \
+                 it names",
+                commondir.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(SellerGitError::Layout(format!(
+                "{} is not statable: {error}",
+                commondir.display()
+            )));
+        }
+    }
+
+    let config = git_dir.join("config");
+    match std::fs::symlink_metadata(&config) {
+        Ok(meta) if meta.is_file() => {}
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(SellerGitError::Layout(format!(
+                "{} is a symlink; a regular file is required",
+                config.display()
+            )));
+        }
+        Ok(_) => {
+            return Err(SellerGitError::Layout(format!(
+                "{} is not a regular file",
+                config.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(SellerGitError::Layout(format!(
+                "{} is not statable: {error}",
+                config.display()
+            )));
+        }
+    }
+    Ok(git_dir)
+}
+
+/// Open the repository at `workdir` for a push-side operation, through the layout gate.
+///
+/// Runs [`assert_plain_repo_layout`] first, then opens with [`RepositoryOpenFlags::NO_SEARCH`] so
+/// libgit2 never walks up to a parent directory, and finally requires that the opened repository is
+/// the one the gate inspected: not bare, not a linked worktree, and `repo.path()` canonicalizes to
+/// `workdir/.git`. The common directory is checked through the same rule the gate used: git2 0.19
+/// does not expose `git_repository_commondir`, and with `.git/commondir` absent and no
+/// `FROM_ENV` flag libgit2 sets the common dir to the git dir itself (`repository.c`,
+/// `lookup_commondir`), so the absence of that entry — verified again on the opened path — is the
+/// commondir check.
+pub fn open_plain_workdir_repo(workdir: &Path) -> Result<Repository, SellerGitError> {
+    let git_dir = assert_plain_repo_layout(workdir)?;
+    let repo = Repository::open_ext(
+        workdir,
+        RepositoryOpenFlags::NO_SEARCH,
+        &[] as &[&std::ffi::OsStr],
+    )
+    .map_err(|error| SellerGitError::Io(format!("open workdir repo: {error}")))?;
+    if repo.is_bare() || repo.is_worktree() {
+        return Err(SellerGitError::Layout(format!(
+            "{} opened as a bare repository or a linked worktree",
+            workdir.display()
+        )));
+    }
+    let expected = std::fs::canonicalize(&git_dir).map_err(|error| {
+        SellerGitError::Layout(format!("canonicalize {}: {error}", git_dir.display()))
+    })?;
+    let actual = std::fs::canonicalize(repo.path()).map_err(|error| {
+        SellerGitError::Layout(format!("canonicalize {}: {error}", repo.path().display()))
+    })?;
+    if actual != expected {
+        return Err(SellerGitError::Layout(format!(
+            "libgit2 opened {} for {}, not {}",
+            actual.display(),
+            workdir.display(),
+            expected.display()
+        )));
+    }
+    if std::fs::symlink_metadata(repo.path().join("commondir")).is_ok() {
+        return Err(SellerGitError::Layout(format!(
+            "{} appeared after the layout check",
+            repo.path().join("commondir").display()
+        )));
+    }
+    Ok(repo)
+}
+
+/// Replace `workdir`'s repo-local git config with a fixed, minimal, redirect-free config, so a push
+/// from `workdir` follows nothing the agent planted in `.git/config`.
 ///
 /// A confirmed exploit: under `[sandbox] mode = "docker"` the whole job workdir is bind-mounted into
 /// the container, `.git` included, so the agent can write `.git/config`. libgit2 applies
-/// `url.<other>.insteadOf` from the config of the repo that RUNS an operation (at connect time, for
-/// `remote_anonymous` too). [`crate::git_transport`] empties the global/XDG/system config search paths
-/// (#610), but a repo-LOCAL `.git/config` is not reached through a search path — so a push straight
-/// from the agent's workdir would follow a planted `insteadOf` and send the seller's token to a host
-/// the agent chose.
+/// `url.<other>.insteadOf` from the config of the repo that RUNS an operation (when it creates the
+/// remote, for `remote_anonymous` too). [`crate::git_transport`] empties the global/XDG/system config
+/// search paths (#610), but a repo-LOCAL `.git/config` is not reached through a search path — so a
+/// push straight from the agent's workdir would follow a planted `insteadOf` and send the seller's
+/// token to a host the agent chose.
 ///
-/// This closes that: it REPLACES the whole `.git/config` (not a targeted edit), which is what makes it
-/// robust rather than a fragile blocklist. One write strips `url.*.insteadOf`, `url.*.pushInsteadOf`,
-/// any `remote.*.pushurl`, and — because the replacement carries no `[include]`/`[includeIf]` directive
-/// and does not enable `extensions.worktreeConfig` — every SECONDARY config file the agent could have
-/// pointed at. A push needs nothing from the config (explicit URL + refspec), so a minimal file
-/// suffices.
+/// What this function does, in order:
+/// 1. [`assert_plain_repo_layout`]: refuse a gitfile or symlinked `.git`, a `.git/commondir` entry,
+///    and a `.git/config` that is not a regular file. Without this step the replacement below can
+///    edit the wrong file: with `.git/commondir` present libgit2 reads its config from the directory
+///    that file names, and a symlinked `.git/config` sends the write elsewhere.
+/// 2. Unlink `.git/config`, then create it anew with `create_new` and write the minimal config. The
+///    bytes go only to a file this call created; nothing is written through a pre-existing path.
+/// 3. Remove any `.git/config.worktree` entry.
+///
+/// The replacement is a whole file, not a targeted edit. It carries no `url.*`, no `remote.*`, no
+/// `[include]`/`[includeIf]`, and no `extensions.worktreeConfig`, so every rewrite knob and every
+/// secondary config file is gone at once. A push needs nothing from the config (explicit URL,
+/// explicit object, explicit refspec), so a minimal file suffices.
+///
+/// This is one of two layers. The transport ([`crate::git_transport`]) also binds every leg to
+/// the URL the caller named, so a rewrite that reaches libgit2 by any other route fails before a
+/// request is built.
 ///
 /// ⚠ Call this only when no agent process can still rewrite the file before the push. On the delivery
 /// path the job container has already exited, so no agent process is alive to re-plant the redirect.
@@ -642,21 +805,59 @@ pub fn neutralize_push_config(workdir: &Path) -> Result<(), SellerGitError> {
     // repositoryformatversion is the one key git requires to recognise the repo; bare=false for a
     // working tree. Nothing else — deliberately no `url.*`, no `include`, no worktree-config extension.
     const MINIMAL_CONFIG: &str = "[core]\n\trepositoryformatversion = 0\n\tbare = false\n";
-    let git_dir = workdir.join(".git");
-    std::fs::write(git_dir.join("config"), MINIMAL_CONFIG)
-        .map_err(|error| SellerGitError::Io(format!("neutralize git config: {error}")))?;
+    let git_dir = assert_plain_repo_layout(workdir)?;
+    let config = git_dir.join("config");
+    match std::fs::remove_file(&config) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(SellerGitError::Io(format!(
+                "neutralize git config: unlink {}: {error}",
+                config.display()
+            )));
+        }
+    }
+    // `create_new` fails if anything appeared at the path after the unlink, a symlink included, so
+    // the bytes never follow a path the job controls.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&config)
+        .map_err(|error| {
+            SellerGitError::Io(format!(
+                "neutralize git config: create {}: {error}",
+                config.display()
+            ))
+        })?;
+    file.write_all(MINIMAL_CONFIG.as_bytes())
+        .map_err(|error| SellerGitError::Io(format!("neutralize git config: write: {error}")))?;
     // Defense in depth: the config above does not enable worktree config, so git will not read
-    // `config.worktree` — but remove any the agent left, so nothing stale can be reached.
+    // `config.worktree` — but remove any entry the agent left, so nothing stale can be reached. A
+    // directory here cannot be removed this way and is a layout refusal.
     let worktree_config = git_dir.join("config.worktree");
-    if worktree_config.exists() {
-        let _ = std::fs::remove_file(&worktree_config);
+    match std::fs::symlink_metadata(&worktree_config) {
+        Ok(_) => std::fs::remove_file(&worktree_config).map_err(|error| {
+            SellerGitError::Layout(format!(
+                "{} cannot be removed: {error}",
+                worktree_config.display()
+            ))
+        })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(SellerGitError::Io(format!(
+                "neutralize git config: stat {}: {error}",
+                worktree_config.display()
+            )));
+        }
     }
     Ok(())
 }
 
-/// Off-runtime: neutralise `workdir`'s config, THEN push. This is the delivery push — hardening the
-/// config first (a whole-file replacement) means an `insteadOf`/`pushInsteadOf`/`include` the agent
-/// planted cannot redirect the token. Both run in one blocking op, so nothing runs between them.
+/// Off-runtime: neutralise `workdir`'s config, THEN push. This is the host-path delivery push. The
+/// layout gate and the whole-file config replacement run first, so an
+/// `insteadOf`/`pushInsteadOf`/`include` the agent planted is gone before libgit2 reads the config;
+/// the push then binds every leg to `remote_url`. Both run in one blocking op, so nothing runs
+/// between them.
 pub async fn neutralize_then_push_off_runtime(
     workdir: PathBuf,
     remote_url: String,
@@ -806,6 +1007,225 @@ mod tests {
     fn allowlist_https_accepted_by_locator_gate() {
         assert_allowed_repo_locator("https://example.invalid/git/owner/repo.git").unwrap();
         assert_allowed_repo_locator("https://example.invalid/repo.git").unwrap();
+    }
+
+    // ── F1 layer (a): the layout gate ────────────────────────────────────────────────────────
+
+    const MINIMAL_CONFIG: &str = "[core]\n\trepositoryformatversion = 0\n\tbare = false\n";
+
+    // A plain workdir with one commit on `refs/heads/job`, made with git2 (no system git).
+    fn plain_repo(label: &str) -> (PathBuf, PathBuf) {
+        let root = temp(label);
+        let _ = fs::remove_dir_all(&root);
+        let workdir = root.join("workdir");
+        let repo = Repository::init(&workdir).expect("init");
+        fs::write(workdir.join("out.txt"), "work\n").expect("write");
+        let mut index = repo.index().expect("index");
+        index.add_path(Path::new("out.txt")).expect("add");
+        index.write().expect("index write");
+        let tree = repo
+            .find_tree(index.write_tree().expect("tree"))
+            .expect("find tree");
+        let sig = Signature::new(
+            "s",
+            "s@example.invalid",
+            &git2::Time::new(1_700_000_000, 0),
+        )
+        .expect("sig");
+        repo.commit(Some("refs/heads/job"), &sig, &sig, "delivery", &tree, &[])
+            .expect("commit");
+        (root, workdir)
+    }
+
+    // Append a rewrite rule to the config file in `git_dir`, the way a job writes a file.
+    fn plant_insteadof(git_dir: &Path, attacker: &str, intended: &str) {
+        let mut config = fs::read_to_string(git_dir.join("config")).unwrap_or_default();
+        config.push_str(&format!("[url \"{attacker}\"]\n\tinsteadOf = {intended}\n"));
+        fs::write(git_dir.join("config"), config).expect("write config");
+    }
+
+    // The job prepared a second, valid git dir with a rewrite rule in ITS config and pointed
+    // `.git/commondir` at it. libgit2 resolves the config through that pointer, so a rewrite of
+    // `workdir/.git/config` alone edits the wrong file. Both the scrub and the push refuse.
+    // Red-on-revert: drop the `assert_plain_repo_layout` call from `neutralize_push_config` and the
+    // scrub returns Ok while the rewrite rule stands.
+    #[test]
+    fn layout_gate_refuses_a_commondir_pointer() {
+        let (root, workdir) = plain_repo("layout-commondir");
+        let other = root.join("other-gitdir");
+        Repository::init_bare(&other).expect("other git dir");
+        plant_insteadof(&other, "https://evil.example/", "https://relay.example/");
+        fs::write(
+            workdir.join(".git").join("commondir"),
+            format!("{}\n", other.display()),
+        )
+        .expect("plant commondir");
+        // Control: libgit2 follows the pointer — it reads the OTHER dir's config as this repo's.
+        let followed = Repository::open(&workdir).expect("fixture: libgit2 opens the layout");
+        let seen = followed
+            .config()
+            .expect("config")
+            .get_string("url.https://evil.example/.insteadof")
+            .expect("fixture: libgit2 reads the rewrite rule through commondir");
+        assert_eq!(seen, "https://relay.example/");
+        drop(followed);
+
+        let err = neutralize_push_config(&workdir).expect_err("the scrub refuses");
+        assert!(
+            matches!(&err, SellerGitError::Layout(m) if m.contains("commondir")),
+            "{err}"
+        );
+        // Nothing was written anywhere: the rule in the other dir still stands.
+        assert!(
+            fs::read_to_string(other.join("config"))
+                .expect("other config")
+                .contains("insteadOf"),
+            "the other config was not touched"
+        );
+        assert!(matches!(
+            open_plain_workdir_repo(&workdir),
+            Err(SellerGitError::Layout(_))
+        ));
+        // The push refuses through the same gate, before it names a remote.
+        let err = push_branch_with_header(&workdir, "https://relay.example/git/o/r.git", "job", None)
+            .expect_err("the push refuses");
+        assert!(
+            matches!(&err, SellerGitError::Transport(m) if m.contains("commondir")),
+            "{err}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // `.git` as a regular file (`gitdir: <elsewhere>`): what `--separate-git-dir` produces, and what
+    // a job can write by hand.
+    #[test]
+    fn layout_gate_refuses_a_gitfile() {
+        let (root, workdir) = plain_repo("layout-gitfile");
+        let real = root.join("real-gitdir");
+        fs::rename(workdir.join(".git"), &real).expect("move git dir");
+        fs::write(workdir.join(".git"), format!("gitdir: {}\n", real.display())).expect("gitfile");
+        assert!(
+            Repository::open(&workdir).is_ok(),
+            "fixture: libgit2 follows the gitfile"
+        );
+        let err = neutralize_push_config(&workdir).expect_err("refused");
+        assert!(
+            matches!(&err, SellerGitError::Layout(m) if m.contains("gitfile")),
+            "{err}"
+        );
+        assert!(matches!(
+            open_plain_workdir_repo(&workdir),
+            Err(SellerGitError::Layout(_))
+        ));
+        assert!(matches!(
+            push_branch_with_header(&workdir, "https://relay.example/git/o/r.git", "job", None),
+            Err(SellerGitError::Transport(_))
+        ));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn layout_gate_refuses_a_symlinked_git_dir() {
+        let (root, workdir) = plain_repo("layout-symlink-gitdir");
+        let real = root.join("real-gitdir");
+        fs::rename(workdir.join(".git"), &real).expect("move git dir");
+        std::os::unix::fs::symlink(&real, workdir.join(".git")).expect("symlink .git");
+        assert!(
+            Repository::open(&workdir).is_ok(),
+            "fixture: libgit2 follows the symlink"
+        );
+        let err = neutralize_push_config(&workdir).expect_err("refused");
+        assert!(
+            matches!(&err, SellerGitError::Layout(m) if m.contains("symlink")),
+            "{err}"
+        );
+        assert!(matches!(
+            open_plain_workdir_repo(&workdir),
+            Err(SellerGitError::Layout(_))
+        ));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // A symlinked `.git/config`: the old `std::fs::write` followed the link and wrote the file the
+    // job chose. The gate refuses, and the file behind the link is untouched.
+    #[test]
+    fn layout_gate_refuses_a_symlinked_config() {
+        let (root, workdir) = plain_repo("layout-symlink-config");
+        let git_dir = workdir.join(".git");
+        let elsewhere = root.join("elsewhere-config");
+        fs::rename(git_dir.join("config"), &elsewhere).expect("move config");
+        std::os::unix::fs::symlink(&elsewhere, git_dir.join("config")).expect("symlink config");
+        let before = fs::read_to_string(&elsewhere).expect("read elsewhere");
+        assert_ne!(before, MINIMAL_CONFIG);
+
+        let err = neutralize_push_config(&workdir).expect_err("refused");
+        assert!(
+            matches!(&err, SellerGitError::Layout(m) if m.contains("config") && m.contains("symlink")),
+            "{err}"
+        );
+        assert_eq!(
+            fs::read_to_string(&elsewhere).expect("read elsewhere"),
+            before,
+            "the file behind the link is untouched"
+        );
+        assert!(
+            fs::symlink_metadata(git_dir.join("config"))
+                .expect("config entry")
+                .file_type()
+                .is_symlink(),
+            "the link itself is untouched"
+        );
+        assert!(matches!(
+            open_plain_workdir_repo(&workdir),
+            Err(SellerGitError::Layout(_))
+        ));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // The plain layout passes: the scrub replaces the config with the minimal file, removes a
+    // planted `config.worktree`, and the gated open works. The gated open never walks upward.
+    #[test]
+    fn layout_gate_accepts_a_plain_workdir_and_the_scrub_replaces_the_config() {
+        let (root, workdir) = plain_repo("layout-plain");
+        let git_dir = workdir.join(".git");
+        plant_insteadof(&git_dir, "https://evil.example/", "https://relay.example/");
+        fs::write(
+            git_dir.join("config.worktree"),
+            "[url \"https://evil.example/\"]\n\tinsteadOf = https://relay.example/\n",
+        )
+        .expect("plant worktree config");
+
+        assert_eq!(assert_plain_repo_layout(&workdir).expect("plain"), git_dir);
+        neutralize_push_config(&workdir).expect("scrub");
+        assert_eq!(
+            fs::read_to_string(git_dir.join("config")).expect("config"),
+            MINIMAL_CONFIG
+        );
+        assert!(
+            fs::symlink_metadata(git_dir.join("config.worktree")).is_err(),
+            "worktree config removed"
+        );
+        let repo = open_plain_workdir_repo(&workdir).expect("gated open");
+        assert!(repo.refname_to_id("refs/heads/job").is_ok());
+        assert!(
+            repo.config()
+                .expect("config")
+                .get_string("url.https://evil.example/.insteadof")
+                .is_err(),
+            "no rewrite rule survives"
+        );
+        drop(repo);
+
+        // A subdirectory has no `.git`: `Repository::discover` walks up and finds the repo; the
+        // gated open refuses instead of searching.
+        let sub = workdir.join("sub");
+        fs::create_dir_all(&sub).expect("subdir");
+        assert!(Repository::discover(&sub).is_ok(), "fixture: discover walks up");
+        assert!(matches!(
+            open_plain_workdir_repo(&sub),
+            Err(SellerGitError::Layout(_))
+        ));
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -14,6 +14,11 @@
 //! test drives that production primitive and asserts the push lands at the URL the seller named. A
 //! positive control at the end RE-PLANTS the rule and shows the push then does redirect — proving the
 //! rule is real and that neutralising it is what protected the delivery.
+//!
+//! The scrub is one of three layers. `seller_git::assert_plain_repo_layout` runs first and refuses a
+//! `.git/commondir`, a gitfile, or a symlinked `.git`/`.git/config` (under those the scrub alone edits
+//! the wrong file; see its tests in `seller_git`). `git_transport` then binds every leg to the URL the
+//! caller named; `tests/push_destination_binding.rs` observes that binding on the wire.
 #![cfg(feature = "git-delivery")]
 
 use maxplayer_core::seller_git::neutralize_push_config;

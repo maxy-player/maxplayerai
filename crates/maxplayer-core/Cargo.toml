@@ -118,6 +118,13 @@ required-features = ["git-delivery"]
 name = "relay_canary"
 required-features = ["git-delivery"]
 
+# F1 destination binding: the seller's push token must never follow a repo-config URL rewrite. An
+# "evil" HTTPS endpoint (the rustls fixture) records what arrives; the push must send it nothing.
+# Gated like above.
+[[test]]
+name = "push_destination_binding"
+required-features = ["git-delivery"]
+
 [dev-dependencies]
 async-trait = "0.1.89"
 cdk-sqlite = "=0.17.2"

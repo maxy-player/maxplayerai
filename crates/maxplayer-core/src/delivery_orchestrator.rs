@@ -4,22 +4,34 @@
 //! ## The exploit this closes
 //! The job agent has full write access to its workdir, INCLUDING `workdir/.git/config`. libgit2
 //! applies `url.<other>.insteadOf = <relay>` rewrite rules from the config of the repository that
-//! RUNS an operation — at connect time, for `remote_anonymous` too. [`crate::git_transport`] empties
-//! the global/XDG/system config search paths so no ambient config is read, but a repo-LOCAL
+//! RUNS an operation — when it creates the remote, for `remote_anonymous` too. [`crate::git_transport`]
+//! empties the global/XDG/system config search paths so no ambient config is read, but a repo-LOCAL
 //! `.git/config` in the agent's own workdir is still consulted. So if the seller host opens the
 //! agent's workdir and pushes, the agent's planted `insteadOf` silently redirects that push — with
 //! the seller's signed NIP-98 token — to a host the agent chose. Test:
 //! `tests/hostile_local_git_config.rs`.
 //!
-//! ## The fix: neutralise the config, then push
-//! Before the push, [`crate::seller_git::neutralize_push_config`] REPLACES the workdir's `.git/config`
-//! with a fixed, minimal, redirect-free file (shipped as the interim host fix; the container push
-//! reuses it — one definition). That is a whole-file replacement, not a targeted edit, so it removes
-//! every redirect knob at once — `insteadOf`, `pushInsteadOf`, `remote.*.pushurl`, and any
-//! `[include]`/`[includeIf]` or worktree-config file the agent could have pointed at — rather than a
-//! fragile blocklist. [`push_delivery`] then pushes from the workdir: the config has no rewrite rule,
-//! so the token can only go to the URL we named. Branch-scoping (the token names one ref) is the
-//! second layer if a token leaks anyway.
+//! A config rewrite alone does not close this. libgit2 also reads `.git/commondir` and resolves the
+//! config (and `objects` and `refs`) through the directory that file names; a `.git` that is a
+//! gitfile or a symlink points elsewhere too. A job that leaves such a layout behind and exits makes
+//! a rewrite of `workdir/.git/config` edit the wrong file.
+//!
+//! ## The fix: refuse the layout, replace the config, bind the destination
+//! [`push_delivery`] runs three layers, in order, before and during the push:
+//! 1. **Layout gate** ([`crate::seller_git::assert_plain_repo_layout`], run by both the config
+//!    replacement and the push-side repository open): `.git` must be a real directory, no
+//!    `.git/commondir` entry may exist, and `.git/config` must be a regular file or absent. The
+//!    repository is opened with `NO_SEARCH` and its `path()` must canonicalize to `workdir/.git`.
+//! 2. **Config replacement** ([`crate::seller_git::neutralize_push_config`]): `.git/config` is
+//!    unlinked and re-created with a fixed, minimal, redirect-free file — a whole-file replacement
+//!    that removes `insteadOf`, `pushInsteadOf`, `remote.*.pushurl`, and every `[include]` or
+//!    worktree-config file at once.
+//! 3. **Destination binding** ([`crate::git_transport`]): the resolved remote URL must equal the
+//!    URL we named, and every https leg the transport builds must target that same URL. A rewrite
+//!    from any source — config, commondir, a future mechanism — fails before a request exists.
+//!
+//! Branch-scoping (the token names one ref) bounds a token that leaks anyway: it can replay a push
+//! to that one ref of that one repository until it expires. That is bounded authority, not zero.
 //!
 //! The push runs in the CONTAINER (or, on the interim host path, after the container that ran the
 //! agent has exited), so no live agent parses the seller key — an unknown git-parser bug at push time
@@ -55,7 +67,7 @@
 //! the agent and every other process are dead and the marker — which carries a nonce only the
 //! orchestrator learned from the deleted inputs — has been verified by the host. A job process that
 //! survives cannot forge the marker without the nonce, and the token is branch-scoped in any case, so a
-//! leak pushes nothing but the seller's own delivery branch.
+//! leak can write nothing but the seller's own delivery branch — a bounded harm, not none.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -117,8 +129,9 @@ impl std::fmt::Display for OrchestratorError {
 
 impl std::error::Error for OrchestratorError {}
 
-// The push-config hardening lives in [`crate::seller_git::neutralize_push_config`] (shipped as the
-// interim host fix). The container push below reuses it — one definition of the config rewrite.
+// The push-side hardening lives in `crate::seller_git` (layout gate + config replacement) and
+// `crate::git_transport` (destination binding). The container push below reuses it — one
+// definition, shared with the host path.
 
 /// The pinned base a contribution delivery forks from. `None` at the [`run_phase1`] call site means a
 /// from-scratch delivery (a root commit whose tree is the whole workdir).
@@ -138,8 +151,9 @@ pub struct Phase1Output {
     /// The gated delivery commit oid (full hex). Deterministic; the host names it in the kind-3403.
     pub delivery_oid: String,
     /// The committed repo phase 2 pushes from. This is the agent's workdir: the delivery branch
-    /// points at the gated commit here. Phase 2 pushes it with a branch-scoped token, so even if the
-    /// agent planted an `insteadOf` the leaked token is worthless (Track A).
+    /// points at the gated commit here. Phase 2 refuses an unexpected repository layout, replaces
+    /// the config, binds every leg to the relay URL, and pushes with a branch-scoped token. A token
+    /// that leaks anyway is bounded to that one ref (Track A).
     pub delivery_repo_dir: PathBuf,
 }
 
@@ -148,9 +162,9 @@ pub struct Phase1Output {
 /// returns; phase 2 ([`push_delivery`]) then pushes the committed repo. No seller key and no push
 /// token exists in this process.
 ///
-/// This does not push. The push ([`push_delivery`]) hardens the workdir config (via
-/// [`crate::seller_git::neutralize_push_config`]) and pushes from the same workdir, so a planted
-/// `insteadOf` cannot redirect the token — no separate clean repo needed.
+/// This does not push. The push ([`push_delivery`]) gates the workdir layout, replaces its config
+/// ([`crate::seller_git::neutralize_push_config`]), binds the transport to the relay URL, and pushes
+/// from the same workdir — no separate clean repo needed.
 ///
 /// `spawn_agent(workdir)` runs the agent against the freshly-provisioned workdir and returns when it
 /// exits. It is a seam: production inherits the container's stdin/stdout to the agent child (so the
@@ -611,8 +625,9 @@ fn full_jitter(backoff: Duration) -> Duration {
 /// `repo_dir` is the committed workdir the delivery branch points into. `header` is `Some` for a
 /// relay-git remote and `None` for a public/anonymous https remote.
 ///
-/// The repo-local config is NEUTRALISED first ([`crate::seller_git::neutralize_push_config`]), so an
-/// `insteadOf` / `pushInsteadOf` the agent may have planted cannot redirect this push. The caller MUST
+/// Before the first attempt the workdir passes the layout gate and its config is REPLACED
+/// ([`crate::seller_git::neutralize_push_config`]); an unexpected layout (a gitfile or symlinked
+/// `.git`, a `.git/commondir`, a symlinked config) is refused before any network. The caller MUST
 /// have reaped the agent's process group already (see that function's docs).
 ///
 /// `expected_oid` (C6): when `Some`, the delivery branch must point at exactly this commit — the one
@@ -658,10 +673,11 @@ pub fn push_delivery(
     Ok(pushed)
 }
 
-/// The commit the local delivery branch points at in `repo_dir` (full hex). Reads the ref only —
-/// no config, no network.
+/// The commit the local delivery branch points at in `repo_dir` (full hex). Opens the workdir
+/// through the layout gate ([`crate::seller_git::open_plain_workdir_repo`]) and reads the ref only —
+/// no network.
 fn local_branch_tip(repo_dir: &Path, branch: &str) -> Result<String, OrchestratorError> {
-    let repo = git2::Repository::open(repo_dir)
+    let repo = seller_git::open_plain_workdir_repo(repo_dir)
         .map_err(|error| OrchestratorError::Io(format!("open delivery repo: {error}")))?;
     repo.refname_to_id(&git_transport::delivery_ref(branch))
         .map(|oid| oid.to_string())
@@ -670,9 +686,8 @@ fn local_branch_tip(repo_dir: &Path, branch: &str) -> Result<String, Orchestrato
         })
 }
 
-/// Off-runtime [`push_delivery`]: neutralise `workdir`'s config and push from it, on a blocking
-/// thread. This is the delivery push the seller daemon runs — it hardens the workdir's git config so
-/// an `insteadOf` the agent planted cannot redirect the token, then pushes. Returns the pushed oid.
+/// Off-runtime [`push_delivery`]: gate the layout, replace `workdir`'s config, and push from it, on
+/// a blocking thread. Returns the pushed oid.
 ///
 /// Safe on the host interim path because the container that ran the agent has already exited: no agent
 /// process is alive to re-plant the config between the neutralise and the push.
@@ -1342,7 +1357,8 @@ mod tests {
     }
 
     // (The config-rewrite security property is proven by tests/hostile_local_git_config.rs against
-    // seller_git::neutralize_push_config, which push_delivery reuses.)
+    // seller_git::neutralize_push_config, which push_delivery reuses. The layout gate has its tests
+    // in seller_git; the destination binding in git_transport and tests/push_destination_binding.rs.)
 
     const NONCE: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 

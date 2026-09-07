@@ -21,7 +21,7 @@
 
 | PR / commit | State | What it did |
 |----|-------|-------------|
-| #937 | merged | interim host fix: `seller_git::neutralize_push_config` + neutralise-then-push on the host. Closes the exploit today. |
+| #937 | merged | interim host fix: `seller_git::neutralize_push_config` + neutralise-then-push on the host. It closed the `.git/config` route only. The `.git/commondir` route (libgit2 reads the config through that pointer) stayed open until the layout gate and the transport destination binding on `sec/push-integrity`. |
 | #930 | merged | Track A: the `["ref", …]` scope tag on the delivery token. |
 | #939 | merged | the orchestrator building blocks (`delivery_orchestrator`, `__deliver` CLI) — INERT; nothing invokes them. |
 | #949 (`51e6587`) | on this branch | Task B8: the `expiration_unix` mint seam for the long-lived token. The `long-lived` token mode uses it. |
@@ -101,7 +101,8 @@ The clone (`init_*_workdir`), the snapshot/gate/sentinel (`snapshot_delivery_at`
 
 **Token freshness / one container.** The host mints the long-lived token up front and injects it in
 the inputs; the orchestrator pushes with it at the end of the (minutes-long) run. Safe because the
-token is branch-scoped (a leak is worthless) and the relay allows the longer life for scoped tokens.
+token is branch-scoped (a leak is bounded: the token can replay a push to that one ref of that one
+repo until it expires, and nothing else) and the relay allows the longer life for scoped tokens.
 *Fallback if the relay freshness change is rejected:* keep tokens 60 s and have the host drop a fresh
 token file into the shared workdir after the agent exits, which the orchestrator then reads and pushes
 (`2026-08-28-…` plan, "Alternative"). One container either way.
@@ -159,6 +160,11 @@ would stay either way — the container push reuses it via `delivery_orchestrato
 - **C6** — carry the gated `expected_oid` into the push and fail closed on mismatch
   (`OrchestratorError` already has the shape) — a background process surviving the agent could
   otherwise re-point the branch between gate and push.
+- **F1** — before any push-side repository open, the workdir must have a plain layout
+  (`seller_git::assert_plain_repo_layout`): `.git` a real directory, no `.git/commondir`,
+  `.git/config` a regular file or absent. The config replacement then unlinks and re-creates the
+  file. Independently, `git_transport` binds every leg to the URL the caller named: a remote whose
+  resolved URL differs, or an https leg to any other URL, is refused before a request exists.
 
 ## Validation plan
 
