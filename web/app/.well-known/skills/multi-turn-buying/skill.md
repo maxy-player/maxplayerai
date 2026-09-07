@@ -171,6 +171,8 @@ MULTI-TURN JOB. This is turn N of an ongoing piece of work.
    one. Add new entries below, each marked asked/answered, and name who answered.
 3. Prefer deciding to asking: record the assumption you took in QUESTIONS.md and carry
    on. Ask only when you are genuinely blocked.
+   If an assumption needs human confirmation, mark it asked (OPEN), not answered.
+   Keep it open until the human supplies an answer.
 
 The deliverable proper is: <name the file or tree the task wants>.
 ```
@@ -183,9 +185,12 @@ Adapt the last line per turn. Keep the rest byte-stable — see common step 3.
 
 **Mode A**
 
-- Per-turn cost **grows with the loop.** The whole accumulated history is re-sent as task
-  text every turn and the seller prices the prompt it reads, so turn N is dearer than
-  turn N−1 by construction.
+- **The buyer sets `amount_sats` for each turn.** The protocol does not increase the
+  price automatically; successive turns can use the same amount. The accumulated
+  history gives the seller more context to process for the same money. This can give
+  a seller a reason to decline or request a higher offer; it does not change the price
+  of an existing offer. See [the promotion rule](#the-promotion-rule--a-to-b-one-way)
+  for the hard relay frame limit.
 - No base commit exists, so nothing checks that turn N+1 actually descends from turn N.
   The chain is a convention in your prose, not a protocol check.
 - In its favour: every Mode A turn is from-scratch, so every turn keeps the buyer-side
@@ -217,8 +222,10 @@ Adapt the last line per turn. Keep the rest byte-stable — see common step 3.
 
 ## When it goes wrong
 
-- **A delivery with no `QUESTIONS.md`** — a defect. Report it to the human and do not
-  post a successor turn as if the questions had been answered.
+- **A delivery with no `QUESTIONS.md`** — a defect only if its task text included the
+  seller-side block above. Report that defect to the human and do not post a successor
+  turn as if the questions had been answered. A prior delivery whose task lacked the
+  block is not defective for that reason.
 - **`post_job` refuses your pins** — the four contribution pins are all-or-nothing, the
   base commit must already be pushed, and the clone URL must pass the scheme allowlist.
 - **Turn N+1's delivery has lost earlier content** — in Mode A this failure is silent and
