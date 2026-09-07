@@ -41,6 +41,19 @@ pub enum WalletOpsError {
     /// than a hardcoded constant — on a real-minibits home the constant would be a false-default
     /// lie (#579).
     MintPinnedDefault { mint_url: String },
+    /// A melt run under a [`MeltCeiling`] was REFUSED before any proof was selected, prepared or
+    /// spent: the quote the mint raised at payment time would take more out of the wallet than the
+    /// caller's hard maximum, or quoted a different invoice amount than the caller planned. The
+    /// seller fee remittance's money hold (stage 2a, addendum 3 §1): the seller never pays more than
+    /// the fee it accrued, enforced at the moment of spending. Nothing left the wallet.
+    MeltExceedsCeiling {
+        mint_url: String,
+        quote_id: String,
+        invoice_sats: u64,
+        fee_reserve_sats: u64,
+        planned_invoice_sats: u64,
+        max_debit_sats: u64,
+    },
     Wallet(String),
 }
 
@@ -61,6 +74,20 @@ impl std::fmt::Display for WalletOpsError {
             Self::MintPinnedDefault { mint_url } => write!(
                 formatter,
                 "cannot remove the default mint ({mint_url}); only extra_mints are removable"
+            ),
+            Self::MeltExceedsCeiling {
+                mint_url,
+                quote_id,
+                invoice_sats,
+                fee_reserve_sats,
+                planned_invoice_sats,
+                max_debit_sats,
+            } => write!(
+                formatter,
+                "melt refused before spending: mint {mint_url} quote {quote_id} would debit {} sats \
+                 ({invoice_sats} sats invoice + {fee_reserve_sats} sats fee reserve; planned invoice \
+                 {planned_invoice_sats} sats) against a ceiling of {max_debit_sats} sats; nothing left the wallet",
+                invoice_sats.saturating_add(*fee_reserve_sats)
             ),
             Self::Wallet(message) => write!(formatter, "wallet error: {message}"),
         }
@@ -167,6 +194,37 @@ pub struct MeltOutcome {
     /// The mint's melt quote id the payment settled under — journaled by the seller fee remittance
     /// so a settled row names the quote the mint can be asked about.
     pub quote_id: String,
+    /// The fee RESERVE the paying quote carried — the ceiling on `fee_sats`, checked against the
+    /// caller's [`MeltCeiling`] before anything was spent. Journaled beside the actual fee.
+    pub fee_reserve_sats: u64,
+}
+
+/// A hard bound a caller places on a melt, checked against the quote the mint raises AT PAYMENT
+/// TIME and BEFORE any proof is selected, prepared or spent ([`melt_within_async`]). The seller fee
+/// remittance's money hold (stage 2a, addendum 3 §1): the plan's estimate is not the quote the spend
+/// runs under — the mint quotes again when the payment is made, and its fee reserve can differ — so
+/// the ceiling is enforced at the moment of spending, not estimated beforehand or regretted
+/// afterwards. A quote that does not fit is refused as [`WalletOpsError::MeltExceedsCeiling`], a
+/// clean failure with nothing moved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeltCeiling {
+    /// The most that may leave the wallet for this melt — invoice amount and fee reserve together.
+    /// For the remittance this is the unremitted accrued gross being discharged.
+    pub max_debit_sats: u64,
+    /// The invoice amount the caller planned; the paying quote must quote exactly this.
+    pub invoice_sats: u64,
+    /// The melt quote the plan was journaled against, for the record. The spend re-validates the
+    /// quote it actually pays under and reports it in [`MeltOutcome::quote_id`].
+    pub planned_quote_id: Option<String>,
+}
+
+impl MeltCeiling {
+    /// Whether a quote of `invoice_sats` with `fee_reserve_sats` fits under this ceiling. Pure, so
+    /// the bound is unit-tested without a mint.
+    pub fn admits(&self, invoice_sats: u64, fee_reserve_sats: u64) -> bool {
+        invoice_sats == self.invoice_sats
+            && invoice_sats.saturating_add(fee_reserve_sats) <= self.max_debit_sats
+    }
 }
 
 /// A melt quote and nothing more: what the mint would charge to pay `bolt11`, read without paying
@@ -762,10 +820,28 @@ pub async fn receive_async(
 /// Pay a lightning invoice from ecash (fail-closed on insufficient / unpaid).
 /// `confirm` is the effect boundary; the post-confirm balance read is observational and never
 /// discards the settled outcome (finding U — see [`post_confirm_balance`]).
+///
+/// The unbounded form `maxplayer wallet melt` uses: [`melt_within_async`] with no ceiling. There is
+/// one melt implementation; this is a name for calling it without a bound.
 pub async fn melt_async(
     home: &MaxplayerHome,
     bolt11: &str,
     mint_override: Option<&str>,
+) -> Result<MeltOutcome, WalletOpsError> {
+    melt_within_async(home, bolt11, mint_override, None).await
+}
+
+/// [`melt_async`] with an optional hard [`MeltCeiling`], checked against the quote the mint raises
+/// here — at payment time — and BEFORE `prepare_melt` selects a single proof. The seller fee
+/// remittance (stage 2a, addendum 3 §1) pays through this with the unremitted accrued gross as the
+/// ceiling; a fee reserve that grew between the plan's estimate and this quote is refused as
+/// [`WalletOpsError::MeltExceedsCeiling`] and nothing leaves the wallet. Same mint resolution, same
+/// `allow_real_mints` gate, same effect boundary as the unbounded form: this IS the one melt.
+pub async fn melt_within_async(
+    home: &MaxplayerHome,
+    bolt11: &str,
+    mint_override: Option<&str>,
+    ceiling: Option<&MeltCeiling>,
 ) -> Result<MeltOutcome, WalletOpsError> {
     let bolt11 = bolt11.trim();
     if bolt11.is_empty() {
@@ -783,7 +859,25 @@ pub async fn melt_async(
         .melt_quote(PaymentMethod::BOLT11, bolt11, None, None)
         .await
         .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
-    let need = quote.amount.to_u64().saturating_add(quote.fee_reserve.to_u64());
+    let invoice_sats = quote.amount.to_u64();
+    let fee_reserve_sats = quote.fee_reserve.to_u64();
+    // The money hold, at the moment of spending: THIS quote — not the plan's estimate — is what the
+    // wallet would pay under, so THIS quote's amount + reserve is what the ceiling bounds. Refused
+    // here, no proof has been selected, prepared or sent; the caller journals a failed attempt and
+    // the balance it meant to discharge is intact.
+    if let Some(ceiling) = ceiling
+        && !ceiling.admits(invoice_sats, fee_reserve_sats)
+    {
+        return Err(WalletOpsError::MeltExceedsCeiling {
+            mint_url,
+            quote_id: quote.id,
+            invoice_sats,
+            fee_reserve_sats,
+            planned_invoice_sats: ceiling.invoice_sats,
+            max_debit_sats: ceiling.max_debit_sats,
+        });
+    }
+    let need = invoice_sats.saturating_add(fee_reserve_sats);
     let before = wallet
         .total_balance()
         .await
@@ -819,6 +913,7 @@ pub async fn melt_async(
         fee_sats,
         balance_sats,
         quote_id: quote.id,
+        fee_reserve_sats,
     })
 }
 
@@ -1064,6 +1159,23 @@ pub fn melt_blocking(
     runtime.block_on(melt_async(home, bolt11, mint_override))
 }
 
+/// [`melt_within_async`] on a runtime of its own — the seller fee remittance's spending call. Same
+/// nested-runtime refusal as every `*_blocking` wrapper here.
+pub fn melt_within_blocking(
+    home: &MaxplayerHome,
+    bolt11: &str,
+    mint_override: Option<&str>,
+    ceiling: Option<&MeltCeiling>,
+) -> Result<MeltOutcome, WalletOpsError> {
+    crate::runtime_guard::refuse_nested_block_on("melt_within_blocking")
+        .map_err(WalletOpsError::Wallet)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+    runtime.block_on(melt_within_async(home, bolt11, mint_override, ceiling))
+}
+
 pub fn melt_quote_blocking(
     home: &MaxplayerHome,
     bolt11: &str,
@@ -1113,6 +1225,34 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    /// Stage 2a, addendum 3 §1: the money hold. A ceiling admits a payment-time quote only when the
+    /// invoice is the one planned AND invoice + the quote's fee reserve fit under the maximum gross
+    /// debit — checked against the quote the mint raised at PAYMENT time, so a reserve that grew
+    /// between the estimate and the payment is refused before any proof is consumed.
+    #[test]
+    fn a_melt_ceiling_admits_only_the_planned_invoice_within_the_gross_debit() {
+        let ceiling = MeltCeiling {
+            max_debit_sats: 15,
+            invoice_sats: 13,
+            planned_quote_id: Some("q-estimate".to_owned()),
+        };
+        assert!(ceiling.admits(13, 2), "13 + 2 = 15 fits exactly");
+        assert!(ceiling.admits(13, 0), "a smaller reserve fits");
+        assert!(
+            !ceiling.admits(13, 4),
+            "13 + 4 = 17 exceeds the 15-sat gross: the reserve grew between estimate and payment"
+        );
+        assert!(
+            !ceiling.admits(12, 0),
+            "a different invoice amount than the one planned is refused even when it fits"
+        );
+        assert!(!ceiling.admits(14, 0), "and so is a larger one");
+        assert!(
+            !ceiling.admits(u64::MAX, u64::MAX),
+            "the sum saturates rather than wrapping under the ceiling"
+        );
+    }
 
     // Finding DD: `SendOutcome.token` is a BEARER cashu token (spendable ecash). Its `Debug` MUST
     // redact the token — a derived Debug would print it verbatim, so any debug log of a SendOutcome

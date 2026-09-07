@@ -26,20 +26,40 @@
 //!
 //! The `[platform_fee] auto_remit` switch ([`crate::home::PlatformFeeConfig`]) turns BOTH node
 //! paths off — the collect path's attempt and the retry tick — and does not touch accrual;
-//! `--confirm` pays regardless. There is no startup sweep, no detached task, and no other call site.
+//! `--confirm` pays regardless. There is no startup sweep and no other call site. The node's two
+//! attempts run on threads the node owns and drains on shutdown (bounded); see `seller_node::run`.
 //!
 //! ## What one attempt does
 //!
 //! Reconcile any in-flight attempt first; read the unremitted balance; resolve
 //! [`PLATFORM_FEE_ADDRESS`] over LNURL-pay ([`crate::lnurl_pay`], fail-closed) and refuse below its
 //! minimum — the expected steady state for small sellers, not an error; probe the mint's melt fee
-//! reserve on the gross and invoice the **net**, so the fee comes OUT of the accrued amount and a
-//! seller never pays more than it accrued; journal the plan (which pins the receipts and refuses a
-//! duplicate — the idempotency that makes two concurrent collects pay at most once); melt through
-//! [`crate::wallet_ops::melt_blocking`], the same gated melt `maxplayer wallet melt` uses (it honours
-//! `allow_real_mints`); settle. Every attempt that meant to pay is journaled with its outcome
-//! (`fee_remit_attempts`), so a payout that keeps failing is visible in the read-out rather than
-//! silent.
+//! reserve on the gross and invoice the **net**, so the fee comes OUT of the accrued amount; journal
+//! the plan (which pins the receipts, records this process as the row's owner under a lease, and
+//! refuses a duplicate — the idempotency that makes two concurrent collects pay at most once); pass
+//! the **pre-spend gate** — re-confirm ownership of the planned row, then melt under a hard
+//! [`MeltCeiling`] through [`crate::wallet_ops::melt_within_blocking`], the same gated melt
+//! `maxplayer wallet melt` uses (it honours `allow_real_mints`), which refuses BEFORE any proof is
+//! spent if the quote raised at payment time would take more than the accrued gross; settle. Every
+//! attempt that meant to pay is journaled with its outcome (`fee_remit_attempts`), so a payout that
+//! keeps failing is visible in the read-out rather than silent.
+//!
+//! ## The two invariants (stage 2a, addendum 3)
+//!
+//! **Money hold (§1):** the seller never pays more than the fee it accrued — gross is the ceiling,
+//! the melt fee comes out of it, and the ceiling is enforced at the moment of spending, not
+//! estimated beforehand or regretted afterwards. The estimate at plan time is a plan; the quote the
+//! wallet actually pays under is checked against `gross` inside the melt, and a reserve that grew in
+//! between is a refused, journaled, failed attempt with the balance intact.
+//!
+//! **Ownership (§2):** a `planned` row is paid only by the process that planned it, and is released
+//! by another process only when its quote is provably terminal (FAILED at the mint) or its owner is
+//! provably gone (the lease of [`REMIT_LEASE`] has run out) — never on UNPAID alone, because UNPAID
+//! means "not yet", not "abandoned". The owner re-validates its claim immediately before spending
+//! and refuses if less than [`SPEND_MARGIN`] of lease remains, so a spend can never start close
+//! enough to the lease's end to land after a release. The owner's own reconciliation of its own row
+//! may release on UNPAID: a process runs at most one attempt at a time
+//! ([`RemitFlight`] in the node; one shot for the command), so its earlier attempt is over.
 //!
 //! Every effect on the world goes through [`RemitEffects`], so the decision logic is tested against
 //! scripted effects without a network or a mint. Exactly one method of that trait spends:
@@ -47,37 +67,96 @@
 
 use std::fmt;
 use std::io::Write;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use crate::home::MaxplayerHome;
 use crate::lnurl_pay::{self, HttpsFetch, LightningAddress, PayRequest, ResolvedInvoice};
 use crate::platform_fee::PLATFORM_FEE_ADDRESS;
 use crate::seller_node::store::{
-    PlanRefused, RemitAttempt, RemitAttemptOutcome, RemitAttemptTrigger, RemittancePlan,
-    SellerStore,
+    FeeRemittance, OwnershipLost, PlanRefused, RemitAttempt, RemitAttemptOutcome,
+    RemitAttemptTrigger, RemitSettlement, RemittancePlan, SellerStore, SettledBy,
 };
-use crate::wallet_ops::{self, MeltEstimate, MeltOutcome, MeltQuoteState, MeltQuoteStatus};
+use crate::wallet_ops::{
+    self, MeltCeiling, MeltEstimate, MeltOutcome, MeltQuoteState, MeltQuoteStatus, WalletOpsError,
+};
 
 /// How many journaled attempts the command prints, newest first.
 pub const RECENT_ATTEMPTS_SHOWN: usize = 5;
+
+/// How long a process's claim on a `planned` row stands (addendum 3 §2). Another process may
+/// release the row on UNPAID / no-quote only after this has passed since the plan. Five minutes is
+/// far longer than a melt needs to leave UNPAID: a melt that reaches the mint turns its quote
+/// PENDING or PAID within seconds, and one that never reaches it errors out and ends the attempt.
+pub const REMIT_LEASE: Duration = Duration::from_secs(5 * 60);
+
+/// How much of its lease an owner must still hold to START a payment. Another process is entitled
+/// to release the row the instant the lease ends; a spend begun with less than this margin could
+/// land after that release. Processes share one host clock (the store is a local file), so the
+/// margin covers scheduling pauses, not clock skew.
+pub const SPEND_MARGIN: Duration = Duration::from_secs(60);
+
+/// Why [`RemitEffects::melt`] did not pay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MeltFailure {
+    /// The melt was refused BEFORE any proof was selected, prepared or sent — the quote the mint
+    /// raised at payment time did not fit the [`MeltCeiling`]. Nothing left the wallet, which the
+    /// caller may rely on: it releases its planned row itself.
+    RefusedBeforeSpending(String),
+    /// The melt failed somewhere the caller cannot see: proofs may or may not have reached the mint.
+    /// The planned row stays for reconciliation against the mint.
+    Failed(String),
+}
+
+impl fmt::Display for MeltFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RefusedBeforeSpending(reason) => write!(formatter, "{reason}"),
+            Self::Failed(error) => write!(formatter, "{error}"),
+        }
+    }
+}
 
 /// The remit path's effects on the world, behind a trait so the decision logic — what is paid,
 /// when, and what is refused — is tested without a network or a mint. Exactly one method moves
 /// money: [`Self::melt`]. Everything else reads.
 pub trait RemitEffects {
+    /// This process's opaque owner token for the rows it plans (addendum 3 §2): stable for the
+    /// life of the process, distinct across processes. The node's attempts and the command's run
+    /// each speak as one owner.
+    fn owner(&self) -> &str;
     /// LNURL step 1–2: the destination's payRequest (callback + sendable bounds).
     fn pay_request(&mut self, address: &LightningAddress) -> Result<PayRequest, String>;
     /// LNURL step 3–4: an invoice for exactly `amount_sats`.
     fn invoice(&mut self, pay: &PayRequest, amount_sats: u64) -> Result<ResolvedInvoice, String>;
     /// A melt quote for the invoice — the mint's fee reserve — WITHOUT paying.
     fn melt_estimate(&mut self, bolt11: &str) -> Result<MeltEstimate, String>;
-    /// **The payment.** Pays the invoice from the seller's ecash. The only method here that spends.
-    fn melt(&mut self, bolt11: &str) -> Result<MeltOutcome, String>;
+    /// **The payment.** Pays the invoice from the seller's ecash under a hard ceiling, refusing
+    /// before anything is spent if the quote raised at payment time does not fit. The only method
+    /// here that spends.
+    fn melt(&mut self, bolt11: &str, ceiling: &MeltCeiling) -> Result<MeltOutcome, MeltFailure>;
     /// What the mint says about the melt quote(s) this wallet raised for the invoice, if any —
     /// used to reconcile an interrupted attempt.
     fn melt_status(&mut self, bolt11: &str) -> Result<Option<MeltQuoteStatus>, String>;
+    /// Observation point: called once the plan is journaled, before the pre-spend gate. The live
+    /// effects do nothing here; tests pause here to interleave a second process against the
+    /// planned row (addendum 3 §2.2).
+    fn after_plan(&mut self, _planned: &FeeRemittance) {}
+}
+
+/// This process's owner token: pid plus a boot nonce from the OS RNG, fixed for the life of the
+/// process. Every [`LiveEffects`] in the process speaks as this one owner.
+fn process_owner() -> &'static str {
+    static OWNER: OnceLock<String> = OnceLock::new();
+    OWNER.get_or_init(|| {
+        let mut nonce = [0u8; 8];
+        let nonce = match getrandom::fill(&mut nonce) {
+            Ok(()) => u64::from_le_bytes(nonce),
+            Err(_) => 0,
+        };
+        format!("pid{}-{nonce:016x}", std::process::id())
+    })
 }
 
 /// The shipped effects: LNURL over https, the packaged CDK wallet at `home`, the home's default
@@ -97,6 +176,10 @@ impl LiveEffects {
 }
 
 impl RemitEffects for LiveEffects {
+    fn owner(&self) -> &str {
+        process_owner()
+    }
+
     fn pay_request(&mut self, address: &LightningAddress) -> Result<PayRequest, String> {
         lnurl_pay::fetch_pay_request(&self.fetch, address).map_err(|error| error.to_string())
     }
@@ -109,8 +192,17 @@ impl RemitEffects for LiveEffects {
         wallet_ops::melt_quote_blocking(&self.home, bolt11, None).map_err(|error| error.to_string())
     }
 
-    fn melt(&mut self, bolt11: &str) -> Result<MeltOutcome, String> {
-        wallet_ops::melt_blocking(&self.home, bolt11, None).map_err(|error| error.to_string())
+    fn melt(&mut self, bolt11: &str, ceiling: &MeltCeiling) -> Result<MeltOutcome, MeltFailure> {
+        wallet_ops::melt_within_blocking(&self.home, bolt11, None, Some(ceiling)).map_err(|error| {
+            match error {
+                // The one error the melt raises BEFORE selecting a proof, typed so it can be relied
+                // on: nothing left the wallet. Every other error is opaque as to how far it got.
+                refused @ WalletOpsError::MeltExceedsCeiling { .. } => {
+                    MeltFailure::RefusedBeforeSpending(refused.to_string())
+                }
+                other => MeltFailure::Failed(other.to_string()),
+            }
+        })
     }
 
     fn melt_status(&mut self, bolt11: &str) -> Result<Option<MeltQuoteStatus>, String> {
@@ -167,6 +259,21 @@ pub enum Refusal {
     ReserveDoesNotFit { gross: u64, reserve: u64 },
     /// An earlier attempt is still settling at the mint (melt quote PENDING or unknown).
     Settling { remittance_id: String },
+    /// An earlier attempt's planned row belongs to another process whose lease has not run out, and
+    /// the mint does not report its quote terminal (addendum 3 §2): UNPAID means "not yet", not
+    /// "abandoned", so this run may not release it and may not plan on top of it.
+    HeldByOwner {
+        remittance_id: String,
+        owner: String,
+        lease_until_unix: i64,
+    },
+    /// The pre-spend gate refused: between journaling the plan and paying it, this process lost its
+    /// claim on the row (another process reconciled it), or too little lease remained to start a
+    /// payment safely. Nothing was spent.
+    OwnershipLost {
+        remittance_id: String,
+        reason: String,
+    },
     /// The store refused to journal the plan (a row already in flight, the balance moved under us,
     /// an invoice already used).
     PlanRefused(String),
@@ -206,6 +313,21 @@ impl fmt::Display for Refusal {
                 formatter,
                 "remittance {remittance_id} is still settling at the mint"
             ),
+            Self::HeldByOwner {
+                remittance_id,
+                owner,
+                lease_until_unix,
+            } => write!(
+                formatter,
+                "remittance {remittance_id} is planned by another live process ({owner}, lease until unix {lease_until_unix}) and its quote is not terminal; not releasing a live payer's intent"
+            ),
+            Self::OwnershipLost {
+                remittance_id,
+                reason,
+            } => write!(
+                formatter,
+                "refused before spending: remittance {remittance_id} — {reason}"
+            ),
             Self::PlanRefused(reason) => write!(formatter, "plan refused: {reason}"),
         }
     }
@@ -231,6 +353,83 @@ pub enum RemitOutcome {
         remittance_id: String,
         error: String,
     },
+    /// The plan was journaled and the melt REFUSED before spending anything — the quote raised at
+    /// payment time would have taken more than the accrued gross (addendum 3 §1). Nothing left the
+    /// wallet, so this process released its own row: the balance is unremitted again, the attempt
+    /// is journaled failed, and the backoff escalates.
+    MeltRefused {
+        remittance_id: String,
+        reason: String,
+    },
+}
+
+/// What reconciliation decides about the one `planned` row, from the mint's answer about its quote
+/// and the row's ownership (addendum 3 §2.1). Pure, so the rule is tested as a table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reconcile {
+    /// The mint reports the quote PAID: settle, keep the receipts discharged, never melt again.
+    Settle,
+    /// Release the receipts back to unremitted; the reason is printed and journaled.
+    Release(String),
+    /// Leave the row exactly as it is and refuse this run; the reason is printed and journaled.
+    Hold(Refusal),
+}
+
+/// The release rule. A `planned` row is released only when:
+/// - the mint reports its quote **FAILED** — terminal, whoever owns the row; or
+/// - the mint reports **UNPAID**, or the wallet never raised a quote for its invoice, AND either
+///   the row is **this process's own** (a process runs one attempt at a time, so its earlier
+///   attempt is over and cannot still be paying) or the owner's **lease has run out** (the owner is
+///   provably gone, or provably not spending: it refuses to start a payment inside
+///   [`SPEND_MARGIN`] of the lease's end).
+///
+/// It is **held** — nothing written, this run refused — when the quote is PENDING or UNKNOWN (a
+/// payment may be settling) or when it is UNPAID / absent but another process's lease still stands:
+/// UNPAID means "not yet", not "abandoned".
+pub fn reconcile_decision(
+    row: &FeeRemittance,
+    status: Option<&MeltQuoteStatus>,
+    my_owner: &str,
+    now_unix: i64,
+) -> Reconcile {
+    let unpaid_reason = match status {
+        None => "the wallet never raised a melt quote for its invoice — no sats left the wallet"
+            .to_owned(),
+        Some(status) => format!(
+            "mint {} reports melt quote {} {} — no sats left the wallet",
+            status.mint_url, status.quote_id, status.state
+        ),
+    };
+    match status.map(|status| status.state) {
+        Some(MeltQuoteState::Paid) => Reconcile::Settle,
+        Some(MeltQuoteState::Pending) | Some(MeltQuoteState::Unknown) => {
+            Reconcile::Hold(Refusal::Settling {
+                remittance_id: row.remittance_id.clone(),
+            })
+        }
+        Some(MeltQuoteState::Failed) => Reconcile::Release(format!(
+            "{unpaid_reason}; FAILED is terminal at the mint whoever owns the row"
+        )),
+        Some(MeltQuoteState::Unpaid) | None => {
+            if row.owner.as_deref() == Some(my_owner) {
+                Reconcile::Release(format!(
+                    "{unpaid_reason}; the row is this process's own earlier attempt, which is over"
+                ))
+            } else if row.lease_expired(now_unix) {
+                Reconcile::Release(format!(
+                    "{unpaid_reason}; its owner's lease ran out at unix {} (owner {})",
+                    row.lease_until_unix.unwrap_or(row.created_at_unix),
+                    row.owner.as_deref().unwrap_or("none recorded")
+                ))
+            } else {
+                Reconcile::Hold(Refusal::HeldByOwner {
+                    remittance_id: row.remittance_id.clone(),
+                    owner: row.owner.clone().unwrap_or_default(),
+                    lease_until_unix: row.lease_until_unix.unwrap_or(row.created_at_unix),
+                })
+            }
+        }
+    }
 }
 
 /// What the run learned before it ended, for the attempt journal.
@@ -251,8 +450,9 @@ struct AttemptTrace {
 ///
 /// Order of operations, and why:
 /// 1. Reconcile any `planned` row first — a payment may be in flight from an interrupted run, and
-///    nothing may be planned on top of it. PAID ⇒ settle; UNPAID/FAILED/no quote ⇒ fail and release;
-///    PENDING ⇒ refuse this run.
+///    nothing may be planned on top of it. PAID ⇒ settle; FAILED ⇒ release; UNPAID / no quote ⇒
+///    release only if the row is this process's own or its owner's lease has run out, else refuse;
+///    PENDING ⇒ refuse this run ([`reconcile_decision`]).
 /// 2. Read the unremitted total. Zero ⇒ refuse (nothing to do), before any network.
 /// 3. Resolve the destination; refuse below its minimum with the shortfall (expected for small
 ///    sellers, not an error).
@@ -260,8 +460,11 @@ struct AttemptTrace {
 ///    the fee comes out of the accrued amount — a seller never pays more than it accrued — and check
 ///    the second quote still fits.
 /// 5. Print the plan. A dry run stops here.
-/// 6. Journal the plan (pins the receipts; refuses a duplicate), then melt, then settle. A melt
-///    error leaves the row `planned` for step 1 of the next run.
+/// 6. Journal the plan (pins the receipts, records this process as owner under [`REMIT_LEASE`];
+///    refuses a duplicate), pass the pre-spend gate (ownership re-confirmed with [`SPEND_MARGIN`] of
+///    lease left; the ceiling checked inside the melt against the quote raised at payment time),
+///    melt, settle. A melt REFUSED at the ceiling released the row (nothing was spent); a melt
+///    ERROR leaves the row `planned` for step 1 of the next run.
 pub fn remit(
     store: &SellerStore,
     effects: &mut dyn RemitEffects,
@@ -321,6 +524,14 @@ fn attempt_record(
             format!("melt failed: {error}"),
             Some(remittance_id.clone()),
         ),
+        Ok(RemitOutcome::MeltRefused {
+            remittance_id,
+            reason,
+        }) => (
+            RemitAttemptOutcome::Failed,
+            format!("refused before spending: {reason}"),
+            Some(remittance_id.clone()),
+        ),
         Err(error) => (
             RemitAttemptOutcome::Failed,
             error.clone(),
@@ -359,7 +570,8 @@ fn remit_inner(
         print_recent_attempts(store, out)?;
     }
 
-    // 1. Reconcile an in-flight attempt before anything else.
+    // 1. Reconcile an in-flight attempt before anything else — under the release rule
+    //    (`reconcile_decision`): never a live payer's intent.
     if let Some(active) = store
         .in_flight_remittance()
         .map_err(|error| format!("read remittances: {error}"))?
@@ -367,62 +579,71 @@ fn remit_inner(
         trace.remittance_id = Some(active.remittance_id.clone());
         let _ = writeln!(
             out,
-            "Reconciling in-flight remittance {} (planned at unix {}: {} sats to {}, gross {} sats)",
+            "Reconciling in-flight remittance {} (planned at unix {} by {}, lease until unix {}: {} sats to {}, gross {} sats)",
             active.remittance_id,
             active.created_at_unix,
+            active.owner.as_deref().unwrap_or("nobody recorded"),
+            active
+                .lease_until_unix
+                .map(|until| until.to_string())
+                .unwrap_or_else(|| "none recorded".to_owned()),
             active.net_sats,
             active.destination,
             active.gross_sats
         );
-        match effects.melt_status(&active.bolt11)? {
-            None => {
+        let status = effects.melt_status(&active.bolt11)?;
+        match reconcile_decision(&active, status.as_ref(), effects.owner(), now_unix) {
+            Reconcile::Settle => {
+                let status = status.expect("Settle is decided only on a PAID status");
+                let settlement = RemitSettlement {
+                    net_paid_sats: Some(status.amount_sats),
+                    melt_fee_sats: None,
+                    melt_fee_reserve_sats: Some(status.fee_reserve_sats),
+                    melt_quote_id: Some(status.quote_id.clone()),
+                    settled_by: SettledBy::Reconciliation,
+                };
+                store
+                    .settle_remittance(&active.remittance_id, &settlement, now_unix)
+                    .map_err(|error| format!("record settled remittance: {error}"))?;
+                let _ = writeln!(
+                    out,
+                    "  mint {} reports melt quote {} PAID — recorded as settled by reconciliation: {} sats reached {}; melt fee at most {} sats (the quote's reserve — the mint reports a quote paid by another run as PAID, not what it kept, so the actual fee is recorded as not observed)",
+                    status.mint_url,
+                    status.quote_id,
+                    status.amount_sats,
+                    active.destination,
+                    status.fee_reserve_sats
+                );
+            }
+            Reconcile::Release(reason) => {
                 store
                     .fail_remittance(&active.remittance_id, now_unix)
                     .map_err(|error| format!("record failed remittance: {error}"))?;
                 let _ = writeln!(
                     out,
-                    "  the wallet never raised a melt quote for its invoice — no sats left the wallet; released {} sats back to unremitted",
+                    "  {reason}; released {} sats back to unremitted",
                     active.gross_sats
                 );
             }
-            Some(status) => match status.state {
-                MeltQuoteState::Paid => {
-                    store
-                        .settle_remittance(
-                            &active.remittance_id,
-                            None,
-                            None,
-                            Some(&status.quote_id),
-                            now_unix,
-                        )
-                        .map_err(|error| format!("record settled remittance: {error}"))?;
-                    let _ = writeln!(
-                        out,
-                        "  mint {} reports melt quote {} PAID — recorded as settled: {} sats reached {} (melt fee not observed by this run)",
-                        status.mint_url, status.quote_id, active.net_sats, active.destination
-                    );
-                }
-                MeltQuoteState::Unpaid | MeltQuoteState::Failed => {
-                    store
-                        .fail_remittance(&active.remittance_id, now_unix)
-                        .map_err(|error| format!("record failed remittance: {error}"))?;
-                    let _ = writeln!(
-                        out,
-                        "  mint {} reports melt quote {} {} — no sats left the wallet; released {} sats back to unremitted",
-                        status.mint_url, status.quote_id, status.state, active.gross_sats
-                    );
-                }
-                MeltQuoteState::Pending | MeltQuoteState::Unknown => {
-                    let _ = writeln!(
-                        out,
-                        "  mint {} reports melt quote {} {}: the payment is still settling. REFUSED — nothing moved by this run; re-run later to reconcile.",
-                        status.mint_url, status.quote_id, status.state
-                    );
-                    return Ok(RemitOutcome::Refused(Refusal::Settling {
-                        remittance_id: active.remittance_id,
-                    }));
-                }
-            },
+            Reconcile::Hold(refusal) => {
+                let _ = writeln!(
+                    out,
+                    "  {}. REFUSED — nothing moved by this run; re-run later to reconcile.",
+                    match &refusal {
+                        Refusal::Settling { .. } => format!(
+                            "mint {} reports melt quote {} {}: the payment is still settling",
+                            status.as_ref().map(|s| s.mint_url.as_str()).unwrap_or("?"),
+                            status.as_ref().map(|s| s.quote_id.as_str()).unwrap_or("?"),
+                            status
+                                .as_ref()
+                                .map(|s| s.state.to_string())
+                                .unwrap_or_default()
+                        ),
+                        other => other.to_string(),
+                    }
+                );
+                return Ok(RemitOutcome::Refused(refusal));
+            }
         }
         trace.remittance_id = None;
     }
@@ -548,16 +769,19 @@ fn remit_inner(
         return Ok(RemitOutcome::DryRun);
     }
 
-    // 6. Journal, pay, settle.
+    // 6. Journal (as this process, under a lease), pass the pre-spend gate, pay under the ceiling,
+    //    settle.
     let plan = RemittancePlan {
         payment_hash: invoice.payment_hash.clone(),
         gross_sats: gross,
         net_sats: net,
+        melt_fee_reserve_sats: estimate.fee_reserve_sats,
         destination: address.to_string(),
         bolt11: invoice.bolt11.clone(),
         melt_quote_id: Some(estimate.quote_id.clone()),
     };
-    let planned = match store.plan_remittance(&plan, now_unix) {
+    let lease_until_unix = now_unix.saturating_add(lease_secs(REMIT_LEASE));
+    let planned = match store.plan_remittance(&plan, effects.owner(), lease_until_unix, now_unix) {
         Ok(planned) => planned,
         Err(PlanRefused::Store(error)) => return Err(format!("journal remittance: {error}")),
         Err(refused) => {
@@ -573,21 +797,71 @@ fn remit_inner(
     trace.remittance_id = Some(planned.remittance_id.clone());
     let _ = writeln!(
         out,
-        "Journaled remittance {} covering {} receipt{}; paying...",
+        "Journaled remittance {} covering {} receipt{} (owner {}, lease until unix {lease_until_unix}); paying...",
         planned.remittance_id,
         planned.receipts,
-        if planned.receipts == 1 { "" } else { "s" }
+        if planned.receipts == 1 { "" } else { "s" },
+        effects.owner()
     );
-    match effects.melt(&invoice.bolt11) {
+    effects.after_plan(&planned);
+
+    // The pre-spend gate, both conditions, before a single proof is touched:
+    // (a) ownership — the row is still planned, still ours, with the spending margin left in the
+    //     lease (another process may release it the moment the lease ends);
+    // (b) the ceiling — enforced INSIDE the melt against the quote raised at payment time.
+    match store
+        .confirm_remittance_ownership(
+            &planned.remittance_id,
+            effects.owner(),
+            now_unix,
+            lease_secs(SPEND_MARGIN),
+        )
+        .map_err(|error| format!("re-read remittance {}: {error}", planned.remittance_id))?
+    {
+        Ok(_) => {}
+        Err(lost) => {
+            // Ours but too little lease left: nothing was spent, so release our own row. Not ours
+            // (or no longer planned): another process holds or resolved it — touch nothing.
+            if matches!(lost, OwnershipLost::LeaseTooShort { .. }) {
+                store
+                    .fail_remittance(&planned.remittance_id, now_unix)
+                    .map_err(|error| format!("release remittance: {error}"))?;
+            }
+            let reason = lost.to_string();
+            let _ = writeln!(
+                out,
+                "REFUSED before spending — {reason}. Nothing moved by this run{}.",
+                if matches!(lost, OwnershipLost::LeaseTooShort { .. }) {
+                    format!(
+                        "; released {} sats back to unremitted for the next attempt",
+                        planned.gross_sats
+                    )
+                } else {
+                    String::new()
+                }
+            );
+            return Ok(RemitOutcome::Refused(Refusal::OwnershipLost {
+                remittance_id: planned.remittance_id,
+                reason,
+            }));
+        }
+    }
+    let ceiling = MeltCeiling {
+        max_debit_sats: gross,
+        invoice_sats: net,
+        planned_quote_id: Some(estimate.quote_id.clone()),
+    };
+    match effects.melt(&invoice.bolt11, &ceiling) {
         Ok(outcome) => {
+            let settlement = RemitSettlement {
+                net_paid_sats: Some(outcome.paid_sats),
+                melt_fee_sats: Some(outcome.fee_sats),
+                melt_fee_reserve_sats: Some(outcome.fee_reserve_sats),
+                melt_quote_id: Some(outcome.quote_id.clone()),
+                settled_by: SettledBy::Melt,
+            };
             let settled = store
-                .settle_remittance(
-                    &planned.remittance_id,
-                    Some(outcome.paid_sats),
-                    Some(outcome.fee_sats),
-                    Some(&outcome.quote_id),
-                    now_unix,
-                )
+                .settle_remittance(&planned.remittance_id, &settlement, now_unix)
                 .map_err(|error| {
                     format!(
                         "PAID {} sats (melt fee {} sats, quote {}) but could not record the settlement: {error}. \
@@ -598,10 +872,12 @@ fn remit_inner(
             let debit = outcome.paid_sats.saturating_add(outcome.fee_sats);
             let _ = writeln!(
                 out,
-                "PAID — remittance {} settled\n  gross discharged: {} sats\n  melt fee taken by the mint: {} sats\n  net paid to {}: {} sats\n  stays in your wallet (unused reserve): {} sats\n  wallet balance now: {} sats at {}\n  receipts discharged: {}",
+                "PAID — remittance {} settled\n  gross discharged: {} sats\n  melt fee taken by the mint: {} sats (quote {} reserved {} sats; ceiling {gross} sats held at the moment of spending)\n  net paid to {}: {} sats\n  stays in your wallet (unused reserve): {} sats\n  wallet balance now: {} sats at {}\n  receipts discharged: {}",
                 settled.remittance_id,
                 settled.gross_sats,
                 outcome.fee_sats,
+                outcome.quote_id,
+                outcome.fee_reserve_sats,
                 settled.destination,
                 outcome.paid_sats,
                 gross.saturating_sub(debit),
@@ -610,9 +886,11 @@ fn remit_inner(
                 settled.receipts
             );
             if debit > gross {
+                // Belt behind the braces: the melt refuses a quote over the ceiling before spending,
+                // and the mint's fee is at most its reserve, so this line should never print.
                 let _ = writeln!(
                     out,
-                    "WARNING: the mint debited {debit} sats against {gross} sats accrued — more than the quoted ceiling. Recorded as settled; report this."
+                    "WARNING: the mint debited {debit} sats against {gross} sats accrued — above the ceiling the melt was admitted under. Recorded as settled; report this."
                 );
             }
             Ok(RemitOutcome::Paid {
@@ -621,7 +899,22 @@ fn remit_inner(
                 melt_fee_sats: outcome.fee_sats,
             })
         }
-        Err(error) => {
+        Err(MeltFailure::RefusedBeforeSpending(reason)) => {
+            // Typed as "nothing left the wallet", and the row is ours: release it ourselves so the
+            // balance is unremitted again for the next attempt (which re-quotes).
+            store
+                .fail_remittance(&planned.remittance_id, now_unix)
+                .map_err(|error| format!("release remittance after refusal: {error}"))?;
+            let _ = writeln!(
+                out,
+                "REFUSED before spending — {reason}.\n  A seller never pays more than it accrued: the ceiling is {gross} sats, enforced against the quote the mint raised for the payment. Nothing left the wallet; released {gross} sats back to unremitted. The next attempt re-quotes.",
+            );
+            Ok(RemitOutcome::MeltRefused {
+                remittance_id: planned.remittance_id,
+                reason,
+            })
+        }
+        Err(MeltFailure::Failed(error)) => {
             let _ = writeln!(
                 out,
                 "melt failed: {error}\n  remittance {} stays journaled as planned. The next attempt (automatic, or `maxplayer seller fees remit`) reconciles it with the mint: settled if the payment landed, released if it did not. Nothing else was attempted.",
@@ -633,6 +926,11 @@ fn remit_inner(
             })
         }
     }
+}
+
+/// A `Duration` as whole unix seconds, for lease arithmetic.
+fn lease_secs(duration: Duration) -> i64 {
+    i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
 }
 
 fn print_recent_attempts(store: &SellerStore, out: &mut dyn Write) -> Result<(), String> {
@@ -707,6 +1005,12 @@ impl RemitReport {
             }) => format!(
                 "melt FAILED ({error}); remittance {remittance_id} stays planned and is reconciled on the next attempt"
             ),
+            Ok(RemitOutcome::MeltRefused {
+                remittance_id,
+                reason,
+            }) => format!(
+                "melt REFUSED before spending ({reason}); remittance {remittance_id} released, the balance stays unremitted and the next attempt re-quotes"
+            ),
             Err(error) => format!(
                 "attempt FAILED ({error}); the balance stays unremitted and the node retries with backoff while it runs"
             ),
@@ -715,12 +1019,14 @@ impl RemitReport {
 
     /// Whether this attempt counts as a FAILURE for pacing ([`RemitBackoff::observe`]): it meant to
     /// pay and did not, for a reason that is not the steady state. `Err` (an effect failed),
-    /// `MeltFailed`, and every refusal that is not at the threshold — the balance stays owed and
-    /// hammering the same host or mint every 30 s would not change that. A threshold refusal, a
-    /// payment and a dry run are not failures.
+    /// `MeltFailed`, `MeltRefused`, and every refusal that is not at the threshold — the balance
+    /// stays owed and hammering the same host or mint every 30 s would not change that. A threshold
+    /// refusal, a payment and a dry run are not failures.
     pub fn is_failure(&self) -> bool {
         match &self.outcome {
-            Err(_) | Ok(RemitOutcome::MeltFailed { .. }) => true,
+            Err(_) | Ok(RemitOutcome::MeltFailed { .. }) | Ok(RemitOutcome::MeltRefused { .. }) => {
+                true
+            }
             Ok(RemitOutcome::Refused(refusal)) => !refusal.is_threshold(),
             Ok(RemitOutcome::Paid { .. }) | Ok(RemitOutcome::DryRun) => false,
         }
@@ -792,8 +1098,8 @@ pub fn remit_live_best_effort(
 
 // ---- retry pacing (stage 2a, addendum 2) ------------------------------------------------------
 
-/// The retry tick's base delay: the first attempt after boot waits this long (jittered), and a streak
-/// of failures doubles it from here.
+/// The retry tick's base delay: the first attempt after boot waits at least this long
+/// ([`RemitBackoff::boot_delay`]), and a streak of failures doubles it from here.
 pub const RETRY_BASE: Duration = Duration::from_secs(30);
 /// The ceiling the doubling stops at. A node whose payout host is down keeps trying at most this
 /// often, for as long as it runs.
@@ -831,9 +1137,11 @@ pub enum Pacing {
 /// the same payout host and the same mint. If they all slept the computed delay, an outage would end
 /// with every node in the fleet retrying in the same second — the correlated burst that turns a
 /// recovered host back into a failed one. So the delay actually slept is a uniform random value in
-/// `[0, computed_delay]`, not the delay plus a small wobble ([`Self::next_delay`]), and the first
-/// attempt after boot draws from `[0, base]` for the same reason: a fleet restarting together must
-/// not all attempt at once.
+/// `[0, computed_delay]`, not the delay plus a small wobble ([`Self::next_delay`]). The first
+/// attempt after boot is the one exception to "from zero" (addendum 3 RULING 1): it waits the full
+/// base and THEN a jitter in `[0, base]` — `[30 s, 60 s]` — so a fleet restarting together neither
+/// attempts at once nor attempts at startup ([`Self::boot_delay`]). Zero is never a legal first
+/// delay.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemitBackoff {
     base: Duration,
@@ -894,12 +1202,14 @@ impl RemitBackoff {
     /// zero. If the RNG is unavailable (it should never be), sleeps the full computed delay — later
     /// is the safe direction.
     pub fn next_delay(&self) -> Duration {
-        let mut bytes = [0u8; 8];
-        let entropy = match getrandom::fill(&mut bytes) {
-            Ok(()) => u64::from_le_bytes(bytes),
-            Err(_) => u64::MAX,
-        };
-        jittered(self.computed_delay(), entropy)
+        jittered(self.computed_delay(), os_entropy())
+    }
+
+    /// The delay before the FIRST attempt after boot (addendum 3 RULING 1): one full base delay,
+    /// plus an additive jitter in `[0, base]` — `[base, 2 × base]`, never less than the base, never
+    /// zero. See [`boot_delay_for`] for the pure form.
+    pub fn boot_delay(&self) -> Duration {
+        boot_delay_for(self.base, os_entropy())
     }
 
     /// Fold one finished attempt into the pacing and say what changed. Failures
@@ -940,6 +1250,22 @@ impl RemitBackoff {
             _ => Pacing::Idle,
         }
     }
+}
+
+/// Eight bytes from the OS RNG as a `u64`. If the RNG is unavailable (it should never be), the
+/// maximum — which every caller maps to the LONGEST delay: later is the safe direction.
+fn os_entropy() -> u64 {
+    let mut bytes = [0u8; 8];
+    match getrandom::fill(&mut bytes) {
+        Ok(()) => u64::from_le_bytes(bytes),
+        Err(_) => u64::MAX,
+    }
+}
+
+/// The boot delay's pure form: `base + jittered(base, entropy)`, so `[base, 2 × base]` — `entropy
+/// = 0` gives exactly the base, never less. Saturates rather than overflowing.
+pub fn boot_delay_for(base: Duration, entropy: u64) -> Duration {
+    base.saturating_add(jittered(base, entropy))
 }
 
 /// Full jitter: a uniform point in `[0, computed]` chosen by `entropy` (`0` ⇒ zero, `u64::MAX` ⇒
@@ -1004,21 +1330,80 @@ impl Drop for RemitPermit {
 /// Scripted effects for tests, shared with `seller_node::run`'s collect-path tests.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
 
-    use super::RemitEffects;
+    use super::{MeltFailure, RemitEffects};
     use crate::lnurl_pay::{LightningAddress, PayRequest, ResolvedInvoice, Url};
-    use crate::wallet_ops::{MeltEstimate, MeltOutcome, MeltQuoteStatus};
+    use crate::seller_node::store::FeeRemittance;
+    use crate::wallet_ops::{MeltCeiling, MeltEstimate, MeltOutcome, MeltQuoteStatus};
 
-    /// Scripted effects. `reserve_for(amount)` is the mint's fee reserve policy; `melt_results` are
-    /// consumed in order; `status` answers the reconciliation query; `pay_request_error` makes the
-    /// LNURL host unreachable. Every call is logged so a test can assert what was — and was not —
-    /// touched; `melt_counter`, when set, counts melts across Fakes on different threads.
+    /// A rendezvous a test uses to PAUSE one attempt at a chosen point (after the plan is journaled,
+    /// or inside the melt) while another attempt runs against the same store — the deterministic
+    /// interleaving addendum 3 §2.2 asks for. The paused side calls [`Self::arrive_and_wait`]; the
+    /// test waits for [`Self::wait_arrived`], does what it wants, then [`Self::release`]s.
+    pub(crate) struct Gate {
+        arrived: AtomicBool,
+        released: Mutex<bool>,
+        cv: Condvar,
+    }
+
+    impl Gate {
+        pub(crate) fn new() -> Arc<Self> {
+            Arc::new(Self {
+                arrived: AtomicBool::new(false),
+                released: Mutex::new(false),
+                cv: Condvar::new(),
+            })
+        }
+
+        pub(crate) fn arrive_and_wait(&self) {
+            self.arrived.store(true, Ordering::SeqCst);
+            let mut released = self.released.lock().unwrap_or_else(|e| e.into_inner());
+            while !*released {
+                released = self.cv.wait(released).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+
+        pub(crate) fn arrived(&self) -> bool {
+            self.arrived.load(Ordering::SeqCst)
+        }
+
+        /// Spin (bounded) until the paused side has arrived.
+        pub(crate) fn wait_arrived(&self, bound: std::time::Duration) {
+            let deadline = std::time::Instant::now() + bound;
+            while !self.arrived() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the paused attempt never reached the gate"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+
+        pub(crate) fn release(&self) {
+            let mut released = self.released.lock().unwrap_or_else(|e| e.into_inner());
+            *released = true;
+            self.cv.notify_all();
+        }
+    }
+
+    /// Scripted effects. `reserve_for(amount)` is the mint's fee reserve policy at ESTIMATE time;
+    /// `live_reserve_for`, when set, is the reserve the quote raised at PAYMENT time carries (the
+    /// two can differ — addendum 3 §1); `melt_results` are consumed in order; `status` answers the
+    /// reconciliation query; `pay_request_error` makes the LNURL host unreachable. Every call is
+    /// logged so a test can assert what was — and was not — touched; `melt_counter`, when set,
+    /// counts ACTUAL debits across Fakes on different threads (a melt refused at the ceiling is not
+    /// a debit and is logged in `ceiling_refusals` instead). `owner` is the process this Fake
+    /// speaks as; `invoice_tag` makes one Fake's invoices distinct from another's, as two real LNURL
+    /// calls would be.
     pub(crate) struct Fake {
+        pub(crate) owner: String,
+        pub(crate) invoice_tag: String,
         pub(crate) min_msat: u64,
         pub(crate) max_msat: u64,
-        pub(crate) reserve_for: Box<dyn Fn(u64) -> u64>,
+        pub(crate) reserve_for: Box<dyn Fn(u64) -> u64 + Send>,
+        pub(crate) live_reserve_for: Option<Box<dyn Fn(u64) -> u64 + Send>>,
         pub(crate) melt_results: Vec<Result<(u64, u64), String>>,
         pub(crate) status: Result<Option<MeltQuoteStatus>, String>,
         pub(crate) pay_request_error: Option<String>,
@@ -1026,16 +1411,23 @@ pub(crate) mod test_support {
         pub(crate) invoices: Vec<u64>,
         pub(crate) estimates: Vec<String>,
         pub(crate) melts: Vec<String>,
+        pub(crate) ceiling_refusals: Vec<String>,
         pub(crate) status_calls: Vec<String>,
         pub(crate) melt_counter: Option<Arc<AtomicUsize>>,
+        pub(crate) plan_gate: Option<Arc<Gate>>,
+        pub(crate) melt_gate: Option<Arc<Gate>>,
+        pub(crate) planned_seen: Vec<FeeRemittance>,
     }
 
     impl Fake {
-        pub(crate) fn new(reserve_for: impl Fn(u64) -> u64 + 'static) -> Self {
+        pub(crate) fn new(reserve_for: impl Fn(u64) -> u64 + Send + 'static) -> Self {
             Self {
+                owner: "fake-owner".to_owned(),
+                invoice_tag: String::new(),
                 min_msat: 1000,
                 max_msat: 1_000_000_000,
                 reserve_for: Box::new(reserve_for),
+                live_reserve_for: None,
                 melt_results: Vec::new(),
                 status: Ok(None),
                 pay_request_error: None,
@@ -1043,8 +1435,12 @@ pub(crate) mod test_support {
                 invoices: Vec::new(),
                 estimates: Vec::new(),
                 melts: Vec::new(),
+                ceiling_refusals: Vec::new(),
                 status_calls: Vec::new(),
                 melt_counter: None,
+                plan_gate: None,
+                melt_gate: None,
+                planned_seen: Vec::new(),
             }
         }
 
@@ -1055,9 +1451,28 @@ pub(crate) mod test_support {
         pub(crate) fn hash_for(amount_sats: u64, sequence: usize) -> String {
             format!("hash-{amount_sats}-{sequence}")
         }
+
+        fn amount_in(bolt11: &str) -> u64 {
+            bolt11
+                .split('-')
+                .nth(2)
+                .and_then(|raw| raw.parse().ok())
+                .expect("fake bolt11 carries its amount")
+        }
     }
 
     impl RemitEffects for Fake {
+        fn owner(&self) -> &str {
+            &self.owner
+        }
+
+        fn after_plan(&mut self, planned: &FeeRemittance) {
+            self.planned_seen.push(planned.clone());
+            if let Some(gate) = &self.plan_gate {
+                gate.arrive_and_wait();
+            }
+        }
+
         fn pay_request(&mut self, address: &LightningAddress) -> Result<PayRequest, String> {
             assert_eq!(address.to_string(), "maxplayer@agi.cash");
             self.pay_requests += 1;
@@ -1081,8 +1496,16 @@ pub(crate) mod test_support {
             self.invoices.push(amount_sats);
             let sequence = self.invoices.len();
             Ok(ResolvedInvoice {
-                bolt11: Self::bolt11_for(amount_sats, sequence),
-                payment_hash: Self::hash_for(amount_sats, sequence),
+                bolt11: format!(
+                    "{}{}",
+                    Self::bolt11_for(amount_sats, sequence),
+                    self.invoice_tag
+                ),
+                payment_hash: format!(
+                    "{}{}",
+                    Self::hash_for(amount_sats, sequence),
+                    self.invoice_tag
+                ),
                 amount_sats,
                 amount_msat: amount_sats * 1000,
             })
@@ -1090,11 +1513,7 @@ pub(crate) mod test_support {
 
         fn melt_estimate(&mut self, bolt11: &str) -> Result<MeltEstimate, String> {
             self.estimates.push(bolt11.to_owned());
-            let amount_sats: u64 = bolt11
-                .split('-')
-                .nth(2)
-                .and_then(|raw| raw.parse().ok())
-                .expect("fake bolt11 carries its amount");
+            let amount_sats = Self::amount_in(bolt11);
             Ok(MeltEstimate {
                 mint_url: "https://mint.example".to_owned(),
                 quote_id: format!("quote-{bolt11}"),
@@ -1103,18 +1522,44 @@ pub(crate) mod test_support {
             })
         }
 
-        fn melt(&mut self, bolt11: &str) -> Result<MeltOutcome, String> {
+        /// The wallet's melt as the shipped one behaves: raise the PAYMENT quote (its reserve is
+        /// `live_reserve_for`, or the estimate's policy when unset), check it against the ceiling
+        /// BEFORE anything is spent — a refusal is not a debit — then pay.
+        fn melt(
+            &mut self,
+            bolt11: &str,
+            ceiling: &MeltCeiling,
+        ) -> Result<MeltOutcome, MeltFailure> {
+            if let Some(gate) = &self.melt_gate {
+                gate.arrive_and_wait();
+            }
+            let amount_sats = Self::amount_in(bolt11);
+            let live_reserve = match &self.live_reserve_for {
+                Some(live) => live(amount_sats),
+                None => (self.reserve_for)(amount_sats),
+            };
+            if !ceiling.admits(amount_sats, live_reserve) {
+                let reason = format!(
+                    "melt refused before spending: mint https://mint.example quote paid-quote-{bolt11} would debit {} sats ({amount_sats} sats invoice + {live_reserve} sats fee reserve; planned invoice {} sats) against a ceiling of {} sats; nothing left the wallet",
+                    amount_sats.saturating_add(live_reserve),
+                    ceiling.invoice_sats,
+                    ceiling.max_debit_sats
+                );
+                self.ceiling_refusals.push(reason.clone());
+                return Err(MeltFailure::RefusedBeforeSpending(reason));
+            }
             self.melts.push(bolt11.to_owned());
             if let Some(counter) = &self.melt_counter {
                 counter.fetch_add(1, Ordering::SeqCst);
             }
-            let (paid, fee) = self.melt_results.remove(0)?;
+            let (paid, fee) = self.melt_results.remove(0).map_err(MeltFailure::Failed)?;
             Ok(MeltOutcome {
                 mint_url: "https://mint.example".to_owned(),
                 paid_sats: paid,
                 fee_sats: fee,
                 balance_sats: 1_000,
                 quote_id: format!("paid-quote-{bolt11}"),
+                fee_reserve_sats: live_reserve,
             })
         }
 
@@ -1253,7 +1698,7 @@ mod tests {
             "exactly one melt, of the NET invoice"
         );
         for needle in [
-            "Journaled remittance hash-13-2 covering 2 receipts; paying...",
+            "Journaled remittance hash-13-2 covering 2 receipts (owner fake-owner, lease until unix 400); paying...",
             "PAID — remittance hash-13-2 settled",
             "gross discharged: 15 sats",
             "melt fee taken by the mint: 1 sats",
@@ -1640,11 +2085,11 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains("Reconciling in-flight remittance hash-9-2 (planned at unix 100: 9 sats to maxplayer@agi.cash, gross 10 sats)"),
+            out.contains("Reconciling in-flight remittance hash-9-2 (planned at unix 100 by fake-owner, lease until unix 400: 9 sats to maxplayer@agi.cash, gross 10 sats)"),
             "{out}"
         );
         assert!(
-            out.contains("reports melt quote paid-quote-lnbc-fake-9-2 PAID — recorded as settled: 9 sats reached maxplayer@agi.cash (melt fee not observed by this run)"),
+            out.contains("reports melt quote paid-quote-lnbc-fake-9-2 PAID — recorded as settled by reconciliation: 9 sats reached maxplayer@agi.cash; melt fee at most 1 sats (the quote's reserve"),
             "{out}"
         );
         assert!(out.contains("Nothing to remit."), "{out}");
@@ -1654,6 +2099,16 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].state, RemittanceState::Settled);
         assert_eq!(rows[0].melt_fee_sats, None, "unobserved, not invented");
+        assert_eq!(
+            rows[0].settled_by,
+            Some(RemittanceState::Settled).map(|_| crate::seller_node::store::SettledBy::Reconciliation),
+            "the row says it was settled by reconciliation"
+        );
+        assert_eq!(
+            rows[0].melt_fee_reserve_sats,
+            Some(1),
+            "the paying quote's reserve — the fee's ceiling — is recorded"
+        );
         assert_eq!(rows[0].net_sats, 9);
         assert_eq!(
             rows[0].melt_quote_id,
@@ -1736,7 +2191,7 @@ mod tests {
         }));
         let (outcome, out) = run_remit(&store, &mut fake, RemitTrigger::DryRun, 102);
         assert_eq!(outcome, RemitOutcome::DryRun, "{out}");
-        assert!(out.contains("reports melt quote q-unpaid UNPAID — no sats left the wallet; released 10 sats back to unremitted"), "{out}");
+        assert!(out.contains("reports melt quote q-unpaid UNPAID — no sats left the wallet; the row is this process's own earlier attempt, which is over; released 10 sats back to unremitted"), "{out}");
         assert!(out.contains("10 sats unremitted"), "{out}");
         assert!(out.contains("DRY RUN — nothing moved."), "{out}");
         assert_eq!(fake.melts.len(), 1);
@@ -1772,7 +2227,7 @@ mod tests {
         fake2.status = Ok(None);
         let (outcome, out) = run_remit(&store2, &mut fake2, RemitTrigger::DryRun, 101);
         assert_eq!(outcome, RemitOutcome::DryRun, "{out}");
-        assert!(out.contains("the wallet never raised a melt quote for its invoice — no sats left the wallet; released 10 sats back to unremitted"), "{out}");
+        assert!(out.contains("the wallet never raised a melt quote for its invoice — no sats left the wallet; the row is this process's own earlier attempt, which is over; released 10 sats back to unremitted"), "{out}");
         assert_eq!(
             store2.remittances().expect("rows")[0].state,
             RemittanceState::Failed
@@ -1930,6 +2385,9 @@ mod tests {
                     // A connection of its own, as two collect handlers on two threads would have.
                     let store = SellerStore::open(&db).expect("open");
                     let mut fake = Fake::new(|_| 2);
+                    // Two real LNURL calls never hand out the same invoice: distinct hashes, so
+                    // the loser cannot be masked by a DuplicateInvoice on the winner's hash.
+                    fake.invoice_tag = format!("-t{thread}");
                     fake.melt_results = vec![Ok((13, 1))];
                     fake.melt_counter = Some(melts);
                     barrier.wait();
@@ -1987,6 +2445,501 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(&root);
         }
+    }
+
+    // ---- addendum 3 §1: the money hold, at the moment of spending (gate 2f) --------------------
+
+    // Gate 2f: gross 15, the ESTIMATE quotes a 2-sat reserve (invoice 13, ceiling 15 holds), but the
+    // quote the mint raises FOR THE PAYMENT carries a 4-sat reserve: 13 + 4 = 17 > 15. The melt is
+    // REFUSED before any proof is spent — zero debits — the attempt is journaled FAILED naming the
+    // row, the row is released, and the accrued balance is exactly what it was. Then the same seller
+    // with a payment-time reserve that FITS pays exactly once.
+    #[test]
+    fn a_reserve_that_grows_between_estimate_and_payment_is_refused_before_spending() {
+        let (store, root) = store_with_fees("ceiling-refused", &[10, 5]);
+        let mut fake = Fake::new(|_| 2);
+        fake.live_reserve_for = Some(Box::new(|_| 4));
+        fake.melt_results = vec![Ok((13, 1))];
+        let (outcome, out) = run_remit(&store, &mut fake, RemitTrigger::Collect, 100);
+        match &outcome {
+            RemitOutcome::MeltRefused {
+                remittance_id,
+                reason,
+            } => {
+                assert_eq!(remittance_id, "hash-13-2");
+                assert!(
+                    reason.contains("would debit 17 sats (13 sats invoice + 4 sats fee reserve; planned invoice 13 sats) against a ceiling of 15 sats; nothing left the wallet"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected MeltRefused, got {other:?}\n{out}"),
+        }
+        assert!(
+            fake.melts.is_empty(),
+            "ZERO debits: the refusal happens before the proofs are touched"
+        );
+        assert_eq!(fake.ceiling_refusals.len(), 1);
+        assert_eq!(
+            fake.melt_results.len(),
+            1,
+            "the scripted payment was never consumed"
+        );
+        assert!(
+            out.contains("REFUSED before spending — melt refused before spending"),
+            "{out}"
+        );
+        assert!(
+            out.contains("A seller never pays more than it accrued: the ceiling is 15 sats, enforced against the quote the mint raised for the payment. Nothing left the wallet; released 15 sats back to unremitted."),
+            "{out}"
+        );
+        // Journaled as a FAILED attempt naming the row; the row is failed and its receipts released.
+        let attempts = store.recent_remit_attempts(10).expect("attempts");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].outcome, RemitAttemptOutcome::Failed);
+        assert_eq!(attempts[0].remittance_id.as_deref(), Some("hash-13-2"));
+        assert!(
+            attempts[0]
+                .detail
+                .starts_with("refused before spending: melt refused before spending"),
+            "{}",
+            attempts[0].detail
+        );
+        assert_eq!(attempts[0].unremitted_sats, 15);
+        let rows = store.remittances().expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, RemittanceState::Failed);
+        assert_eq!(rows[0].receipts, 0, "released");
+        let accrued = store.accrued_fees().expect("read");
+        assert_eq!(
+            (
+                accrued.remitted_fee_sats,
+                accrued.in_flight_fee_sats,
+                accrued.unremitted_fee_sats
+            ),
+            (0, 0, 15),
+            "the accrued balance is unchanged: nothing paid, nothing in flight"
+        );
+        // It is a failure for the pacing: the backoff escalates.
+        let report = RemitReport {
+            outcome: Ok(outcome),
+            lines: Vec::new(),
+        };
+        assert!(report.is_failure());
+        assert!(
+            report
+                .summary()
+                .starts_with("melt REFUSED before spending (")
+        );
+
+        // The payment-time reserve fits (2: 13 + 2 = 15 ≤ 15): pays exactly once, and the
+        // settlement records the PAYING quote's reserve beside the actual fee.
+        fake.live_reserve_for = Some(Box::new(|_| 2));
+        let (outcome, out) = run_remit(&store, &mut fake, RemitTrigger::Retry, 101);
+        assert!(is_paid(&outcome), "{out}");
+        assert_eq!(fake.melts.len(), 1, "exactly one debit, ever");
+        assert!(
+            out.contains("melt fee taken by the mint: 1 sats (quote paid-quote-lnbc-fake-13-4 reserved 2 sats; ceiling 15 sats held at the moment of spending)"),
+            "{out}"
+        );
+        let rows = store.remittances().expect("rows");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].state, RemittanceState::Settled);
+        assert_eq!(rows[1].melt_fee_sats, Some(1));
+        assert_eq!(rows[1].melt_fee_reserve_sats, Some(2));
+        assert_eq!(
+            rows[1].settled_by,
+            Some(crate::seller_node::store::SettledBy::Melt)
+        );
+        assert_eq!(
+            rows[1].melt_quote_id,
+            Some("paid-quote-lnbc-fake-13-4".to_owned()),
+            "the quote that actually paid is the one recorded"
+        );
+        assert_eq!(store.accrued_fees().expect("read").remitted_fee_sats, 15);
+
+        // Exactly at the ceiling is admitted; one sat over is not (the pure rule the melt applies).
+        let ceiling = MeltCeiling {
+            max_debit_sats: 15,
+            invoice_sats: 13,
+            planned_quote_id: None,
+        };
+        assert!(ceiling.admits(13, 2));
+        assert!(!ceiling.admits(13, 3));
+        assert!(
+            !ceiling.admits(12, 0),
+            "a quote for a different amount than planned is refused too"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- addendum 3 §2: ownership — never release a live payer's intent (gate 2g) ---------------
+
+    fn status(state: MeltQuoteState, quote_id: &str) -> MeltQuoteStatus {
+        MeltQuoteStatus {
+            mint_url: "https://mint.example".to_owned(),
+            quote_id: quote_id.to_owned(),
+            state,
+            amount_sats: 13,
+            fee_reserve_sats: 2,
+        }
+    }
+
+    fn planned_row(owner: Option<&str>, lease_until: Option<i64>) -> FeeRemittance {
+        FeeRemittance {
+            remittance_id: "x".to_owned(),
+            gross_sats: 15,
+            melt_fee_sats: None,
+            melt_fee_reserve_sats: Some(2),
+            net_sats: 13,
+            destination: PLATFORM_FEE_ADDRESS.to_owned(),
+            melt_quote_id: Some("q".to_owned()),
+            payment_hash: "x".to_owned(),
+            bolt11: "ln-x".to_owned(),
+            state: RemittanceState::Planned,
+            created_at_unix: 100,
+            settled_at_unix: None,
+            settled_by: None,
+            owner: owner.map(str::to_owned),
+            lease_until_unix: lease_until,
+            receipts: 2,
+        }
+    }
+
+    // The release rule as a table: PAID settles; PENDING/UNKNOWN hold; FAILED releases whoever owns
+    // the row; UNPAID / no quote release only for the row's own process or after the lease — and
+    // HOLD while another process's lease stands. A pre-v11 row (no owner, no lease) reads as expired.
+    #[test]
+    fn reconciliation_releases_only_terminal_quotes_own_rows_or_expired_leases() {
+        let theirs = planned_row(Some("proc-b"), Some(400));
+        let mine = planned_row(Some("proc-a"), Some(400));
+        let legacy = planned_row(None, None);
+        let paid = status(MeltQuoteState::Paid, "q-paid");
+        let pending = status(MeltQuoteState::Pending, "q-pending");
+        let unknown = status(MeltQuoteState::Unknown, "q-unknown");
+        let failed = status(MeltQuoteState::Failed, "q-failed");
+        let unpaid = status(MeltQuoteState::Unpaid, "q-unpaid");
+
+        assert_eq!(
+            reconcile_decision(&theirs, Some(&paid), "proc-a", 200),
+            Reconcile::Settle
+        );
+        assert_eq!(
+            reconcile_decision(&theirs, Some(&pending), "proc-a", 200),
+            Reconcile::Hold(Refusal::Settling {
+                remittance_id: "x".to_owned()
+            })
+        );
+        assert_eq!(
+            reconcile_decision(&mine, Some(&unknown), "proc-a", 200),
+            Reconcile::Hold(Refusal::Settling {
+                remittance_id: "x".to_owned()
+            }),
+            "unknown is not terminal, even on our own row"
+        );
+        assert!(matches!(
+            reconcile_decision(&theirs, Some(&failed), "proc-a", 200),
+            Reconcile::Release(reason) if reason.contains("FAILED is terminal")
+        ));
+        // UNPAID / no quote, another process's live lease: HOLD — "not yet" is not "abandoned".
+        assert_eq!(
+            reconcile_decision(&theirs, Some(&unpaid), "proc-a", 200),
+            Reconcile::Hold(Refusal::HeldByOwner {
+                remittance_id: "x".to_owned(),
+                owner: "proc-b".to_owned(),
+                lease_until_unix: 400,
+            })
+        );
+        assert_eq!(
+            reconcile_decision(&theirs, None, "proc-a", 399),
+            Reconcile::Hold(Refusal::HeldByOwner {
+                remittance_id: "x".to_owned(),
+                owner: "proc-b".to_owned(),
+                lease_until_unix: 400,
+            }),
+            "one second before the lease ends it still holds"
+        );
+        // …and RELEASE once the lease has run out (the owner is provably gone or not spending).
+        assert!(matches!(
+            reconcile_decision(&theirs, Some(&unpaid), "proc-a", 400),
+            Reconcile::Release(reason) if reason.contains("lease ran out at unix 400")
+        ));
+        assert!(matches!(
+            reconcile_decision(&theirs, None, "proc-a", 401),
+            Reconcile::Release(reason) if reason.contains("never raised a melt quote")
+        ));
+        // Our own row: release on UNPAID / none at any time — our earlier attempt is over.
+        assert!(matches!(
+            reconcile_decision(&mine, Some(&unpaid), "proc-a", 101),
+            Reconcile::Release(reason) if reason.contains("this process's own earlier attempt")
+        ));
+        assert!(matches!(
+            reconcile_decision(&mine, None, "proc-a", 101),
+            Reconcile::Release(_)
+        ));
+        // A pre-v11 row: nobody's, lease expired ⇒ releasable on UNPAID / none, settled on PAID.
+        assert!(matches!(
+            reconcile_decision(&legacy, Some(&unpaid), "proc-a", 101),
+            Reconcile::Release(reason) if reason.contains("owner none recorded")
+        ));
+        assert_eq!(
+            reconcile_decision(&legacy, Some(&paid), "proc-a", 101),
+            Reconcile::Settle
+        );
+        assert!(
+            !Refusal::HeldByOwner {
+                remittance_id: "x".to_owned(),
+                owner: "proc-b".to_owned(),
+                lease_until_unix: 400,
+            }
+            .is_threshold()
+        );
+    }
+
+    /// Two processes against one store: `first` is paused at `gate` (after its plan is journaled),
+    /// `second` runs whatever the test scripts meanwhile. Returns each side's outcome and output.
+    fn run_paused(
+        db: &PathBuf,
+        mut first: Fake,
+        first_now: i64,
+        gate: Arc<super::test_support::Gate>,
+        melts: Arc<AtomicUsize>,
+        meanwhile: impl FnOnce(&SellerStore) -> Vec<(RemitOutcome, String)>,
+    ) -> (
+        (Result<RemitOutcome, String>, String),
+        Vec<(RemitOutcome, String)>,
+    ) {
+        first.plan_gate = Some(Arc::clone(&gate));
+        first.melt_counter = Some(Arc::clone(&melts));
+        let db_a = db.clone();
+        let a = std::thread::spawn(move || {
+            let store = SellerStore::open(&db_a).expect("open A");
+            let mut out = Vec::new();
+            let outcome = remit(&store, &mut first, RemitTrigger::Collect, first_now, &mut out);
+            (outcome, String::from_utf8_lossy(&out).into_owned())
+        });
+        gate.wait_arrived(Duration::from_secs(10));
+        let store_b = SellerStore::open(db).expect("open B");
+        let b = meanwhile(&store_b);
+        gate.release();
+        let a = a.join().expect("A's thread");
+        (a, b)
+    }
+
+    // Gate 2g, the live owner: process A journals its plan (invoice X) and PAUSES before spending.
+    // Process B — another owner, another connection, distinct invoices — runs reconciliation and
+    // then `--confirm`: it finds X planned by a LIVE owner with the mint saying UNPAID, and HOLDS.
+    // It plans nothing, pays nothing. A resumes, passes the pre-spend gate, pays X once. Exactly one
+    // debit (melts counted, not settlement reports); one settled row; B's refusals journaled.
+    #[test]
+    fn a_second_process_cannot_release_a_live_owners_planned_row_and_exactly_one_debit_happens() {
+        let (store, root) = store_with_fees("live-owner", &[10, 5]);
+        drop(store);
+        let db = root.join(STATE_DB_FILE);
+        let melts = Arc::new(AtomicUsize::new(0));
+        let mut a = Fake::new(|_| 2);
+        a.owner = "proc-a".to_owned();
+        a.invoice_tag = "-a".to_owned();
+        a.melt_results = vec![Ok((13, 1))];
+        let (a_result, b_results) = run_paused(
+            &db,
+            a,
+            100,
+            super::test_support::Gate::new(),
+            Arc::clone(&melts),
+            |store_b| {
+                let mut results = Vec::new();
+                for (trigger, now) in [(RemitTrigger::DryRun, 110), (RemitTrigger::Command, 111)] {
+                    let mut b = Fake::new(|_| 2);
+                    b.owner = "proc-b".to_owned();
+                    b.invoice_tag = "-b".to_owned();
+                    b.melt_results = vec![Ok((13, 1))];
+                    b.melt_counter = Some(Arc::clone(&melts));
+                    // The mint's honest answer about A's planned invoice while A is paused: UNPAID.
+                    b.status = Ok(Some(status(MeltQuoteState::Unpaid, "quote-lnbc-fake-13-2-a")));
+                    let (outcome, out) = run_remit(store_b, &mut b, trigger, now);
+                    assert!(b.melts.is_empty(), "B must not pay: {out}");
+                    assert!(
+                        b.invoices.is_empty(),
+                        "B must not even plan on top of a held row: {out}"
+                    );
+                    results.push((outcome, out));
+                }
+                results
+            },
+        );
+        for (outcome, out) in &b_results {
+            assert_eq!(
+                outcome,
+                &RemitOutcome::Refused(Refusal::HeldByOwner {
+                    remittance_id: "hash-13-2-a".to_owned(),
+                    owner: "proc-a".to_owned(),
+                    lease_until_unix: 400,
+                }),
+                "{out}"
+            );
+            assert!(
+                out.contains("is planned by another live process (proc-a, lease until unix 400) and its quote is not terminal; not releasing a live payer's intent. REFUSED"),
+                "{out}"
+            );
+        }
+        let (a_outcome, a_out) = a_result;
+        assert!(
+            matches!(a_outcome, Ok(RemitOutcome::Paid { .. })),
+            "A pays once it resumes: {a_outcome:?}\n{a_out}"
+        );
+        assert_eq!(melts.load(Ordering::SeqCst), 1, "exactly one actual debit");
+        let store = SellerStore::open(&db).expect("open");
+        let rows = store.remittances().expect("rows");
+        assert_eq!(rows.len(), 1, "one row, A's: {rows:?}");
+        assert_eq!(rows[0].remittance_id, "hash-13-2-a");
+        assert_eq!(rows[0].state, RemittanceState::Settled);
+        assert_eq!(rows[0].owner.as_deref(), Some("proc-a"));
+        let accrued = store.accrued_fees().expect("read");
+        assert_eq!(
+            (
+                accrued.remitted_fee_sats,
+                accrued.in_flight_fee_sats,
+                accrued.unremitted_fee_sats
+            ),
+            (15, 0, 0)
+        );
+        // B's --confirm refusal is journaled (the dry run is not an attempt).
+        let attempts = store.recent_remit_attempts(10).expect("attempts");
+        assert_eq!(attempts.len(), 2, "{attempts:?}");
+        assert_eq!(attempts[0].outcome, RemitAttemptOutcome::Paid);
+        assert_eq!(attempts[1].trigger, RemitAttemptTrigger::Command);
+        assert_eq!(attempts[1].outcome, RemitAttemptOutcome::Refused);
+        assert_eq!(attempts[1].remittance_id.as_deref(), Some("hash-13-2-a"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Gate 2g, the gone owner: A journals X and pauses; B runs AFTER A's lease has run out, with the
+    // mint saying UNPAID — B may release X (the owner is provably not spending: it refuses to start
+    // inside the margin), plans a DISTINCT invoice Y and pays it. A then resumes: its pre-spend gate
+    // finds X no longer planned and REFUSES without touching the wallet. Exactly one debit — B's.
+    #[test]
+    fn an_owner_that_outlives_its_lease_is_released_and_then_refuses_to_spend() {
+        let (store, root) = store_with_fees("expired-owner", &[10, 5]);
+        drop(store);
+        let db = root.join(STATE_DB_FILE);
+        let melts = Arc::new(AtomicUsize::new(0));
+        let mut a = Fake::new(|_| 2);
+        a.owner = "proc-a".to_owned();
+        a.invoice_tag = "-a".to_owned();
+        a.melt_results = vec![Ok((13, 1))];
+        let (a_result, b_results) = run_paused(
+            &db,
+            a,
+            100,
+            super::test_support::Gate::new(),
+            Arc::clone(&melts),
+            |store_b| {
+                let mut b = Fake::new(|_| 2);
+                b.owner = "proc-b".to_owned();
+                b.invoice_tag = "-b".to_owned();
+                b.melt_results = vec![Ok((13, 1))];
+                b.melt_counter = Some(Arc::clone(&melts));
+                b.status = Ok(Some(status(MeltQuoteState::Unpaid, "quote-lnbc-fake-13-2-a")));
+                // 100 + REMIT_LEASE (300) = 400: the lease has run out.
+                let (outcome, out) = run_remit(store_b, &mut b, RemitTrigger::Command, 400);
+                assert!(is_paid(&outcome), "B pays Y once X is released: {out}");
+                assert_eq!(b.melts, vec!["lnbc-fake-13-2-b".to_owned()]);
+                assert!(
+                    out.contains("its owner's lease ran out at unix 400 (owner proc-a); released 15 sats back to unremitted"),
+                    "{out}"
+                );
+                vec![(outcome, out)]
+            },
+        );
+        let (a_outcome, a_out) = a_result;
+        match a_outcome {
+            Ok(RemitOutcome::Refused(Refusal::OwnershipLost {
+                remittance_id,
+                reason,
+            })) => {
+                assert_eq!(remittance_id, "hash-13-2-a");
+                assert!(
+                    reason.contains("the row is no longer planned (now failed): another process reconciled it"),
+                    "{reason}"
+                );
+            }
+            other => panic!("A must refuse at the pre-spend gate, got {other:?}\n{a_out}"),
+        }
+        assert!(
+            a_out.contains("REFUSED before spending — the row is no longer planned (now failed)"),
+            "{a_out}"
+        );
+        assert_eq!(melts.load(Ordering::SeqCst), 1, "exactly one actual debit — B's");
+        assert_eq!(b_results.len(), 1);
+        let store = SellerStore::open(&db).expect("open");
+        let rows = store.remittances().expect("rows");
+        assert_eq!(
+            rows.iter()
+                .map(|r| (r.remittance_id.as_str(), r.state))
+                .collect::<Vec<_>>(),
+            vec![
+                ("hash-13-2-a", RemittanceState::Failed),
+                ("hash-13-2-b", RemittanceState::Settled)
+            ]
+        );
+        let accrued = store.accrued_fees().expect("read");
+        assert_eq!(
+            (
+                accrued.remitted_fee_sats,
+                accrued.in_flight_fee_sats,
+                accrued.unremitted_fee_sats
+            ),
+            (15, 0, 0)
+        );
+        // A's refusal at the gate is journaled as a refused attempt naming X.
+        let attempts = store.recent_remit_attempts(10).expect("attempts");
+        let a_attempt = attempts
+            .iter()
+            .find(|a| a.trigger == RemitAttemptTrigger::Collect)
+            .expect("A's attempt");
+        assert_eq!(a_attempt.outcome, RemitAttemptOutcome::Refused);
+        assert_eq!(a_attempt.remittance_id.as_deref(), Some("hash-13-2-a"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The owner's own margin at the store boundary: with less than SPEND_MARGIN of lease left, the
+    // ownership check refuses (the remit path then releases its own row rather than spend).
+    #[test]
+    fn an_owner_with_too_little_lease_left_is_refused_at_the_gate() {
+        let (store, root) = store_with_fees("lease-margin", &[10, 5]);
+        // Plan at 100 ⇒ lease until 400. At 341 there are 59 s left: under the 60 s margin.
+        let plan = RemittancePlan {
+            payment_hash: "manual".to_owned(),
+            gross_sats: 15,
+            net_sats: 13,
+            melt_fee_reserve_sats: 2,
+            destination: PLATFORM_FEE_ADDRESS.to_owned(),
+            bolt11: "ln-manual".to_owned(),
+            melt_quote_id: None,
+        };
+        store
+            .plan_remittance(&plan, "fake-owner", 400, 100)
+            .expect("plan");
+        assert_eq!(
+            store
+                .confirm_remittance_ownership("manual", "fake-owner", 341, lease_secs(SPEND_MARGIN))
+                .expect("query"),
+            Err(OwnershipLost::LeaseTooShort {
+                lease_until_unix: Some(400),
+                now_unix: 341,
+                margin_secs: 60,
+            })
+        );
+        assert!(
+            store
+                .confirm_remittance_ownership("manual", "fake-owner", 340, lease_secs(SPEND_MARGIN))
+                .expect("query")
+                .is_ok(),
+            "exactly the margin left is enough"
+        );
+        assert_eq!(lease_secs(REMIT_LEASE), 300);
+        assert_eq!(lease_secs(SPEND_MARGIN), 60);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // The attempts journal is bounded and newest-first, and a limit of zero returns nothing.
@@ -2220,6 +3173,32 @@ mod tests {
         let clamped = RemitBackoff::with_bounds(Duration::from_secs(5), Duration::from_secs(1));
         assert_eq!(clamped.computed_delay(), Duration::from_secs(5));
         assert!(clamped.at_cap());
+    }
+
+    // Addendum 3 RULING 1: the first attempt after boot fires no earlier than one base delay, with
+    // an additive jitter in [0, base] — [30 s, 60 s]. Zero is never a legal first delay.
+    #[test]
+    fn the_boot_delay_is_never_less_than_the_base_and_at_most_twice_it() {
+        assert_eq!(boot_delay_for(RETRY_BASE, 0), Duration::from_secs(30));
+        assert_eq!(boot_delay_for(RETRY_BASE, u64::MAX), Duration::from_secs(60));
+        let mid = boot_delay_for(RETRY_BASE, u64::MAX / 2);
+        assert!(mid > Duration::from_secs(44) && mid < Duration::from_secs(46));
+        for entropy in [0, 1, u64::MAX / 3, u64::MAX / 2, u64::MAX - 1, u64::MAX] {
+            let delay = boot_delay_for(RETRY_BASE, entropy);
+            assert!(delay >= RETRY_BASE, "{delay:?} is below the base");
+            assert!(delay <= RETRY_BASE * 2, "{delay:?} is above twice the base");
+        }
+        assert_eq!(boot_delay_for(Duration::MAX, u64::MAX), Duration::MAX);
+        let pacing = RemitBackoff::new();
+        for _ in 0..64 {
+            let drawn = pacing.boot_delay();
+            assert!(drawn >= RETRY_BASE && drawn <= RETRY_BASE * 2, "{drawn:?}");
+        }
+        // Explicit bounds: the boot delay follows the base the test set.
+        let short =
+            RemitBackoff::with_bounds(Duration::from_millis(25), Duration::from_millis(100));
+        let drawn = short.boot_delay();
+        assert!(drawn >= Duration::from_millis(25) && drawn <= Duration::from_millis(50));
     }
 
     // Full jitter is a uniform point in [0, computed]: the two extremes are exact, and a huge

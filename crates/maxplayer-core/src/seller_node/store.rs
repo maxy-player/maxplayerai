@@ -30,7 +30,13 @@ use crate::gateway::EventDraft;
 /// remittance, if any, discharged each receipt's platform fee — so the unremitted balance is a
 /// query and a paid fee can never be paid twice; and `fee_remit_attempts`, the journal of every
 /// attempt to pay (automatic or by command) with its outcome, so a failing payout is visible.
-pub const SCHEMA_VERSION: i64 = 10;
+/// v11 (stage 2a, addendum 3) added four nullable columns to `fee_remittances`: `owner` and
+/// `lease_until_unix` — the durable ownership of a `planned` row, so reconciliation in another
+/// process can never release a live payer's intent — and `melt_fee_reserve_sats` / `settled_by`,
+/// so a settlement records the reserve of the quote that paid and how the row was settled (by the
+/// melt itself, or by reconciliation against the mint, which can report the quote PAID but not the
+/// fee it kept).
+pub const SCHEMA_VERSION: i64 = 11;
 
 /// The platform fee as journaled so far: what is owed on paper, what has been remitted, and the
 /// figures around them. Returned by [`SellerStore::accrued_fees`]. A query and nothing more — the
@@ -172,12 +178,57 @@ pub struct RemittancePlan {
     pub gross_sats: u64,
     /// The invoice amount — what the platform receives: gross minus the melt fee reserve.
     pub net_sats: u64,
+    /// The melt fee reserve the estimate quoted on the net invoice — the plan's ceiling figure.
+    /// The spend re-checks the reserve of the quote it actually pays under (addendum 3 §1).
+    pub melt_fee_reserve_sats: u64,
     /// The Lightning address literal being paid, journaled so a later change leaves history.
     pub destination: String,
     /// The invoice being paid, kept so an interrupted attempt can be reconciled against the mint.
     pub bolt11: String,
     /// The melt quote id from the estimate, if one was raised.
     pub melt_quote_id: Option<String>,
+}
+
+/// How a `settled` remittance row came to be settled — the row says so itself, because the two
+/// paths can observe different things (addendum 3 §2.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettledBy {
+    /// The melt confirmed in this process: net paid, actual melt fee and paying quote all observed.
+    Melt,
+    /// Reconciliation: the mint reports the quote PAID. The quote carries amount, fee reserve and
+    /// id; the fee the mint actually kept is not reported for a quote paid by another run, so the
+    /// row records the reserve (the fee's ceiling) and leaves the actual fee unobserved — said so,
+    /// never invented.
+    Reconciliation,
+}
+
+impl SettledBy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Melt => "melt",
+            Self::Reconciliation => "reconciliation",
+        }
+    }
+
+    fn parse(raw: &str) -> Result<Self, StoreError> {
+        match raw {
+            "melt" => Ok(Self::Melt),
+            "reconciliation" => Ok(Self::Reconciliation),
+            other => Err(StoreError(format!("unknown settled_by {other:?}"))),
+        }
+    }
+}
+
+/// What a settlement observed, for [`SellerStore::settle_remittance`]. `None` fields are
+/// "not observed", and the row keeps its planned figure (net) or NULL (fee); never a guess.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemitSettlement {
+    pub net_paid_sats: Option<u64>,
+    pub melt_fee_sats: Option<u64>,
+    /// The fee reserve of the quote that paid — the actual fee's ceiling. Observable on both paths.
+    pub melt_fee_reserve_sats: Option<u64>,
+    pub melt_quote_id: Option<String>,
+    pub settled_by: SettledBy,
 }
 
 /// One row of `fee_remittances`.
@@ -188,6 +239,9 @@ pub struct FeeRemittance {
     /// The melt fee the mint actually took. `None` while planned, and on a row settled by
     /// reconciliation (the mint confirms PAID but the fee it kept was not observed).
     pub melt_fee_sats: Option<u64>,
+    /// The fee reserve of the quote this row was planned against, replaced at settlement by the
+    /// reserve of the quote that actually paid. `None` only on rows written before v11.
+    pub melt_fee_reserve_sats: Option<u64>,
     pub net_sats: u64,
     pub destination: String,
     pub melt_quote_id: Option<String>,
@@ -196,8 +250,83 @@ pub struct FeeRemittance {
     pub state: RemittanceState,
     pub created_at_unix: i64,
     pub settled_at_unix: Option<i64>,
+    /// How the row was settled; `None` while planned or failed, and on settled rows written before
+    /// v11.
+    pub settled_by: Option<SettledBy>,
+    /// The process that planned this row and is the only one entitled to pay it (addendum 3 §2):
+    /// an opaque per-process token. `None` on rows planned before v11.
+    pub owner: Option<String>,
+    /// Until when the owner's claim stands. Another process may release a `planned` row on
+    /// UNPAID / no-quote only once this has passed — or on a quote the mint reports FAILED, which
+    /// is terminal whoever owns it. `None` on rows planned before v11 (read as expired).
+    pub lease_until_unix: Option<i64>,
     /// How many receipt rows are pinned to this remittance.
     pub receipts: usize,
+}
+
+impl FeeRemittance {
+    /// Whether `owner`'s claim on this row stands at `now_unix` with at least `margin_secs` to
+    /// spare. A row with no lease (pre-v11) is read as expired: fail-closed toward "not yours".
+    pub fn lease_holds(&self, owner: &str, now_unix: i64, margin_secs: i64) -> bool {
+        self.owner.as_deref() == Some(owner)
+            && self
+                .lease_until_unix
+                .is_some_and(|until| until.saturating_sub(now_unix) >= margin_secs)
+    }
+
+    /// Whether the owner's lease has run out at `now_unix` (a missing lease counts as run out).
+    pub fn lease_expired(&self, now_unix: i64) -> bool {
+        self.lease_until_unix.is_none_or(|until| now_unix >= until)
+    }
+}
+
+/// Why the pre-spend ownership check refused ([`SellerStore::confirm_remittance_ownership`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnershipLost {
+    /// The row no longer exists.
+    Missing,
+    /// The row is no longer `planned`: another process reconciled it while this one paused.
+    NotPlanned { state: RemittanceState },
+    /// The row is planned but owned by someone else (or by nobody: a pre-v11 row).
+    OtherOwner { owner: Option<String> },
+    /// The row is this caller's, but too little of its lease remains to start a payment safely:
+    /// another process is entitled to release it at `lease_until_unix`, and a spend that began
+    /// this close to that instant could land after the release.
+    LeaseTooShort {
+        lease_until_unix: Option<i64>,
+        now_unix: i64,
+        margin_secs: i64,
+    },
+}
+
+impl std::fmt::Display for OwnershipLost {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing => write!(formatter, "the planned row no longer exists"),
+            Self::NotPlanned { state } => write!(
+                formatter,
+                "the row is no longer planned (now {}): another process reconciled it",
+                state.as_str()
+            ),
+            Self::OtherOwner { owner } => write!(
+                formatter,
+                "the planned row is owned by {}",
+                owner.as_deref().unwrap_or("nobody (planned before ownership was recorded)")
+            ),
+            Self::LeaseTooShort {
+                lease_until_unix,
+                now_unix,
+                margin_secs,
+            } => write!(
+                formatter,
+                "the row is ours but its lease {} leaves less than the {margin_secs}s spending margin at unix {now_unix}",
+                match lease_until_unix {
+                    Some(until) => format!("(until unix {until})"),
+                    None => "(none recorded)".to_owned(),
+                }
+            ),
+        }
+    }
 }
 
 /// Who attempted a remittance — the three callers of `crate::fee_remit::remit` that pay.
@@ -766,6 +895,13 @@ impl SellerStore {
              -- the constant leaves history. `state` moves planned → settled | failed; the receipts
              -- pinned to a planned row (receipts.remittance_id) are released on failed and kept on
              -- settled. The partial unique index below lets at most ONE row be planned at a time.
+             -- v11 (addendum 3): `owner` / `lease_until_unix` are the planned row's durable
+             -- ownership — only the owner pays it, and another process may release it on
+             -- UNPAID/no-quote only after the lease, or on a quote the mint reports FAILED;
+             -- `melt_fee_reserve_sats` is the reserve of the quote planned against, replaced at
+             -- settlement by the reserve of the quote that paid; `settled_by` says whether the melt
+             -- itself or reconciliation settled the row. All four nullable, reaching existing stores
+             -- through `migrate` as ALTER TABLE ADD COLUMN — never a rebuild.
              CREATE TABLE IF NOT EXISTS fee_remittances (
                  remittance_id   TEXT PRIMARY KEY,
                  gross_sats      INTEGER NOT NULL CHECK (gross_sats >= 0),
@@ -777,7 +913,11 @@ impl SellerStore {
                  bolt11          TEXT NOT NULL,
                  state           TEXT NOT NULL CHECK (state IN ('planned','settled','failed')),
                  created_at_unix INTEGER NOT NULL,
-                 settled_at_unix INTEGER
+                 settled_at_unix INTEGER,
+                 owner           TEXT,
+                 lease_until_unix INTEGER,
+                 melt_fee_reserve_sats INTEGER CHECK (melt_fee_reserve_sats IS NULL OR melt_fee_reserve_sats >= 0),
+                 settled_by      TEXT CHECK (settled_by IS NULL OR settled_by IN ('melt','reconciliation'))
              );
              CREATE UNIQUE INDEX IF NOT EXISTS fee_remittances_one_planned
                  ON fee_remittances (state) WHERE state = 'planned';
@@ -884,6 +1024,29 @@ impl SellerStore {
         // EXISTS` in the schema above, which runs on every open. Additive + idempotent.
         if !Self::column_exists(conn, "receipts", "remittance_id")? {
             conn.execute_batch("ALTER TABLE receipts ADD COLUMN remittance_id TEXT;")?;
+        }
+        // v11 — ownership and settlement provenance on the remittance row (addendum 3). Nullable, no
+        // default: a v10 row reads `owner = NULL, lease_until_unix = NULL`, which every reader treats
+        // as an EXPIRED claim by nobody — fail-closed toward "not yours to pay", releasable by
+        // reconciliation once its quote is known terminal or unpaid. `melt_fee_reserve_sats` and
+        // `settled_by` read NULL: not recorded, never a guess. Additive + idempotent.
+        if !Self::column_exists(conn, "fee_remittances", "owner")? {
+            conn.execute_batch("ALTER TABLE fee_remittances ADD COLUMN owner TEXT;")?;
+        }
+        if !Self::column_exists(conn, "fee_remittances", "lease_until_unix")? {
+            conn.execute_batch("ALTER TABLE fee_remittances ADD COLUMN lease_until_unix INTEGER;")?;
+        }
+        if !Self::column_exists(conn, "fee_remittances", "melt_fee_reserve_sats")? {
+            conn.execute_batch(
+                "ALTER TABLE fee_remittances ADD COLUMN melt_fee_reserve_sats INTEGER
+                     CHECK (melt_fee_reserve_sats IS NULL OR melt_fee_reserve_sats >= 0);",
+            )?;
+        }
+        if !Self::column_exists(conn, "fee_remittances", "settled_by")? {
+            conn.execute_batch(
+                "ALTER TABLE fee_remittances ADD COLUMN settled_by TEXT
+                     CHECK (settled_by IS NULL OR settled_by IN ('melt','reconciliation'));",
+            )?;
         }
         Ok(())
     }
@@ -1665,6 +1828,18 @@ impl SellerStore {
                 Box::new(error),
             )
         })?;
+        let settled_by = row
+            .get::<_, Option<String>>(15)?
+            .map(|raw| {
+                SettledBy::parse(&raw).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        15,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })
+            })
+            .transpose()?;
         Ok(FeeRemittance {
             remittance_id: row.get(0)?,
             gross_sats: u64::try_from(row.get::<_, i64>(1)?).unwrap_or(0),
@@ -1680,13 +1855,20 @@ impl SellerStore {
             created_at_unix: row.get(9)?,
             settled_at_unix: row.get(10)?,
             receipts: usize::try_from(row.get::<_, i64>(11)?).unwrap_or(0),
+            owner: row.get(12)?,
+            lease_until_unix: row.get(13)?,
+            melt_fee_reserve_sats: row
+                .get::<_, Option<i64>>(14)?
+                .map(|reserve| u64::try_from(reserve).unwrap_or(0)),
+            settled_by,
         })
     }
 
     const REMITTANCE_COLUMNS: &'static str =
         "f.remittance_id, f.gross_sats, f.melt_fee_sats, f.net_sats, f.destination, f.melt_quote_id,
          f.payment_hash, f.bolt11, f.state, f.created_at_unix, f.settled_at_unix,
-         (SELECT COUNT(*) FROM receipts r WHERE r.remittance_id = f.remittance_id)";
+         (SELECT COUNT(*) FROM receipts r WHERE r.remittance_id = f.remittance_id),
+         f.owner, f.lease_until_unix, f.melt_fee_reserve_sats, f.settled_by";
 
     fn in_flight_remittance_in(conn: &Connection) -> Result<Option<FeeRemittance>, StoreError> {
         let found = conn
@@ -1732,9 +1914,16 @@ impl SellerStore {
     /// unremitted sum differs from `plan.gross_sats` ([`PlanRefused::GrossMismatch`] — the ledger
     /// moved under the caller); the payment hash was already journaled
     /// ([`PlanRefused::DuplicateInvoice`]); or there is nothing unremitted.
+    ///
+    /// `owner` is the planning process's token and `lease_until_unix` how long its claim stands
+    /// (addendum 3 §2): only the owner pays this row
+    /// ([`Self::confirm_remittance_ownership`] immediately before spending), and another process may
+    /// release it on UNPAID / no-quote only once the lease has passed.
     pub fn plan_remittance(
         &self,
         plan: &RemittancePlan,
+        owner: &str,
+        lease_until_unix: i64,
         now_unix: i64,
     ) -> Result<FeeRemittance, PlanRefused> {
         if plan.net_sats > plan.gross_sats {
@@ -1742,6 +1931,11 @@ impl SellerStore {
                 "net {} exceeds gross {}: the melt fee must come out of the gross, never on top",
                 plan.net_sats, plan.gross_sats
             ))));
+        }
+        if owner.trim().is_empty() {
+            return Err(PlanRefused::Store(StoreError(
+                "a remittance plan needs an owner token".to_owned(),
+            )));
         }
         let mut conn = self.lock()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1761,8 +1955,9 @@ impl SellerStore {
         let inserted = tx.execute(
             "INSERT OR IGNORE INTO fee_remittances
                  (remittance_id, gross_sats, melt_fee_sats, net_sats, destination, melt_quote_id,
-                  payment_hash, bolt11, state, created_at_unix, settled_at_unix)
-             VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?1, ?6, ?8, ?7, NULL)",
+                  payment_hash, bolt11, state, created_at_unix, settled_at_unix,
+                  owner, lease_until_unix, melt_fee_reserve_sats, settled_by)
+             VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?1, ?6, ?8, ?7, NULL, ?9, ?10, ?11, NULL)",
             params![
                 plan.payment_hash,
                 plan.gross_sats as i64,
@@ -1772,6 +1967,9 @@ impl SellerStore {
                 plan.bolt11,
                 now_unix,
                 RemittanceState::Planned.as_str(),
+                owner,
+                lease_until_unix,
+                plan.melt_fee_reserve_sats as i64,
             ],
         )?;
         if inserted == 0 {
@@ -1795,16 +1993,57 @@ impl SellerStore {
         Ok(row)
     }
 
+    /// The pre-spend ownership check (addendum 3 §2.1): read the row and say whether `owner` may
+    /// pay it NOW — it must still be `planned`, owned by `owner`, and hold at least `margin_secs`
+    /// of lease, because another process is entitled to release it once the lease has run out and a
+    /// spend that started any closer to that instant could land after the release. Read-only.
+    pub fn confirm_remittance_ownership(
+        &self,
+        remittance_id: &str,
+        owner: &str,
+        now_unix: i64,
+        margin_secs: i64,
+    ) -> Result<Result<FeeRemittance, OwnershipLost>, StoreError> {
+        let conn = self.lock()?;
+        let Some(row) = conn
+            .query_row(
+                &format!(
+                    "SELECT {} FROM fee_remittances f WHERE f.remittance_id = ?1",
+                    Self::REMITTANCE_COLUMNS
+                ),
+                params![remittance_id],
+                Self::read_remittance,
+            )
+            .optional()?
+        else {
+            return Ok(Err(OwnershipLost::Missing));
+        };
+        if row.state != RemittanceState::Planned {
+            return Ok(Err(OwnershipLost::NotPlanned { state: row.state }));
+        }
+        if row.owner.as_deref() != Some(owner) {
+            return Ok(Err(OwnershipLost::OtherOwner {
+                owner: row.owner.clone(),
+            }));
+        }
+        if !row.lease_holds(owner, now_unix, margin_secs) {
+            return Ok(Err(OwnershipLost::LeaseTooShort {
+                lease_until_unix: row.lease_until_unix,
+                now_unix,
+                margin_secs,
+            }));
+        }
+        Ok(Ok(row))
+    }
+
     /// Mark a `planned` remittance settled: the melt confirmed (or the mint reports the quote PAID
-    /// on reconciliation). `net_paid_sats` / `melt_fee_sats` / `melt_quote_id` are what the mint
-    /// reported, `None` where reconciliation could not observe them. Pinned receipts stay
-    /// discharged. Refused if the row is not `planned` — a settled or failed row never moves again.
+    /// on reconciliation). The [`RemitSettlement`] carries what was observed — `None` where it could
+    /// not be — and says which path settled the row. Pinned receipts stay discharged. Refused if the
+    /// row is not `planned` — a settled or failed row never moves again.
     pub fn settle_remittance(
         &self,
         remittance_id: &str,
-        net_paid_sats: Option<u64>,
-        melt_fee_sats: Option<u64>,
-        melt_quote_id: Option<&str>,
+        settlement: &RemitSettlement,
         now_unix: i64,
     ) -> Result<FeeRemittance, StoreError> {
         let mut conn = self.lock()?;
@@ -1815,16 +2054,20 @@ impl SellerStore {
                  settled_at_unix = ?2,
                  melt_fee_sats = ?3,
                  net_sats = COALESCE(?4, net_sats),
-                 melt_quote_id = COALESCE(?5, melt_quote_id)
+                 melt_quote_id = COALESCE(?5, melt_quote_id),
+                 melt_fee_reserve_sats = COALESCE(?8, melt_fee_reserve_sats),
+                 settled_by = ?9
              WHERE remittance_id = ?1 AND state = ?7",
             params![
                 remittance_id,
                 now_unix,
-                melt_fee_sats.map(|fee| fee as i64),
-                net_paid_sats.map(|net| net as i64),
-                melt_quote_id,
+                settlement.melt_fee_sats.map(|fee| fee as i64),
+                settlement.net_paid_sats.map(|net| net as i64),
+                settlement.melt_quote_id,
                 RemittanceState::Settled.as_str(),
                 RemittanceState::Planned.as_str(),
+                settlement.melt_fee_reserve_sats.map(|reserve| reserve as i64),
+                settlement.settled_by.as_str(),
             ],
         )?;
         if changed == 0 {
@@ -3373,9 +3616,35 @@ mod tests {
             payment_hash: hash.to_owned(),
             gross_sats: gross,
             net_sats: net,
+            melt_fee_reserve_sats: gross.saturating_sub(net),
             destination: "maxplayer@agi.cash".to_owned(),
             bolt11: format!("lnbc-test-{hash}"),
             melt_quote_id: Some(format!("quote-{hash}")),
+        }
+    }
+
+    /// The test process's owner token and a lease far in the future: these tests are about the
+    /// ledger, not the lease; `ownership_*` below are about the lease.
+    const OWNER: &str = "test-owner";
+    const LEASE: i64 = 1_000_000;
+
+    fn by_melt(net: u64, fee: u64, quote: Option<&str>) -> RemitSettlement {
+        RemitSettlement {
+            net_paid_sats: Some(net),
+            melt_fee_sats: Some(fee),
+            melt_fee_reserve_sats: Some(fee.saturating_add(1)),
+            melt_quote_id: quote.map(str::to_owned),
+            settled_by: SettledBy::Melt,
+        }
+    }
+
+    fn by_reconciliation(quote: Option<&str>, reserve: Option<u64>) -> RemitSettlement {
+        RemitSettlement {
+            net_paid_sats: None,
+            melt_fee_sats: None,
+            melt_fee_reserve_sats: reserve,
+            melt_quote_id: quote.map(str::to_owned),
+            settled_by: SettledBy::Reconciliation,
         }
     }
 
@@ -3445,7 +3714,7 @@ mod tests {
 
         // The migrated store can plan against its old row: the column is writable.
         let row = store
-            .plan_remittance(&plan("h1", 10, 9), 100)
+            .plan_remittance(&plan("h1", 10, 9), OWNER, LEASE, 100)
             .expect("plan on migrated store");
         assert_eq!(row.receipts, 1);
         assert_eq!(
@@ -3483,7 +3752,7 @@ mod tests {
         assert_eq!(accrued.unremitted_fee_sats, 15);
 
         let planned = store
-            .plan_remittance(&plan("h1", 15, 14), 10)
+            .plan_remittance(&plan("h1", 15, 14), OWNER, LEASE, 10)
             .expect("plan");
         assert_eq!(planned.state, RemittanceState::Planned);
         assert_eq!(planned.remittance_id, "h1");
@@ -3494,6 +3763,10 @@ mod tests {
         assert_eq!(planned.melt_quote_id, Some("quote-h1".to_owned()));
         assert_eq!(planned.bolt11, "lnbc-test-h1");
         assert_eq!(planned.receipts, 3);
+        assert_eq!(planned.owner.as_deref(), Some(OWNER));
+        assert_eq!(planned.lease_until_unix, Some(LEASE));
+        assert_eq!(planned.melt_fee_reserve_sats, Some(1));
+        assert_eq!(planned.settled_by, None);
         assert_eq!(
             (planned.created_at_unix, planned.settled_at_unix),
             (10, None)
@@ -3530,12 +3803,18 @@ mod tests {
 
         // Settle with what the mint reported: paid 14, fee 1, quote id from the payment.
         let settled = store
-            .settle_remittance("h1", Some(14), Some(1), Some("quote-pay-h1"), 12)
+            .settle_remittance("h1", &by_melt(14, 1, Some("quote-pay-h1")), 12)
             .expect("settle");
         assert_eq!(settled.state, RemittanceState::Settled);
         assert_eq!(settled.melt_fee_sats, Some(1));
         assert_eq!(settled.net_sats, 14);
         assert_eq!(settled.melt_quote_id, Some("quote-pay-h1".to_owned()));
+        assert_eq!(settled.settled_by, Some(SettledBy::Melt));
+        assert_eq!(
+            settled.melt_fee_reserve_sats,
+            Some(2),
+            "replaced by the reserve of the quote that paid"
+        );
         assert_eq!(settled.settled_at_unix, Some(12));
         assert_eq!(settled.receipts, 3);
         let accrued = store.accrued_fees().expect("read-out");
@@ -3548,34 +3827,34 @@ mod tests {
         assert_eq!(store.in_flight_remittance().expect("query"), None);
 
         // A settled row never moves again.
-        assert!(store.settle_remittance("h1", None, None, None, 13).is_err());
+        assert!(store.settle_remittance("h1", &by_reconciliation(None, None), 13).is_err());
         assert!(store.fail_remittance("h1", 13).is_err());
 
         // The next plan covers exactly the new receipt; planning the OLD figure is a mismatch.
         assert_eq!(
-            store.plan_remittance(&plan("h2", 15, 15), 14),
+            store.plan_remittance(&plan("h2", 15, 15), OWNER, LEASE, 14),
             Err(PlanRefused::GrossMismatch {
                 planned: 15,
                 unremitted: 20
             })
         );
         let second = store
-            .plan_remittance(&plan("h2", 20, 19), 14)
+            .plan_remittance(&plan("h2", 20, 19), OWNER, LEASE, 14)
             .expect("second plan");
         assert_eq!(second.receipts, 1);
         store
-            .settle_remittance("h2", Some(19), Some(1), None, 15)
+            .settle_remittance("h2", &by_melt(19, 1, None), 15)
             .expect("settle 2");
         let accrued = store.accrued_fees().expect("read-out");
         assert_eq!(accrued.unremitted_fee_sats, 0);
         assert_eq!(accrued.remitted_fee_sats, 35);
         // Everything is discharged: a third plan has nothing to remit, whatever figure it claims.
         assert_eq!(
-            store.plan_remittance(&plan("h3", 0, 0), 16),
+            store.plan_remittance(&plan("h3", 0, 0), OWNER, LEASE, 16),
             Err(PlanRefused::NothingToRemit)
         );
         assert_eq!(
-            store.plan_remittance(&plan("h3", 35, 35), 16),
+            store.plan_remittance(&plan("h3", 35, 35), OWNER, LEASE, 16),
             Err(PlanRefused::NothingToRemit)
         );
         assert_eq!(store.remittances().expect("rows").len(), 2);
@@ -3592,9 +3871,9 @@ mod tests {
             .collect_receipt("r1", "job-1", 100, fees(1, 1000, 10), 1)
             .expect("collect");
         let first = store
-            .plan_remittance(&plan("h1", 10, 9), 2)
+            .plan_remittance(&plan("h1", 10, 9), OWNER, LEASE, 2)
             .expect("first plan");
-        match store.plan_remittance(&plan("h2", 10, 9), 3) {
+        match store.plan_remittance(&plan("h2", 10, 9), OWNER, LEASE, 3) {
             Err(PlanRefused::InFlight(active)) => assert_eq!(*active, first),
             other => panic!("expected InFlight, got {other:?}"),
         }
@@ -3603,7 +3882,7 @@ mod tests {
             .collect_receipt("r2", "job-2", 100, fees(1, 1000, 10), 4)
             .expect("collect 2");
         assert!(matches!(
-            store.plan_remittance(&plan("h3", 10, 9), 5),
+            store.plan_remittance(&plan("h3", 10, 9), OWNER, LEASE, 5),
             Err(PlanRefused::InFlight(_))
         ));
         // The index refuses a raw second planned row too.
@@ -3638,7 +3917,7 @@ mod tests {
         store
             .collect_receipt("r1", "job-1", 100, fees(1, 1000, 10), 1)
             .expect("collect");
-        store.plan_remittance(&plan("h1", 10, 9), 2).expect("plan");
+        store.plan_remittance(&plan("h1", 10, 9), OWNER, LEASE, 2).expect("plan");
         let failed = store.fail_remittance("h1", 3).expect("fail");
         assert_eq!(failed.state, RemittanceState::Failed);
         assert_eq!(failed.settled_at_unix, Some(3));
@@ -3649,11 +3928,11 @@ mod tests {
         assert_eq!(accrued.by_job[0].remittance_id, None);
         assert_eq!(store.in_flight_remittance().expect("query"), None);
         // A failed row never moves again.
-        assert!(store.settle_remittance("h1", None, None, None, 4).is_err());
+        assert!(store.settle_remittance("h1", &by_reconciliation(None, None), 4).is_err());
         assert!(store.fail_remittance("h1", 4).is_err());
         // The same invoice cannot be re-planned; a fresh one can.
         assert_eq!(
-            store.plan_remittance(&plan("h1", 10, 9), 5),
+            store.plan_remittance(&plan("h1", 10, 9), OWNER, LEASE, 5),
             Err(PlanRefused::DuplicateInvoice {
                 payment_hash: "h1".to_owned()
             })
@@ -3664,12 +3943,12 @@ mod tests {
             "a refused plan pins nothing"
         );
         let second = store
-            .plan_remittance(&plan("h2", 10, 9), 6)
+            .plan_remittance(&plan("h2", 10, 9), OWNER, LEASE, 6)
             .expect("re-plan");
         assert_eq!(second.receipts, 1);
         // Settling by reconciliation (mint says PAID, fee unobserved) records None for the fee.
         let settled = store
-            .settle_remittance("h2", None, None, Some("quote-seen"), 7)
+            .settle_remittance("h2", &by_reconciliation(Some("quote-seen"), Some(2)), 7)
             .expect("settle by reconciliation");
         assert_eq!(settled.melt_fee_sats, None);
         assert_eq!(
@@ -3677,6 +3956,16 @@ mod tests {
             "the planned net stands when the mint's figure is unobserved"
         );
         assert_eq!(settled.melt_quote_id, Some("quote-seen".to_owned()));
+        assert_eq!(
+            settled.settled_by,
+            Some(SettledBy::Reconciliation),
+            "the row says HOW it was settled, which is why its fee is unobserved"
+        );
+        assert_eq!(
+            settled.melt_fee_reserve_sats,
+            Some(2),
+            "the paying quote's reserve — the fee's ceiling — IS observable and is recorded"
+        );
         let history = store.remittances().expect("rows");
         assert_eq!(
             history
@@ -3700,7 +3989,7 @@ mod tests {
             .collect_receipt("r1", "job-1", 100, fees(1, 1000, 10), 1)
             .expect("collect");
         assert!(matches!(
-            store.plan_remittance(&plan("h1", 10, 11), 2),
+            store.plan_remittance(&plan("h1", 10, 11), OWNER, LEASE, 2),
             Err(PlanRefused::Store(_))
         ));
         assert!(store.remittances().expect("rows").is_empty());
@@ -3716,6 +4005,198 @@ mod tests {
             "CHECK (net_sats <= gross_sats) must refuse"
         );
         drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Addendum 3 §2.4: a store written by a v10 binary (the remittance table WITHOUT owner / lease /
+    // reserve / settled_by) opens under v11 additively — the four columns are added, its planned row
+    // survives and reads as owned by NOBODY with an EXPIRED lease (fail-closed: not yours to pay,
+    // releasable by reconciliation), its settled row reads `settled_by = None` (not recorded, not
+    // invented) — and a second open is a no-op.
+    #[test]
+    fn a_v10_store_migrates_to_v11_additively_and_its_rows_read_as_unowned() {
+        let path = temp_db("v10-to-v11");
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).expect("create v10 store");
+            conn.execute_batch(
+                "CREATE TABLE seller_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO seller_meta VALUES ('schema_version', '10');
+                 CREATE TABLE receipts (
+                     receipt_id      TEXT PRIMARY KEY,
+                     job_id          TEXT NOT NULL,
+                     amount_sats     INTEGER NOT NULL CHECK (amount_sats >= 0),
+                     received_at_unix INTEGER NOT NULL,
+                     fee_bps         INTEGER NOT NULL DEFAULT 0,
+                     fee_sats        INTEGER NOT NULL DEFAULT 0,
+                     mint_fee_sats   INTEGER,
+                     remittance_id   TEXT
+                 );
+                 INSERT INTO receipts VALUES ('r-settled', 'job-s', 100, 1, 1000, 10, 1, 'v10-settled');
+                 INSERT INTO receipts VALUES ('r-planned', 'job-p', 50, 2, 1000, 5, 1, 'v10-planned');
+                 CREATE TABLE fee_remittances (
+                     remittance_id   TEXT PRIMARY KEY,
+                     gross_sats      INTEGER NOT NULL CHECK (gross_sats >= 0),
+                     melt_fee_sats   INTEGER,
+                     net_sats        INTEGER NOT NULL CHECK (net_sats >= 0 AND net_sats <= gross_sats),
+                     destination     TEXT NOT NULL,
+                     melt_quote_id   TEXT,
+                     payment_hash    TEXT NOT NULL UNIQUE,
+                     bolt11          TEXT NOT NULL,
+                     state           TEXT NOT NULL CHECK (state IN ('planned','settled','failed')),
+                     created_at_unix INTEGER NOT NULL,
+                     settled_at_unix INTEGER
+                 );
+                 CREATE UNIQUE INDEX fee_remittances_one_planned ON fee_remittances (state) WHERE state = 'planned';
+                 INSERT INTO fee_remittances VALUES ('v10-settled', 10, 1, 9, 'maxplayer@agi.cash', 'q1', 'v10-settled', 'ln1', 'settled', 3, 4);
+                 INSERT INTO fee_remittances VALUES ('v10-planned', 5, NULL, 4, 'maxplayer@agi.cash', 'q2', 'v10-planned', 'ln2', 'planned', 5, NULL);",
+            )
+            .expect("v10 schema");
+        }
+
+        let store = SellerStore::open(&path).expect("a v10 store opens clean under v11");
+        assert_eq!(
+            store.health().expect("health").schema_version,
+            SCHEMA_VERSION
+        );
+        let rows = store.remittances().expect("rows");
+        assert_eq!(rows.len(), 2, "both v10 rows survive");
+        let settled = rows
+            .iter()
+            .find(|r| r.remittance_id == "v10-settled")
+            .expect("settled");
+        assert_eq!(settled.state, RemittanceState::Settled);
+        assert_eq!(
+            (settled.gross_sats, settled.melt_fee_sats, settled.net_sats),
+            (10, Some(1), 9)
+        );
+        assert_eq!(
+            settled.settled_by, None,
+            "not recorded by v10, not invented by v11"
+        );
+        assert_eq!(settled.melt_fee_reserve_sats, None);
+        let planned = rows
+            .iter()
+            .find(|r| r.remittance_id == "v10-planned")
+            .expect("planned");
+        assert_eq!(planned.state, RemittanceState::Planned);
+        assert_eq!(planned.owner, None);
+        assert_eq!(planned.lease_until_unix, None);
+        assert!(
+            planned.lease_expired(0),
+            "a row planned before ownership was recorded reads as an expired claim by nobody"
+        );
+        assert!(!planned.lease_holds("anyone", 0, 0));
+        assert_eq!(
+            store
+                .confirm_remittance_ownership("v10-planned", "anyone", 6, 60)
+                .expect("query"),
+            Err(OwnershipLost::OtherOwner { owner: None }),
+            "nobody may PAY a pre-v11 planned row; reconciliation releases or settles it"
+        );
+        let accrued = store.accrued_fees().expect("read-out");
+        assert_eq!(
+            (
+                accrued.remitted_fee_sats,
+                accrued.in_flight_fee_sats,
+                accrued.unremitted_fee_sats
+            ),
+            (10, 5, 0)
+        );
+        // Reconciliation can still release it, and the release reads back through the new columns.
+        let released = store.fail_remittance("v10-planned", 7).expect("release");
+        assert_eq!(released.state, RemittanceState::Failed);
+        assert_eq!(
+            store.accrued_fees().expect("read-out").unremitted_fee_sats,
+            5
+        );
+
+        drop(store);
+        let store = SellerStore::open(&path).expect("second open is a no-op");
+        assert_eq!(
+            store.health().expect("health").schema_version,
+            SCHEMA_VERSION
+        );
+        assert_eq!(store.remittances().expect("rows").len(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Addendum 3 §2.1: the pre-spend ownership check. Only the owner, only while the row is planned,
+    // and only with the spending margin still inside the lease.
+    #[test]
+    fn ownership_is_confirmed_only_for_the_owner_of_a_planned_row_with_lease_to_spare() {
+        let (store, path) = fresh_store("remit-ownership");
+        store
+            .collect_receipt("r1", "job-1", 100, fees(1, 1000, 10), 1)
+            .expect("collect");
+        assert!(
+            matches!(
+                store.plan_remittance(&plan("h0", 10, 9), "   ", 500, 2),
+                Err(PlanRefused::Store(_))
+            ),
+            "an empty owner token is refused"
+        );
+        let planned = store
+            .plan_remittance(&plan("h1", 10, 9), "proc-a", 500, 2)
+            .expect("plan");
+        assert_eq!(planned.owner.as_deref(), Some("proc-a"));
+        assert_eq!(planned.lease_until_unix, Some(500));
+
+        // The owner, with 60 s to spare inside the lease: confirmed, and the row comes back.
+        assert_eq!(
+            store
+                .confirm_remittance_ownership("h1", "proc-a", 400, 60)
+                .expect("query"),
+            Ok(planned.clone())
+        );
+        // Exactly the margin left is still enough; one second less is not.
+        assert!(
+            store
+                .confirm_remittance_ownership("h1", "proc-a", 440, 60)
+                .expect("query")
+                .is_ok()
+        );
+        assert_eq!(
+            store
+                .confirm_remittance_ownership("h1", "proc-a", 441, 60)
+                .expect("query"),
+            Err(OwnershipLost::LeaseTooShort {
+                lease_until_unix: Some(500),
+                now_unix: 441,
+                margin_secs: 60,
+            })
+        );
+        // Another process, however early: refused — even a live lease is not ITS lease.
+        assert_eq!(
+            store
+                .confirm_remittance_ownership("h1", "proc-b", 3, 60)
+                .expect("query"),
+            Err(OwnershipLost::OtherOwner {
+                owner: Some("proc-a".to_owned()),
+            })
+        );
+        // A row that is no longer planned: refused, whoever asks.
+        store.fail_remittance("h1", 10).expect("release");
+        assert_eq!(
+            store
+                .confirm_remittance_ownership("h1", "proc-a", 11, 60)
+                .expect("query"),
+            Err(OwnershipLost::NotPlanned {
+                state: RemittanceState::Failed,
+            })
+        );
+        assert_eq!(
+            store
+                .confirm_remittance_ownership("nope", "proc-a", 11, 60)
+                .expect("query"),
+            Err(OwnershipLost::Missing)
+        );
+        // The pure helpers agree with the store.
+        assert!(planned.lease_holds("proc-a", 440, 60));
+        assert!(!planned.lease_holds("proc-a", 441, 60));
+        assert!(!planned.lease_holds("proc-b", 3, 60));
+        assert!(!planned.lease_expired(499));
+        assert!(planned.lease_expired(500));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -3885,8 +4366,8 @@ mod free_lane_tests {
             SCHEMA_VERSION
         );
         assert_eq!(
-            SCHEMA_VERSION, 10,
-            "v7 was the free lane; v8 added the receipt fee columns; v9 the mint fee; v10 the fee remittance ledger"
+            SCHEMA_VERSION, 11,
+            "v7 was the free lane; v8 added the receipt fee columns; v9 the mint fee; v10 the fee remittance ledger; v11 its ownership and settlement provenance"
         );
 
         // The legacy rows SURVIVE and read as PAID — correct by construction, because every job

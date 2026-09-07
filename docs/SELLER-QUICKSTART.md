@@ -1244,28 +1244,40 @@ its own:
 - Otherwise it takes a melt quote from your default mint, invoices the balance **minus** the mint's
   melt fee reserve — **you never pay more than the fee you accrued; the melt fee comes out of that
   amount, not on top of it** — journals the attempt in `seller.sqlite` (`fee_remittances`: gross,
-  melt fee, net, the address literal, melt quote id, payment hash, state), pays the invoice from your
-  ecash through the same gated melt `maxplayer wallet melt` uses (it honours `allow_real_mints`), and
-  marks the receipts it covered as discharged.
+  melt fee, net, the address literal, melt quote id, payment hash, state, and which process owns
+  the attempt), pays the invoice from your ecash through the same gated melt `maxplayer wallet melt`
+  uses (it honours `allow_real_mints`), and marks the receipts it covered as discharged. **The
+  accrued fee is a hard ceiling on the payment, enforced at the moment of spending**: the wallet
+  checks the quote the mint raises for the actual payment — invoice plus that quote's fee reserve —
+  against the gross fee owed, and if the mint's reserve grew between the estimate and the payment
+  so that the two no longer fit, it refuses before any ecash is consumed. The refusal is journaled,
+  the balance stays unremitted, and the next attempt re-quotes.
 - **It cannot affect the payment it followed.** Your receipt is written and the job is marked paid
   before the attempt starts. If the attempt fails — the mint is down, the payout host is unreachable,
   the wallet is short, no route — the failure is written to the node log and journaled
   (`fee_remit_attempts`), and the balance stays unremitted. **The node then retries on its own clock,
-  for as long as it runs**: 30 seconds after the failure, then doubling — 1, 2, 4, 8, 16 minutes — up
-  to once every 30 minutes, each delay randomised between zero and that figure so a fleet of sellers
-  does not hit a recovering host in the same second. A success resets the clock to 30 seconds; a
-  balance under the destination's minimum is not a failure and does not lengthen it. The retries
-  live inside the node's main loop, so stopping the node stops them — nothing keeps running after it
-  exits, and nothing runs at startup (the first check is 30 seconds in). The next collected payment
-  also tries again with the whole accumulated balance. An attempt interrupted mid-payment is
-  reconciled with the mint on the next attempt (settled if the payment landed, released if it did
-  not), never repeated. Two payments landing at the same moment cannot pay the fee twice: at most one
-  remittance can be in flight, and the receipts it covers are pinned to it.
+  for as long as it runs**: after a failure the next attempt comes within a minute, and the ceiling
+  on the wait then doubles — 2, 4, 8, 16 minutes — up to once every 30 minutes, each delay
+  randomised between zero and that ceiling so a fleet of sellers does not hit a recovering host in
+  the same second. A success resets the clock to its 30-second base; a balance under the
+  destination's minimum is not a failure and does not lengthen it. Nothing runs at startup: the
+  first check comes between 30 and 60 seconds after boot, never sooner. The retries live inside the
+  node's main loop, so stopping the node stops them from being scheduled — and a payment already in
+  flight when you stop the node is **drained, not cut off**: the node waits up to 60 seconds for it
+  to finish (ecash that may already be with the mint is never abandoned mid-payment), and if that
+  wait runs out it logs one incident line and exits while the attempt finishes on its own. The next
+  collected payment also tries again with the whole accumulated balance. An attempt interrupted
+  mid-payment is reconciled with the mint on the next attempt (settled if the payment landed,
+  released if the mint says it failed or the owning process is provably gone), never repeated. Two
+  payments landing at the same moment cannot pay the fee twice: at most one remittance can be in
+  flight, the receipts it covers are pinned to it, and a planned attempt is owned by the process that
+  made it — another process (a hand-run `maxplayer seller fees remit --confirm`, say) will not release
+  it while its owner may still be paying.
 - **The log stays readable while it retries.** The first failure is logged in full with its error;
-  later attempts in the same streak get one line each (how many have failed, when the next is); the
-  moment the delay reaches its 30-minute cap gets one line; and the success that ends a streak says
-  how many attempts failed and for how long the fee sat owed — the line to look for when you ask
-  "did it ever go out?".
+  later attempts in the same streak get exactly one line each (how many have failed, when the next
+  is; the moment the delay reaches its 30-minute cap is said on that same line); and the success
+  that ends a streak says how many attempts failed and for how long the fee sat owed — the line to
+  look for when you ask "did it ever go out?".
 
 **The off switch.** If you need to stop the automatic payout — a misbehaving mint, an incident — set
 

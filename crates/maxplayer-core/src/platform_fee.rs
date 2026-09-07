@@ -101,8 +101,8 @@ pub fn fee_sats(face_sats: u64, fee_bps: u32) -> u64 {
 /// zero. This is a display-time derivation from the three journaled figures — it is deliberately
 /// NOT stored, so it can never disagree with the columns it comes from. Both deductions are taken
 /// from the face: the mint's swap fee is what the mint kept before the sats reached the wallet, and
-/// the platform fee is what collection records as owed (remitted later, only by the explicit
-/// command).
+/// the platform fee is what collection records as owed — remitted afterwards by the seller node
+/// itself (after the collect, and on its retry clock), or by `maxplayer seller fees remit --confirm`.
 pub fn kept_sats(face_sats: u64, mint_fee_sats: u64, platform_fee_sats: u64) -> u64 {
     face_sats
         .saturating_sub(mint_fee_sats)

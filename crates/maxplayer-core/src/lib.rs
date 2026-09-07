@@ -74,8 +74,9 @@ pub mod platform_fee;
 #[cfg(feature = "wallet")]
 pub mod lnurl_pay;
 /// Paying the accrued platform fee: the ONE remit path in the product, behind an effects trait so
-/// the decision logic is tested without a network or a mint. Two callers — the seller node's collect
-/// path (automatic, best-effort) and `maxplayer seller fees remit` (inspection and recovery).
+/// the decision logic is tested without a network or a mint. Three callers — the seller node's
+/// collect path (automatic, best-effort), the seller node's retry tick (automatic, backed off), and
+/// `maxplayer seller fees remit` (inspection and recovery).
 #[cfg(feature = "wallet")]
 pub mod fee_remit;
 pub mod receipt;

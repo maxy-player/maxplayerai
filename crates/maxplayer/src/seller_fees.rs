@@ -17,9 +17,10 @@
 //! **Without `--confirm` that is all it does** (a dry run is the default). With `--confirm` it forces
 //! an attempt now — for an operator whose automatic path has been failing, or who has turned it off
 //! with `[platform_fee] auto_remit = false` — paying the invoice from the seller's ecash through
-//! `wallet_ops::melt_blocking`, the same gated melt `maxplayer wallet melt` uses (it honours
-//! `allow_real_mints`), and recording the settlement so the same sats are never paid twice. Running
-//! it again after a payment pays nothing.
+//! `wallet_ops::melt_within_blocking`, the bounded form of the same gated melt `maxplayer wallet
+//! melt` uses (it honours `allow_real_mints`, and refuses before spending if the quote raised at
+//! payment time would take more than the accrued gross), and recording the settlement so the same
+//! sats are never paid twice. Running it again after a payment pays nothing.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -126,7 +127,7 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
 fn usage(w: &mut dyn Write) {
     let _ = writeln!(
         w,
-        "Usage:\n  maxplayer seller fees [--home <dir>]\n  maxplayer seller fees remit [--home <dir>] [--dry-run | --confirm]\n\n`seller fees` prints, for every job this seat has collected payment on, what the buyer paid, the\nmint's fee, the platform fee (rate and sats) and what you keep, then the totals — the platform fee\nbroken out by the rate each job was recorded at and split into remitted / unremitted — and every\nremittance so far. Moves no sats (it only opens, reads and prints the seller store).\n\nThe seller node pays the platform fee AUTOMATICALLY: after each payment it collects, it remits the\nunremitted balance to the platform's Lightning address (fixed in the product; not configurable),\nbest-effort — a failed attempt is logged and tried again after the next payment. Set\n`[platform_fee] auto_remit = false` in config.toml to stop the automatic attempt; the fee still\naccrues and is still owed.\n\n`seller fees remit` is inspection and recovery. The default is a DRY RUN: it prints the recent\nattempts and their outcomes, resolves the address, quotes the mint's melt fee, prints the plan and\nmoves nothing. `--confirm` pays NOW (whether or not auto_remit is on), at most the unremitted total —\nthe mint's melt fee comes out of that amount, never on top. It refuses (exit 3, nothing moved) when\nnothing is unremitted, when the balance is below the destination's minimum (small balances\naccumulate until they clear it), or when an earlier attempt is still settling. Running it again\nafter a payment pays nothing: the receipts it discharged are recorded, and an interrupted attempt\nis reconciled with the mint, not repeated.\nExit 0 = dry run printed or payment made; 1 = usage; 2 = error; 3 = refused, nothing moved."
+        "Usage:\n  maxplayer seller fees [--home <dir>]\n  maxplayer seller fees remit [--home <dir>] [--dry-run | --confirm]\n\n`seller fees` prints, for every job this seat has collected payment on, what the buyer paid, the\nmint's fee, the platform fee (rate and sats) and what you keep, then the totals — the platform fee\nbroken out by the rate each job was recorded at and split into remitted / unremitted — and every\nremittance so far. Moves no sats (it only opens, reads and prints the seller store).\n\nThe seller node pays the platform fee AUTOMATICALLY: after each payment it collects, it remits the\nunremitted balance to the platform's Lightning address (fixed in the product; not configurable),\nbest-effort — a failed attempt is logged and journaled, and the node retries on its own clock while\nit runs (backing off from 30 seconds to at most every 30 minutes); the next collected payment is one\nmore trigger. Set `[platform_fee] auto_remit = false` in config.toml to stop the automatic attempts;\nthe fee still accrues and is still owed.\n\n`seller fees remit` is inspection and recovery. The default is a DRY RUN: it prints the recent\nattempts and their outcomes, resolves the address, quotes the mint's melt fee, prints the plan and\nmoves nothing. `--confirm` pays NOW (whether or not auto_remit is on), at most the unremitted total —\nthe mint's melt fee comes out of that amount, never on top, enforced against the quote the mint\nraises for the payment itself. It refuses (exit 3, nothing moved) when nothing is unremitted, when\nthe balance is below the destination's minimum (small balances accumulate until they clear it),\nwhen an earlier attempt is still settling, or when another live process (the node) holds a planned\nattempt whose lease has not run out. Running it again after a payment pays nothing: the receipts it\ndischarged are recorded, and an interrupted attempt is reconciled with the mint, not repeated.\nExit 0 = dry run printed or payment made; 1 = usage; 2 = error; 3 = refused, nothing moved."
     );
 }
 
@@ -186,7 +187,7 @@ pub(crate) fn render(
     db: &str,
 ) -> String {
     use maxplayer_core::platform_fee::bps_to_percent_label;
-    use maxplayer_core::seller_node::store::RemittanceState;
+    use maxplayer_core::seller_node::store::{RemittanceState, SettledBy};
 
     let mut text = String::new();
     text.push_str(&format!("Seller fee ledger — {db}\n"));
@@ -286,9 +287,17 @@ pub(crate) fn render(
         );
     }
     for row in remittances {
-        let melt_fee = match row.melt_fee_sats {
-            Some(fee) => format!("{fee} sats"),
-            None => "not observed".to_owned(),
+        let melt_fee = match (row.melt_fee_sats, row.settled_by, row.melt_fee_reserve_sats) {
+            (Some(fee), _, _) => format!("{fee} sats"),
+            // Settled by reconciliation: the mint reports the quote PAID but not the fee it kept for
+            // a quote another run paid; the quote's reserve is the fee's ceiling and IS recorded.
+            (None, Some(SettledBy::Reconciliation), Some(reserve)) => format!(
+                "not observed (settled by reconciliation against the mint, which reports the quote paid but not the fee it kept; at most {reserve} sats, the quote's reserve)"
+            ),
+            (None, Some(SettledBy::Reconciliation), None) => {
+                "not observed (settled by reconciliation against the mint, which reports the quote paid but not the fee it kept)".to_owned()
+            }
+            (None, _, _) => "not observed".to_owned(),
         };
         let state = match row.state {
             RemittanceState::Planned => "PLANNED (settling — re-run remit to reconcile)",
@@ -395,6 +404,9 @@ fn remit_live(home: Option<PathBuf>, confirm: bool, out: &mut dyn Write) -> Resu
     Ok(match outcome {
         RemitOutcome::DryRun | RemitOutcome::Paid { .. } => SUCCESS,
         RemitOutcome::Refused(_) => REFUSED,
+        // A melt refused at the ceiling (addendum 3 §1) spent nothing and needs no operator action
+        // beyond a later retry: it exits like any other refusal, not like a failed payment.
+        RemitOutcome::MeltRefused { .. } => REFUSED,
         RemitOutcome::MeltFailed { .. } => RUNTIME_ERROR,
     })
 }
@@ -459,6 +471,7 @@ mod tests {
     use super::*;
     use maxplayer_core::seller_node::store::{
         AccruedFees, FeeRemittance, JobFeeAccrual, ReceiptFees, RemittanceState, SellerStore,
+        SettledBy,
     };
 
     fn row(
@@ -640,6 +653,7 @@ mod tests {
                 remittance_id: "old".to_owned(),
                 gross_sats: 7,
                 melt_fee_sats: None,
+                melt_fee_reserve_sats: Some(1),
                 net_sats: 6,
                 destination: "maxplayer@agi.cash".to_owned(),
                 melt_quote_id: None,
@@ -648,12 +662,16 @@ mod tests {
                 state: RemittanceState::Failed,
                 created_at_unix: 5,
                 settled_at_unix: Some(6),
+                settled_by: None,
+                owner: Some("pid1-a".to_owned()),
+                lease_until_unix: Some(305),
                 receipts: 0,
             },
             FeeRemittance {
                 remittance_id: "abc123".to_owned(),
                 gross_sats: 10,
                 melt_fee_sats: Some(1),
+                melt_fee_reserve_sats: Some(2),
                 net_sats: 9,
                 destination: "maxplayer@agi.cash".to_owned(),
                 melt_quote_id: Some("q".to_owned()),
@@ -662,7 +680,30 @@ mod tests {
                 state: RemittanceState::Settled,
                 created_at_unix: 7,
                 settled_at_unix: Some(8),
+                settled_by: Some(SettledBy::Melt),
+                owner: Some("pid1-a".to_owned()),
+                lease_until_unix: Some(307),
                 receipts: 1,
+            },
+            // Settled by reconciliation: the fee is unobserved and the row SAYS why, with the
+            // paying quote's reserve as the ceiling on it.
+            FeeRemittance {
+                remittance_id: "rec".to_owned(),
+                gross_sats: 20,
+                melt_fee_sats: None,
+                melt_fee_reserve_sats: Some(3),
+                net_sats: 17,
+                destination: "maxplayer@agi.cash".to_owned(),
+                melt_quote_id: Some("q-rec".to_owned()),
+                payment_hash: "rec".to_owned(),
+                bolt11: "ln-rec".to_owned(),
+                state: RemittanceState::Settled,
+                created_at_unix: 9,
+                settled_at_unix: Some(10),
+                settled_by: Some(SettledBy::Reconciliation),
+                owner: Some("pid2-b".to_owned()),
+                lease_until_unix: Some(309),
+                receipts: 2,
             },
         ];
         let text = render(&accrued, &remittances, "db");
@@ -673,6 +714,7 @@ mod tests {
             "Remittances:\n",
             "  failed (no sats left; receipts released): 6 sats to maxplayer@agi.cash — gross 7 sats, melt fee not observed, invoice old, 0 receipts, planned at unix 5, resolved at unix 6\n",
             "  settled: 9 sats to maxplayer@agi.cash — gross 10 sats, melt fee 1 sats, invoice abc123, 1 receipt, planned at unix 7, resolved at unix 8\n",
+            "  settled: 17 sats to maxplayer@agi.cash — gross 20 sats, melt fee not observed (settled by reconciliation against the mint, which reports the quote paid but not the fee it kept; at most 3 sats, the quote's reserve), invoice rec, 2 receipts, planned at unix 9, resolved at unix 10\n",
         ] {
             assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
         }

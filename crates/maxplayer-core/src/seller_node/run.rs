@@ -3776,10 +3776,153 @@ pub struct SellerNodeRunner {
     /// retry tick (which sleeps by it) and the collect path's thread (whose outcome also moves it, so
     /// a success on either path resets it). See [`crate::fee_remit::RemitBackoff`].
     remit_pacing: Arc<Mutex<crate::fee_remit::RemitBackoff>>,
+    /// Stage 2a, addendum 3 §3: the collect thread's outcome moved the shared backoff, so the
+    /// loop's LIVE retry timer must follow — a success pulls the pending sleep back to base, a
+    /// failure pushes a too-short deadline out. The thread `notify_one`s; the loop has a `select!`
+    /// arm on `notified()` that re-arms the `Sleep` ([`rearm_deadline`]).
+    remit_pacing_changed: Arc<tokio::sync::Notify>,
+    /// Stage 2a, addendum 3 RULING 2: raised the moment serving ends. No remittance attempt may
+    /// START after it (collect path or tick); the one already in flight — a melt whose proofs may
+    /// be with the mint, which is never cancelled — is DRAINED with a bounded wait
+    /// ([`Self::drain_remit_in_flight`]) before `run` returns.
+    remit_closed: std::sync::atomic::AtomicBool,
     /// Test seam for addendum 2 gate 2e: how many retry-tick attempts this node has STARTED. Read
     /// after the loop returned to prove none started after it.
     #[cfg(test)]
     remit_retry_started: Arc<std::sync::atomic::AtomicUsize>,
+    /// Test seam for addendum 3 gate 2e (strengthened): scripted effects for the node's attempts in
+    /// place of the live LNURL + wallet, so a test can hold a PENDING payment across a shutdown.
+    #[cfg(test)]
+    remit_effects_for_test: Mutex<Option<RemitEffectsFactory>>,
+    /// Test seam: a shorter drain bound than [`REMIT_DRAIN_BOUND`], so the "abandoned at the bound"
+    /// branch is exercised without waiting a minute.
+    #[cfg(test)]
+    remit_drain_bound_for_test: Mutex<Option<Duration>>,
+}
+
+/// How long a requested shutdown waits for a remittance attempt already in flight before it gives
+/// up waiting and lets `run` return (addendum 3 RULING 2). The attempt is never cancelled — its
+/// proofs may already be with the mint — only the WAIT is bounded; a melt still running past this
+/// finishes on its own thread and its planned row is reconciled at the next start.
+pub const REMIT_DRAIN_BOUND: Duration = Duration::from_secs(60);
+
+/// Builds the effects one remittance attempt runs against. Only a test ever installs one; the
+/// live node passes `None` and the thread builds [`crate::fee_remit::LiveEffects`].
+type RemitEffectsFactory =
+    Arc<dyn Fn() -> Box<dyn crate::fee_remit::RemitEffects + Send> + Send + Sync>;
+
+/// One remittance attempt, on a remittance thread: the live entry point, or the test's scripted
+/// effects through the same decision logic.
+fn run_remit_attempt(
+    store: &super::store::SellerStore,
+    home: MaxplayerHome,
+    trigger: crate::fee_remit::RemitTrigger,
+    factory: Option<RemitEffectsFactory>,
+) -> crate::fee_remit::RemitReport {
+    match factory {
+        Some(factory) => {
+            let mut effects = factory();
+            crate::fee_remit::remit_best_effort(store, effects.as_mut(), trigger, now_unix())
+        }
+        None => crate::fee_remit::remit_live_best_effort(store, home, trigger, now_unix()),
+    }
+}
+
+/// The ONE logging policy for a node remittance attempt, whichever path ran it (addendum 3 §3; the
+/// collect path and the retry tick used to log differently). A node whose payout host is down
+/// retries for hours, and the retry must not become the log:
+///
+/// - Steady state (nothing owed, or under the destination's minimum) is verbose-only.
+/// - A payment is one line.
+/// - The FIRST failure of a streak is logged in full, with the attempt's own lines and its error.
+/// - Every later failure in the streak is EXACTLY one line — streak, cause, next attempt — and the
+///   transition into the 30-minute cap is said on that same line, never a second one.
+/// - A payment that ends a streak says how many attempts failed and how long the fee sat owed.
+///
+/// `next` is the delay the caller re-armed the tick with, when it knows it (the tick's own path);
+/// the collect path does not own the timer, so it names the computed delay the re-arm draws from.
+fn log_remit_outcome(
+    path: &str,
+    report: &crate::fee_remit::RemitReport,
+    pacing: &crate::fee_remit::Pacing,
+    next: Option<Duration>,
+    computed: Duration,
+) {
+    use crate::fee_remit::Pacing;
+    let when = match next {
+        Some(next) => format!("in {}s (computed {}s)", next.as_secs(), computed.as_secs()),
+        None => format!(
+            "on the retry tick, re-armed to within {}s",
+            computed.as_secs()
+        ),
+    };
+    match pacing {
+        Pacing::Idle => {
+            opline_verbose!(
+                "seller node platform fee {path}: {}; next check {when}",
+                report.summary()
+            );
+        }
+        Pacing::Paid => {
+            opline!("seller node platform fee {path}: {}", report.summary());
+        }
+        Pacing::FirstFailure => {
+            for line in &report.lines {
+                opline!("seller node platform fee {path}: {line}");
+            }
+            opline!(
+                "seller node platform fee {path}: {} — streak 1; retrying with backoff (base {}s, doubling to a {}s cap, full jitter): next attempt {when}",
+                report.summary(),
+                crate::fee_remit::RETRY_BASE.as_secs(),
+                crate::fee_remit::RETRY_CAP.as_secs()
+            );
+        }
+        Pacing::RepeatFailure {
+            streak,
+            entered_cap,
+        } => {
+            let cap_note = if *entered_cap {
+                format!(
+                    "; backoff has reached the {}s cap and stays there until a remittance succeeds",
+                    computed.as_secs()
+                )
+            } else {
+                String::new()
+            };
+            opline!(
+                "seller node platform fee {path}: still failing (streak {streak}: {}); next attempt {when}{cap_note}",
+                report.summary()
+            );
+        }
+        Pacing::Recovered {
+            failed_attempts,
+            owed_for_secs,
+        } => {
+            opline!(
+                "seller node platform fee {path}: RECOVERED — {} — after {failed_attempts} failed attempt(s) over {owed_for_secs}s; backoff reset to base",
+                report.summary()
+            );
+        }
+    }
+}
+
+/// Where the live retry timer should fire after a SHARED outcome (a collect-path attempt) moved the
+/// backoff (addendum 3 §3): a success (`streak == 0`) resets the pending sleep to the freshly drawn
+/// base-streak delay however far away it was; a failure never shortens a deadline — it extends a
+/// too-short one to the drawn delay and keeps a longer one. Pure, so the rule is tested against a
+/// real `Sleep` under a paused clock.
+pub(crate) fn rearm_deadline(
+    current_deadline: tokio::time::Instant,
+    now: tokio::time::Instant,
+    streak: u32,
+    drawn: Duration,
+) -> tokio::time::Instant {
+    let proposed = now + drawn;
+    if streak == 0 {
+        proposed
+    } else {
+        proposed.max(current_deadline)
+    }
 }
 
 impl SellerNodeRunner {
@@ -3911,9 +4054,97 @@ impl SellerNodeRunner {
             shutdown: shutdown::ShutdownChannel::new(),
             remit_flight: crate::fee_remit::RemitFlight::new(),
             remit_pacing: Arc::new(Mutex::new(crate::fee_remit::RemitBackoff::new())),
+            remit_pacing_changed: Arc::new(tokio::sync::Notify::new()),
+            remit_closed: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             remit_retry_started: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            remit_effects_for_test: Mutex::new(None),
+            #[cfg(test)]
+            remit_drain_bound_for_test: Mutex::new(None),
         })
+    }
+
+    /// Test seam (addendum 3 gate 2e): run the node's remittance attempts against scripted effects
+    /// instead of the live LNURL host and wallet, and bound the shutdown drain. Called BEFORE
+    /// [`Self::run`].
+    #[cfg(test)]
+    fn remit_effects_for_test(&self, factory: RemitEffectsFactory, drain_bound: Option<Duration>) {
+        *self
+            .remit_effects_for_test
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(factory);
+        *self
+            .remit_drain_bound_for_test
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = drain_bound;
+    }
+
+    /// The effects factory a remittance thread should use: the test's, or none (live).
+    fn remit_effects_factory(&self) -> Option<RemitEffectsFactory> {
+        #[cfg(test)]
+        {
+            self.remit_effects_for_test
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+        #[cfg(not(test))]
+        {
+            None
+        }
+    }
+
+    /// How long [`Self::drain_remit_in_flight`] waits: [`REMIT_DRAIN_BOUND`], or the test's bound.
+    fn remit_drain_bound(&self) -> Duration {
+        #[cfg(test)]
+        {
+            if let Some(bound) = *self
+                .remit_drain_bound_for_test
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+            {
+                return bound;
+            }
+        }
+        REMIT_DRAIN_BOUND
+    }
+
+    /// Addendum 3 RULING 2 — shutdown DRAINS, it does not kill. Called once serving has ended and
+    /// [`Self::remit_closed`] is raised (so nothing new can start): waits for the remittance attempt
+    /// in flight, if any, to finish — a melt whose proofs may already be with the mint must not be
+    /// cancelled mid-flight, which would risk the seller's sats; a slow exit is the lesser harm.
+    /// The wait is bounded by [`Self::remit_drain_bound`]: if it elapses, one incident line says
+    /// exactly what was abandoned, and the persisted planned row makes the outcome recoverable at
+    /// the next start (reconciliation, made safe by ownership: the next start is a new owner and
+    /// cannot release this row until its quote is terminal or its lease has run out).
+    async fn drain_remit_in_flight(&self) {
+        if !self.remit_flight.in_flight() {
+            return;
+        }
+        let bound = self.remit_drain_bound();
+        opline!(
+            "seller node platform fee: shutdown with a remittance attempt in flight — waiting up to {}ms for it to finish (a melt whose proofs may be with the mint is never cancelled)",
+            bound.as_millis()
+        );
+        let started = tokio::time::Instant::now();
+        loop {
+            if !self.remit_flight.in_flight() {
+                opline!(
+                    "seller node platform fee: the in-flight remittance attempt finished after {}ms; nothing of the remittance is left running",
+                    started.elapsed().as_millis()
+                );
+                return;
+            }
+            if started.elapsed() >= bound {
+                opline!(
+                    "seller node platform fee: INCIDENT — a remittance attempt is still in flight after the {}ms drain bound; abandoning the wait, not the attempt: its thread finishes on its own, and its planned row (if it journaled one) is reconciled at the next start",
+                    bound.as_millis()
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     /// Test seam (addendum 2 gate 2e): shorten the retry tick's bounds so a test can watch several
@@ -4255,7 +4486,14 @@ impl SellerNodeRunner {
     /// cover for those. Belt AND braces, never a replacement.
     async fn run_loop(self: Arc<Self>) -> Result<(), NodeError> {
         let served = Arc::clone(&self).serve().await;
+        // Addendum 3 RULING 2: serving has ended — no remittance attempt may start from here on
+        // (the flag is checked by both node paths), the seat retracts, and then the attempt already
+        // in flight (if any) is drained with a bounded wait. `run` returning means nothing of this
+        // PR's is still running, or one INCIDENT line above said exactly what was abandoned.
+        self.remit_closed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.publish_retraction().await;
+        self.drain_remit_in_flight().await;
         served
     }
 
@@ -4357,16 +4595,19 @@ impl SellerNodeRunner {
         // Stage 2a, addendum 2: the platform-fee remittance RETRY, on this loop's clock. The collect
         // path's attempt is the fast path (the fee normally leaves within a second of the sale); this
         // is the safety net behind it — a failed remittance retries with backoff for as long as the
-        // node runs, and stops with the loop: a requested shutdown or a relay-pool close ends the
-        // retries by ending this `select!`, with nothing left running after the node exits.
+        // node runs, and stops SCHEDULING with the loop: a requested shutdown or a relay-pool close
+        // ends this `select!`, `run_loop` raises `remit_closed`, and the attempt in flight (if any)
+        // is drained with a bounded wait before `run` returns (addendum 3 RULING 2).
         //
         // A re-armed `Sleep` rather than an `interval`: the delay changes with every outcome
         // (`RemitBackoff`), and `interval` fires immediately on first poll, which would make the whole
-        // fleet attempt at startup. The first attempt after boot waits one jittered base delay.
-        // `remit_retry_pending` holds the in-flight attempt's report channel; while it is `Some` the
-        // timer arm is disabled, so a slow attempt can never stack a second one.
+        // fleet attempt at startup. The first attempt after boot waits the FULL base delay plus a
+        // jitter in [0, base] — [30 s, 60 s], never zero (addendum 3 RULING 1). `remit_retry_pending`
+        // holds the in-flight attempt's report channel; while it is `Some` the timer arm is disabled,
+        // so a slow attempt can never stack a second one. A collect-path outcome that moved the
+        // shared backoff re-arms this same timer through `remit_pacing_changed` (addendum 3 §3).
         let auto_remit = self.node.home().config.platform_fee.auto_remit;
-        let remit_retry = tokio::time::sleep(self.remit_pacing_lock().next_delay());
+        let remit_retry = tokio::time::sleep(self.remit_pacing_lock().boot_delay());
         tokio::pin!(remit_retry);
         let mut remit_retry_pending: Option<
             tokio::sync::oneshot::Receiver<crate::fee_remit::RemitReport>,
@@ -4460,6 +4701,26 @@ impl SellerNodeRunner {
                     remit_retry_pending = None;
                     let next = self.settle_retry_remit(report.ok());
                     remit_retry.as_mut().reset(tokio::time::Instant::now() + next);
+                }
+                // Addendum 3 §3: a SHARED outcome (the collect thread's attempt) moved the backoff;
+                // make the live timer follow — a success pulls the pending sleep back to base, a
+                // failure pushes a too-short deadline out and never shortens a longer one.
+                () = self.remit_pacing_changed.notified(), if auto_remit => {
+                    let (streak, drawn) = {
+                        let pacing = self.remit_pacing_lock();
+                        (pacing.streak(), pacing.next_delay())
+                    };
+                    let deadline = rearm_deadline(
+                        remit_retry.deadline(),
+                        tokio::time::Instant::now(),
+                        streak,
+                        drawn,
+                    );
+                    remit_retry.as_mut().reset(deadline);
+                    opline_verbose!(
+                        "seller node platform fee retry: timer re-armed after a collect-path outcome (streak {streak}); next check in {}ms",
+                        deadline.saturating_duration_since(tokio::time::Instant::now()).as_millis()
+                    );
                 }
                 // Re-ask the relay for stored payment wraps AND stored offers, so a silently-deaf 1059
                 // or offer subscription recovers without a restart (#560). Also the node's only
@@ -7915,10 +8176,20 @@ impl SellerNodeRunner {
     ///   makes a double payment impossible.
     /// - `[platform_fee] auto_remit = false` turns this attempt off (and the tick's) and nothing
     ///   else: the fee still accrues and stays owed; `maxplayer seller fees remit --confirm` pays it.
+    /// - Its outcome is logged under the ONE policy both paths share ([`log_remit_outcome`]) and,
+    ///   when it moved the backoff, re-arms the loop's live retry timer (addendum 3 §3).
+    /// - Once serving has ended (`remit_closed`) it does not start: the drain is waiting for the
+    ///   attempt in flight, and nothing new may join it (addendum 3 RULING 2).
     fn remit_platform_fee_after_collect(&self, job_id: &str) {
         if !self.node.home().config.platform_fee.auto_remit {
             opline!(
                 "seller node platform fee (job_id={job_id}): automatic remittance is OFF ([platform_fee] auto_remit = false); the fee stays accrued and owed — `maxplayer seller fees remit --confirm` pays it by hand"
+            );
+            return;
+        }
+        if self.remit_closed.load(std::sync::atomic::Ordering::SeqCst) {
+            opline!(
+                "seller node platform fee remit (after job_id={job_id}): the node is shutting down; not starting an attempt — the fee stays accrued for the next start"
             );
             return;
         }
@@ -7931,6 +8202,8 @@ impl SellerNodeRunner {
         let store = self.node.store().clone();
         let home = self.node.home().clone();
         let pacing = Arc::clone(&self.remit_pacing);
+        let pacing_changed = Arc::clone(&self.remit_pacing_changed);
+        let effects_factory = self.remit_effects_factory();
         let owned_job_id = job_id.to_owned();
         let spawned = std::thread::Builder::new()
             .name("platform-fee-remit".to_owned())
@@ -7939,25 +8212,30 @@ impl SellerNodeRunner {
                 // closure, or on unwind if the attempt panics.
                 let _permit = permit;
                 let job_id = owned_job_id;
-                let report = crate::fee_remit::remit_live_best_effort(
+                let report = run_remit_attempt(
                     &store,
                     home,
                     crate::fee_remit::RemitTrigger::Collect,
-                    now_unix(),
+                    effects_factory,
                 );
-                if !report.is_quiet() {
-                    for line in &report.lines {
-                        opline!("seller node platform fee remit (after job_id={job_id}): {line}");
-                    }
+                let (pacing_change, computed) = {
+                    let mut guard = pacing
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let change = guard.observe(&report, now_unix());
+                    (change, guard.computed_delay())
+                };
+                log_remit_outcome(
+                    &format!("remit (after job_id={job_id})"),
+                    &report,
+                    &pacing_change,
+                    None,
+                    computed,
+                );
+                // The shared backoff moved (a payment or a failure): the loop re-arms its timer.
+                if pacing_change != crate::fee_remit::Pacing::Idle {
+                    pacing_changed.notify_one();
                 }
-                opline!(
-                    "seller node platform fee remit (after job_id={job_id}): {}",
-                    report.summary()
-                );
-                let _ = pacing
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .observe(&report, now_unix());
             });
         if let Err(error) = spawned {
             opline!(
@@ -7970,28 +8248,35 @@ impl SellerNodeRunner {
     /// under `RemitTrigger::Retry`, on a plain OS thread (same reason as the collect path's: the
     /// wallet's blocking wrappers refuse a Tokio context, and a 20-second LNURL timeout must not
     /// stall the loop). Returns the channel the report arrives on, or `None` when the tick SKIPPED:
-    /// an attempt is already in flight (single-flight, §3 — the tick does not queue behind it), or
-    /// the thread could not start. The loop re-arms the timer either way.
+    /// an attempt is already in flight (single-flight, §3 — the tick does not queue behind it),
+    /// serving has ended (`remit_closed`), or the thread could not start. The loop re-arms the timer
+    /// either way.
     ///
-    /// The thread outlives nothing: when the loop breaks with an attempt in flight, the receiver is
-    /// dropped, the thread finishes its one attempt, its `send` fails silently, and its permit drops.
-    /// No new attempt can start, because the only thing that starts one is this loop's tick.
+    /// Lifecycle (addendum 3 RULING 2): the thread is owned by the node through the single-flight
+    /// permit it holds — when the loop ends with an attempt in flight, `run_loop` raises
+    /// `remit_closed` (so no new attempt can start) and DRAINS: it waits, bounded, for the permit to
+    /// drop before `run` returns. The receiver is dropped with the loop, so the thread's `send`
+    /// fails silently; its attempt is still journaled in the store.
     fn start_retry_remit(
         &self,
     ) -> Option<tokio::sync::oneshot::Receiver<crate::fee_remit::RemitReport>> {
+        if self.remit_closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return None;
+        }
         let permit = self.remit_flight.try_acquire()?;
         let store = self.node.store().clone();
         let home = self.node.home().clone();
+        let effects_factory = self.remit_effects_factory();
         let (report_tx, report_rx) = tokio::sync::oneshot::channel();
         let spawned = std::thread::Builder::new()
             .name("platform-fee-remit-retry".to_owned())
             .spawn(move || {
                 let _permit = permit;
-                let report = crate::fee_remit::remit_live_best_effort(
+                let report = run_remit_attempt(
                     &store,
                     home,
                     crate::fee_remit::RemitTrigger::Retry,
-                    now_unix(),
+                    effects_factory,
                 );
                 let _ = report_tx.send(report);
             });
@@ -8011,21 +8296,13 @@ impl SellerNodeRunner {
         }
     }
 
-    /// Fold a finished retry attempt into the pacing and log it under the addendum 2 §5 discipline
-    /// — a node whose payout host is down retries for hours, and the retry loop must not become the
-    /// log. Returns the (jittered) delay to sleep before the next attempt.
-    ///
-    /// - The steady state (nothing owed, or under the destination's minimum) is verbose-only.
-    /// - The FIRST failure of a streak is logged in full, with its error.
-    /// - Later failures in the streak are one line each — streak length and next delay — plus one
-    ///   extra line on the transition into the 30-minute cap.
-    /// - A payment that ends a streak says how many attempts failed and how long the fee sat owed:
-    ///   the line an operator wants when they ask "did it ever go out?".
+    /// Fold a finished retry attempt into the pacing and log it under the one policy both paths
+    /// share ([`log_remit_outcome`]). Returns the (jittered) delay to sleep before the next attempt.
     ///
     /// `None` means the attempt's thread ended without reporting (it panicked): that is a failure
     /// for the pacing, and it is logged as one.
     fn settle_retry_remit(&self, report: Option<crate::fee_remit::RemitReport>) -> Duration {
-        use crate::fee_remit::{Pacing, RemitReport};
+        use crate::fee_remit::RemitReport;
         let report = report.unwrap_or_else(|| RemitReport {
             outcome: Err("the remittance thread ended without reporting (panicked)".to_owned()),
             lines: Vec::new(),
@@ -8035,56 +8312,7 @@ impl SellerNodeRunner {
             let pacing = guard.observe(&report, now_unix());
             (pacing, guard.next_delay(), guard.computed_delay())
         };
-        match pacing {
-            Pacing::Idle => {
-                opline_verbose!(
-                    "seller node platform fee retry: {}; next check in {}s",
-                    report.summary(),
-                    next.as_secs()
-                );
-            }
-            Pacing::Paid => {
-                opline!("seller node platform fee retry: {}", report.summary());
-            }
-            Pacing::FirstFailure => {
-                for line in &report.lines {
-                    opline!("seller node platform fee retry: {line}");
-                }
-                opline!(
-                    "seller node platform fee retry: {} — streak 1; retrying with backoff (base {}s, doubling to a {}s cap, full jitter): next attempt in {}s",
-                    report.summary(),
-                    crate::fee_remit::RETRY_BASE.as_secs(),
-                    crate::fee_remit::RETRY_CAP.as_secs(),
-                    next.as_secs()
-                );
-            }
-            Pacing::RepeatFailure {
-                streak,
-                entered_cap,
-            } => {
-                if entered_cap {
-                    opline!(
-                        "seller node platform fee retry: backoff has reached the {}s cap after {streak} consecutive failures; it stays there until a remittance succeeds",
-                        computed.as_secs()
-                    );
-                }
-                opline!(
-                    "seller node platform fee retry: still failing (streak {streak}: {}); next attempt in {}s (computed {}s)",
-                    report.summary(),
-                    next.as_secs(),
-                    computed.as_secs()
-                );
-            }
-            Pacing::Recovered {
-                failed_attempts,
-                owed_for_secs,
-            } => {
-                opline!(
-                    "seller node platform fee retry: RECOVERED — {} — after {failed_attempts} failed attempt(s) over {owed_for_secs}s; backoff reset to base",
-                    report.summary()
-                );
-            }
-        }
+        log_remit_outcome("retry", &report, &pacing, Some(next), computed);
         next
     }
 
@@ -15037,8 +15265,10 @@ mod tests {
     ///
     /// Stage 2a, addendum 2, gate 2e: **a requested shutdown ends the platform-fee retries** — after
     /// the loop exits, no further attempt is made. This is the property that keeps the retry from
-    /// outliving the node, and it holds by construction (the retry is an arm of the loop's own
-    /// `select!`, not a detached task), so the test drives the real loop: with the tick's bounds
+    /// outliving the node: the retry is an arm of the loop's own `select!`, and the attempt it
+    /// starts runs on a thread the node owns through the single-flight permit and drains on exit
+    /// (addendum 3 RULING 2 — the strengthened case, a payment pending across the request, is the
+    /// next test). This one drives the real loop against an empty ledger: with the tick's bounds
     /// shortened it watches several attempts START, asks the loop to stop, waits for it to RETURN,
     /// then waits many more base delays and asserts the started count did not move.
     ///
@@ -15109,6 +15339,252 @@ mod tests {
              and ends with it"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A node whose ledger owes 10 sats, whose remittance attempts run against scripted effects
+    /// that BLOCK inside the melt until `gate` is released — a payment pending at the mint.
+    /// Returns the runner, the second connection to its ledger, the tick's started-counter, and
+    /// the gate.
+    async fn runner_with_a_pending_payment(
+        label: &str,
+        drain_bound: Option<Duration>,
+    ) -> (
+        SellerNodeRunner,
+        crate::seller_node::store::SellerStore,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<crate::fee_remit::test_support::Gate>,
+        std::path::PathBuf,
+        PGateRelay,
+    ) {
+        use crate::fee_remit::test_support::{Fake, Gate};
+        use crate::seller_node::store::{ReceiptFees, SellerStore};
+        use_fast_backfill_tick();
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root(label);
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        home.config.relay_url = fixture.url();
+        home.config.seller = Some(seller_cfg(1, false));
+        // Seed the node's OWN ledger (the file it opens at boot) through a second connection: one
+        // collected receipt owing a 10-sat platform fee.
+        let store =
+            SellerStore::open(root.join(crate::seller_node::STATE_DB_FILE)).expect("open store");
+        store
+            .collect_receipt(
+                "receipt-1",
+                "job-1",
+                100,
+                ReceiptFees {
+                    mint_fee_sats: 1,
+                    fee_bps: 1000,
+                    fee_sats: 10,
+                },
+                1,
+            )
+            .expect("collect");
+        let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
+        let started = runner.remit_retry_bounds_for_test(
+            Duration::from_millis(25),
+            Duration::from_millis(100),
+        );
+        let gate = Gate::new();
+        let gate_for_fake = Arc::clone(&gate);
+        runner.remit_effects_for_test(
+            Arc::new(move || {
+                let mut fake = Fake::new(|_| 1);
+                fake.melt_results = vec![Ok((9, 1))];
+                fake.melt_gate = Some(Arc::clone(&gate_for_fake));
+                Box::new(fake)
+            }),
+            drain_bound,
+        );
+        (runner, store, started, gate, root, fixture)
+    }
+
+    /// Stage 2a, addendum 3 RULING 2 — gate 2e STRENGTHENED: a requested shutdown **drains** a
+    /// payment in flight; it does not race it. The retry tick starts an attempt that journals its
+    /// planned row and then blocks INSIDE the melt (proofs with the mint, no answer yet). The loop
+    /// is asked to stop while that payment is pending. It must NOT return while the melt is
+    /// pending, must start nothing new, and when the mint finally answers the attempt runs to its
+    /// end — the row is settled by the melt — and only then does `run` return.
+    ///
+    /// RED ON REVERT: drop `drain_remit_in_flight` from `run_loop` and the loop returns with the
+    /// melt still pending (first assertion); drop the `remit_closed` check and a collect-path call
+    /// could start a second attempt after serving ended.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_requested_shutdown_drains_a_pending_remittance_before_the_loop_returns() {
+        use crate::seller_node::store::{RemittanceState, SettledBy};
+        use std::sync::atomic::Ordering;
+        let base = Duration::from_millis(25);
+        let (runner, store, started, gate, root, _fixture) =
+            runner_with_a_pending_payment("remit-shutdown-drains", None).await;
+        let shutdown = runner.shutdown_handle();
+
+        let local = tokio::task::LocalSet::new();
+        let loop_handle = local.spawn_local(async move { runner.run().await });
+        let joined = local
+            .run_until(async {
+                // Harness check: an attempt reaches the melt and stops there — a pending payment.
+                let deadline = tokio::time::Instant::now() + FIXTURE_WAIT;
+                while !gate.arrived() {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "harness check: no remittance attempt reached the melt"
+                    );
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                let in_flight = started.load(Ordering::SeqCst);
+                assert!(
+                    shutdown.request("test-requested stop"),
+                    "the loop must accept a shutdown request"
+                );
+                // The payment is pending: the loop must stay, draining, well past any tick delay.
+                tokio::time::sleep(base * 12).await;
+                assert!(
+                    !loop_handle.is_finished(),
+                    "the loop returned while a melt was pending — RULING 2: shutdown DRAINS the \
+                     owned attempt, it does not abandon it"
+                );
+                assert_eq!(
+                    started.load(Ordering::SeqCst),
+                    in_flight,
+                    "nothing new may start once serving has ended"
+                );
+                assert_eq!(
+                    store
+                        .remittances()
+                        .expect("remittances")
+                        .last()
+                        .map(|row| row.state.clone()),
+                    Some(RemittanceState::Planned),
+                    "the pending payment's row is journaled Planned while the mint has not answered"
+                );
+                // The mint answers. The attempt finishes; the drain sees the permit drop.
+                gate.release();
+                tokio::time::timeout(FIXTURE_WAIT, loop_handle).await
+            })
+            .await;
+        let outcome = joined
+            .expect("run must RETURN once the in-flight attempt finished")
+            .expect("the loop task must not panic");
+        assert!(outcome.is_ok(), "a drained shutdown is a clean exit: {outcome:?}");
+
+        // The payment ran to its end — not cancelled, not left Planned: settled by the melt.
+        let rows = store.remittances().expect("remittances");
+        assert_eq!(rows.len(), 1, "exactly one attempt was journaled");
+        assert_eq!(rows[0].state, RemittanceState::Settled);
+        assert_eq!(rows[0].settled_by, Some(SettledBy::Melt));
+        assert_eq!(rows[0].melt_fee_sats, Some(1));
+        let at_exit = started.load(Ordering::SeqCst);
+        tokio::time::sleep(base * 40).await;
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            at_exit,
+            "no remittance attempt may START after the loop exited"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Addendum 3 RULING 2, the other half: the drain's wait is BOUNDED. When the pending payment
+    /// does not finish inside the bound, `run` returns anyway — after the bound, not before — with
+    /// the attempt still pending (its row Planned), and the attempt is abandoned by the WAIT only:
+    /// its thread finishes on its own once the mint answers, and the row settles.
+    ///
+    /// RED ON REVERT: drop the bound from `drain_remit_in_flight` and the join times out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_shutdown_drain_gives_up_waiting_at_its_bound_but_never_cancels_the_attempt() {
+        use crate::seller_node::store::RemittanceState;
+        let bound = Duration::from_millis(300);
+        let (runner, store, _started, gate, root, _fixture) =
+            runner_with_a_pending_payment("remit-shutdown-drain-bound", Some(bound)).await;
+        let shutdown = runner.shutdown_handle();
+
+        let local = tokio::task::LocalSet::new();
+        let loop_handle = local.spawn_local(async move { runner.run().await });
+        let (joined, waited) = local
+            .run_until(async {
+                let deadline = tokio::time::Instant::now() + FIXTURE_WAIT;
+                while !gate.arrived() {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "harness check: no remittance attempt reached the melt"
+                    );
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                assert!(shutdown.request("test-requested stop"));
+                let asked = tokio::time::Instant::now();
+                let joined = tokio::time::timeout(FIXTURE_WAIT, loop_handle).await;
+                (joined, asked.elapsed())
+            })
+            .await;
+        let outcome = joined
+            .expect("run must RETURN at the drain bound even though the melt is still pending")
+            .expect("the loop task must not panic");
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert!(
+            waited >= bound,
+            "run returned after {waited:?}, before the {bound:?} drain bound elapsed"
+        );
+        // Abandoned by the wait, not cancelled: still pending, row still Planned…
+        assert!(
+            gate.arrived(),
+            "harness check: the melt is still blocked"
+        );
+        let rows = store.remittances().expect("remittances");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, RemittanceState::Planned);
+        // …and when the mint answers, the thread finishes its attempt on its own.
+        gate.release();
+        let deadline = std::time::Instant::now() + FIXTURE_WAIT;
+        loop {
+            let rows = store.remittances().expect("remittances");
+            if rows[0].state == RemittanceState::Settled {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the abandoned attempt never settled its row after the mint answered"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Addendum 3 §3: a SHARED outcome — the collect thread's attempt moved the backoff — re-arms
+    /// the loop's LIVE timer. The rule is `rearm_deadline`, proven here against a real `Sleep`
+    /// under Tokio's paused clock: a success pulls a 15-minute pending sleep back to the drawn
+    /// base-streak delay and the sleep fires there, not at its old deadline; a failure never
+    /// shortens a deadline — it extends a too-short one to the drawn delay and keeps a longer one.
+    #[tokio::test(start_paused = true)]
+    async fn a_shared_outcome_re_arms_the_live_retry_timer() {
+        let now = tokio::time::Instant::now();
+        let sleep = tokio::time::sleep(Duration::from_secs(900));
+        tokio::pin!(sleep);
+        // Success (streak 0): reset to the drawn delay, however far away the old deadline was.
+        let deadline = rearm_deadline(sleep.deadline(), now, 0, Duration::from_secs(12));
+        assert_eq!(deadline, now + Duration::from_secs(12));
+        sleep.as_mut().reset(deadline);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(11), sleep.as_mut())
+                .await
+                .is_err(),
+            "the re-armed timer must not fire before its new deadline"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), sleep.as_mut())
+                .await
+                .is_ok(),
+            "the re-armed timer fires at its new deadline, not the old 15-minute one"
+        );
+        // Failure (streak 2): a far deadline is kept; a too-short one is pushed out to the draw.
+        let now = tokio::time::Instant::now();
+        assert_eq!(
+            rearm_deadline(now + Duration::from_secs(600), now, 2, Duration::from_secs(90)),
+            now + Duration::from_secs(600)
+        );
+        assert_eq!(
+            rearm_deadline(now + Duration::from_secs(5), now, 2, Duration::from_secs(90)),
+            now + Duration::from_secs(90)
+        );
     }
 
     /// RED ON REVERT: drop the `self.publish_retraction().await` from `run_loop` (or the
