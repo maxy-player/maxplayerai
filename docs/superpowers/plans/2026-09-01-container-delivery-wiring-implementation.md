@@ -127,12 +127,27 @@ and any container-reported usage is spoofable by the job.
   from that. (Ties to #863.)
 - The container may still emit a usage summary for observability; money decisions use the proxy count.
 
-## Final step — remove the interim host push
+## Final step — remove the interim host push — ⛔ BLOCKED, do NOT do this
 
-Once the container path is the default AND the relay is confirmed enforcing the scope: delete the
-host-side `neutralize_then_push_off_runtime` call in `execute_job` and (if unused elsewhere) the
-`neutralize_then_push_off_runtime` wrapper. `seller_git::neutralize_push_config` stays — the container
-push reuses it via `delivery_orchestrator::push_delivery`.
+> **Decided 2026-09-07: the host push STAYS.** Both original conditions are now met — the container
+> path is the default for a docker seat, and the canary confirms the relay enforces the scope — and
+> the step is still blocked, for a reason this section originally missed.
+
+`SandboxMode::Launcher` is the **default** mode (`home.rs`), not `Docker`. A launcher-mode seat
+creates no container, and `seller_exec.rs` refuses the container-delivery keys under launcher mode.
+So the host push is not a redundant fallback: it is the ONLY delivery path for every seat that has
+not opted into Docker. Deleting it strands all of them.
+
+The same fact bounds the default: `container_delivery` is `Option<bool>` and defaults to on only
+where a container exists. It can never be a plain `true`, because a launcher seat would trip that
+refusal and fail to boot.
+
+This step becomes possible only if launcher mode is retired first, which is a separate decision
+nobody has taken. Until then, treat this section as blocked rather than pending.
+
+For the record, what it WOULD have been: delete the host-side `neutralize_then_push_off_runtime`
+call in `execute_job` and (if unused elsewhere) the wrapper. `seller_git::neutralize_push_config`
+would stay either way — the container push reuses it via `delivery_orchestrator::push_delivery`.
 
 ## Security checks that land WITH this wiring (reviewer C3/C4/C6)
 
