@@ -1751,13 +1751,16 @@ impl Drop for RemitPermit {
 /// Scripted effects for tests, shared with `seller_node::run`'s collect-path tests.
 #[cfg(test)]
 pub(crate) mod test_support {
+    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
 
-    use super::{MeltFailure, RemitEffects, host_now_unix};
+    use super::{MeltFailure, Reconcile, RemitEffects, host_now_unix};
     use crate::lnurl_pay::{LightningAddress, PayRequest, ResolvedInvoice, Url};
     use crate::seller_node::store::FeeRemittance;
-    use crate::wallet_ops::{MeltCeiling, MeltEstimate, MeltOutcome, MeltQuoteStatus};
+    use crate::wallet_ops::{
+        MeltCeiling, MeltEstimate, MeltOutcome, MeltQuoteState, MeltQuoteStatus,
+    };
 
     /// A rendezvous a test uses to PAUSE one attempt at a chosen point (after the plan is journaled,
     /// or inside the melt) while another attempt runs against the same store — the deterministic
@@ -1809,15 +1812,41 @@ pub(crate) mod test_support {
         }
     }
 
+    /// One melt quote at the fake mint, as BOTH sides of a test see it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct FakeQuote {
+        pub(crate) bolt11: String,
+        pub(crate) state: MeltQuoteState,
+        pub(crate) amount_sats: u64,
+        pub(crate) fee_reserve_sats: u64,
+        pub(crate) expiry_unix: u64,
+    }
+
+    /// The fake mint's quote registry, SHARED between the Fakes of one test (one `Arc`, addendum 5
+    /// §2): a quote raised by one side is visible to the other; a test moves a quote's state or
+    /// expiry in place and both sides read the change; a payment marks its quote PAID for everyone.
+    /// A Fake without a registry answers status queries from its scripted `status` instead.
+    pub(crate) type QuoteRegistry = Arc<Mutex<BTreeMap<String, FakeQuote>>>;
+
+    pub(crate) fn quote_registry() -> QuoteRegistry {
+        Arc::new(Mutex::new(BTreeMap::new()))
+    }
+
     /// Scripted effects. `reserve_for(amount)` is the mint's fee reserve policy at ESTIMATE time;
-    /// `live_reserve_for`, when set, is the reserve the quote raised at PAYMENT time carries (the
-    /// two can differ — addendum 3 §1); `melt_results` are consumed in order; `status` answers the
-    /// reconciliation query; `pay_request_error` makes the LNURL host unreachable. Every call is
-    /// logged so a test can assert what was — and was not — touched; `melt_counter`, when set,
-    /// counts ACTUAL debits across Fakes on different threads (a melt refused at the ceiling is not
-    /// a debit and is logged in `ceiling_refusals` instead). `owner` is the process this Fake
-    /// speaks as; `invoice_tag` makes one Fake's invoices distinct from another's, as two real LNURL
-    /// calls would be.
+    /// `live_reserve_for`, when set, is the reserve the PAYMENT quote carries (the two can differ —
+    /// addendum 3 §1); `melt_results` are consumed in order by payments; `status` answers the
+    /// reconciliation queries when no `registry` is set; `pay_request_error` makes the LNURL host
+    /// unreachable. Every call is logged so a test can assert what was — and was not — touched;
+    /// `melt_counter`, when set, counts ACTUAL debits across Fakes on different threads (a payment
+    /// refused at the ceiling or by the mint is not a debit and is logged in `ceiling_refusals` /
+    /// `pay_refusals` instead). `owner` is the process this Fake speaks as; `invoice_tag` makes one
+    /// Fake's invoices distinct from another's, as two real LNURL calls would be.
+    ///
+    /// Quote ids: the estimate for `bolt11` is `quote-{bolt11}`, the payment quote is
+    /// `paid-quote-{bolt11}` — two quotes, two ids, as the wallet raises them. With a `registry`
+    /// every quote raised is recorded there (UNPAID, expiring at `quote_expiry_unix`) and every
+    /// status query reads it; [`Self::pay_melt_quote`] pays only a quote that is UNPAID and not
+    /// expired, and marks it PAID.
     pub(crate) struct Fake {
         pub(crate) owner: String,
         pub(crate) invoice_tag: String,
@@ -1827,25 +1856,43 @@ pub(crate) mod test_support {
         pub(crate) live_reserve_for: Option<Box<dyn Fn(u64) -> u64 + Send>>,
         pub(crate) melt_results: Vec<Result<(u64, u64), String>>,
         pub(crate) status: Result<Option<MeltQuoteStatus>, String>,
+        pub(crate) registry: Option<QuoteRegistry>,
+        /// Expiry stamped on every quote this Fake raises (registry or not). Far future by default.
+        pub(crate) quote_expiry_unix: u64,
         pub(crate) pay_request_error: Option<String>,
         pub(crate) pay_requests: usize,
         pub(crate) invoices: Vec<u64>,
         pub(crate) estimates: Vec<String>,
+        /// Payment quotes raised (bolt11s), in order.
+        pub(crate) quotes: Vec<String>,
+        /// Actual payments (bolt11s), in order — the debits.
         pub(crate) melts: Vec<String>,
         pub(crate) ceiling_refusals: Vec<String>,
+        /// Payments the fake mint refused: the bound quote was not UNPAID, or had expired.
+        pub(crate) pay_refusals: Vec<String>,
         pub(crate) status_calls: Vec<String>,
+        /// Reconciliation queries BY QUOTE ID (a spending row's bound quote).
+        pub(crate) quote_status_calls: Vec<String>,
         pub(crate) melt_counter: Option<Arc<AtomicUsize>>,
         pub(crate) plan_gate: Option<Arc<Gate>>,
-        /// Pause point AFTER the compare-and-set admitted the melt and BEFORE the melt (addendum 4
-        /// §1, test b): the row is `spending` while the paused side waits here.
+        /// Pause point AFTER the payment quote is raised and has passed the ceiling, BEFORE the fence
+        /// (addendum 5 §2, `AfterQuote`): the row is still `planned` while the paused side waits.
+        pub(crate) quote_gate: Option<Arc<Gate>>,
+        /// Pause point AFTER the compare-and-set admitted the melt and BEFORE the payment (addendum
+        /// 4 §1): the row is `spending`, bound to its quote, while the paused side waits here.
         pub(crate) admit_gate: Option<Arc<Gate>>,
+        /// Pause point inside the payment itself, after the mint accepted the quote for paying.
         pub(crate) melt_gate: Option<Arc<Gate>>,
+        /// Pause point AFTER reconciliation decided and BEFORE it writes (addendum 5 §2,
+        /// `AfterDecision`): a test moves the row under a decided release here.
+        pub(crate) decision_gate: Option<Arc<Gate>>,
         pub(crate) planned_seen: Vec<FeeRemittance>,
         pub(crate) admitted_seen: Vec<FeeRemittance>,
-        /// The injectable clock [`RemitEffects::now_unix`] reads at the fence. Shared between the
-        /// Fakes of one test (`Arc`) so that "the clock advanced while A was paused" is a fact A
-        /// reads FRESH at its fence and the store compares in SQL — not a number a test hands the
-        /// store. Unset (`i64::MIN`) the Fake reads the host clock, like the live effects.
+        pub(crate) decisions_seen: Vec<Reconcile>,
+        /// The injectable clock [`RemitEffects::now_unix`] reads at the fence and before paying.
+        /// Shared between the Fakes of one test (`Arc`) so that "the clock advanced while A was
+        /// paused" is a fact A reads FRESH — inside the store's lock — and the store compares in
+        /// SQL. Unset (`i64::MIN`) the Fake reads the host clock, like the live effects.
         pub(crate) clock: Arc<AtomicI64>,
     }
 
@@ -1860,19 +1907,27 @@ pub(crate) mod test_support {
                 live_reserve_for: None,
                 melt_results: Vec::new(),
                 status: Ok(None),
+                registry: None,
+                quote_expiry_unix: u64::MAX,
                 pay_request_error: None,
                 pay_requests: 0,
                 invoices: Vec::new(),
                 estimates: Vec::new(),
+                quotes: Vec::new(),
                 melts: Vec::new(),
                 ceiling_refusals: Vec::new(),
+                pay_refusals: Vec::new(),
                 status_calls: Vec::new(),
+                quote_status_calls: Vec::new(),
                 melt_counter: None,
                 plan_gate: None,
+                quote_gate: None,
                 admit_gate: None,
                 melt_gate: None,
+                decision_gate: None,
                 planned_seen: Vec::new(),
                 admitted_seen: Vec::new(),
+                decisions_seen: Vec::new(),
                 clock: Arc::new(AtomicI64::new(i64::MIN)),
             }
         }
@@ -1890,12 +1945,71 @@ pub(crate) mod test_support {
             format!("hash-{amount_sats}-{sequence}")
         }
 
+        /// The payment quote's id for an invoice, as this Fake raises it.
+        pub(crate) fn pay_quote_id(bolt11: &str) -> String {
+            format!("paid-quote-{bolt11}")
+        }
+
         fn amount_in(bolt11: &str) -> u64 {
             bolt11
                 .split('-')
                 .nth(2)
                 .and_then(|raw| raw.parse().ok())
                 .expect("fake bolt11 carries its amount")
+        }
+
+        fn live_reserve(&self, amount_sats: u64) -> u64 {
+            match &self.live_reserve_for {
+                Some(live) => live(amount_sats),
+                None => (self.reserve_for)(amount_sats),
+            }
+        }
+
+        fn register(&self, quote_id: &str, quote: FakeQuote) {
+            if let Some(registry) = &self.registry {
+                registry
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(quote_id.to_owned(), quote);
+            }
+        }
+
+        fn registered(&self, quote_id: &str) -> Option<FakeQuote> {
+            self.registry.as_ref().and_then(|registry| {
+                registry
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(quote_id)
+                    .cloned()
+            })
+        }
+
+        fn status_of(quote_id: &str, quote: &FakeQuote) -> MeltQuoteStatus {
+            MeltQuoteStatus {
+                mint_url: "https://mint.example".to_owned(),
+                quote_id: quote_id.to_owned(),
+                state: quote.state,
+                amount_sats: quote.amount_sats,
+                fee_reserve_sats: quote.fee_reserve_sats,
+                expiry_unix: quote.expiry_unix,
+            }
+        }
+
+        /// How "alive" a quote is, for the by-invoice query (the shipped helper's ranking): a paid
+        /// quote outranks a pending one, which outranks a live unpaid one; expired and failed last.
+        fn liveness(quote: &FakeQuote, now_unix: i64) -> u8 {
+            match quote.state {
+                MeltQuoteState::Paid => 0,
+                MeltQuoteState::Pending => 1,
+                MeltQuoteState::Unpaid
+                    if !u64::try_from(now_unix).is_ok_and(|now| now > quote.expiry_unix) =>
+                {
+                    2
+                }
+                MeltQuoteState::Unknown => 3,
+                MeltQuoteState::Unpaid => 4,
+                MeltQuoteState::Failed => 5,
+            }
         }
     }
 
@@ -1917,9 +2031,22 @@ pub(crate) mod test_support {
             }
         }
 
+        fn after_quote(&mut self, _planned: &FeeRemittance, _quote: &MeltEstimate) {
+            if let Some(gate) = &self.quote_gate {
+                gate.arrive_and_wait();
+            }
+        }
+
         fn after_admit(&mut self, admitted: &FeeRemittance) {
             self.admitted_seen.push(admitted.clone());
             if let Some(gate) = &self.admit_gate {
+                gate.arrive_and_wait();
+            }
+        }
+
+        fn after_decision(&mut self, _row: &FeeRemittance, decision: &Reconcile) {
+            self.decisions_seen.push(decision.clone());
+            if let Some(gate) = &self.decision_gate {
                 gate.arrive_and_wait();
             }
         }
@@ -1974,58 +2101,165 @@ pub(crate) mod test_support {
         fn melt_estimate(&mut self, bolt11: &str) -> Result<MeltEstimate, String> {
             self.estimates.push(bolt11.to_owned());
             let amount_sats = Self::amount_in(bolt11);
+            let fee_reserve_sats = (self.reserve_for)(amount_sats);
+            let quote_id = format!("quote-{bolt11}");
+            self.register(
+                &quote_id,
+                FakeQuote {
+                    bolt11: bolt11.to_owned(),
+                    state: MeltQuoteState::Unpaid,
+                    amount_sats,
+                    fee_reserve_sats,
+                    expiry_unix: self.quote_expiry_unix,
+                },
+            );
             Ok(MeltEstimate {
                 mint_url: "https://mint.example".to_owned(),
-                quote_id: format!("quote-{bolt11}"),
+                quote_id,
                 amount_sats,
-                fee_reserve_sats: (self.reserve_for)(amount_sats),
+                fee_reserve_sats,
+                expiry_unix: self.quote_expiry_unix,
             })
         }
 
-        /// The wallet's melt as the shipped one behaves: raise the PAYMENT quote (its reserve is
-        /// `live_reserve_for`, or the estimate's policy when unset), check it against the ceiling
-        /// BEFORE anything is spent — a refusal is not a debit — then pay.
-        fn melt(
+        /// The PAYMENT quote, as the shipped wallet raises it: a fresh quote for the invoice whose
+        /// reserve is `live_reserve_for` (or the estimate's policy when unset). Spends nothing.
+        fn melt_quote(&mut self, bolt11: &str) -> Result<MeltEstimate, String> {
+            self.quotes.push(bolt11.to_owned());
+            let amount_sats = Self::amount_in(bolt11);
+            let fee_reserve_sats = self.live_reserve(amount_sats);
+            let quote_id = Self::pay_quote_id(bolt11);
+            self.register(
+                &quote_id,
+                FakeQuote {
+                    bolt11: bolt11.to_owned(),
+                    state: MeltQuoteState::Unpaid,
+                    amount_sats,
+                    fee_reserve_sats,
+                    expiry_unix: self.quote_expiry_unix,
+                },
+            );
+            Ok(MeltEstimate {
+                mint_url: "https://mint.example".to_owned(),
+                quote_id,
+                amount_sats,
+                fee_reserve_sats,
+                expiry_unix: self.quote_expiry_unix,
+            })
+        }
+
+        /// The payment, BY QUOTE ID, as the shipped one behaves: the quote must be one this wallet
+        /// raised and the mint must still accept it (UNPAID, not expired), its STORED amount and
+        /// reserve are re-checked against the ceiling BEFORE anything is spent — a refusal is not a
+        /// debit — then it pays and the quote is PAID for everyone reading the registry.
+        fn pay_melt_quote(
             &mut self,
-            bolt11: &str,
+            quote_id: &str,
             ceiling: &MeltCeiling,
         ) -> Result<MeltOutcome, MeltFailure> {
-            if let Some(gate) = &self.melt_gate {
-                gate.arrive_and_wait();
-            }
-            let amount_sats = Self::amount_in(bolt11);
-            let live_reserve = match &self.live_reserve_for {
-                Some(live) => live(amount_sats),
-                None => (self.reserve_for)(amount_sats),
+            let quote = match self.registered(quote_id) {
+                Some(quote) => quote,
+                None => {
+                    // No registry: the quote is the one this Fake raised for the invoice its id
+                    // names, with the reserve the payment quote carries.
+                    let bolt11 = quote_id
+                        .strip_prefix("paid-quote-")
+                        .unwrap_or_else(|| {
+                            panic!("the payer must pay the PAYMENT quote it raised, not {quote_id}")
+                        })
+                        .to_owned();
+                    let amount_sats = Self::amount_in(&bolt11);
+                    FakeQuote {
+                        fee_reserve_sats: self.live_reserve(amount_sats),
+                        bolt11,
+                        state: MeltQuoteState::Unpaid,
+                        amount_sats,
+                        expiry_unix: self.quote_expiry_unix,
+                    }
+                }
             };
-            if !ceiling.admits(amount_sats, live_reserve) {
+            if quote.state != MeltQuoteState::Unpaid {
                 let reason = format!(
-                    "melt refused before spending: mint https://mint.example quote paid-quote-{bolt11} would debit {} sats ({amount_sats} sats invoice + {live_reserve} sats fee reserve; planned invoice {} sats) against a ceiling of {} sats; nothing left the wallet",
-                    amount_sats.saturating_add(live_reserve),
+                    "mint https://mint.example refuses to pay melt quote {quote_id}: it is {}",
+                    quote.state
+                );
+                self.pay_refusals.push(reason.clone());
+                return Err(MeltFailure::Failed(reason));
+            }
+            let now = self.now_unix();
+            if u64::try_from(now).is_ok_and(|now| now > quote.expiry_unix) {
+                let reason = format!(
+                    "mint https://mint.example refuses to pay melt quote {quote_id}: it expired at unix {} (now {now})",
+                    quote.expiry_unix
+                );
+                self.pay_refusals.push(reason.clone());
+                return Err(MeltFailure::Failed(reason));
+            }
+            if !ceiling.admits(quote.amount_sats, quote.fee_reserve_sats) {
+                let reason = format!(
+                    "melt refused before spending: mint https://mint.example quote {quote_id} would debit {} sats ({} sats invoice + {} sats fee reserve; planned invoice {} sats) against a ceiling of {} sats; nothing left the wallet",
+                    quote.amount_sats.saturating_add(quote.fee_reserve_sats),
+                    quote.amount_sats,
+                    quote.fee_reserve_sats,
                     ceiling.invoice_sats,
                     ceiling.max_debit_sats
                 );
                 self.ceiling_refusals.push(reason.clone());
                 return Err(MeltFailure::RefusedBeforeSpending(reason));
             }
-            self.melts.push(bolt11.to_owned());
+            if let Some(gate) = &self.melt_gate {
+                gate.arrive_and_wait();
+            }
+            self.melts.push(quote.bolt11.clone());
             if let Some(counter) = &self.melt_counter {
                 counter.fetch_add(1, Ordering::SeqCst);
             }
             let (paid, fee) = self.melt_results.remove(0).map_err(MeltFailure::Failed)?;
+            if let Some(registry) = &self.registry
+                && let Some(entry) = registry
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_mut(quote_id)
+            {
+                entry.state = MeltQuoteState::Paid;
+            }
             Ok(MeltOutcome {
                 mint_url: "https://mint.example".to_owned(),
                 paid_sats: paid,
                 fee_sats: fee,
                 balance_sats: 1_000,
-                quote_id: format!("paid-quote-{bolt11}"),
-                fee_reserve_sats: live_reserve,
+                quote_id: quote_id.to_owned(),
+                fee_reserve_sats: quote.fee_reserve_sats,
             })
         }
 
+        /// By invoice: the most alive of the quotes raised for it (registry), else the script.
         fn melt_status(&mut self, bolt11: &str) -> Result<Option<MeltQuoteStatus>, String> {
             self.status_calls.push(bolt11.to_owned());
-            self.status.clone()
+            let Some(registry) = &self.registry else {
+                return self.status.clone();
+            };
+            let now = self.now_unix();
+            let registry = registry.lock().unwrap_or_else(|e| e.into_inner());
+            Ok(registry
+                .iter()
+                .filter(|(_, quote)| quote.bolt11 == bolt11)
+                .min_by_key(|(_, quote)| Self::liveness(quote, now))
+                .map(|(quote_id, quote)| Self::status_of(quote_id, quote)))
+        }
+
+        /// By id: exactly that quote (registry), else the script.
+        fn melt_status_for_quote(
+            &mut self,
+            quote_id: &str,
+        ) -> Result<Option<MeltQuoteStatus>, String> {
+            self.quote_status_calls.push(quote_id.to_owned());
+            if self.registry.is_none() {
+                return self.status.clone();
+            }
+            Ok(self
+                .registered(quote_id)
+                .map(|quote| Self::status_of(quote_id, &quote)))
         }
     }
 }
