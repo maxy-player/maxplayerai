@@ -86,7 +86,7 @@ use crate::home::MaxplayerHome;
 use crate::lnurl_pay::{self, HttpsFetch, LightningAddress, PayRequest, ResolvedInvoice};
 use crate::platform_fee::PLATFORM_FEE_ADDRESS;
 use crate::seller_node::store::{
-    FeeRemittance, OwnershipLost, PlanRefused, RemitAttempt, RemitAttemptOutcome,
+    FeeRemittance, OwnershipLost, PlanRefused, ReleaseOn, RemitAttempt, RemitAttemptOutcome,
     RemitAttemptTrigger, RemitSettlement, RemittancePlan, RemittanceState, SellerStore, SettledBy,
 };
 use crate::wallet_ops::{
@@ -102,21 +102,28 @@ pub const RECENT_ATTEMPTS_SHOWN: usize = 5;
 /// PENDING or PAID within seconds, and one that never reaches it errors out and ends the attempt.
 pub const REMIT_LEASE: Duration = Duration::from_secs(5 * 60);
 
-/// How much of its lease an owner must still hold to START a payment. Another process is entitled
-/// to release the row the instant the lease ends; a spend begun with less than this margin could
-/// land after that release. Processes share one host clock (the store is a local file), so the
-/// margin covers scheduling pauses, not clock skew.
+/// How much of its lease an owner must still hold to be ADMITTED to a payment, and how far past a
+/// bound quote's expiry the mint's UNPAID is read as terminal. Another process is entitled to
+/// release a PLANNED row once its lease ends (a spending row it never releases on time), so an
+/// admission that landed with less than this margin would race that release; and a payer refuses
+/// to pay its bound quote inside this margin of the quote's expiry, so that a quote reconciliation
+/// calls terminal (UNPAID past expiry + margin) is one its owner will not pay. Processes share one
+/// host clock (the store is a local file); the margin covers scheduling pauses on that clock. The
+/// residual it does NOT cover is a mint clock ahead of the host's by more than the margin.
 pub const SPEND_MARGIN: Duration = Duration::from_secs(60);
 
-/// Why [`RemitEffects::melt`] did not pay.
+/// Why [`RemitEffects::pay_melt_quote`] did not pay.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MeltFailure {
-    /// The melt was refused BEFORE any proof was selected, prepared or sent — the quote the mint
-    /// raised at payment time did not fit the [`MeltCeiling`]. Nothing left the wallet, which the
-    /// caller may rely on: it releases its planned row itself.
+    /// The payment was refused BEFORE any proof was selected, prepared or sent — the bound quote's
+    /// stored amount and reserve did not fit the [`MeltCeiling`] on the re-check immediately before
+    /// `prepare_melt`. Nothing left the wallet. (The same figures were checked against the same
+    /// ceiling before the fence, so this is a belt behind braces; the row, already spending, is
+    /// left for reconciliation of its bound quote rather than released on a typed promise.)
     RefusedBeforeSpending(String),
-    /// The melt failed somewhere the caller cannot see: proofs may or may not have reached the mint.
-    /// The planned row stays for reconciliation against the mint.
+    /// The payment failed somewhere the caller cannot see: proofs may or may not have reached the
+    /// mint, or the mint refused the bound quote (expired, failed). The spending row stays for
+    /// reconciliation of its bound quote against the mint; the payer never re-quotes.
     Failed(String),
 }
 
@@ -131,7 +138,7 @@ impl fmt::Display for MeltFailure {
 
 /// The remit path's effects on the world, behind a trait so the decision logic — what is paid,
 /// when, and what is refused — is tested without a network or a mint. Exactly one method moves
-/// money: [`Self::melt`]. Everything else reads.
+/// money: [`Self::pay_melt_quote`]. Everything else reads (raising a quote spends nothing).
 pub trait RemitEffects {
     /// This process's opaque owner token for the rows it plans (addendum 3 §2): stable for the
     /// life of the process, distinct across processes. The node's attempts and the command's run
@@ -141,23 +148,48 @@ pub trait RemitEffects {
     fn pay_request(&mut self, address: &LightningAddress) -> Result<PayRequest, String>;
     /// LNURL step 3–4: an invoice for exactly `amount_sats`.
     fn invoice(&mut self, pay: &PayRequest, amount_sats: u64) -> Result<ResolvedInvoice, String>;
-    /// A melt quote for the invoice — the mint's fee reserve — WITHOUT paying.
+    /// A melt quote for the invoice — the mint's fee reserve — WITHOUT paying. The ESTIMATE, at
+    /// plan time: it sizes the net invoice and is journaled on the planned row as `melt_quote_id`.
     fn melt_estimate(&mut self, bolt11: &str) -> Result<MeltEstimate, String>;
-    /// **The payment.** Pays the invoice from the seller's ecash under a hard ceiling, refusing
-    /// before anything is spent if the quote raised at payment time does not fit. The only method
-    /// here that spends.
-    fn melt(&mut self, bolt11: &str, ceiling: &MeltCeiling) -> Result<MeltOutcome, MeltFailure>;
+    /// **The payment quote** for the planned invoice (addendum 5 §1, rule 1 step 1): raised after
+    /// the plan is journaled, checked against the ceiling, then BOUND to the row by the fence — the
+    /// one quote [`Self::pay_melt_quote`] pays. Raising it spends nothing. The same wallet call as
+    /// [`Self::melt_estimate`], distinguished so the two quotes' roles are told apart in the ledger.
+    fn melt_quote(&mut self, bolt11: &str) -> Result<MeltEstimate, String>;
+    /// **The payment.** Pays the bound quote, BY ID, from the seller's ecash: re-checks the quote's
+    /// stored amount and reserve against the ceiling immediately before `prepare_melt`, then
+    /// `prepare_melt(quote_id)` / `confirm`. Never raises a quote. The only method here that spends.
+    fn pay_melt_quote(
+        &mut self,
+        quote_id: &str,
+        ceiling: &MeltCeiling,
+    ) -> Result<MeltOutcome, MeltFailure>;
     /// What the mint says about the melt quote(s) this wallet raised for the invoice, if any —
-    /// used to reconcile an interrupted attempt.
+    /// used to reconcile a PLANNED row (no quote bound yet) and a spending row admitted before
+    /// quotes were bound.
     fn melt_status(&mut self, bolt11: &str) -> Result<Option<MeltQuoteStatus>, String>;
-    /// Observation point: called once the plan is journaled, before the pre-spend gate. The live
-    /// effects do nothing here; tests pause here to interleave a second process against the
-    /// planned row (addendum 3 §2.2).
+    /// What the mint says about ONE quote, by id — the quote a SPENDING row's admission bound
+    /// (addendum 5 §1, rule 2). `None` when this wallet never raised it.
+    fn melt_status_for_quote(
+        &mut self,
+        quote_id: &str,
+    ) -> Result<Option<MeltQuoteStatus>, String>;
+    /// Observation point: called once the plan is journaled, before the payment quote is raised.
+    /// The live effects do nothing here; tests pause here to interleave a second process against
+    /// the planned row (addendum 3 §2.2).
     fn after_plan(&mut self, _planned: &FeeRemittance) {}
+    /// Observation point: called once the payment quote is raised and has passed the ceiling, before
+    /// the fence (addendum 5 §2, `AfterQuote`). The row is still `planned`; tests pause here.
+    fn after_quote(&mut self, _planned: &FeeRemittance, _quote: &MeltEstimate) {}
     /// Observation point: called once the compare-and-set has admitted the melt (the row is
-    /// `spending`) and before the melt itself. The live effects do nothing here; tests pause here
-    /// to interleave a second process against a SPENDING row (addendum 4 §1, test b).
+    /// `spending`, bound to its quote) and before the payment. The live effects do nothing here;
+    /// tests pause here to interleave a second process against a SPENDING row (addendum 4 §1).
     fn after_admit(&mut self, _admitted: &FeeRemittance) {}
+    /// Observation point: called with reconciliation's decision about the in-flight row, AFTER the
+    /// decision is taken and BEFORE the release / settle is written (addendum 5 §2,
+    /// `AfterDecision`). Tests pause here so another process can move the row under a decided
+    /// release, which must then change zero rows.
+    fn after_decision(&mut self, _row: &FeeRemittance, _decision: &Reconcile) {}
     /// **The clock, read now.** The pre-spend fence compares the row's lease against the time at
     /// the instant of admission — never the attempt's entry time, which may be arbitrarily stale by
     /// then (addendum 4 §1.1). The live effects read the host clock; tests inject one so "the clock
@@ -223,11 +255,19 @@ impl RemitEffects for LiveEffects {
         wallet_ops::melt_quote_blocking(&self.home, bolt11, None).map_err(|error| error.to_string())
     }
 
-    fn melt(&mut self, bolt11: &str, ceiling: &MeltCeiling) -> Result<MeltOutcome, MeltFailure> {
-        wallet_ops::melt_within_blocking(&self.home, bolt11, None, Some(ceiling)).map_err(|error| {
+    fn melt_quote(&mut self, bolt11: &str) -> Result<MeltEstimate, String> {
+        wallet_ops::melt_quote_blocking(&self.home, bolt11, None).map_err(|error| error.to_string())
+    }
+
+    fn pay_melt_quote(
+        &mut self,
+        quote_id: &str,
+        ceiling: &MeltCeiling,
+    ) -> Result<MeltOutcome, MeltFailure> {
+        wallet_ops::pay_melt_quote_blocking(&self.home, quote_id, None, ceiling).map_err(|error| {
             match error {
-                // The one error the melt raises BEFORE selecting a proof, typed so it can be relied
-                // on: nothing left the wallet. Every other error is opaque as to how far it got.
+                // The one error the payment raises BEFORE selecting a proof, typed: nothing left the
+                // wallet. Every other error is opaque as to how far it got.
                 refused @ WalletOpsError::MeltExceedsCeiling { .. } => {
                     MeltFailure::RefusedBeforeSpending(refused.to_string())
                 }
@@ -238,6 +278,14 @@ impl RemitEffects for LiveEffects {
 
     fn melt_status(&mut self, bolt11: &str) -> Result<Option<MeltQuoteStatus>, String> {
         wallet_ops::melt_status_for_invoice_blocking(&self.home, bolt11, None)
+            .map_err(|error| error.to_string())
+    }
+
+    fn melt_status_for_quote(
+        &mut self,
+        quote_id: &str,
+    ) -> Result<Option<MeltQuoteStatus>, String> {
+        wallet_ops::melt_status_for_quote_blocking(&self.home, quote_id, None)
             .map_err(|error| error.to_string())
     }
 }
@@ -315,6 +363,11 @@ pub enum Refusal {
         remittance_id: String,
         reason: String,
     },
+    /// Reconciliation decided to release the in-flight row, and the conditional release then
+    /// changed ZERO rows: the row moved under this run between the decision and the write (its
+    /// owner was admitted, or another process resolved it). Nothing written; re-run to reconcile
+    /// against the row as it now stands (addendum 5 §1, rule 2).
+    RowChangedUnderMe { remittance_id: String },
     /// The store refused to journal the plan (a row already in flight, the balance moved under us,
     /// an invoice already used).
     PlanRefused(String),
@@ -377,6 +430,10 @@ impl fmt::Display for Refusal {
                 formatter,
                 "refused before spending: remittance {remittance_id} — {reason}"
             ),
+            Self::RowChangedUnderMe { remittance_id } => write!(
+                formatter,
+                "remittance {remittance_id} changed under this run between the release decision and the release itself; nothing written"
+            ),
             Self::PlanRefused(reason) => write!(formatter, "plan refused: {reason}"),
         }
     }
@@ -396,59 +453,88 @@ pub enum RemitOutcome {
     },
     /// Declined; nothing moved.
     Refused(Refusal),
-    /// The plan was journaled and the melt then failed: the row stays `planned` and is reconciled
-    /// with the mint by the next attempt — settled if the payment landed, released if it did not.
+    /// The plan was journaled, the fence admitted the melt and the payment of the bound quote then
+    /// failed (or was refused locally, the quote being inside its margin of expiry): the row stays
+    /// `spending`, bound to its quote, and is reconciled with the mint by the next attempt —
+    /// settled if the payment landed, released once the mint reports the bound quote terminal.
     MeltFailed {
         remittance_id: String,
         error: String,
     },
-    /// The plan was journaled and the melt REFUSED before spending anything — the quote raised at
-    /// payment time would have taken more than the accrued gross (addendum 3 §1). Nothing left the
-    /// wallet, so this process released its own row: the balance is unremitted again, the attempt
-    /// is journaled failed, and the backoff escalates.
+    /// The plan was journaled and the payment was REFUSED before the fence, nothing spent — the
+    /// payment quote would have taken more than the accrued gross (addendum 3 §1), or expires
+    /// inside the spending margin. The row was still planned and this process's own, so it
+    /// released it: the balance is unremitted again, the attempt is journaled failed, and the
+    /// backoff escalates. The next attempt plans a fresh row and raises fresh quotes.
     MeltRefused {
         remittance_id: String,
         reason: String,
     },
+    /// The plan was journaled and the payment quote could not be raised (mint unreachable, or it
+    /// quoted a different amount). Nothing spent; the planned row, this process's own, was
+    /// released; journaled failed; backoff escalates.
+    QuoteFailed {
+        remittance_id: String,
+        error: String,
+    },
 }
 
-/// What reconciliation decides about the one `planned` row, from the mint's answer about its quote
-/// and the row's ownership (addendum 3 §2.1). Pure, so the rule is tested as a table.
+/// What reconciliation decides about the one in-flight row, from the mint's answer about its
+/// quote and the row's state and ownership (addendum 3 §2.1, addendum 5 §1 rule 2). Pure, so the
+/// rule is tested as a table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reconcile {
     /// The mint reports the quote PAID: settle, keep the receipts discharged, never melt again.
     Settle,
-    /// Release the receipts back to unremitted; the reason is printed and journaled.
-    Release(String),
+    /// Release the receipts back to unremitted — by the conditional transition `on`, which changes
+    /// zero rows if the row is no longer as this decision found it. `reason` is printed and
+    /// journaled.
+    Release { reason: String, on: ReleaseOn },
     /// Leave the row exactly as it is and refuse this run; the reason is printed and journaled.
     Hold(Refusal),
 }
 
-/// The release rule. The in-flight row is **settled** when the mint reports its quote **PAID**,
-/// whatever its state or owner. It is **released** only when:
-/// - the mint reports its quote **FAILED**, or **UNPAID with the quote's expiry behind the clock**
-///   — an expired quote is one the mint will never pay: terminal, whoever owns the row and
-///   whatever its state; or
-/// - the row is **`planned`** (its melt was never admitted, so nothing can have been spent against
-///   it), the mint reports **UNPAID** or the wallet never raised a quote for its invoice, AND either
-///   the row is **this process's own** (a process runs one attempt at a time, so its earlier
-///   attempt is over) or the owner's **lease has run out** (the owner is provably gone, or provably
-///   not spending: its compare-and-set refuses inside [`SPEND_MARGIN`] of the lease's end and,
-///   once past it, changes zero rows).
+/// The release rule. `status` is the mint's answer about the row's **bound quote, by id**, when the
+/// row is `spending` with a quote bound (addendum 5 §1, rule 2) — and about the invoice's quote(s)
+/// otherwise (a `planned` row has no quote bound yet; a spending row admitted before v13 has none).
+///
+/// The in-flight row is **settled** when the mint reports the quote **PAID**, whatever its state
+/// or owner. It is **released** — always by the conditional transition that carries the reason
+/// ([`ReleaseOn`]), never unconditionally — only when:
+/// - the row is **`spending`** and its **bound quote** is terminal: the mint reports it **FAILED**,
+///   or **UNPAID with `now > expiry + SPEND_MARGIN`** — its owner refuses to pay the bound quote
+///   inside the margin of its expiry and never raises another for the row, so past the margin the
+///   mint will never pay it and the owner will never ask it to ([`ReleaseOn::TerminalBoundQuote`],
+///   naming the quote); or
+/// - the row is **`planned`** (never admitted: nothing spent against it) and the invoice's quote
+///   is **FAILED** or **UNPAID and expired** ([`ReleaseOn::TerminalQuotePlanned`]); or
+/// - the row is **`planned`**, the mint reports **UNPAID** or the wallet never raised a quote for
+///   its invoice, AND either the row is **this process's own** (a process runs one attempt at a
+///   time, so its earlier attempt is over — [`ReleaseOn::OwnPlanned`]) or the owner's **lease has
+///   run out** (the owner is provably not spending: its fence refuses inside [`SPEND_MARGIN`] of
+///   the lease's end and, once past it, changes zero rows — [`ReleaseOn::LeaseExpired`]).
 ///
 /// It is **held** — nothing written, this run refused — when the quote is PENDING or UNKNOWN (a
 /// payment may be settling); when a `planned` row is UNPAID / absent but another process's lease
 /// still stands (UNPAID means "not yet", not "abandoned"); and when the row is **`spending`** and
-/// the quote is not terminal (addendum 4 §1.2): its owner's compare-and-set admitted the melt, so
-/// the owner may be mid-melt, and **lease expiry alone never touches a spending row** — it resolves
-/// exactly when the mint resolves its quote. This holds even for this process's own spending row:
-/// a melt that returned an error may still have reached the mint.
+/// its bound quote is not terminal (addendum 4 §1.2): its owner's compare-and-set admitted the
+/// melt, so the owner may be mid-melt on that quote, and **lease expiry alone never touches a
+/// spending row** — it resolves exactly when the mint resolves the bound quote. This holds even
+/// for this process's own spending row: a payment that returned an error may still have reached
+/// the mint. A spending row whose wallet knows no such quote (`None`) is held too: "no quote" is
+/// not the mint saying terminal.
 pub fn reconcile_decision(
     row: &FeeRemittance,
     status: Option<&MeltQuoteStatus>,
     my_owner: &str,
     now_unix: i64,
 ) -> Reconcile {
+    let spending = row.state == RemittanceState::Spending;
+    let bound = if spending {
+        row.spending_quote_id.as_deref()
+    } else {
+        None
+    };
     let unpaid_reason = match status {
         None => "the wallet never raised a melt quote for its invoice — no sats left the wallet"
             .to_owned(),
@@ -457,6 +543,26 @@ pub fn reconcile_decision(
             status.mint_url, status.quote_id, status.state
         ),
     };
+    // The transition a terminal quote releases THIS row by: a spending row only through its bound
+    // quote (or, admitted before quotes were bound, through the unbound-spending transition); a
+    // planned row through the planned transition.
+    let terminal_release = |reason: String| {
+        let on = match (spending, bound) {
+            (true, Some(quote_id)) => ReleaseOn::TerminalBoundQuote {
+                quote_id: quote_id.to_owned(),
+            },
+            (true, None) => ReleaseOn::TerminalUnboundSpending,
+            (false, _) => ReleaseOn::TerminalQuotePlanned,
+        };
+        Reconcile::Release { reason, on }
+    };
+    let hold_spending = || {
+        Reconcile::Hold(Refusal::SpendingHeld {
+            remittance_id: row.remittance_id.clone(),
+            owner: row.owner.clone().unwrap_or_default(),
+            spending_since_unix: row.spending_since_unix.unwrap_or(row.created_at_unix),
+        })
+    };
     match status.map(|status| status.state) {
         Some(MeltQuoteState::Paid) => Reconcile::Settle,
         Some(MeltQuoteState::Pending) | Some(MeltQuoteState::Unknown) => {
@@ -464,34 +570,54 @@ pub fn reconcile_decision(
                 remittance_id: row.remittance_id.clone(),
             })
         }
-        Some(MeltQuoteState::Failed) => Reconcile::Release(format!(
+        Some(MeltQuoteState::Failed) => terminal_release(format!(
             "{unpaid_reason}; FAILED is terminal at the mint whoever owns the row"
         )),
+        Some(MeltQuoteState::Unpaid) if bound.is_some() => {
+            // A bound quote: terminal only past expiry PLUS the margin its owner refuses inside.
+            let status = status.expect("Unpaid status is Some");
+            let expiry_unix = status.expiry_unix;
+            let past_margin = u64::try_from(now_unix).is_ok_and(|now| {
+                now > expiry_unix.saturating_add(lease_secs(SPEND_MARGIN).unsigned_abs())
+            });
+            if past_margin {
+                terminal_release(format!(
+                    "{unpaid_reason}; the bound quote expired at unix {expiry_unix} and the spending margin ({} s) has passed since — its owner will not pay it and the mint will never pay it: terminal",
+                    lease_secs(SPEND_MARGIN)
+                ))
+            } else {
+                hold_spending()
+            }
+        }
         Some(MeltQuoteState::Unpaid)
             if status.is_some_and(|status| status.expired_at(now_unix)) =>
         {
-            Reconcile::Release(format!(
+            terminal_release(format!(
                 "{unpaid_reason}; the quote expired at unix {} and the mint will never pay it — terminal whoever owns the row",
                 status.map(|status| status.expiry_unix).unwrap_or_default()
             ))
         }
         Some(MeltQuoteState::Unpaid) | None => {
-            if row.state == RemittanceState::Spending {
-                Reconcile::Hold(Refusal::SpendingHeld {
-                    remittance_id: row.remittance_id.clone(),
-                    owner: row.owner.clone().unwrap_or_default(),
-                    spending_since_unix: row.spending_since_unix.unwrap_or(row.created_at_unix),
-                })
+            if spending {
+                hold_spending()
             } else if row.owner.as_deref() == Some(my_owner) {
-                Reconcile::Release(format!(
-                    "{unpaid_reason}; the row is this process's own earlier attempt, which is over"
-                ))
+                Reconcile::Release {
+                    reason: format!(
+                        "{unpaid_reason}; the row is this process's own earlier attempt, which is over"
+                    ),
+                    on: ReleaseOn::OwnPlanned {
+                        owner: my_owner.to_owned(),
+                    },
+                }
             } else if row.lease_expired(now_unix) {
-                Reconcile::Release(format!(
-                    "{unpaid_reason}; its owner's lease ran out at unix {} (owner {})",
-                    row.lease_until_unix.unwrap_or(row.created_at_unix),
-                    row.owner.as_deref().unwrap_or("none recorded")
-                ))
+                Reconcile::Release {
+                    reason: format!(
+                        "{unpaid_reason}; its owner's lease ran out at unix {} (owner {})",
+                        row.lease_until_unix.unwrap_or(row.created_at_unix),
+                        row.owner.as_deref().unwrap_or("none recorded")
+                    ),
+                    on: ReleaseOn::LeaseExpired { now_unix },
+                }
             } else {
                 Reconcile::Hold(Refusal::HeldByOwner {
                     remittance_id: row.remittance_id.clone(),
@@ -601,6 +727,14 @@ fn attempt_record(
         }) => (
             RemitAttemptOutcome::Failed,
             format!("refused before spending: {reason}"),
+            Some(remittance_id.clone()),
+        ),
+        Ok(RemitOutcome::QuoteFailed {
+            remittance_id,
+            error,
+        }) => (
+            RemitAttemptOutcome::Failed,
+            format!("payment quote failed: {error}"),
             Some(remittance_id.clone()),
         ),
         Err(error) => (
@@ -1095,6 +1229,12 @@ impl RemitReport {
             }) => format!(
                 "melt REFUSED before spending ({reason}); remittance {remittance_id} released, the balance stays unremitted and the next attempt re-quotes"
             ),
+            Ok(RemitOutcome::QuoteFailed {
+                remittance_id,
+                error,
+            }) => format!(
+                "payment quote FAILED ({error}); remittance {remittance_id} released, nothing spent, the balance stays unremitted and the next attempt re-quotes"
+            ),
             Err(error) => format!(
                 "attempt FAILED ({error}); the balance stays unremitted and the node retries with backoff while it runs"
             ),
@@ -1103,14 +1243,15 @@ impl RemitReport {
 
     /// Whether this attempt counts as a FAILURE for pacing ([`RemitBackoff::observe`]): it meant to
     /// pay and did not, for a reason that is not the steady state. `Err` (an effect failed),
-    /// `MeltFailed`, `MeltRefused`, and every refusal that is not at the threshold — the balance
-    /// stays owed and hammering the same host or mint every 30 s would not change that. A threshold
-    /// refusal, a payment and a dry run are not failures.
+    /// `MeltFailed`, `MeltRefused`, `QuoteFailed`, and every refusal that is not at the threshold —
+    /// the balance stays owed and hammering the same host or mint every 30 s would not change that.
+    /// A threshold refusal, a payment and a dry run are not failures.
     pub fn is_failure(&self) -> bool {
         match &self.outcome {
-            Err(_) | Ok(RemitOutcome::MeltFailed { .. }) | Ok(RemitOutcome::MeltRefused { .. }) => {
-                true
-            }
+            Err(_)
+            | Ok(RemitOutcome::MeltFailed { .. })
+            | Ok(RemitOutcome::MeltRefused { .. })
+            | Ok(RemitOutcome::QuoteFailed { .. }) => true,
             Ok(RemitOutcome::Refused(refusal)) => !refusal.is_threshold(),
             Ok(RemitOutcome::Paid { .. }) | Ok(RemitOutcome::DryRun) => false,
         }
