@@ -2101,7 +2101,8 @@ mod tests {
         assert_eq!(rows[0].melt_fee_sats, None, "unobserved, not invented");
         assert_eq!(
             rows[0].settled_by,
-            Some(RemittanceState::Settled).map(|_| crate::seller_node::store::SettledBy::Reconciliation),
+            Some(RemittanceState::Settled)
+                .map(|_| crate::seller_node::store::SettledBy::Reconciliation),
             "the row says it was settled by reconciliation"
         );
         assert_eq!(
@@ -2695,6 +2696,12 @@ mod tests {
         );
     }
 
+    /// The paused side's (outcome, output) and every `meanwhile` run's (outcome, output).
+    type PausedRun = (
+        (Result<RemitOutcome, String>, String),
+        Vec<(RemitOutcome, String)>,
+    );
+
     /// Two processes against one store: `first` is paused at `gate` (after its plan is journaled),
     /// `second` runs whatever the test scripts meanwhile. Returns each side's outcome and output.
     fn run_paused(
@@ -2704,17 +2711,20 @@ mod tests {
         gate: Arc<super::test_support::Gate>,
         melts: Arc<AtomicUsize>,
         meanwhile: impl FnOnce(&SellerStore) -> Vec<(RemitOutcome, String)>,
-    ) -> (
-        (Result<RemitOutcome, String>, String),
-        Vec<(RemitOutcome, String)>,
-    ) {
+    ) -> PausedRun {
         first.plan_gate = Some(Arc::clone(&gate));
         first.melt_counter = Some(Arc::clone(&melts));
         let db_a = db.clone();
         let a = std::thread::spawn(move || {
             let store = SellerStore::open(&db_a).expect("open A");
             let mut out = Vec::new();
-            let outcome = remit(&store, &mut first, RemitTrigger::Collect, first_now, &mut out);
+            let outcome = remit(
+                &store,
+                &mut first,
+                RemitTrigger::Collect,
+                first_now,
+                &mut out,
+            );
             (outcome, String::from_utf8_lossy(&out).into_owned())
         });
         gate.wait_arrived(Duration::from_secs(10));
@@ -2755,7 +2765,10 @@ mod tests {
                     b.melt_results = vec![Ok((13, 1))];
                     b.melt_counter = Some(Arc::clone(&melts));
                     // The mint's honest answer about A's planned invoice while A is paused: UNPAID.
-                    b.status = Ok(Some(status(MeltQuoteState::Unpaid, "quote-lnbc-fake-13-2-a")));
+                    b.status = Ok(Some(status(
+                        MeltQuoteState::Unpaid,
+                        "quote-lnbc-fake-13-2-a",
+                    )));
                     let (outcome, out) = run_remit(store_b, &mut b, trigger, now);
                     assert!(b.melts.is_empty(), "B must not pay: {out}");
                     assert!(
@@ -2839,7 +2852,10 @@ mod tests {
                 b.invoice_tag = "-b".to_owned();
                 b.melt_results = vec![Ok((13, 1))];
                 b.melt_counter = Some(Arc::clone(&melts));
-                b.status = Ok(Some(status(MeltQuoteState::Unpaid, "quote-lnbc-fake-13-2-a")));
+                b.status = Ok(Some(status(
+                    MeltQuoteState::Unpaid,
+                    "quote-lnbc-fake-13-2-a",
+                )));
                 // 100 + REMIT_LEASE (300) = 400: the lease has run out.
                 let (outcome, out) = run_remit(store_b, &mut b, RemitTrigger::Command, 400);
                 assert!(is_paid(&outcome), "B pays Y once X is released: {out}");
@@ -2859,7 +2875,9 @@ mod tests {
             })) => {
                 assert_eq!(remittance_id, "hash-13-2-a");
                 assert!(
-                    reason.contains("the row is no longer planned (now failed): another process reconciled it"),
+                    reason.contains(
+                        "the row is no longer planned (now failed): another process reconciled it"
+                    ),
                     "{reason}"
                 );
             }
@@ -2869,7 +2887,11 @@ mod tests {
             a_out.contains("REFUSED before spending — the row is no longer planned (now failed)"),
             "{a_out}"
         );
-        assert_eq!(melts.load(Ordering::SeqCst), 1, "exactly one actual debit — B's");
+        assert_eq!(
+            melts.load(Ordering::SeqCst),
+            1,
+            "exactly one actual debit — B's"
+        );
         assert_eq!(b_results.len(), 1);
         let store = SellerStore::open(&db).expect("open");
         let rows = store.remittances().expect("rows");
@@ -3180,7 +3202,10 @@ mod tests {
     #[test]
     fn the_boot_delay_is_never_less_than_the_base_and_at_most_twice_it() {
         assert_eq!(boot_delay_for(RETRY_BASE, 0), Duration::from_secs(30));
-        assert_eq!(boot_delay_for(RETRY_BASE, u64::MAX), Duration::from_secs(60));
+        assert_eq!(
+            boot_delay_for(RETRY_BASE, u64::MAX),
+            Duration::from_secs(60)
+        );
         let mid = boot_delay_for(RETRY_BASE, u64::MAX / 2);
         assert!(mid > Duration::from_secs(44) && mid < Duration::from_secs(46));
         for entropy in [0, 1, u64::MAX / 3, u64::MAX / 2, u64::MAX - 1, u64::MAX] {

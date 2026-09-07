@@ -311,7 +311,9 @@ impl std::fmt::Display for OwnershipLost {
             Self::OtherOwner { owner } => write!(
                 formatter,
                 "the planned row is owned by {}",
-                owner.as_deref().unwrap_or("nobody (planned before ownership was recorded)")
+                owner
+                    .as_deref()
+                    .unwrap_or("nobody (planned before ownership was recorded)")
             ),
             Self::LeaseTooShort {
                 lease_until_unix,
@@ -2066,7 +2068,9 @@ impl SellerStore {
                 settlement.melt_quote_id,
                 RemittanceState::Settled.as_str(),
                 RemittanceState::Planned.as_str(),
-                settlement.melt_fee_reserve_sats.map(|reserve| reserve as i64),
+                settlement
+                    .melt_fee_reserve_sats
+                    .map(|reserve| reserve as i64),
                 settlement.settled_by.as_str(),
             ],
         )?;
@@ -3827,7 +3831,11 @@ mod tests {
         assert_eq!(store.in_flight_remittance().expect("query"), None);
 
         // A settled row never moves again.
-        assert!(store.settle_remittance("h1", &by_reconciliation(None, None), 13).is_err());
+        assert!(
+            store
+                .settle_remittance("h1", &by_reconciliation(None, None), 13)
+                .is_err()
+        );
         assert!(store.fail_remittance("h1", 13).is_err());
 
         // The next plan covers exactly the new receipt; planning the OLD figure is a mismatch.
@@ -3917,7 +3925,9 @@ mod tests {
         store
             .collect_receipt("r1", "job-1", 100, fees(1, 1000, 10), 1)
             .expect("collect");
-        store.plan_remittance(&plan("h1", 10, 9), OWNER, LEASE, 2).expect("plan");
+        store
+            .plan_remittance(&plan("h1", 10, 9), OWNER, LEASE, 2)
+            .expect("plan");
         let failed = store.fail_remittance("h1", 3).expect("fail");
         assert_eq!(failed.state, RemittanceState::Failed);
         assert_eq!(failed.settled_at_unix, Some(3));
@@ -3928,7 +3938,11 @@ mod tests {
         assert_eq!(accrued.by_job[0].remittance_id, None);
         assert_eq!(store.in_flight_remittance().expect("query"), None);
         // A failed row never moves again.
-        assert!(store.settle_remittance("h1", &by_reconciliation(None, None), 4).is_err());
+        assert!(
+            store
+                .settle_remittance("h1", &by_reconciliation(None, None), 4)
+                .is_err()
+        );
         assert!(store.fail_remittance("h1", 4).is_err());
         // The same invoice cannot be re-planned; a fresh one can.
         assert_eq!(

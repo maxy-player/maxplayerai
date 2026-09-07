@@ -15382,10 +15382,8 @@ mod tests {
             )
             .expect("collect");
         let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
-        let started = runner.remit_retry_bounds_for_test(
-            Duration::from_millis(25),
-            Duration::from_millis(100),
-        );
+        let started = runner
+            .remit_retry_bounds_for_test(Duration::from_millis(25), Duration::from_millis(100));
         let gate = Gate::new();
         let gate_for_fake = Arc::clone(&gate);
         runner.remit_effects_for_test(
@@ -15454,7 +15452,7 @@ mod tests {
                         .remittances()
                         .expect("remittances")
                         .last()
-                        .map(|row| row.state.clone()),
+                        .map(|row| row.state),
                     Some(RemittanceState::Planned),
                     "the pending payment's row is journaled Planned while the mint has not answered"
                 );
@@ -15466,7 +15464,10 @@ mod tests {
         let outcome = joined
             .expect("run must RETURN once the in-flight attempt finished")
             .expect("the loop task must not panic");
-        assert!(outcome.is_ok(), "a drained shutdown is a clean exit: {outcome:?}");
+        assert!(
+            outcome.is_ok(),
+            "a drained shutdown is a clean exit: {outcome:?}"
+        );
 
         // The payment ran to its end — not cancelled, not left Planned: settled by the melt.
         let rows = store.remittances().expect("remittances");
@@ -15525,10 +15526,7 @@ mod tests {
             "run returned after {waited:?}, before the {bound:?} drain bound elapsed"
         );
         // Abandoned by the wait, not cancelled: still pending, row still Planned…
-        assert!(
-            gate.arrived(),
-            "harness check: the melt is still blocked"
-        );
+        assert!(gate.arrived(), "harness check: the melt is still blocked");
         let rows = store.remittances().expect("remittances");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].state, RemittanceState::Planned);
@@ -15578,11 +15576,21 @@ mod tests {
         // Failure (streak 2): a far deadline is kept; a too-short one is pushed out to the draw.
         let now = tokio::time::Instant::now();
         assert_eq!(
-            rearm_deadline(now + Duration::from_secs(600), now, 2, Duration::from_secs(90)),
+            rearm_deadline(
+                now + Duration::from_secs(600),
+                now,
+                2,
+                Duration::from_secs(90)
+            ),
             now + Duration::from_secs(600)
         );
         assert_eq!(
-            rearm_deadline(now + Duration::from_secs(5), now, 2, Duration::from_secs(90)),
+            rearm_deadline(
+                now + Duration::from_secs(5),
+                now,
+                2,
+                Duration::from_secs(90)
+            ),
             now + Duration::from_secs(90)
         );
     }
