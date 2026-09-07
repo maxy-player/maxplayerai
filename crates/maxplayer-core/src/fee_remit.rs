@@ -467,7 +467,9 @@ pub fn reconcile_decision(
         Some(MeltQuoteState::Failed) => Reconcile::Release(format!(
             "{unpaid_reason}; FAILED is terminal at the mint whoever owns the row"
         )),
-        Some(MeltQuoteState::Unpaid) if status.is_some_and(|status| status.expired_at(now_unix)) => {
+        Some(MeltQuoteState::Unpaid)
+            if status.is_some_and(|status| status.expired_at(now_unix)) =>
+        {
             Reconcile::Release(format!(
                 "{unpaid_reason}; the quote expired at unix {} and the mint will never pay it — terminal whoever owns the row",
                 status.map(|status| status.expiry_unix).unwrap_or_default()
@@ -2163,7 +2165,9 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains("remittance hash-9-2 stays journaled as spending: proofs may have reached the mint"),
+            out.contains(
+                "remittance hash-9-2 stays journaled as spending: proofs may have reached the mint"
+            ),
             "{out}"
         );
         assert!(
@@ -2353,9 +2357,17 @@ mod tests {
             "{out}"
         );
         assert_eq!(fake.melts.len(), 1);
-        assert_eq!(fake.invoices.len(), invoices_before, "no new invoice on a held row");
         assert_eq!(
-            store.in_flight_remittance().expect("query").expect("held").state,
+            fake.invoices.len(),
+            invoices_before,
+            "no new invoice on a held row"
+        );
+        assert_eq!(
+            store
+                .in_flight_remittance()
+                .expect("query")
+                .expect("held")
+                .state,
             RemittanceState::Spending
         );
         assert_eq!(store.accrued_fees().expect("read").in_flight_fee_sats, 10);
@@ -2409,7 +2421,10 @@ mod tests {
             store2.remittances().expect("rows")[0].state,
             RemittanceState::Spending
         );
-        fake2.status = Ok(Some(status(MeltQuoteState::Failed, "paid-quote-lnbc-fake-9-2")));
+        fake2.status = Ok(Some(status(
+            MeltQuoteState::Failed,
+            "paid-quote-lnbc-fake-9-2",
+        )));
         let (outcome, out) = run_remit(&store2, &mut fake2, RemitTrigger::DryRun, 102);
         assert_eq!(outcome, RemitOutcome::DryRun, "{out}");
         assert!(out.contains("FAILED is terminal at the mint whoever owns the row; released 10 sats back to unremitted"), "{out}");
@@ -3228,7 +3243,11 @@ mod tests {
             (15, 0, 0)
         );
         let attempts = store.recent_remit_attempts(10).expect("attempts");
-        assert_eq!(attempts.len(), 2, "A's payment and B's refused --confirm: {attempts:?}");
+        assert_eq!(
+            attempts.len(),
+            2,
+            "A's payment and B's refused --confirm: {attempts:?}"
+        );
         assert_eq!(attempts[0].outcome, RemitAttemptOutcome::Paid);
         assert_eq!(attempts[1].trigger, RemitAttemptTrigger::Command);
         assert_eq!(attempts[1].outcome, RemitAttemptOutcome::Refused);

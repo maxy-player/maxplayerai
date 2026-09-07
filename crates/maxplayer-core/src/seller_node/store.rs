@@ -1118,7 +1118,9 @@ impl SellerStore {
         // are otherwise untouched; the `state` CHECK and the one-in-flight index are unchanged.
         // Additive + idempotent.
         if !Self::column_exists(conn, "fee_remittances", "spending_since_unix")? {
-            conn.execute_batch("ALTER TABLE fee_remittances ADD COLUMN spending_since_unix INTEGER;")?;
+            conn.execute_batch(
+                "ALTER TABLE fee_remittances ADD COLUMN spending_since_unix INTEGER;",
+            )?;
         }
         Ok(())
     }
@@ -1894,13 +1896,14 @@ impl SellerStore {
     fn read_remittance(row: &rusqlite::Row<'_>) -> rusqlite::Result<FeeRemittance> {
         let state_raw: String = row.get(8)?;
         let spending_since_unix: Option<i64> = row.get(16)?;
-        let state = RemittanceState::from_columns(&state_raw, spending_since_unix).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(
-                8,
-                rusqlite::types::Type::Text,
-                Box::new(error),
-            )
-        })?;
+        let state =
+            RemittanceState::from_columns(&state_raw, spending_since_unix).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    8,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
         let settled_by = row
             .get::<_, Option<String>>(15)?
             .map(|raw| {
