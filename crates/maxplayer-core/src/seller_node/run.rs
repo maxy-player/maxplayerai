@@ -14717,14 +14717,15 @@ mod tests {
         assert_eq!(
             accrued.unremitted_fee_sats + accrued.in_flight_fee_sats,
             10,
-            "the fee is still owed — pinned to the planned row until the next attempt reconciles it"
+            "the fee is still owed — pinned to the in-flight row until the next attempt reconciles it"
         );
         assert_eq!(
             store
                 .in_flight_remittance()
                 .expect("query")
                 .map(|row| row.state),
-            Some(RemittanceState::Planned)
+            Some(RemittanceState::Spending),
+            "the fence admitted the melt before the mint refused it: SPENDING, resolved by the mint's verdict"
         );
 
         // Both failures are journaled as attempts, newest first, for the operator to read.
@@ -15454,8 +15455,8 @@ mod tests {
                         .expect("remittances")
                         .last()
                         .map(|row| row.state),
-                    Some(RemittanceState::Planned),
-                    "the pending payment's row is journaled Planned while the mint has not answered"
+                    Some(RemittanceState::Spending),
+                    "the pending payment's row is journaled SPENDING (admitted, melt in progress) while the mint has not answered"
                 );
                 // The mint answers. The attempt finishes; the drain sees the permit drop.
                 gate.release();
@@ -15526,11 +15527,12 @@ mod tests {
             waited >= bound,
             "run returned after {waited:?}, before the {bound:?} drain bound elapsed"
         );
-        // Abandoned by the wait, not cancelled: still pending, row still Planned…
+        // Abandoned by the wait, not cancelled: still pending, row still in flight (SPENDING: the
+        // fence admitted the melt before it blocked inside the mint call)…
         assert!(gate.arrived(), "harness check: the melt is still blocked");
         let rows = store.remittances().expect("remittances");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].state, RemittanceState::Planned);
+        assert_eq!(rows[0].state, RemittanceState::Spending);
         // …and when the mint answers, the thread finishes its attempt on its own.
         gate.release();
         let deadline = std::time::Instant::now() + FIXTURE_WAIT;
