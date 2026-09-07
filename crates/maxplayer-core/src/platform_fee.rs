@@ -1,21 +1,26 @@
-//! Seller-side platform fee, stage 1: a product-set rate, computed and journaled when a payment is
-//! collected.
+//! Seller-side platform fee: a product-set rate, computed and journaled when a payment is collected
+//! (stage 1), and a product-set payout destination the accrued balance is remitted to by one
+//! explicit command (stage 2a).
 //!
-//! Two pieces live here — the rate ([`PLATFORM_FEE_BPS`]) and the arithmetic ([`fee_sats`]) — so the
-//! collect seam reads one and calls the other instead of reimplementing either. Ungated on purpose:
-//! the arithmetic is worth compiling and testing on every build, not only the money-path one.
+//! Three pieces live here — the rate ([`PLATFORM_FEE_BPS`]), the arithmetic ([`fee_sats`]) and the
+//! destination ([`PLATFORM_FEE_ADDRESS`]) — so the collect seam and the remit command read them
+//! instead of reimplementing any. Ungated on purpose: the arithmetic is worth compiling and testing
+//! on every build, not only the money-path one.
 //!
-//! ## What this stage does and does not do
+//! ## What is accrued, and what pays it
 //!
-//! The fee is **accrued and recorded**. Every collected payment journals the rate in force and the
-//! sats it comes to, against the job that earned it. **Nothing is remitted**: there is no fee
-//! recipient in the product yet, so no call here or in any caller moves a sat. Paying the accrued
-//! balance out is a later stage that sits on top of this journal.
+//! The fee is **accrued and recorded** at collect time: every collected payment journals the rate in
+//! force and the sats it comes to, against the job that earned it. **Nothing on the payment path
+//! remits it.** The only code that moves the accrued balance is `maxplayer seller fees remit
+//! --confirm` — an explicit, operator-run, idempotent command that pays the unremitted total to
+//! [`PLATFORM_FEE_ADDRESS`] from the seller's ecash and journals the remittance. Without `--confirm`
+//! it is a dry run. There is no timer, no sweep at startup and no automatic remittance of any kind.
 //!
-//! ## Who sets the rate
+//! ## Who sets the rate and the destination
 //!
-//! The product does, in this source file. A seller cannot change it: there is no config key, no env
-//! override and no CLI flag, and nothing parses, so nothing can fail at load.
+//! The product does, in this source file. A seller cannot change either: there is no config key, no
+//! env override and no CLI flag, and nothing parses, so nothing can fail at load. See
+//! [`PLATFORM_FEE_ADDRESS`] for why the destination in particular must not be seller-editable.
 
 /// The platform fee rate, in **basis points** (`1 bp = 0.01%`, so `250` is 2.5% and `10_000` is the
 /// whole payment). This constant is the whole specification of the fee:
@@ -29,10 +34,29 @@
 /// - The rate in force is journaled beside every receipt (`receipts.fee_bps`), so a store that
 ///   outlives a change to this number still says what each collection owed.
 ///
-/// **Currently `1000` — ten percent.** Stage 1 accrues and records what this rate comes to on each
-/// collection; it pays nobody, because no payout destination exists in the product yet. The rows
-/// this stage writes are a journal, not a bill.
+/// **Currently `1000` — ten percent.** Collection accrues and records what this rate comes to on
+/// each payment; the accrued balance is paid to [`PLATFORM_FEE_ADDRESS`] only when the operator runs
+/// `maxplayer seller fees remit --confirm`. The receipt rows are the journal that command settles
+/// against; nothing on the collect path pays anyone.
 pub const PLATFORM_FEE_BPS: u32 = 1000;
+
+/// The Lightning address (LUD-16, `user@host`) the accrued platform fee is remitted to. Ordered by
+/// Josip (real-sats authority), 2026-09-07. This constant is the whole specification of where the
+/// fee goes:
+///
+/// - It is set by the product, here, and **not by the seller**. There is no config key, no env
+///   override and no CLI flag, deliberately: the seller runs this binary, and the seller is the
+///   party that owes the fee. A seller-editable `fee_address` would let any seller point the
+///   platform's fee at themselves. A compiled-in constant costs a release to change; a seller-editable
+///   one costs the whole fee. The release is the cheaper defect.
+/// - It is resolved at remit time over LNURL-pay (`https://host/.well-known/lnurlp/user`), fail
+///   closed, by [`crate::lnurl_pay`]. Nothing here or in the collect path contacts it.
+/// - **Every remittance journals the literal it paid** (`fee_remittances.destination`), so a later
+///   change to this constant leaves a readable history rather than an ambiguous one.
+///
+/// The proper long-term fix — an authoritatively signed platform parameter carrying the rate and the
+/// address together, so neither needs a release — is a separate, later stage.
+pub const PLATFORM_FEE_ADDRESS: &str = "maxplayer@agi.cash";
 
 /// Basis points in one hundred percent — the ceiling on any rate.
 pub const BPS_PER_WHOLE: u32 = 10_000;
@@ -68,7 +92,8 @@ pub fn fee_sats(face_sats: u64, fee_bps: u32) -> u64 {
 /// zero. This is a display-time derivation from the three journaled figures — it is deliberately
 /// NOT stored, so it can never disagree with the columns it comes from. Both deductions are taken
 /// from the face: the mint's swap fee is what the mint kept before the sats reached the wallet, and
-/// the platform fee is what this stage records as owed (and does not remit).
+/// the platform fee is what collection records as owed (remitted later, only by the explicit
+/// command).
 pub fn kept_sats(face_sats: u64, mint_fee_sats: u64, platform_fee_sats: u64) -> u64 {
     face_sats
         .saturating_sub(mint_fee_sats)
@@ -168,14 +193,26 @@ mod tests {
         assert_eq!(bps_to_percent_label(PLATFORM_FEE_BPS), "10%");
     }
 
-    // ---- the constant ----
+    // ---- the constants ----
 
     #[test]
     fn the_shipped_rate_is_ten_percent_and_within_the_whole() {
-        // Stage 1 accrues at 10% and pays nobody. The `<= 10_000` bound is enforced at compile time
-        // by the `const _` assertion in the module body.
+        // Collection accrues at 10%; only the explicit remit command pays it out. The `<= 10_000`
+        // bound is enforced at compile time by the `const _` assertion in the module body.
         assert_eq!(PLATFORM_FEE_BPS, 1000);
         assert_eq!(fee_sats(100, PLATFORM_FEE_BPS), 10);
         assert_eq!(fee_sats(9, PLATFORM_FEE_BPS), 0);
+    }
+
+    // Stage 2a: the destination is the address Josip ordered, in LUD-16 `user@host` shape, and it is
+    // a constant — no config surface reads or writes it (see the doc comment for why).
+    #[test]
+    fn the_shipped_destination_is_the_ordered_lightning_address() {
+        assert_eq!(PLATFORM_FEE_ADDRESS, "maxplayer@agi.cash");
+        let (user, host) = PLATFORM_FEE_ADDRESS
+            .split_once('@')
+            .expect("a LUD-16 address has exactly one @");
+        assert_eq!((user, host), ("maxplayer", "agi.cash"));
+        assert!(!host.contains('@') && !host.contains('/'));
     }
 }

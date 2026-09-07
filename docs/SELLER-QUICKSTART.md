@@ -1200,13 +1200,14 @@ On a typical keyset the fee is **1 sat** for small amounts:
 - **The setup default is `100`, and that is the number to start from.** Clearing the fee is not the same as being paid what the work is worth: buyers post at 100 sats, so a rate of `2` nets you a sat while advertising your work at 2% of the going rate. Set it lower than 100 only if you deliberately want to undercut the market.
 - The **receipt / journal records the FACE (offer) amount**, not your wallet net. The face is the accounting figure; the **sats you receive are `face − fee`**. Do not read the receipt's face number as "sats pocketed."
 
-### Platform fee (stage 1: recorded, not paid)
+### Platform fee (recorded at collect; paid only by an explicit command)
 
 The product charges a platform fee on each payment you collect. **The rate is set by the product,
 in the binary, and you cannot change it** — there is no config key, no environment variable and no
-flag for it. **The rate is 10%.** This stage only records what that comes to: **there is no way to
-pay it yet**, because no payout destination exists in the product, so the figure in your journal is
-not a bill that is due.
+flag for it. **The rate is 10%.** Collection only records what that comes to. **Nothing pays it
+automatically**: the accrued balance leaves your wallet only when you run
+`maxplayer seller fees remit --confirm` (see below); until then the figure in your journal is what
+you owe, not a payment in progress.
 
 **The fee is 10% of the offer amount — the price the buyer paid — not of what lands in your
 wallet.** The mint's own input fee (described above) is a separate deduction and does not shrink the
@@ -1222,17 +1223,41 @@ maxplayer seller fees [--home <dir>]
 ```
 
 and each collected job prints four figures with plain labels: **what the buyer paid** (the offer
-amount), **mint fee**, **platform fee (10%)**, and **you keep** (`paid − mint fee − platform fee`),
-plus the totals. The `seller node collect ok` log line carries the same figures
-(`amount_received=` is what the buyer paid, then `mint_fee=`, `fee_sats=`, `fee_bps=`, `kept=`).
-Jobs collected before the mint fee was recorded print `mint fee: not recorded` and no "you keep"
-figure, rather than a made-up zero.
+amount), **mint fee**, **platform fee (10%)** with whether it is unremitted or which remittance paid
+it, and **you keep** (`paid − mint fee − platform fee`), plus the totals — the platform fee split
+into remitted and unremitted — and every remittance so far. The `seller node collect ok` log line
+carries the same figures (`amount_received=` is what the buyer paid, then `mint_fee=`, `fee_sats=`,
+`fee_bps=`, `kept=`). Jobs collected before the mint fee was recorded print `mint fee: not recorded`
+and no "you keep" figure, rather than a made-up zero.
 
-**This stage records the fee and pays nobody.** No sats leave your wallet on account of it: there is
-no fee recipient in this version, and no payout, transfer or remittance of the recorded amount exists
-anywhere in the binary. A 100-sat offer with a 1-sat mint fee, for example, records
-`amount_sats = 100, mint_fee_sats = 1, fee_bps = 1000, fee_sats = 10`, prints `you keep: 89 sats`,
-and moves nothing.
+**Collecting a payment moves nothing on account of the fee.** A 100-sat offer with a 1-sat mint fee,
+for example, records `amount_sats = 100, mint_fee_sats = 1, fee_bps = 1000, fee_sats = 10`, prints
+`you keep: 89 sats`, and the 10 sats stay in your wallet as **unremitted** platform fee.
+
+**Paying the fee is one explicit command, and it is a dry run unless you say otherwise.**
+
+```
+maxplayer seller fees remit [--home <dir>]              # dry run: resolve, quote, print the plan, move nothing
+maxplayer seller fees remit --confirm [--home <dir>]    # pay the unremitted balance
+```
+
+The destination is the platform's Lightning address, fixed in the binary (not configurable — a
+seller-editable address would let a seller pay the fee to itself). `remit` resolves it over
+LNURL-pay, takes a melt quote from your default mint for the unremitted total, and prints: the gross
+unremitted fee, the mint's melt fee reserve, the invoice amount the platform receives, and the most
+that can leave your wallet — **which is never more than the fee you accrued: the melt fee comes out
+of that amount, not on top of it.** With `--confirm` it journals the attempt in `seller.sqlite`
+(`fee_remittances`: gross, melt fee, net, the address literal, melt quote id, payment hash, state),
+pays the invoice from your ecash through the same gated melt `maxplayer wallet melt` uses (it honours
+`allow_real_mints`), and marks the receipts it covered as discharged.
+
+It refuses, moving nothing (exit 3), when nothing is unremitted; when the balance is below the
+destination's minimum (a 10% fee on payments under 10 sats owes under 1 sat — small balances
+accumulate until they clear the minimum, and the command prints how far short you are); or when an
+earlier attempt is still settling at the mint. **Running it again after a payment pays nothing** — the
+receipts it discharged are recorded — and an attempt interrupted mid-payment is reconciled with the
+mint on the next run (settled if the payment landed, released if it did not), never repeated. There is
+no timer and no automatic sweep: if you never run `remit --confirm`, no sats ever leave for the fee.
 
 ---
 

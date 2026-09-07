@@ -164,6 +164,37 @@ pub struct MeltOutcome {
     pub paid_sats: u64,
     pub fee_sats: u64,
     pub balance_sats: u64,
+    /// The mint's melt quote id the payment settled under — journaled by the seller fee remittance
+    /// so a settled row names the quote the mint can be asked about.
+    pub quote_id: String,
+}
+
+/// A melt quote and nothing more: what the mint would charge to pay `bolt11`, read without paying
+/// it. The dry-run half of the seller fee remittance; see [`melt_quote_async`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeltEstimate {
+    pub mint_url: String,
+    pub quote_id: String,
+    /// The invoice amount the mint quoted, in sats.
+    pub amount_sats: u64,
+    /// The mint's fee RESERVE for this melt — the ceiling on the fee it will take; the actual fee is
+    /// at most this, and the difference returns as change.
+    pub fee_reserve_sats: u64,
+}
+
+/// The mint's melt-quote lifecycle, re-exported so a CLI caller can match on it without depending
+/// on `cdk` directly.
+pub use cdk::nuts::MeltQuoteState;
+
+/// The mint's answer about a melt quote raised earlier for a given invoice. Used to reconcile an
+/// interrupted remittance without paying again; see [`melt_status_for_invoice_async`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeltQuoteStatus {
+    pub mint_url: String,
+    pub quote_id: String,
+    pub state: MeltQuoteState,
+    pub amount_sats: u64,
+    pub fee_reserve_sats: u64,
 }
 
 fn sqlite_path(wallet_dir: &Path) -> std::path::PathBuf {
@@ -787,7 +818,94 @@ pub async fn melt_async(
         paid_sats,
         fee_sats,
         balance_sats,
+        quote_id: quote.id,
     })
+}
+
+/// Raise a melt quote for `bolt11` and return it WITHOUT paying. Same mint resolution and real-mint
+/// gate as [`melt_async`]; no proofs are selected, prepared or spent. A quote is the only honest
+/// estimate of the melt fee, so the seller fee remittance's dry run calls this and prints it.
+pub async fn melt_quote_async(
+    home: &MaxplayerHome,
+    bolt11: &str,
+    mint_override: Option<&str>,
+) -> Result<MeltEstimate, WalletOpsError> {
+    let bolt11 = bolt11.trim();
+    if bolt11.is_empty() {
+        return Err(WalletOpsError::Wallet("bolt11 invoice is empty".into()));
+    }
+    let mint_url = resolve_mint(home, mint_override)?;
+    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+        return Err(WalletOpsError::RealMintDisallowed { mint_url });
+    }
+    let wallet = open_wallet_async(home, &mint_url).await?;
+    let quote = wallet
+        .melt_quote(PaymentMethod::BOLT11, bolt11, None, None)
+        .await
+        .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+    Ok(MeltEstimate {
+        mint_url,
+        quote_id: quote.id,
+        amount_sats: quote.amount.to_u64(),
+        fee_reserve_sats: quote.fee_reserve.to_u64(),
+    })
+}
+
+/// What the mint says about the melt quote(s) this wallet raised for `bolt11`, refreshed from the
+/// mint. `None` when the wallet never raised a quote for that invoice — which means no melt for it
+/// can have started, because [`melt_async`] persists its quote before it prepares anything. When
+/// several quotes exist for one invoice (an estimate plus the payment's own), the one that says
+/// PAID wins, then PENDING, so a payment that landed is never read as unpaid. Read-only: nothing
+/// here spends.
+pub async fn melt_status_for_invoice_async(
+    home: &MaxplayerHome,
+    bolt11: &str,
+    mint_override: Option<&str>,
+) -> Result<Option<MeltQuoteStatus>, WalletOpsError> {
+    let bolt11 = bolt11.trim();
+    let mint_url = resolve_mint(home, mint_override)?;
+    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+        return Err(WalletOpsError::RealMintDisallowed { mint_url });
+    }
+    let wallet = open_wallet_async(home, &mint_url).await?;
+    let mine: Vec<String> = wallet
+        .localstore
+        .get_melt_quotes()
+        .await
+        .map_err(|error| WalletOpsError::Wallet(error.to_string()))?
+        .into_iter()
+        .filter(|quote| quote.request.trim() == bolt11)
+        .map(|quote| quote.id)
+        .collect();
+    if mine.is_empty() {
+        return Ok(None);
+    }
+    let rank = |state: MeltQuoteState| match state {
+        MeltQuoteState::Paid => 0,
+        MeltQuoteState::Pending | MeltQuoteState::Unknown => 1,
+        MeltQuoteState::Unpaid | MeltQuoteState::Failed => 2,
+    };
+    let mut best: Option<MeltQuoteStatus> = None;
+    for quote_id in mine {
+        let quote = wallet
+            .check_melt_quote_status(&quote_id)
+            .await
+            .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+        let status = MeltQuoteStatus {
+            mint_url: mint_url.clone(),
+            quote_id: quote.id,
+            state: quote.state,
+            amount_sats: quote.amount.to_u64(),
+            fee_reserve_sats: quote.fee_reserve.to_u64(),
+        };
+        if best
+            .as_ref()
+            .is_none_or(|current| rank(status.state) < rank(current.state))
+        {
+            best = Some(status);
+        }
+    }
+    Ok(best)
 }
 
 /// List configured mints (default first).
@@ -944,6 +1062,34 @@ pub fn melt_blocking(
         .build()
         .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
     runtime.block_on(melt_async(home, bolt11, mint_override))
+}
+
+pub fn melt_quote_blocking(
+    home: &MaxplayerHome,
+    bolt11: &str,
+    mint_override: Option<&str>,
+) -> Result<MeltEstimate, WalletOpsError> {
+    crate::runtime_guard::refuse_nested_block_on("melt_quote_blocking")
+        .map_err(WalletOpsError::Wallet)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+    runtime.block_on(melt_quote_async(home, bolt11, mint_override))
+}
+
+pub fn melt_status_for_invoice_blocking(
+    home: &MaxplayerHome,
+    bolt11: &str,
+    mint_override: Option<&str>,
+) -> Result<Option<MeltQuoteStatus>, WalletOpsError> {
+    crate::runtime_guard::refuse_nested_block_on("melt_status_for_invoice_blocking")
+        .map_err(WalletOpsError::Wallet)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+    runtime.block_on(melt_status_for_invoice_async(home, bolt11, mint_override))
 }
 
 pub fn invoice_blocking(

@@ -13988,7 +13988,8 @@ mod tests {
                 mint_fee_sats: Some(1),
                 fee_bps: 1000,
                 fee_sats: 10,
-                received_at_unix: 5000
+                received_at_unix: 5000,
+                remittance_id: None,
             }]
         );
         assert!(
@@ -14026,7 +14027,8 @@ mod tests {
                 mint_fee_sats: Some(1),
                 fee_bps: 200,
                 fee_sats: 2,
-                received_at_unix: 5000
+                received_at_unix: 5000,
+                remittance_id: None,
             }]
         );
         let _ = std::fs::remove_dir_all(&root);

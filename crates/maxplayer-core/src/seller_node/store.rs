@@ -26,11 +26,15 @@ use crate::gateway::EventDraft;
 /// Current on-disk schema version. v8 added `receipts.fee_bps` / `receipts.fee_sats` (the platform
 /// fee, stage 1 — journaled, not remitted). v9 added `receipts.mint_fee_sats` (the mint's own swap
 /// fee, so a receipt shows every figure between what the buyer paid and what the seller keeps).
-pub const SCHEMA_VERSION: i64 = 9;
+/// v10 (stage 2a) added the `fee_remittances` table and `receipts.remittance_id` — which
+/// remittance, if any, discharged each receipt's platform fee — so the unremitted balance is a
+/// query and a paid fee can never be paid twice.
+pub const SCHEMA_VERSION: i64 = 10;
 
-/// The platform fee (stage 1) as journaled so far: what is owed on paper, and the figures around
-/// it. Returned by [`SellerStore::accrued_fees`]. Nothing in this stage moves the balance it
-/// reports.
+/// The platform fee as journaled so far: what is owed on paper, what has been remitted, and the
+/// figures around them. Returned by [`SellerStore::accrued_fees`]. A query and nothing more — the
+/// only thing that moves the unremitted balance is the explicit remit command, through
+/// [`SellerStore::plan_remittance`] / [`SellerStore::settle_remittance`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AccruedFees {
     /// Sum of `amount_sats` (the offer face — what buyers paid) over every receipt ever collected.
@@ -42,8 +46,17 @@ pub struct AccruedFees {
     /// Receipts collected before the mint fee was journaled (schema < v9). Their mint fee is
     /// unknown — not zero — and so is what the seller kept of them.
     pub rows_without_mint_fee: usize,
-    /// Sum of `fee_sats` (the platform fee) over every receipt ever collected.
+    /// Sum of `fee_sats` (the platform fee) over every receipt ever collected — accrued all-time,
+    /// remitted or not.
     pub total_fee_sats: u64,
+    /// Sum of `fee_sats` over receipts NOT yet discharged by any remittance (`remittance_id IS
+    /// NULL`). This is the figure the remit command pays.
+    pub unremitted_fee_sats: u64,
+    /// Sum of `fee_sats` over receipts discharged by a SETTLED remittance.
+    pub remitted_fee_sats: u64,
+    /// Sum of `fee_sats` over receipts pinned to a remittance that is still `planned` — money that
+    /// may be in flight at the mint. Non-zero only between a `--confirm` and its settle/fail.
+    pub in_flight_fee_sats: u64,
     /// One entry per receipt row, oldest collection first — in practice one per paid job.
     pub by_job: Vec<JobFeeAccrual>,
 }
@@ -96,6 +109,10 @@ pub struct JobFeeAccrual {
     /// `floor(amount_sats × fee_bps / 10_000)`, as written at collection.
     pub fee_sats: u64,
     pub received_at_unix: i64,
+    /// The remittance that discharged this receipt's platform fee (`fee_remittances.remittance_id`),
+    /// or `None` while it is unremitted. Set when a remittance is planned, cleared if that
+    /// remittance fails, kept once it settles.
+    pub remittance_id: Option<String>,
 }
 
 impl JobFeeAccrual {
@@ -105,6 +122,141 @@ impl JobFeeAccrual {
         self.mint_fee_sats.map(|mint_fee| {
             crate::platform_fee::kept_sats(self.amount_sats, mint_fee, self.fee_sats)
         })
+    }
+}
+
+/// Lifecycle of one remittance attempt. `Planned` is the only state under which money may be
+/// moving; at most ONE row may be `Planned` at a time (enforced by a partial unique index AND by
+/// [`SellerStore::plan_remittance`]), which is what makes a second `--confirm` a no-op rather than
+/// a second payment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemittanceState {
+    /// Journaled before the melt: the receipts it covers are pinned to it and the invoice is known.
+    Planned,
+    /// The melt settled; the receipts stay discharged.
+    Settled,
+    /// The melt did not happen (mint reports unpaid/failed, or no quote was ever raised); the
+    /// receipts are released back to unremitted.
+    Failed,
+}
+
+impl RemittanceState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Planned => "planned",
+            Self::Settled => "settled",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn parse(raw: &str) -> Result<Self, StoreError> {
+        match raw {
+            "planned" => Ok(Self::Planned),
+            "settled" => Ok(Self::Settled),
+            "failed" => Ok(Self::Failed),
+            other => Err(StoreError(format!("unknown remittance state {other:?}"))),
+        }
+    }
+}
+
+/// What the remit command knows BEFORE it pays, journaled by [`SellerStore::plan_remittance`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemittancePlan {
+    /// The idempotency key: the bolt11 payment hash (hex). One invoice, one row, ever.
+    pub payment_hash: String,
+    /// The unremitted platform fee this attempt discharges, in sats. Must equal the store's own
+    /// unremitted sum at plan time or the plan is refused.
+    pub gross_sats: u64,
+    /// The invoice amount — what the platform receives: gross minus the melt fee reserve.
+    pub net_sats: u64,
+    /// The Lightning address literal being paid, journaled so a later change leaves history.
+    pub destination: String,
+    /// The invoice being paid, kept so an interrupted attempt can be reconciled against the mint.
+    pub bolt11: String,
+    /// The melt quote id from the estimate, if one was raised.
+    pub melt_quote_id: Option<String>,
+}
+
+/// One row of `fee_remittances`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeeRemittance {
+    pub remittance_id: String,
+    pub gross_sats: u64,
+    /// The melt fee the mint actually took. `None` while planned, and on a row settled by
+    /// reconciliation (the mint confirms PAID but the fee it kept was not observed).
+    pub melt_fee_sats: Option<u64>,
+    pub net_sats: u64,
+    pub destination: String,
+    pub melt_quote_id: Option<String>,
+    pub payment_hash: String,
+    pub bolt11: String,
+    pub state: RemittanceState,
+    pub created_at_unix: i64,
+    pub settled_at_unix: Option<i64>,
+    /// How many receipt rows are pinned to this remittance.
+    pub receipts: usize,
+}
+
+/// Why a plan was refused. Typed so the command can print the right sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanRefused {
+    /// A `planned` row already exists — a payment may be in flight. Following
+    /// `crossmint_hop`'s `DuplicatePlanned`: refuse, never stack a second attempt.
+    InFlight(Box<FeeRemittance>),
+    /// The store's unremitted sum is not what the caller computed — receipts landed (or a
+    /// remittance settled) between the read and the plan. Re-read and re-plan; never pay a stale
+    /// figure.
+    GrossMismatch {
+        planned: u64,
+        unremitted: u64,
+    },
+    /// The payment hash was already used by an earlier attempt (any state).
+    DuplicateInvoice {
+        payment_hash: String,
+    },
+    /// Nothing is unremitted.
+    NothingToRemit,
+    Store(StoreError),
+}
+
+impl std::fmt::Display for PlanRefused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InFlight(row) => write!(
+                formatter,
+                "remittance {} (planned at {}, {} sats to {}) is still in flight; refusing a second \
+                 attempt while the first is unresolved",
+                row.remittance_id, row.created_at_unix, row.net_sats, row.destination
+            ),
+            Self::GrossMismatch {
+                planned,
+                unremitted,
+            } => write!(
+                formatter,
+                "unremitted total moved: planned {planned} sats but the store now holds {unremitted}; \
+                 re-run to re-plan"
+            ),
+            Self::DuplicateInvoice { payment_hash } => write!(
+                formatter,
+                "invoice {payment_hash} was already used by an earlier remittance attempt"
+            ),
+            Self::NothingToRemit => write!(formatter, "nothing to remit"),
+            Self::Store(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for PlanRefused {}
+
+impl From<StoreError> for PlanRefused {
+    fn from(value: StoreError) -> Self {
+        Self::Store(value)
+    }
+}
+
+impl From<rusqlite::Error> for PlanRefused {
+    fn from(value: rusqlite::Error) -> Self {
+        Self::Store(value.into())
     }
 }
 
@@ -127,7 +279,7 @@ pub struct SellerStore {
 }
 
 /// Store open / query failure.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreError(pub String);
 
 impl std::fmt::Display for StoreError {
@@ -461,7 +613,13 @@ impl SellerStore {
                  -- default: a row from before v9 reads NULL, meaning NOT RECORDED — never a
                  -- measured 0. What the seller keeps (face − mint fee − platform fee) is derived at
                  -- read time from these three columns and is deliberately not a fourth column.
-                 mint_fee_sats   INTEGER CHECK (mint_fee_sats IS NULL OR mint_fee_sats >= 0)
+                 mint_fee_sats   INTEGER CHECK (mint_fee_sats IS NULL OR mint_fee_sats >= 0),
+                 -- v10 (stage 2a): the fee_remittances row that discharged this receipt's platform
+                 -- fee. NULL ⇒ UNREMITTED — the balance `maxplayer seller fees remit` pays. Set in
+                 -- the same transaction that journals a planned remittance, cleared if that
+                 -- remittance fails, kept once it settles. Not a foreign key on purpose: the
+                 -- additive-only migration cannot add one, and the fresh schema must match it.
+                 remittance_id   TEXT
              );
              -- Intent-to-receive breadcrumbs, written BEFORE the mint swap (payment ordering,
              -- invariant 3). A breadcrumb records ONLY that a swap was attempted for a token — it is
@@ -513,7 +671,31 @@ impl SellerStore {
                  env_kind           TEXT NOT NULL,
                  env_lock_ref       TEXT NOT NULL,
                  captured_at_unix   INTEGER NOT NULL
-             );",
+             );
+             -- v10 (stage 2a): every attempt to remit the accrued platform fee, one row per invoice.
+             -- `remittance_id` IS the bolt11 payment hash (hex) — the idempotency key: one invoice
+             -- can be journaled once, ever. `gross_sats` is the unremitted fee the attempt
+             -- discharges; `net_sats` the invoice amount (gross minus the melt fee reserve — the fee
+             -- comes OUT of the gross, never on top); `melt_fee_sats` what the mint actually took,
+             -- NULL until settled. `destination` is the address LITERAL paid, so a later change of
+             -- the constant leaves history. `state` moves planned → settled | failed; the receipts
+             -- pinned to a planned row (receipts.remittance_id) are released on failed and kept on
+             -- settled. The partial unique index below lets at most ONE row be planned at a time.
+             CREATE TABLE IF NOT EXISTS fee_remittances (
+                 remittance_id   TEXT PRIMARY KEY,
+                 gross_sats      INTEGER NOT NULL CHECK (gross_sats >= 0),
+                 melt_fee_sats   INTEGER CHECK (melt_fee_sats IS NULL OR melt_fee_sats >= 0),
+                 net_sats        INTEGER NOT NULL CHECK (net_sats >= 0 AND net_sats <= gross_sats),
+                 destination     TEXT NOT NULL,
+                 melt_quote_id   TEXT,
+                 payment_hash    TEXT NOT NULL UNIQUE,
+                 bolt11          TEXT NOT NULL,
+                 state           TEXT NOT NULL CHECK (state IN ('planned','settled','failed')),
+                 created_at_unix INTEGER NOT NULL,
+                 settled_at_unix INTEGER
+             );
+             CREATE UNIQUE INDEX IF NOT EXISTS fee_remittances_one_planned
+                 ON fee_remittances (state) WHERE state = 'planned';",
         )?;
         Self::migrate(conn)?;
         conn.execute(
@@ -590,6 +772,13 @@ impl SellerStore {
                 "ALTER TABLE receipts ADD COLUMN mint_fee_sats INTEGER
                      CHECK (mint_fee_sats IS NULL OR mint_fee_sats >= 0);",
             )?;
+        }
+        // v10 — which remittance discharged each receipt's platform fee. Nullable, no default: every
+        // pre-existing row reads NULL, i.e. UNREMITTED, which is the truth of a store that has never
+        // remitted. The `fee_remittances` table and its index are created by `CREATE ... IF NOT
+        // EXISTS` in the schema above, which runs on every open. Additive + idempotent.
+        if !Self::column_exists(conn, "receipts", "remittance_id")? {
+            conn.execute_batch("ALTER TABLE receipts ADD COLUMN remittance_id TEXT;")?;
         }
         Ok(())
     }
@@ -1276,38 +1465,48 @@ impl SellerStore {
         Ok(found)
     }
 
-    /// What the platform fee (stage 1) has come to: the all-time total and the receipt rows behind
-    /// it, oldest collection first. This is the read-out a later remit stage settles against; it is
-    /// a query and nothing more — no call here or anywhere in this stage moves the balance it reports.
+    /// What the platform fee has come to: the all-time total, how much of it is remitted /
+    /// unremitted / in flight, and the receipt rows behind it, oldest collection first. This is the
+    /// read-out the remit command settles against; it is a query and nothing more — nothing here
+    /// moves the balance it reports.
     ///
     /// Rows collected before the fee existed report `fee_bps = 0, fee_sats = 0` (the migration
     /// default), which is what they owed. Rows collected before v9 report `mint_fee_sats = None`:
     /// the mint fee was not recorded, and the totals say how many such rows there are rather than
-    /// counting them as zero. `by_job` carries one entry per receipt row; the collect path receipts
-    /// a job at most once (`has_receipt` guards the redeem), so that is one per job.
+    /// counting them as zero. Rows collected before v10 report `remittance_id = None`: unremitted,
+    /// which is the truth of a store that has never remitted. `by_job` carries one entry per receipt
+    /// row; the collect path receipts a job at most once (`has_receipt` guards the redeem), so that
+    /// is one per job.
     pub fn accrued_fees(&self) -> Result<AccruedFees, StoreError> {
         let conn = self.lock()?;
         let mut statement = conn.prepare(
-            "SELECT job_id, amount_sats, mint_fee_sats, fee_bps, fee_sats, received_at_unix
-             FROM receipts
-             ORDER BY received_at_unix ASC, receipt_id ASC",
+            "SELECT r.job_id, r.amount_sats, r.mint_fee_sats, r.fee_bps, r.fee_sats,
+                    r.received_at_unix, r.remittance_id, f.state
+             FROM receipts r
+             LEFT JOIN fee_remittances f ON f.remittance_id = r.remittance_id
+             ORDER BY r.received_at_unix ASC, r.receipt_id ASC",
         )?;
-        let by_job = statement
+        let rows = statement
             .query_map([], |row| {
-                Ok(JobFeeAccrual {
-                    job_id: row.get(0)?,
-                    amount_sats: u64::try_from(row.get::<_, i64>(1)?).unwrap_or(0),
-                    mint_fee_sats: row
-                        .get::<_, Option<i64>>(2)?
-                        .map(|fee| u64::try_from(fee).unwrap_or(0)),
-                    fee_bps: u32::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
-                    fee_sats: u64::try_from(row.get::<_, i64>(4)?).unwrap_or(0),
-                    received_at_unix: row.get(5)?,
-                })
+                Ok((
+                    JobFeeAccrual {
+                        job_id: row.get(0)?,
+                        amount_sats: u64::try_from(row.get::<_, i64>(1)?).unwrap_or(0),
+                        mint_fee_sats: row
+                            .get::<_, Option<i64>>(2)?
+                            .map(|fee| u64::try_from(fee).unwrap_or(0)),
+                        fee_bps: u32::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
+                        fee_sats: u64::try_from(row.get::<_, i64>(4)?).unwrap_or(0),
+                        received_at_unix: row.get(5)?,
+                        remittance_id: row.get(6)?,
+                    },
+                    row.get::<_, Option<String>>(7)?,
+                ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         let mut totals = AccruedFees::default();
-        for row in &by_job {
+        let mut by_job = Vec::with_capacity(rows.len());
+        for (row, remittance_state) in rows {
             totals.total_amount_sats = totals.total_amount_sats.saturating_add(row.amount_sats);
             totals.total_fee_sats = totals.total_fee_sats.saturating_add(row.fee_sats);
             match row.mint_fee_sats {
@@ -1317,9 +1516,268 @@ impl SellerStore {
                 }
                 None => totals.rows_without_mint_fee += 1,
             }
+            // A receipt pinned to a row that no longer exists, or to one in an unknown state, is
+            // read as unremitted: fail-closed toward "still owed", never toward "already paid".
+            match remittance_state.as_deref().map(RemittanceState::parse) {
+                Some(Ok(RemittanceState::Settled)) => {
+                    totals.remitted_fee_sats =
+                        totals.remitted_fee_sats.saturating_add(row.fee_sats);
+                }
+                Some(Ok(RemittanceState::Planned)) => {
+                    totals.in_flight_fee_sats =
+                        totals.in_flight_fee_sats.saturating_add(row.fee_sats);
+                }
+                _ => {
+                    totals.unremitted_fee_sats =
+                        totals.unremitted_fee_sats.saturating_add(row.fee_sats);
+                }
+            }
+            by_job.push(row);
         }
         totals.by_job = by_job;
         Ok(totals)
+    }
+
+    // ---- Platform fee remittance (stage 2a) ------------------------------------------------------
+
+    /// Sum of `fee_sats` over receipts pinned to no remittance — computed inside the caller's
+    /// transaction so the plan checks the figure it is about to pin.
+    fn unremitted_fee_sats_in(conn: &Connection) -> Result<u64, StoreError> {
+        let sum: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(fee_sats), 0) FROM receipts WHERE remittance_id IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(u64::try_from(sum).unwrap_or(0))
+    }
+
+    fn read_remittance(row: &rusqlite::Row<'_>) -> rusqlite::Result<FeeRemittance> {
+        let state_raw: String = row.get(8)?;
+        let state = RemittanceState::parse(&state_raw).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                8,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+        Ok(FeeRemittance {
+            remittance_id: row.get(0)?,
+            gross_sats: u64::try_from(row.get::<_, i64>(1)?).unwrap_or(0),
+            melt_fee_sats: row
+                .get::<_, Option<i64>>(2)?
+                .map(|fee| u64::try_from(fee).unwrap_or(0)),
+            net_sats: u64::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
+            destination: row.get(4)?,
+            melt_quote_id: row.get(5)?,
+            payment_hash: row.get(6)?,
+            bolt11: row.get(7)?,
+            state,
+            created_at_unix: row.get(9)?,
+            settled_at_unix: row.get(10)?,
+            receipts: usize::try_from(row.get::<_, i64>(11)?).unwrap_or(0),
+        })
+    }
+
+    const REMITTANCE_COLUMNS: &'static str =
+        "f.remittance_id, f.gross_sats, f.melt_fee_sats, f.net_sats, f.destination, f.melt_quote_id,
+         f.payment_hash, f.bolt11, f.state, f.created_at_unix, f.settled_at_unix,
+         (SELECT COUNT(*) FROM receipts r WHERE r.remittance_id = f.remittance_id)";
+
+    fn in_flight_remittance_in(conn: &Connection) -> Result<Option<FeeRemittance>, StoreError> {
+        let found = conn
+            .query_row(
+                &format!(
+                    "SELECT {} FROM fee_remittances f WHERE f.state = 'planned' LIMIT 1",
+                    Self::REMITTANCE_COLUMNS
+                ),
+                [],
+                Self::read_remittance,
+            )
+            .optional()?;
+        Ok(found)
+    }
+
+    /// The single `planned` remittance, if one exists — a payment that may be in flight at the mint
+    /// and MUST be reconciled (settled or failed) before another may be planned.
+    pub fn in_flight_remittance(&self) -> Result<Option<FeeRemittance>, StoreError> {
+        let conn = self.lock()?;
+        Self::in_flight_remittance_in(&conn)
+    }
+
+    /// Every remittance attempt, oldest first.
+    pub fn remittances(&self) -> Result<Vec<FeeRemittance>, StoreError> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(&format!(
+            "SELECT {} FROM fee_remittances f ORDER BY f.created_at_unix ASC, f.remittance_id ASC",
+            Self::REMITTANCE_COLUMNS
+        ))?;
+        let rows = statement
+            .query_map([], Self::read_remittance)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Journal a remittance BEFORE paying it, and pin every currently-unremitted receipt to it, in
+    /// one `IMMEDIATE` transaction. This is the durable intent record the payment is made against:
+    /// a crash after it leaves a `planned` row the next run reconciles, never a payment nobody
+    /// journaled.
+    ///
+    /// Refused, with nothing written, when: a `planned` row already exists ([`PlanRefused::InFlight`]
+    /// — the precedent is `crossmint_hop`'s refusal of a duplicate Planned record); the store's
+    /// unremitted sum differs from `plan.gross_sats` ([`PlanRefused::GrossMismatch`] — the ledger
+    /// moved under the caller); the payment hash was already journaled
+    /// ([`PlanRefused::DuplicateInvoice`]); or there is nothing unremitted.
+    pub fn plan_remittance(
+        &self,
+        plan: &RemittancePlan,
+        now_unix: i64,
+    ) -> Result<FeeRemittance, PlanRefused> {
+        if plan.net_sats > plan.gross_sats {
+            return Err(PlanRefused::Store(StoreError(format!(
+                "net {} exceeds gross {}: the melt fee must come out of the gross, never on top",
+                plan.net_sats, plan.gross_sats
+            ))));
+        }
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(active) = Self::in_flight_remittance_in(&tx)? {
+            return Err(PlanRefused::InFlight(Box::new(active)));
+        }
+        let unremitted = Self::unremitted_fee_sats_in(&tx)?;
+        if unremitted == 0 {
+            return Err(PlanRefused::NothingToRemit);
+        }
+        if unremitted != plan.gross_sats {
+            return Err(PlanRefused::GrossMismatch {
+                planned: plan.gross_sats,
+                unremitted,
+            });
+        }
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO fee_remittances
+                 (remittance_id, gross_sats, melt_fee_sats, net_sats, destination, melt_quote_id,
+                  payment_hash, bolt11, state, created_at_unix, settled_at_unix)
+             VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?1, ?6, ?8, ?7, NULL)",
+            params![
+                plan.payment_hash,
+                plan.gross_sats as i64,
+                plan.net_sats as i64,
+                plan.destination,
+                plan.melt_quote_id,
+                plan.bolt11,
+                now_unix,
+                RemittanceState::Planned.as_str(),
+            ],
+        )?;
+        if inserted == 0 {
+            return Err(PlanRefused::DuplicateInvoice {
+                payment_hash: plan.payment_hash.clone(),
+            });
+        }
+        tx.execute(
+            "UPDATE receipts SET remittance_id = ?1 WHERE remittance_id IS NULL",
+            params![plan.payment_hash],
+        )?;
+        let row = tx.query_row(
+            &format!(
+                "SELECT {} FROM fee_remittances f WHERE f.remittance_id = ?1",
+                Self::REMITTANCE_COLUMNS
+            ),
+            params![plan.payment_hash],
+            Self::read_remittance,
+        )?;
+        tx.commit()?;
+        Ok(row)
+    }
+
+    /// Mark a `planned` remittance settled: the melt confirmed (or the mint reports the quote PAID
+    /// on reconciliation). `net_paid_sats` / `melt_fee_sats` / `melt_quote_id` are what the mint
+    /// reported, `None` where reconciliation could not observe them. Pinned receipts stay
+    /// discharged. Refused if the row is not `planned` — a settled or failed row never moves again.
+    pub fn settle_remittance(
+        &self,
+        remittance_id: &str,
+        net_paid_sats: Option<u64>,
+        melt_fee_sats: Option<u64>,
+        melt_quote_id: Option<&str>,
+        now_unix: i64,
+    ) -> Result<FeeRemittance, StoreError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE fee_remittances
+             SET state = ?6,
+                 settled_at_unix = ?2,
+                 melt_fee_sats = ?3,
+                 net_sats = COALESCE(?4, net_sats),
+                 melt_quote_id = COALESCE(?5, melt_quote_id)
+             WHERE remittance_id = ?1 AND state = ?7",
+            params![
+                remittance_id,
+                now_unix,
+                melt_fee_sats.map(|fee| fee as i64),
+                net_paid_sats.map(|net| net as i64),
+                melt_quote_id,
+                RemittanceState::Settled.as_str(),
+                RemittanceState::Planned.as_str(),
+            ],
+        )?;
+        if changed == 0 {
+            return Err(StoreError(format!(
+                "remittance {remittance_id} is not planned; refusing to settle it"
+            )));
+        }
+        let row = tx.query_row(
+            &format!(
+                "SELECT {} FROM fee_remittances f WHERE f.remittance_id = ?1",
+                Self::REMITTANCE_COLUMNS
+            ),
+            params![remittance_id],
+            Self::read_remittance,
+        )?;
+        tx.commit()?;
+        Ok(row)
+    }
+
+    /// Mark a `planned` remittance failed — the mint reports the quote unpaid/failed, or no quote
+    /// was ever raised for its invoice — and release its receipts back to unremitted so the next
+    /// attempt pays them. Refused if the row is not `planned`.
+    pub fn fail_remittance(
+        &self,
+        remittance_id: &str,
+        now_unix: i64,
+    ) -> Result<FeeRemittance, StoreError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE fee_remittances SET state = ?3, settled_at_unix = ?2
+             WHERE remittance_id = ?1 AND state = ?4",
+            params![
+                remittance_id,
+                now_unix,
+                RemittanceState::Failed.as_str(),
+                RemittanceState::Planned.as_str(),
+            ],
+        )?;
+        if changed == 0 {
+            return Err(StoreError(format!(
+                "remittance {remittance_id} is not planned; refusing to fail it"
+            )));
+        }
+        tx.execute(
+            "UPDATE receipts SET remittance_id = NULL WHERE remittance_id = ?1",
+            params![remittance_id],
+        )?;
+        let row = tx.query_row(
+            &format!(
+                "SELECT {} FROM fee_remittances f WHERE f.remittance_id = ?1",
+                Self::REMITTANCE_COLUMNS
+            ),
+            params![remittance_id],
+            Self::read_remittance,
+        )?;
+        tx.commit()?;
+        Ok(row)
     }
 
     /// Whether a delivery has been journaled for `job_id` (#552). A delivery row is written only by
@@ -2535,7 +2993,8 @@ mod tests {
                     mint_fee_sats: Some(1),
                     fee_bps: 200,
                     fee_sats: 2,
-                    received_at_unix: 3
+                    received_at_unix: 3,
+                    remittance_id: None,
                 },
                 JobFeeAccrual {
                     job_id: job_b.clone(),
@@ -2543,7 +3002,8 @@ mod tests {
                     mint_fee_sats: Some(3),
                     fee_bps: 250,
                     fee_sats: 25,
-                    received_at_unix: 4
+                    received_at_unix: 4,
+                    remittance_id: None,
                 },
             ],
             "one row per receipt, oldest first, each carrying the rate in force and what it came to"
@@ -2613,6 +3073,7 @@ mod tests {
                 fee_bps: 0,
                 fee_sats: 0,
                 received_at_unix: 7,
+                remittance_id: None,
             }],
             "the pre-existing receipt is untouched, reads a fee of 0/0, and has NO mint fee (not a zero one)"
         );
@@ -2694,6 +3155,7 @@ mod tests {
                 fee_bps: 1000,
                 fee_sats: 10,
                 received_at_unix: 7,
+                remittance_id: None,
             }],
             "the v8 row keeps its fee and carries NO mint fee"
         );
@@ -2733,6 +3195,359 @@ mod tests {
             SCHEMA_VERSION
         );
         assert_eq!(store.accrued_fees().expect("read-out").by_job.len(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- Stage 2a: the fee remittance ledger ----
+
+    fn plan(hash: &str, gross: u64, net: u64) -> RemittancePlan {
+        RemittancePlan {
+            payment_hash: hash.to_owned(),
+            gross_sats: gross,
+            net_sats: net,
+            destination: "maxplayer@agi.cash".to_owned(),
+            bolt11: format!("lnbc-test-{hash}"),
+            melt_quote_id: Some(format!("quote-{hash}")),
+        }
+    }
+
+    // A store written by a v9 binary (mint_fee_sats present, NO remittance_id column, no
+    // fee_remittances table) opens under v10: the column and table are added additively, the
+    // existing receipt reads as UNREMITTED (remittance_id None), the totals put its fee in
+    // `unremitted_fee_sats`, and a second open is a no-op.
+    #[test]
+    fn a_v9_store_migrates_to_v10_and_reads_its_receipts_as_unremitted() {
+        let path = temp_db("pre-remittance");
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).expect("create v9 store");
+            conn.execute_batch(
+                "CREATE TABLE seller_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO seller_meta VALUES ('schema_version', '9');
+                 CREATE TABLE receipts (
+                     receipt_id      TEXT PRIMARY KEY,
+                     job_id          TEXT NOT NULL,
+                     amount_sats     INTEGER NOT NULL CHECK (amount_sats >= 0),
+                     received_at_unix INTEGER NOT NULL,
+                     fee_bps         INTEGER NOT NULL DEFAULT 0 CHECK (fee_bps >= 0 AND fee_bps <= 10000),
+                     fee_sats        INTEGER NOT NULL DEFAULT 0 CHECK (fee_sats >= 0),
+                     mint_fee_sats   INTEGER CHECK (mint_fee_sats IS NULL OR mint_fee_sats >= 0)
+                 );
+                 INSERT INTO receipts VALUES ('v9-receipt', 'v9-job', 100, 7, 1000, 10, 1);",
+            )
+            .expect("v9 schema");
+            let tables: Vec<String> = conn
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+                .expect("prepare")
+                .query_map([], |row| row.get(0))
+                .expect("query")
+                .collect::<Result<_, _>>()
+                .expect("names");
+            assert!(
+                !tables.iter().any(|name| name == "fee_remittances"),
+                "fixture must predate the remittance table: {tables:?}"
+            );
+        }
+
+        let store = SellerStore::open(&path).expect("a v9 store opens clean under v10");
+        assert_eq!(
+            store.health().expect("health").schema_version,
+            SCHEMA_VERSION
+        );
+        let accrued = store.accrued_fees().expect("read-out on a migrated store");
+        assert_eq!(
+            accrued.by_job,
+            vec![JobFeeAccrual {
+                job_id: "v9-job".to_owned(),
+                amount_sats: 100,
+                mint_fee_sats: Some(1),
+                fee_bps: 1000,
+                fee_sats: 10,
+                received_at_unix: 7,
+                remittance_id: None,
+            }],
+            "the v9 row keeps every figure and is UNREMITTED"
+        );
+        assert_eq!(accrued.total_fee_sats, 10);
+        assert_eq!(accrued.unremitted_fee_sats, 10);
+        assert_eq!(accrued.remitted_fee_sats, 0);
+        assert_eq!(accrued.in_flight_fee_sats, 0);
+        assert!(store.remittances().expect("table exists").is_empty());
+        assert_eq!(store.in_flight_remittance().expect("query"), None);
+
+        // The migrated store can plan against its old row: the column is writable.
+        let row = store
+            .plan_remittance(&plan("h1", 10, 9), 100)
+            .expect("plan on migrated store");
+        assert_eq!(row.receipts, 1);
+        assert_eq!(
+            store.accrued_fees().expect("read-out").by_job[0].remittance_id,
+            Some("h1".to_owned())
+        );
+
+        drop(store);
+        let store = SellerStore::open(&path).expect("second open is a no-op");
+        assert_eq!(
+            store.health().expect("health").schema_version,
+            SCHEMA_VERSION
+        );
+        assert_eq!(store.remittances().expect("rows").len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // The load-bearing property (brief §3.4): plan pins exactly the unremitted receipts; settle keeps
+    // them discharged so the unremitted balance is ZERO afterwards and a second plan finds nothing to
+    // remit; a receipt collected AFTER the plan is not swept into it.
+    #[test]
+    fn plan_then_settle_discharges_the_receipts_and_a_second_plan_finds_nothing() {
+        let (store, path) = fresh_store("remit-settle");
+        store
+            .collect_receipt("r1", "job-1", 100, fees(1, 1000, 10), 1)
+            .expect("collect 1");
+        store
+            .collect_receipt("r2", "job-2", 50, fees(1, 1000, 5), 2)
+            .expect("collect 2");
+        // A zero-fee receipt (a 9-sat job at 10% owes 0) is discharged too — it owes nothing.
+        store
+            .collect_receipt("r0", "job-0", 9, fees(0, 1000, 0), 3)
+            .expect("collect 0");
+        let accrued = store.accrued_fees().expect("read-out");
+        assert_eq!(accrued.unremitted_fee_sats, 15);
+
+        let planned = store
+            .plan_remittance(&plan("h1", 15, 14), 10)
+            .expect("plan");
+        assert_eq!(planned.state, RemittanceState::Planned);
+        assert_eq!(planned.remittance_id, "h1");
+        assert_eq!(planned.payment_hash, "h1");
+        assert_eq!((planned.gross_sats, planned.net_sats), (15, 14));
+        assert_eq!(planned.melt_fee_sats, None);
+        assert_eq!(planned.destination, "maxplayer@agi.cash");
+        assert_eq!(planned.melt_quote_id, Some("quote-h1".to_owned()));
+        assert_eq!(planned.bolt11, "lnbc-test-h1");
+        assert_eq!(planned.receipts, 3);
+        assert_eq!(
+            (planned.created_at_unix, planned.settled_at_unix),
+            (10, None)
+        );
+        let accrued = store.accrued_fees().expect("read-out");
+        assert_eq!(
+            accrued.unremitted_fee_sats, 0,
+            "pinned receipts are no longer unremitted"
+        );
+        assert_eq!(accrued.in_flight_fee_sats, 15, "…they are in flight");
+        assert_eq!(accrued.remitted_fee_sats, 0);
+        assert_eq!(
+            accrued.total_fee_sats, 15,
+            "the all-time total does not move"
+        );
+        assert!(
+            accrued
+                .by_job
+                .iter()
+                .all(|row| row.remittance_id.as_deref() == Some("h1"))
+        );
+        assert_eq!(
+            store.in_flight_remittance().expect("query"),
+            Some(planned.clone())
+        );
+
+        // A receipt collected while the payment is in flight is NOT swept into it.
+        store
+            .collect_receipt("r3", "job-3", 200, fees(2, 1000, 20), 11)
+            .expect("collect 3");
+        let accrued = store.accrued_fees().expect("read-out");
+        assert_eq!(accrued.unremitted_fee_sats, 20);
+        assert_eq!(accrued.in_flight_fee_sats, 15);
+
+        // Settle with what the mint reported: paid 14, fee 1, quote id from the payment.
+        let settled = store
+            .settle_remittance("h1", Some(14), Some(1), Some("quote-pay-h1"), 12)
+            .expect("settle");
+        assert_eq!(settled.state, RemittanceState::Settled);
+        assert_eq!(settled.melt_fee_sats, Some(1));
+        assert_eq!(settled.net_sats, 14);
+        assert_eq!(settled.melt_quote_id, Some("quote-pay-h1".to_owned()));
+        assert_eq!(settled.settled_at_unix, Some(12));
+        assert_eq!(settled.receipts, 3);
+        let accrued = store.accrued_fees().expect("read-out");
+        assert_eq!(accrued.remitted_fee_sats, 15);
+        assert_eq!(accrued.in_flight_fee_sats, 0);
+        assert_eq!(
+            accrued.unremitted_fee_sats, 20,
+            "only the post-plan receipt is owed"
+        );
+        assert_eq!(store.in_flight_remittance().expect("query"), None);
+
+        // A settled row never moves again.
+        assert!(store.settle_remittance("h1", None, None, None, 13).is_err());
+        assert!(store.fail_remittance("h1", 13).is_err());
+
+        // The next plan covers exactly the new receipt; planning the OLD figure is a mismatch.
+        assert_eq!(
+            store.plan_remittance(&plan("h2", 15, 15), 14),
+            Err(PlanRefused::GrossMismatch {
+                planned: 15,
+                unremitted: 20
+            })
+        );
+        let second = store
+            .plan_remittance(&plan("h2", 20, 19), 14)
+            .expect("second plan");
+        assert_eq!(second.receipts, 1);
+        store
+            .settle_remittance("h2", Some(19), Some(1), None, 15)
+            .expect("settle 2");
+        let accrued = store.accrued_fees().expect("read-out");
+        assert_eq!(accrued.unremitted_fee_sats, 0);
+        assert_eq!(accrued.remitted_fee_sats, 35);
+        // Everything is discharged: a third plan has nothing to remit, whatever figure it claims.
+        assert_eq!(
+            store.plan_remittance(&plan("h3", 0, 0), 16),
+            Err(PlanRefused::NothingToRemit)
+        );
+        assert_eq!(
+            store.plan_remittance(&plan("h3", 35, 35), 16),
+            Err(PlanRefused::NothingToRemit)
+        );
+        assert_eq!(store.remittances().expect("rows").len(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // The crossmint_hop precedent: while a planned row exists, a second plan is REFUSED — at the
+    // API and, belt-and-braces, by the partial unique index — so no second payment can be journaled
+    // against receipts that may already be paid for.
+    #[test]
+    fn a_second_plan_while_one_is_in_flight_is_refused_by_api_and_by_index() {
+        let (store, path) = fresh_store("remit-duplicate");
+        store
+            .collect_receipt("r1", "job-1", 100, fees(1, 1000, 10), 1)
+            .expect("collect");
+        let first = store
+            .plan_remittance(&plan("h1", 10, 9), 2)
+            .expect("first plan");
+        match store.plan_remittance(&plan("h2", 10, 9), 3) {
+            Err(PlanRefused::InFlight(active)) => assert_eq!(*active, first),
+            other => panic!("expected InFlight, got {other:?}"),
+        }
+        // Even a plan for a fresh receipt is refused while the first is unresolved.
+        store
+            .collect_receipt("r2", "job-2", 100, fees(1, 1000, 10), 4)
+            .expect("collect 2");
+        assert!(matches!(
+            store.plan_remittance(&plan("h3", 10, 9), 5),
+            Err(PlanRefused::InFlight(_))
+        ));
+        // The index refuses a raw second planned row too.
+        {
+            let conn = store.lock().expect("lock");
+            let raw = conn.execute(
+                "INSERT INTO fee_remittances
+                     (remittance_id, gross_sats, net_sats, destination, payment_hash, bolt11, state, created_at_unix)
+                 VALUES ('raw', 1, 1, 'x@y', 'raw', 'ln', 'planned', 6)",
+                [],
+            );
+            assert!(
+                raw.is_err(),
+                "the partial unique index must refuse a second planned row"
+            );
+        }
+        // Nothing was written by the refusals.
+        assert_eq!(store.remittances().expect("rows").len(), 1);
+        assert_eq!(
+            store.accrued_fees().expect("read-out").unremitted_fee_sats,
+            10
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Recovery: a planned row whose melt never happened is FAILED, which releases its receipts back
+    // to unremitted so the next attempt pays them — and the failed row keeps its history. The same
+    // invoice can never be journaled twice, in any state.
+    #[test]
+    fn fail_releases_the_receipts_and_the_invoice_stays_used() {
+        let (store, path) = fresh_store("remit-fail");
+        store
+            .collect_receipt("r1", "job-1", 100, fees(1, 1000, 10), 1)
+            .expect("collect");
+        store.plan_remittance(&plan("h1", 10, 9), 2).expect("plan");
+        let failed = store.fail_remittance("h1", 3).expect("fail");
+        assert_eq!(failed.state, RemittanceState::Failed);
+        assert_eq!(failed.settled_at_unix, Some(3));
+        assert_eq!(failed.receipts, 0, "its receipts were released");
+        let accrued = store.accrued_fees().expect("read-out");
+        assert_eq!(accrued.unremitted_fee_sats, 10);
+        assert_eq!(accrued.in_flight_fee_sats, 0);
+        assert_eq!(accrued.by_job[0].remittance_id, None);
+        assert_eq!(store.in_flight_remittance().expect("query"), None);
+        // A failed row never moves again.
+        assert!(store.settle_remittance("h1", None, None, None, 4).is_err());
+        assert!(store.fail_remittance("h1", 4).is_err());
+        // The same invoice cannot be re-planned; a fresh one can.
+        assert_eq!(
+            store.plan_remittance(&plan("h1", 10, 9), 5),
+            Err(PlanRefused::DuplicateInvoice {
+                payment_hash: "h1".to_owned()
+            })
+        );
+        assert_eq!(
+            store.accrued_fees().expect("read-out").unremitted_fee_sats,
+            10,
+            "a refused plan pins nothing"
+        );
+        let second = store
+            .plan_remittance(&plan("h2", 10, 9), 6)
+            .expect("re-plan");
+        assert_eq!(second.receipts, 1);
+        // Settling by reconciliation (mint says PAID, fee unobserved) records None for the fee.
+        let settled = store
+            .settle_remittance("h2", None, None, Some("quote-seen"), 7)
+            .expect("settle by reconciliation");
+        assert_eq!(settled.melt_fee_sats, None);
+        assert_eq!(
+            settled.net_sats, 9,
+            "the planned net stands when the mint's figure is unobserved"
+        );
+        assert_eq!(settled.melt_quote_id, Some("quote-seen".to_owned()));
+        let history = store.remittances().expect("rows");
+        assert_eq!(
+            history
+                .iter()
+                .map(|row| (row.remittance_id.as_str(), row.state))
+                .collect::<Vec<_>>(),
+            vec![
+                ("h1", RemittanceState::Failed),
+                ("h2", RemittanceState::Settled)
+            ]
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // The amount rule (brief §3.3) at the store boundary: a net above the gross is refused before any
+    // transaction, and the schema refuses it too.
+    #[test]
+    fn a_plan_whose_net_exceeds_its_gross_is_refused() {
+        let (store, path) = fresh_store("remit-net-gt-gross");
+        store
+            .collect_receipt("r1", "job-1", 100, fees(1, 1000, 10), 1)
+            .expect("collect");
+        assert!(matches!(
+            store.plan_remittance(&plan("h1", 10, 11), 2),
+            Err(PlanRefused::Store(_))
+        ));
+        assert!(store.remittances().expect("rows").is_empty());
+        let conn = store.lock().expect("lock");
+        assert!(
+            conn.execute(
+                "INSERT INTO fee_remittances
+                     (remittance_id, gross_sats, net_sats, destination, payment_hash, bolt11, state, created_at_unix)
+                 VALUES ('raw', 10, 11, 'x@y', 'raw', 'ln', 'planned', 3)",
+                [],
+            )
+            .is_err(),
+            "CHECK (net_sats <= gross_sats) must refuse"
+        );
+        drop(conn);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2902,8 +3717,8 @@ mod free_lane_tests {
             SCHEMA_VERSION
         );
         assert_eq!(
-            SCHEMA_VERSION, 9,
-            "v7 was the free lane; v8 added the receipt fee columns; v9 the mint fee"
+            SCHEMA_VERSION, 10,
+            "v7 was the free lane; v8 added the receipt fee columns; v9 the mint fee; v10 the fee remittance ledger"
         );
 
         // The legacy rows SURVIVE and read as PAID — correct by construction, because every job
