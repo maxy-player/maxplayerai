@@ -76,7 +76,7 @@ use crate::lnurl_pay::{self, HttpsFetch, LightningAddress, PayRequest, ResolvedI
 use crate::platform_fee::PLATFORM_FEE_ADDRESS;
 use crate::seller_node::store::{
     FeeRemittance, OwnershipLost, PlanRefused, RemitAttempt, RemitAttemptOutcome,
-    RemitAttemptTrigger, RemitSettlement, RemittancePlan, SellerStore, SettledBy,
+    RemitAttemptTrigger, RemitSettlement, RemittancePlan, RemittanceState, SellerStore, SettledBy,
 };
 use crate::wallet_ops::{
     self, MeltCeiling, MeltEstimate, MeltOutcome, MeltQuoteState, MeltQuoteStatus, WalletOpsError,
@@ -143,6 +143,26 @@ pub trait RemitEffects {
     /// effects do nothing here; tests pause here to interleave a second process against the
     /// planned row (addendum 3 §2.2).
     fn after_plan(&mut self, _planned: &FeeRemittance) {}
+    /// Observation point: called once the compare-and-set has admitted the melt (the row is
+    /// `spending`) and before the melt itself. The live effects do nothing here; tests pause here
+    /// to interleave a second process against a SPENDING row (addendum 4 §1, test b).
+    fn after_admit(&mut self, _admitted: &FeeRemittance) {}
+    /// **The clock, read now.** The pre-spend fence compares the row's lease against the time at
+    /// the instant of admission — never the attempt's entry time, which may be arbitrarily stale by
+    /// then (addendum 4 §1.1). The live effects read the host clock; tests inject one so "the clock
+    /// advanced while A was paused" is real arithmetic in the store.
+    fn now_unix(&self) -> i64 {
+        host_now_unix()
+    }
+}
+
+/// The host's unix clock in whole seconds; `0` if the clock is before the epoch (it is not).
+fn host_now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| i64::try_from(elapsed.as_secs()).ok())
+        .unwrap_or(0)
 }
 
 /// This process's owner token: pid plus a boot nonce from the OS RNG, fixed for the life of the
@@ -267,6 +287,16 @@ pub enum Refusal {
         owner: String,
         lease_until_unix: i64,
     },
+    /// An earlier attempt's row is SPENDING — its owner's compare-and-set admitted the melt — and
+    /// the mint does not report its quote terminal (addendum 4 §1.2): the owner may be mid-melt,
+    /// whatever the clock says, so no run releases it on time. Whoever asks, however late, this row
+    /// resolves exactly when the mint resolves its quote: PAID settles it, FAILED or an expired
+    /// quote releases it.
+    SpendingHeld {
+        remittance_id: String,
+        owner: String,
+        spending_since_unix: i64,
+    },
     /// The pre-spend gate refused: between journaling the plan and paying it, this process lost its
     /// claim on the row (another process reconciled it), or too little lease remained to start a
     /// payment safely. Nothing was spent.
@@ -320,6 +350,14 @@ impl fmt::Display for Refusal {
             } => write!(
                 formatter,
                 "remittance {remittance_id} is planned by another live process ({owner}, lease until unix {lease_until_unix}) and its quote is not terminal; not releasing a live payer's intent"
+            ),
+            Self::SpendingHeld {
+                remittance_id,
+                owner,
+                spending_since_unix,
+            } => write!(
+                formatter,
+                "remittance {remittance_id} is SPENDING (its melt was admitted by {owner} at unix {spending_since_unix}) and its quote is not terminal; a spending row is never released on time — it settles when the mint reports the quote PAID and releases when the mint reports it FAILED or expired"
             ),
             Self::OwnershipLost {
                 remittance_id,
@@ -375,17 +413,25 @@ pub enum Reconcile {
     Hold(Refusal),
 }
 
-/// The release rule. A `planned` row is released only when:
-/// - the mint reports its quote **FAILED** — terminal, whoever owns the row; or
-/// - the mint reports **UNPAID**, or the wallet never raised a quote for its invoice, AND either
+/// The release rule. The in-flight row is **settled** when the mint reports its quote **PAID**,
+/// whatever its state or owner. It is **released** only when:
+/// - the mint reports its quote **FAILED**, or **UNPAID with the quote's expiry behind the clock**
+///   — an expired quote is one the mint will never pay: terminal, whoever owns the row and
+///   whatever its state; or
+/// - the row is **`planned`** (its melt was never admitted, so nothing can have been spent against
+///   it), the mint reports **UNPAID** or the wallet never raised a quote for its invoice, AND either
 ///   the row is **this process's own** (a process runs one attempt at a time, so its earlier
-///   attempt is over and cannot still be paying) or the owner's **lease has run out** (the owner is
-///   provably gone, or provably not spending: it refuses to start a payment inside
-///   [`SPEND_MARGIN`] of the lease's end).
+///   attempt is over) or the owner's **lease has run out** (the owner is provably gone, or provably
+///   not spending: its compare-and-set refuses inside [`SPEND_MARGIN`] of the lease's end and,
+///   once past it, changes zero rows).
 ///
 /// It is **held** — nothing written, this run refused — when the quote is PENDING or UNKNOWN (a
-/// payment may be settling) or when it is UNPAID / absent but another process's lease still stands:
-/// UNPAID means "not yet", not "abandoned".
+/// payment may be settling); when a `planned` row is UNPAID / absent but another process's lease
+/// still stands (UNPAID means "not yet", not "abandoned"); and when the row is **`spending`** and
+/// the quote is not terminal (addendum 4 §1.2): its owner's compare-and-set admitted the melt, so
+/// the owner may be mid-melt, and **lease expiry alone never touches a spending row** — it resolves
+/// exactly when the mint resolves its quote. This holds even for this process's own spending row:
+/// a melt that returned an error may still have reached the mint.
 pub fn reconcile_decision(
     row: &FeeRemittance,
     status: Option<&MeltQuoteStatus>,
@@ -410,8 +456,20 @@ pub fn reconcile_decision(
         Some(MeltQuoteState::Failed) => Reconcile::Release(format!(
             "{unpaid_reason}; FAILED is terminal at the mint whoever owns the row"
         )),
+        Some(MeltQuoteState::Unpaid) if status.is_some_and(|status| status.expired_at(now_unix)) => {
+            Reconcile::Release(format!(
+                "{unpaid_reason}; the quote expired at unix {} and the mint will never pay it — terminal whoever owns the row",
+                status.map(|status| status.expiry_unix).unwrap_or_default()
+            ))
+        }
         Some(MeltQuoteState::Unpaid) | None => {
-            if row.owner.as_deref() == Some(my_owner) {
+            if row.state == RemittanceState::Spending {
+                Reconcile::Hold(Refusal::SpendingHeld {
+                    remittance_id: row.remittance_id.clone(),
+                    owner: row.owner.clone().unwrap_or_default(),
+                    spending_since_unix: row.spending_since_unix.unwrap_or(row.created_at_unix),
+                })
+            } else if row.owner.as_deref() == Some(my_owner) {
                 Reconcile::Release(format!(
                     "{unpaid_reason}; the row is this process's own earlier attempt, which is over"
                 ))
@@ -805,23 +863,30 @@ fn remit_inner(
     );
     effects.after_plan(&planned);
 
-    // The pre-spend gate, both conditions, before a single proof is touched:
-    // (a) ownership — the row is still planned, still ours, with the spending margin left in the
-    //     lease (another process may release it the moment the lease ends);
+    // The pre-spend gate, both conditions, before a single proof is touched (addendum 3 §2.1,
+    // addendum 4 §1):
+    // (a) the fence — ONE compare-and-set in the store advances the row planned → spending, and
+    //     only if it is still planned, still ours, and its lease ends more than SPEND_MARGIN after
+    //     the clock AS READ NOW (not the attempt's entry time: however long we paused between the
+    //     plan and this line, that time counts). Zero rows changed ⇒ refuse, no spend. Once
+    //     admitted, the row is released by nobody on time: only the mint's verdict on its quote
+    //     resolves it.
     // (b) the ceiling — enforced INSIDE the melt against the quote raised at payment time.
-    match store
-        .confirm_remittance_ownership(
+    let admit_now_unix = effects.now_unix();
+    let admitted = match store
+        .admit_remittance_spend(
             &planned.remittance_id,
             effects.owner(),
-            now_unix,
+            admit_now_unix,
             lease_secs(SPEND_MARGIN),
         )
-        .map_err(|error| format!("re-read remittance {}: {error}", planned.remittance_id))?
+        .map_err(|error| format!("admit remittance {}: {error}", planned.remittance_id))?
     {
-        Ok(_) => {}
+        Ok(admitted) => admitted,
         Err(lost) => {
-            // Ours but too little lease left: nothing was spent, so release our own row. Not ours
-            // (or no longer planned): another process holds or resolved it — touch nothing.
+            // Ours, still planned, but too little lease left: nothing was spent, so release our own
+            // row. Not ours, gone, or no longer planned: another process holds or resolved it —
+            // touch nothing.
             if matches!(lost, OwnershipLost::LeaseTooShort { .. }) {
                 store
                     .fail_remittance(&planned.remittance_id, now_unix)
@@ -830,7 +895,7 @@ fn remit_inner(
             let reason = lost.to_string();
             let _ = writeln!(
                 out,
-                "REFUSED before spending — {reason}. Nothing moved by this run{}.",
+                "REFUSED before spending — {reason} (checked at unix {admit_now_unix}). Nothing moved by this run{}.",
                 if matches!(lost, OwnershipLost::LeaseTooShort { .. }) {
                     format!(
                         "; released {} sats back to unremitted for the next attempt",
@@ -845,7 +910,13 @@ fn remit_inner(
                 reason,
             }));
         }
-    }
+    };
+    let _ = writeln!(
+        out,
+        "Admitted to spend at unix {admit_now_unix}: remittance {} is now spending (lease until unix {lease_until_unix}); from here only the mint's verdict on its quote resolves it",
+        admitted.remittance_id
+    );
+    effects.after_admit(&admitted);
     let ceiling = MeltCeiling {
         max_debit_sats: gross,
         invoice_sats: net,
@@ -917,7 +988,7 @@ fn remit_inner(
         Err(MeltFailure::Failed(error)) => {
             let _ = writeln!(
                 out,
-                "melt failed: {error}\n  remittance {} stays journaled as planned. The next attempt (automatic, or `maxplayer seller fees remit`) reconciles it with the mint: settled if the payment landed, released if it did not. Nothing else was attempted.",
+                "melt failed: {error}\n  remittance {} stays journaled as spending: proofs may have reached the mint. The next attempt (automatic, or `maxplayer seller fees remit`) reconciles it with the mint: settled if the quote is PAID, released if the mint reports it FAILED or expired, held while it is UNPAID or PENDING. Nothing else was attempted.",
                 planned.remittance_id
             );
             Ok(RemitOutcome::MeltFailed {
@@ -1330,10 +1401,10 @@ impl Drop for RemitPermit {
 /// Scripted effects for tests, shared with `seller_node::run`'s collect-path tests.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
 
-    use super::{MeltFailure, RemitEffects};
+    use super::{MeltFailure, RemitEffects, host_now_unix};
     use crate::lnurl_pay::{LightningAddress, PayRequest, ResolvedInvoice, Url};
     use crate::seller_node::store::FeeRemittance;
     use crate::wallet_ops::{MeltCeiling, MeltEstimate, MeltOutcome, MeltQuoteStatus};
@@ -1415,8 +1486,17 @@ pub(crate) mod test_support {
         pub(crate) status_calls: Vec<String>,
         pub(crate) melt_counter: Option<Arc<AtomicUsize>>,
         pub(crate) plan_gate: Option<Arc<Gate>>,
+        /// Pause point AFTER the compare-and-set admitted the melt and BEFORE the melt (addendum 4
+        /// §1, test b): the row is `spending` while the paused side waits here.
+        pub(crate) admit_gate: Option<Arc<Gate>>,
         pub(crate) melt_gate: Option<Arc<Gate>>,
         pub(crate) planned_seen: Vec<FeeRemittance>,
+        pub(crate) admitted_seen: Vec<FeeRemittance>,
+        /// The injectable clock [`RemitEffects::now_unix`] reads at the fence. Shared between the
+        /// Fakes of one test (`Arc`) so that "the clock advanced while A was paused" is a fact A
+        /// reads FRESH at its fence and the store compares in SQL — not a number a test hands the
+        /// store. Unset (`i64::MIN`) the Fake reads the host clock, like the live effects.
+        pub(crate) clock: Arc<AtomicI64>,
     }
 
     impl Fake {
@@ -1439,9 +1519,17 @@ pub(crate) mod test_support {
                 status_calls: Vec::new(),
                 melt_counter: None,
                 plan_gate: None,
+                admit_gate: None,
                 melt_gate: None,
                 planned_seen: Vec::new(),
+                admitted_seen: Vec::new(),
+                clock: Arc::new(AtomicI64::new(i64::MIN)),
             }
+        }
+
+        /// Set the clock this Fake (and every Fake sharing its `clock`) reads at the fence.
+        pub(crate) fn set_clock(&self, now_unix: i64) {
+            self.clock.store(now_unix, Ordering::SeqCst);
         }
 
         pub(crate) fn bolt11_for(amount_sats: u64, sequence: usize) -> String {
@@ -1470,6 +1558,20 @@ pub(crate) mod test_support {
             self.planned_seen.push(planned.clone());
             if let Some(gate) = &self.plan_gate {
                 gate.arrive_and_wait();
+            }
+        }
+
+        fn after_admit(&mut self, admitted: &FeeRemittance) {
+            self.admitted_seen.push(admitted.clone());
+            if let Some(gate) = &self.admit_gate {
+                gate.arrive_and_wait();
+            }
+        }
+
+        fn now_unix(&self) -> i64 {
+            match self.clock.load(Ordering::SeqCst) {
+                i64::MIN => host_now_unix(),
+                set => set,
             }
         }
 
@@ -1621,6 +1723,8 @@ mod tests {
         trigger: RemitTrigger,
         now: i64,
     ) -> (RemitOutcome, String) {
+        // The fence reads the clock fresh; a single-process test's clock is the time it runs at.
+        fake.set_clock(now);
         let mut out = Vec::new();
         let outcome = remit(store, fake, trigger, now, &mut out).expect("remit runs");
         (outcome, String::from_utf8(out).expect("utf8"))
@@ -2073,6 +2177,7 @@ mod tests {
             state: MeltQuoteState::Paid,
             amount_sats: 9,
             fee_reserve_sats: 1,
+            expiry_unix: u64::MAX,
         }));
         let (outcome, out) = run_remit(&store, &mut fake, RemitTrigger::Command, 101);
         assert_eq!(
@@ -2147,6 +2252,7 @@ mod tests {
             state: MeltQuoteState::Pending,
             amount_sats: 9,
             fee_reserve_sats: 1,
+            expiry_unix: u64::MAX,
         }));
         let invoices_before = fake.invoices.len();
         let (outcome, out) = run_remit(&store, &mut fake, RemitTrigger::Collect, 101);
@@ -2189,6 +2295,7 @@ mod tests {
             state: MeltQuoteState::Unpaid,
             amount_sats: 9,
             fee_reserve_sats: 1,
+            expiry_unix: u64::MAX,
         }));
         let (outcome, out) = run_remit(&store, &mut fake, RemitTrigger::DryRun, 102);
         assert_eq!(outcome, RemitOutcome::DryRun, "{out}");
@@ -2391,6 +2498,7 @@ mod tests {
                     fake.invoice_tag = format!("-t{thread}");
                     fake.melt_results = vec![Ok((13, 1))];
                     fake.melt_counter = Some(melts);
+                    fake.set_clock(100 + thread);
                     barrier.wait();
                     let mut out = Vec::new();
                     let outcome = remit(
@@ -2575,6 +2683,7 @@ mod tests {
 
     // ---- addendum 3 §2: ownership — never release a live payer's intent (gate 2g) ---------------
 
+    /// A quote status whose expiry is far in the future: live until a test says otherwise.
     fn status(state: MeltQuoteState, quote_id: &str) -> MeltQuoteStatus {
         MeltQuoteStatus {
             mint_url: "https://mint.example".to_owned(),
@@ -2582,6 +2691,7 @@ mod tests {
             state,
             amount_sats: 13,
             fee_reserve_sats: 2,
+            expiry_unix: u64::MAX,
         }
     }
 
@@ -2602,7 +2712,17 @@ mod tests {
             settled_by: None,
             owner: owner.map(str::to_owned),
             lease_until_unix: lease_until,
+            spending_since_unix: None,
             receipts: 2,
+        }
+    }
+
+    /// A row whose owner's compare-and-set admitted the melt at `since` (addendum 4 §1.2).
+    fn spending_row(owner: &str, lease_until: i64, since: i64) -> FeeRemittance {
+        FeeRemittance {
+            state: RemittanceState::Spending,
+            spending_since_unix: Some(since),
+            ..planned_row(Some(owner), Some(lease_until))
         }
     }
 

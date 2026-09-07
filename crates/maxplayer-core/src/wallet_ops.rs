@@ -253,6 +253,17 @@ pub struct MeltQuoteStatus {
     pub state: MeltQuoteState,
     pub amount_sats: u64,
     pub fee_reserve_sats: u64,
+    /// When the quote expires at the mint (unix seconds), as the quote itself states. An UNPAID
+    /// quote past this is one the mint will never pay — terminal, like FAILED.
+    pub expiry_unix: u64,
+}
+
+impl MeltQuoteStatus {
+    /// Whether the quote's expiry is behind `now_unix` (a clock before the epoch never expires
+    /// anything: fail-closed toward "still live").
+    pub fn expired_at(&self, now_unix: i64) -> bool {
+        u64::try_from(now_unix).is_ok_and(|now| now > self.expiry_unix)
+    }
 }
 
 fn sqlite_path(wallet_dir: &Path) -> std::path::PathBuf {
@@ -975,10 +986,21 @@ pub async fn melt_status_for_invoice_async(
     if mine.is_empty() {
         return Ok(None);
     }
-    let rank = |state: MeltQuoteState| match state {
+    // The invoice may have several quotes (the remittance raises an estimate quote at plan time and
+    // a payment quote at melt time). Report the one that is MOST alive: PAID over settling over a
+    // live UNPAID over anything terminal — and among live UNPAID quotes the one expiring last — so
+    // that a caller reading "UNPAID and expired" or "FAILED" knows NO quote for this invoice can
+    // still be paid, and never releases a row while a later quote is live or mid-payment.
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let rank = |status: &MeltQuoteStatus| match status.state {
         MeltQuoteState::Paid => 0,
         MeltQuoteState::Pending | MeltQuoteState::Unknown => 1,
-        MeltQuoteState::Unpaid | MeltQuoteState::Failed => 2,
+        MeltQuoteState::Unpaid if now_unix <= status.expiry_unix => 2,
+        MeltQuoteState::Unpaid => 3,
+        MeltQuoteState::Failed => 4,
     };
     let mut best: Option<MeltQuoteStatus> = None;
     for quote_id in mine {
@@ -992,11 +1014,12 @@ pub async fn melt_status_for_invoice_async(
             state: quote.state,
             amount_sats: quote.amount.to_u64(),
             fee_reserve_sats: quote.fee_reserve.to_u64(),
+            expiry_unix: quote.expiry,
         };
-        if best
-            .as_ref()
-            .is_none_or(|current| rank(status.state) < rank(current.state))
-        {
+        if best.as_ref().is_none_or(|current| {
+            rank(&status) < rank(current)
+                || (rank(&status) == rank(current) && status.expiry_unix > current.expiry_unix)
+        }) {
             best = Some(status);
         }
     }
