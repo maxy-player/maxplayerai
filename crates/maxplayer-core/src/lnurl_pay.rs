@@ -24,7 +24,7 @@
 //! A minimum rounds UP to sats (1500 msat means you need 2 whole sats), a maximum rounds DOWN.
 //!
 //! This module moves no money. It produces an invoice; paying it is the caller's act
-//! ([`crate::fee_remit`], through `wallet_ops::melt_blocking`).
+//! ([`crate::fee_remit`], through `wallet_ops::melt_within_blocking` under a ceiling).
 
 use std::fmt;
 use std::str::FromStr;

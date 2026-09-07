@@ -969,7 +969,7 @@ mod tests {
     }
 
     // §4 gate 1 in code: the live path builds its effects on the packaged wallet through
-    // `wallet_ops::melt_blocking` — but `run remit` on a store with NOTHING unremitted returns before
+    // `wallet_ops::melt_within_blocking` — but `run remit` on a store with NOTHING unremitted returns before
     // any network or wallet call, so this exercises the real CLI entry point offline, including the
     // line that tells the operator whether the automatic remittance is on.
     #[test]

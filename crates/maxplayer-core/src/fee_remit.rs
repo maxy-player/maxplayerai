@@ -1,5 +1,5 @@
 //! Paying the accrued platform fee to the platform's Lightning address — **the one remit path in
-//! the product**, and the first code in it that moves real money.
+//! the product**, and its first seller-fee payment code (operator melts existed before it).
 //!
 //! ## Who calls this, and when
 //!
@@ -37,14 +37,16 @@
 //! reserve on the gross and invoice the **net**, so the fee comes OUT of the accrued amount; journal
 //! the plan (which pins the receipts, records this process as the row's owner under a lease, and
 //! refuses a duplicate — the idempotency that makes two concurrent collects pay at most once); pass
-//! the **pre-spend gate** — re-confirm ownership of the planned row, then melt under a hard
-//! [`MeltCeiling`] through [`crate::wallet_ops::melt_within_blocking`], the same gated melt
-//! `maxplayer wallet melt` uses (it honours `allow_real_mints`), which refuses BEFORE any proof is
-//! spent if the quote raised at payment time would take more than the accrued gross; settle. Every
-//! attempt that meant to pay is journaled with its outcome (`fee_remit_attempts`), so a payout that
-//! keeps failing is visible in the read-out rather than silent.
+//! the **pre-spend gate** — ONE compare-and-set in the store advances the row `planned → spending`
+//! (only if still planned, still ours, with more than [`SPEND_MARGIN`] of lease left at the clock
+//! read at that instant; zero rows changed is a refusal), then melt under a hard [`MeltCeiling`]
+//! through [`crate::wallet_ops::melt_within_blocking`], the same gated melt `maxplayer wallet melt`
+//! uses (it honours `allow_real_mints`), which refuses BEFORE any proof is spent if the quote raised
+//! at payment time would take more than the accrued gross; settle. Every attempt that meant to pay
+//! is journaled with its outcome (`fee_remit_attempts`), so a payout that keeps failing is visible
+//! in the read-out rather than silent.
 //!
-//! ## The two invariants (stage 2a, addendum 3)
+//! ## The two invariants (stage 2a, addendum 3; the fence of addendum 4)
 //!
 //! **Money hold (§1):** the seller never pays more than the fee it accrued — gross is the ceiling,
 //! the melt fee comes out of it, and the ceiling is enforced at the moment of spending, not
@@ -52,14 +54,23 @@
 //! wallet actually pays under is checked against `gross` inside the melt, and a reserve that grew in
 //! between is a refused, journaled, failed attempt with the balance intact.
 //!
-//! **Ownership (§2):** a `planned` row is paid only by the process that planned it, and is released
-//! by another process only when its quote is provably terminal (FAILED at the mint) or its owner is
-//! provably gone (the lease of [`REMIT_LEASE`] has run out) — never on UNPAID alone, because UNPAID
-//! means "not yet", not "abandoned". The owner re-validates its claim immediately before spending
-//! and refuses if less than [`SPEND_MARGIN`] of lease remains, so a spend can never start close
-//! enough to the lease's end to land after a release. The owner's own reconciliation of its own row
-//! may release on UNPAID: a process runs at most one attempt at a time
-//! ([`RemitFlight`] in the node; one shot for the command), so its earlier attempt is over.
+//! **Ownership (§2), as the tests in this module prove it:** a row is paid only by the process that
+//! planned it, and only through the fence — [`SellerStore::admit_remittance_spend`] — which two
+//! processes cannot both pass. A `planned` row (fence not yet passed: nothing spent against it) is
+//! released by another process only when its quote is terminal at the mint (FAILED, or UNPAID and
+//! expired) or its owner's lease of [`REMIT_LEASE`] has run out — never on a live UNPAID alone,
+//! because UNPAID means "not yet", not "abandoned"; and a planned row whose lease ran down while
+//! its owner paused is refused by the owner's own fence, which reads the clock fresh (the test
+//! `an_owner_whose_lease_ran_down_while_it_paused_is_refused_by_its_own_fence`; the release-then-
+//! refuse interleaving is `an_owner_that_outlives_its_lease_is_released_and_its_fence_then_changes_zero_rows`).
+//! A `spending` row (fence passed: its owner may be mid-melt) is released by nobody on time — only
+//! a terminal quote releases it and only PAID settles it, however long ago its lease ran out
+//! (`a_spending_row_is_not_released_when_its_lease_expires_and_its_owner_pays_exactly_once`,
+//! `a_spending_row_is_released_only_on_a_terminal_quote_never_on_time`). Under those tests, two
+//! processes sharing one store debit an accrued balance exactly once. The owner's own reconciliation
+//! of its own `planned` row may release on UNPAID: a process runs at most one attempt at a time
+//! ([`RemitFlight`] in the node; one shot for the command), so its earlier attempt is over and, the
+//! fence never having been passed, spent nothing. Its own `spending` row gets no such exception.
 //!
 //! Every effect on the world goes through [`RemitEffects`], so the decision logic is tested against
 //! scripted effects without a network or a mint. Exactly one method of that trait spends:
