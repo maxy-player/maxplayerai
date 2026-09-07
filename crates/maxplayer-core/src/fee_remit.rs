@@ -3371,16 +3371,27 @@ mod tests {
             owner: owner.map(str::to_owned),
             lease_until_unix: lease_until,
             spending_since_unix: None,
+            spending_quote_id: None,
             receipts: 2,
         }
     }
 
-    /// A row whose owner's compare-and-set admitted the melt at `since` (addendum 4 §1.2).
+    /// A row whose owner's compare-and-set admitted the melt at `since` and BOUND the payment
+    /// quote `q-bound` to it (addendum 4 §1.2, addendum 5 §1).
     fn spending_row(owner: &str, lease_until: i64, since: i64) -> FeeRemittance {
         FeeRemittance {
             state: RemittanceState::Spending,
             spending_since_unix: Some(since),
+            spending_quote_id: Some("q-bound".to_owned()),
             ..planned_row(Some(owner), Some(lease_until))
+        }
+    }
+
+    /// The conditional transition a decision carries, or `None` when it is not a release.
+    fn release_on(decision: &Reconcile) -> Option<ReleaseOn> {
+        match decision {
+            Reconcile::Release { on, .. } => Some(on.clone()),
+            _ => None,
         }
     }
 
@@ -3417,7 +3428,7 @@ mod tests {
         );
         assert!(matches!(
             reconcile_decision(&theirs, Some(&failed), "proc-a", 200),
-            Reconcile::Release(reason) if reason.contains("FAILED is terminal")
+            Reconcile::Release { reason, .. } if reason.contains("FAILED is terminal")
         ));
         // UNPAID / no quote, another process's live lease: HOLD — "not yet" is not "abandoned".
         assert_eq!(
@@ -3437,28 +3448,51 @@ mod tests {
             }),
             "one second before the lease ends it still holds"
         );
-        // …and RELEASE once the lease has run out (the owner is provably gone or not spending).
+        // …and RELEASE once the lease has run out (the owner is provably gone or not spending) —
+        // by the LEASE transition, which carries the clock it was decided on and applies to a
+        // planned row only (addendum 5 §1, rule 2).
+        let on_lease = reconcile_decision(&theirs, Some(&unpaid), "proc-a", 400);
         assert!(matches!(
-            reconcile_decision(&theirs, Some(&unpaid), "proc-a", 400),
-            Reconcile::Release(reason) if reason.contains("lease ran out at unix 400")
+            &on_lease,
+            Reconcile::Release { reason, .. } if reason.contains("lease ran out at unix 400")
         ));
+        assert_eq!(
+            release_on(&on_lease),
+            Some(ReleaseOn::LeaseExpired { now_unix: 400 })
+        );
+        assert_eq!(
+            release_on(&reconcile_decision(&theirs, None, "proc-a", 401)),
+            Some(ReleaseOn::LeaseExpired { now_unix: 401 }),
+            "never raised a melt quote — released on the lease"
+        );
+        // Our own row: release on UNPAID / none at any time — our earlier attempt is over — by the
+        // OWN-PLANNED transition, naming us.
+        let own = reconcile_decision(&mine, Some(&unpaid), "proc-a", 101);
         assert!(matches!(
-            reconcile_decision(&theirs, None, "proc-a", 401),
-            Reconcile::Release(reason) if reason.contains("never raised a melt quote")
+            &own,
+            Reconcile::Release { reason, .. } if reason.contains("this process's own earlier attempt")
         ));
-        // Our own row: release on UNPAID / none at any time — our earlier attempt is over.
-        assert!(matches!(
-            reconcile_decision(&mine, Some(&unpaid), "proc-a", 101),
-            Reconcile::Release(reason) if reason.contains("this process's own earlier attempt")
-        ));
-        assert!(matches!(
-            reconcile_decision(&mine, None, "proc-a", 101),
-            Reconcile::Release(_)
-        ));
+        assert_eq!(
+            release_on(&own),
+            Some(ReleaseOn::OwnPlanned {
+                owner: "proc-a".to_owned()
+            })
+        );
+        assert_eq!(
+            release_on(&reconcile_decision(&mine, None, "proc-a", 101)),
+            Some(ReleaseOn::OwnPlanned {
+                owner: "proc-a".to_owned()
+            })
+        );
+        // Terminal quotes on a PLANNED row release by the planned-terminal transition.
+        assert_eq!(
+            release_on(&reconcile_decision(&theirs, Some(&failed), "proc-a", 200)),
+            Some(ReleaseOn::TerminalQuotePlanned)
+        );
         // A pre-v11 row: nobody's, lease expired ⇒ releasable on UNPAID / none, settled on PAID.
         assert!(matches!(
             reconcile_decision(&legacy, Some(&unpaid), "proc-a", 101),
-            Reconcile::Release(reason) if reason.contains("owner none recorded")
+            Reconcile::Release { reason, .. } if reason.contains("owner none recorded")
         ));
         assert_eq!(
             reconcile_decision(&legacy, Some(&paid), "proc-a", 101),
@@ -3477,7 +3511,7 @@ mod tests {
         unpaid_expired.expiry_unix = 150;
         assert!(matches!(
             reconcile_decision(&theirs, Some(&unpaid_expired), "proc-a", 151),
-            Reconcile::Release(reason) if reason.contains("the quote expired at unix 150")
+            Reconcile::Release { reason, .. } if reason.contains("the quote expired at unix 150")
         ));
         assert_eq!(
             reconcile_decision(&theirs, Some(&unpaid_expired), "proc-a", 150),
@@ -3490,33 +3524,47 @@ mod tests {
         );
     }
 
-    // Gate 2g (d), addendum 4 §1.2 — the SPENDING row as a table: PAID settles; FAILED releases;
-    // UNPAID with the quote EXPIRED releases; UNPAID with a live quote HOLDS — whoever owns it, and
-    // however long ago the lease ran out (lease expiry alone never touches a spending row); no quote
-    // at all HOLDS; PENDING / UNKNOWN hold as for any row.
+    // The SPENDING row's rule as a pure table (kept as an extra beside the full-path gate 2g (d)
+    // below — addendum 5 §2): the status is the BOUND quote's. PAID settles; FAILED releases;
+    // UNPAID releases only once `now > expiry + SPEND_MARGIN` — its owner refuses to pay the bound
+    // quote inside that margin, so past it nobody will pay it; UNPAID inside the margin, or live,
+    // HOLDS — whoever owns it, and however long ago the lease ran out (lease expiry alone never
+    // touches a spending row); no quote at all HOLDS; PENDING / UNKNOWN hold as for any row. Every
+    // release is the BOUND-QUOTE transition naming `q-bound`; a spending row admitted before quotes
+    // were bound releases by the unbound-spending transition.
     #[test]
     fn a_spending_row_is_released_only_on_a_terminal_quote_never_on_time() {
         let theirs = spending_row("proc-b", 400, 150);
         let mine = spending_row("proc-a", 400, 150);
-        let paid = status(MeltQuoteState::Paid, "q-paid");
-        let pending = status(MeltQuoteState::Pending, "q-pending");
-        let failed = status(MeltQuoteState::Failed, "q-failed");
-        let unpaid_live = status(MeltQuoteState::Unpaid, "q-unpaid");
-        let mut unpaid_expired = status(MeltQuoteState::Unpaid, "q-unpaid");
+        let paid = status(MeltQuoteState::Paid, "q-bound");
+        let pending = status(MeltQuoteState::Pending, "q-bound");
+        let unknown = status(MeltQuoteState::Unknown, "q-bound");
+        let failed = status(MeltQuoteState::Failed, "q-bound");
+        let unpaid_live = status(MeltQuoteState::Unpaid, "q-bound");
+        let mut unpaid_expired = status(MeltQuoteState::Unpaid, "q-bound");
         unpaid_expired.expiry_unix = 900;
+        let on_bound = Some(ReleaseOn::TerminalBoundQuote {
+            quote_id: "q-bound".to_owned(),
+        });
 
         assert_eq!(
             reconcile_decision(&theirs, Some(&paid), "proc-a", 10_000),
             Reconcile::Settle
         );
+        let on_failed = reconcile_decision(&theirs, Some(&failed), "proc-a", 10_000);
         assert!(matches!(
-            reconcile_decision(&theirs, Some(&failed), "proc-a", 10_000),
-            Reconcile::Release(reason) if reason.contains("FAILED is terminal")
+            &on_failed,
+            Reconcile::Release { reason, .. } if reason.contains("FAILED is terminal")
         ));
+        assert_eq!(release_on(&on_failed), on_bound);
+        // UNPAID, expired at 900: terminal at 961 (900 + 60 < 961), not at 960.
+        let on_expired = reconcile_decision(&mine, Some(&unpaid_expired), "proc-a", 961);
         assert!(matches!(
-            reconcile_decision(&mine, Some(&unpaid_expired), "proc-a", 901),
-            Reconcile::Release(reason) if reason.contains("the quote expired at unix 900 and the mint will never pay it")
+            &on_expired,
+            Reconcile::Release { reason, .. }
+                if reason.contains("the bound quote expired at unix 900 and the spending margin (60 s) has passed since")
         ));
+        assert_eq!(release_on(&on_expired), on_bound);
         // UNPAID, live quote, lease long expired (400 ≪ 10 000): HOLD — theirs AND ours.
         let held = |row: &FeeRemittance, owner: &str| {
             Reconcile::Hold(Refusal::SpendingHeld {
@@ -3535,6 +3583,11 @@ mod tests {
             "our own spending row: the melt that errored may have reached the mint"
         );
         assert_eq!(
+            reconcile_decision(&mine, Some(&unpaid_expired), "proc-a", 960),
+            held(&mine, "proc-a"),
+            "expired, but inside the margin its owner may still be paying it: hold"
+        );
+        assert_eq!(
             reconcile_decision(&mine, Some(&unpaid_expired), "proc-a", 900),
             held(&mine, "proc-a"),
             "at the expiry second the quote is still live"
@@ -3549,6 +3602,31 @@ mod tests {
             Reconcile::Hold(Refusal::Settling {
                 remittance_id: "x".to_owned()
             })
+        );
+        assert_eq!(
+            reconcile_decision(&theirs, Some(&unknown), "proc-a", 10_000),
+            Reconcile::Hold(Refusal::Settling {
+                remittance_id: "x".to_owned()
+            }),
+            "UNKNOWN holds a spending row"
+        );
+        // A spending row admitted before v13 (no bound quote): the status is the invoice's; FAILED
+        // or plain expiry releases it by the unbound-spending transition, as v12 did.
+        let unbound = FeeRemittance {
+            spending_quote_id: None,
+            ..spending_row("proc-b", 400, 150)
+        };
+        assert_eq!(
+            release_on(&reconcile_decision(&unbound, Some(&failed), "proc-a", 200)),
+            Some(ReleaseOn::TerminalUnboundSpending)
+        );
+        assert_eq!(
+            release_on(&reconcile_decision(&unbound, Some(&unpaid_expired), "proc-a", 901)),
+            Some(ReleaseOn::TerminalUnboundSpending)
+        );
+        assert_eq!(
+            reconcile_decision(&unbound, Some(&unpaid_live), "proc-a", 10_000),
+            held(&unbound, "proc-b")
         );
         assert!(
             !Refusal::SpendingHeld {

@@ -671,6 +671,7 @@ mod tests {
                 owner: Some("pid1-a".to_owned()),
                 lease_until_unix: Some(305),
                 spending_since_unix: None,
+                spending_quote_id: None,
                 receipts: 0,
             },
             FeeRemittance {
@@ -690,6 +691,7 @@ mod tests {
                 owner: Some("pid1-a".to_owned()),
                 lease_until_unix: Some(307),
                 spending_since_unix: None,
+                spending_quote_id: None,
                 receipts: 1,
             },
             // Settled by reconciliation: the fee is unobserved and the row SAYS why, with the
@@ -711,6 +713,7 @@ mod tests {
                 owner: Some("pid2-b".to_owned()),
                 lease_until_unix: Some(309),
                 spending_since_unix: None,
+                spending_quote_id: None,
                 receipts: 2,
             },
             // Addendum 4 §1: a SPENDING row (melt admitted, mint not yet heard) is named as such,
@@ -732,6 +735,7 @@ mod tests {
                 owner: Some("pid3-c".to_owned()),
                 lease_until_unix: Some(311),
                 spending_since_unix: Some(12),
+                spending_quote_id: Some("q-mid-pay".to_owned()),
                 receipts: 1,
             },
         ];
