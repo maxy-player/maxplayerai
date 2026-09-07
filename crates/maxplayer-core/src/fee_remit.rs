@@ -2727,12 +2727,12 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains("Admitted to spend at unix 100: remittance hash-9-2 is now spending"),
+            out.contains("Admitted to spend at unix 100: remittance hash-9-2 is now spending, bound to melt quote paid-quote-lnbc-fake-9-2"),
             "{out}"
         );
         assert!(
             out.contains(
-                "remittance hash-9-2 stays journaled as spending: proofs may have reached the mint"
+                "remittance hash-9-2 stays journaled as spending, bound to melt quote paid-quote-lnbc-fake-9-2: proofs may have reached the mint"
             ),
             "{out}"
         );
@@ -2800,7 +2800,12 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("Nothing to remit."), "{out}");
-        assert_eq!(fake.status_calls, vec!["lnbc-fake-9-2".to_owned()]);
+        // A spending row is reconciled by its BOUND quote, by id — never by the invoice.
+        assert_eq!(
+            fake.quote_status_calls,
+            vec!["paid-quote-lnbc-fake-9-2".to_owned()]
+        );
+        assert!(fake.status_calls.is_empty());
         assert_eq!(fake.melts.len(), 1, "reconciliation never melts");
         let rows = store.remittances().expect("rows");
         assert_eq!(rows.len(), 1);
@@ -2899,10 +2904,10 @@ mod tests {
 
         // UNPAID with a LIVE quote (expires at unix 2000): HOLD — our own row, and the lease (until
         // 400) is long gone at 1000, and neither matters: the row is SPENDING. Nothing released, no
-        // new invoice, journaled as a refusal naming the row.
+        // new invoice, journaled as a refusal naming the row. The status is the BOUND quote's.
         fake.status = Ok(Some(MeltQuoteStatus {
             mint_url: "https://mint.example".to_owned(),
-            quote_id: "q-unpaid".to_owned(),
+            quote_id: "paid-quote-lnbc-fake-9-2".to_owned(),
             state: MeltQuoteState::Unpaid,
             amount_sats: 9,
             fee_reserve_sats: 1,
@@ -2938,11 +2943,22 @@ mod tests {
         );
         assert_eq!(store.accrued_fees().expect("read").in_flight_fee_sats, 10);
 
-        // UNPAID and the quote has EXPIRED at the mint (2000 < 2001): terminal — fail, release, and
-        // continue into a fresh DRY RUN on a new invoice.
+        // UNPAID and the bound quote has EXPIRED at the mint (2000), but the spending margin has not
+        // passed (2001 ≤ 2000 + 60): still HOLD — the owner may be paying it up to the margin.
         let (outcome, out) = run_remit(&store, &mut fake, RemitTrigger::DryRun, 2001);
+        assert!(
+            matches!(outcome, RemitOutcome::Refused(Refusal::SpendingHeld { .. })),
+            "{out}"
+        );
+        assert_eq!(
+            store.remittances().expect("rows")[0].state,
+            RemittanceState::Spending
+        );
+        // Past expiry PLUS the margin (2061 > 2060): terminal — fail, release by the bound-quote
+        // transition, and continue into a fresh DRY RUN on a new invoice.
+        let (outcome, out) = run_remit(&store, &mut fake, RemitTrigger::DryRun, 2061);
         assert_eq!(outcome, RemitOutcome::DryRun, "{out}");
-        assert!(out.contains("reports melt quote q-unpaid UNPAID — no sats left the wallet; the quote expired at unix 2000 and the mint will never pay it — terminal whoever owns the row; released 10 sats back to unremitted"), "{out}");
+        assert!(out.contains("reports melt quote paid-quote-lnbc-fake-9-2 UNPAID — no sats left the wallet; the bound quote expired at unix 2000 and the spending margin (60 s) has passed since — its owner will not pay it and the mint will never pay it: terminal; released 10 sats back to unremitted (release condition: its bound melt quote paid-quote-lnbc-fake-9-2 is terminal at the mint)"), "{out}");
         assert!(out.contains("10 sats unremitted"), "{out}");
         assert!(out.contains("DRY RUN — nothing moved."), "{out}");
         assert_eq!(fake.melts.len(), 1);
@@ -2950,12 +2966,17 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].state, RemittanceState::Failed);
         assert_eq!(rows[0].receipts, 0);
+        assert_eq!(
+            rows[0].spending_quote_id.as_deref(),
+            Some("paid-quote-lnbc-fake-9-2"),
+            "the binding stays on the failed row as history"
+        );
         assert_eq!(store.accrued_fees().expect("read").unremitted_fee_sats, 10);
 
         // Now a confirm pays ONCE on a fresh invoice; the failed row's invoice is never reused.
         fake.status = Ok(None);
         fake.melt_results = vec![Ok((9, 1))];
-        let (outcome, out) = run_remit(&store, &mut fake, RemitTrigger::Command, 2002);
+        let (outcome, out) = run_remit(&store, &mut fake, RemitTrigger::Command, 2062);
         assert!(is_paid(&outcome), "{out}");
         assert_eq!(fake.melts.len(), 2);
         assert_ne!(
@@ -3245,7 +3266,14 @@ mod tests {
             fake.melts.is_empty(),
             "ZERO debits: the refusal happens before the proofs are touched"
         );
-        assert_eq!(fake.ceiling_refusals.len(), 1);
+        // Addendum 5 §1 rule 1: the payment quote was raised and checked BEFORE the fence — the row
+        // was never admitted, so it was released as a planned row of our own.
+        assert_eq!(fake.quotes, vec!["lnbc-fake-13-2".to_owned()]);
+        assert!(fake.admitted_seen.is_empty(), "refused before the fence");
+        assert!(
+            fake.ceiling_refusals.is_empty(),
+            "the wallet's own re-check never ran: nothing reached the payment"
+        );
         assert_eq!(
             fake.melt_results.len(),
             1,
