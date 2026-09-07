@@ -1251,6 +1251,11 @@ impl RemitBackoff {
         self.streak
     }
 
+    /// The base delay: the floor under the first retry after boot (RULING 1), whatever re-arms it.
+    pub fn base(&self) -> Duration {
+        self.base
+    }
+
     /// The delay the current streak computes to, BEFORE jitter: `base × 2^streak`, capped.
     pub fn computed_delay(&self) -> Duration {
         let mut delay = self.base;

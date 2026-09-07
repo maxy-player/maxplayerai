@@ -3828,26 +3828,39 @@ fn run_remit_attempt(
     }
 }
 
+/// At what volume [`remit_outcome_lines`] wants its lines logged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemitLogVolume {
+    /// `opline_verbose!`: the steady state, not for a quiet log.
+    Verbose,
+    /// `opline!`.
+    Normal,
+}
+
 /// The ONE logging policy for a node remittance attempt, whichever path ran it (addendum 3 §3; the
-/// collect path and the retry tick used to log differently). A node whose payout host is down
-/// retries for hours, and the retry must not become the log:
+/// collect path and the retry tick used to log differently), as PURE text so the policy is tested
+/// by counting lines. A node whose payout host is down retries for hours, and the retry must not
+/// become the log — **every attempt logs at most ONE line, the first failure included** (addendum 4
+/// §2.1):
 ///
-/// - Steady state (nothing owed, or under the destination's minimum) is verbose-only.
+/// - Steady state (nothing owed, or under the destination's minimum) is one verbose-only line.
 /// - A payment is one line.
-/// - The FIRST failure of a streak is logged in full, with the attempt's own lines and its error.
-/// - Every later failure in the streak is EXACTLY one line — streak, cause, next attempt — and the
+/// - The FIRST failure of a streak is one line carrying the attempt's detail — destination, the
+///   balance it saw, its own lines and its error — folded in, and the backoff it starts.
+/// - Every later failure in the streak is one line — streak, cause, next attempt — and the
 ///   transition into the 30-minute cap is said on that same line, never a second one.
-/// - A payment that ends a streak says how many attempts failed and how long the fee sat owed.
+/// - A payment that ends a streak is one line saying how many attempts failed and how long the fee
+///   sat owed.
 ///
 /// `next` is the delay the caller re-armed the tick with, when it knows it (the tick's own path);
 /// the collect path does not own the timer, so it names the computed delay the re-arm draws from.
-fn log_remit_outcome(
+pub(crate) fn remit_outcome_lines(
     path: &str,
     report: &crate::fee_remit::RemitReport,
     pacing: &crate::fee_remit::Pacing,
     next: Option<Duration>,
     computed: Duration,
-) {
+) -> (RemitLogVolume, Vec<String>) {
     use crate::fee_remit::Pacing;
     let when = match next {
         Some(next) => format!("in {}s (computed {}s)", next.as_secs(), computed.as_secs()),
@@ -3856,26 +3869,38 @@ fn log_remit_outcome(
             computed.as_secs()
         ),
     };
-    match pacing {
+    let line = match pacing {
         Pacing::Idle => {
-            opline_verbose!(
-                "seller node platform fee {path}: {}; next check {when}",
-                report.summary()
+            return (
+                RemitLogVolume::Verbose,
+                vec![format!(
+                    "seller node platform fee {path}: {}; next check {when}",
+                    report.summary()
+                )],
             );
         }
-        Pacing::Paid => {
-            opline!("seller node platform fee {path}: {}", report.summary());
-        }
+        Pacing::Paid => format!("seller node platform fee {path}: {}", report.summary()),
         Pacing::FirstFailure => {
-            for line in &report.lines {
-                opline!("seller node platform fee {path}: {line}");
-            }
-            opline!(
-                "seller node platform fee {path}: {} — streak 1; retrying with backoff (base {}s, doubling to a {}s cap, full jitter): next attempt {when}",
+            // The whole first failure on ONE line: what it was trying to pay, to where, what it saw
+            // (the attempt's own lines, joined), and the error — then the backoff it starts.
+            let detail = if report.lines.is_empty() {
+                "no detail printed".to_owned()
+            } else {
+                report
+                    .lines
+                    .iter()
+                    .map(|line| line.trim())
+                    .filter(|line| !line.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            };
+            format!(
+                "seller node platform fee {path}: {} — streak 1; destination {}; attempt detail: {detail}; retrying with backoff (base {}s, doubling to a {}s cap, full jitter): next attempt {when}",
                 report.summary(),
+                crate::platform_fee::PLATFORM_FEE_ADDRESS,
                 crate::fee_remit::RETRY_BASE.as_secs(),
                 crate::fee_remit::RETRY_CAP.as_secs()
-            );
+            )
         }
         Pacing::RepeatFailure {
             streak,
@@ -3889,19 +3914,35 @@ fn log_remit_outcome(
             } else {
                 String::new()
             };
-            opline!(
+            format!(
                 "seller node platform fee {path}: still failing (streak {streak}: {}); next attempt {when}{cap_note}",
                 report.summary()
-            );
+            )
         }
         Pacing::Recovered {
             failed_attempts,
             owed_for_secs,
-        } => {
-            opline!(
-                "seller node platform fee {path}: RECOVERED — {} — after {failed_attempts} failed attempt(s) over {owed_for_secs}s; backoff reset to base",
-                report.summary()
-            );
+        } => format!(
+            "seller node platform fee {path}: RECOVERED — {} — after {failed_attempts} failed attempt(s) over {owed_for_secs}s; backoff reset to base",
+            report.summary()
+        ),
+    };
+    (RemitLogVolume::Normal, vec![line])
+}
+
+/// Emit [`remit_outcome_lines`] to the node log at the volume it asks for.
+fn log_remit_outcome(
+    path: &str,
+    report: &crate::fee_remit::RemitReport,
+    pacing: &crate::fee_remit::Pacing,
+    next: Option<Duration>,
+    computed: Duration,
+) {
+    let (volume, lines) = remit_outcome_lines(path, report, pacing, next, computed);
+    for line in lines {
+        match volume {
+            RemitLogVolume::Verbose => opline_verbose!("{line}"),
+            RemitLogVolume::Normal => opline!("{line}"),
         }
     }
 }
@@ -3909,20 +3950,25 @@ fn log_remit_outcome(
 /// Where the live retry timer should fire after a SHARED outcome (a collect-path attempt) moved the
 /// backoff (addendum 3 §3): a success (`streak == 0`) resets the pending sleep to the freshly drawn
 /// base-streak delay however far away it was; a failure never shortens a deadline — it extends a
-/// too-short one to the drawn delay and keeps a longer one. Pure, so the rule is tested against a
-/// real `Sleep` under a paused clock.
+/// too-short one to the drawn delay and keeps a longer one. Either way the result is never before
+/// `boot_floor` — boot plus [`crate::fee_remit::RETRY_BASE`] — so a collect success in the node's
+/// first seconds cannot pull the FIRST retry under 30 s after boot (addendum 3 RULING 1, held under
+/// re-arm by addendum 4 §2.2). Pure, so the rule is tested against a real `Sleep` under a paused
+/// clock.
 pub(crate) fn rearm_deadline(
     current_deadline: tokio::time::Instant,
     now: tokio::time::Instant,
     streak: u32,
     drawn: Duration,
+    boot_floor: tokio::time::Instant,
 ) -> tokio::time::Instant {
     let proposed = now + drawn;
-    if streak == 0 {
+    let deadline = if streak == 0 {
         proposed
     } else {
         proposed.max(current_deadline)
-    }
+    };
+    deadline.max(boot_floor)
 }
 
 impl SellerNodeRunner {
@@ -4607,6 +4653,10 @@ impl SellerNodeRunner {
         // so a slow attempt can never stack a second one. A collect-path outcome that moved the
         // shared backoff re-arms this same timer through `remit_pacing_changed` (addendum 3 §3).
         let auto_remit = self.node.home().config.platform_fee.auto_remit;
+        // RULING 1's floor, kept under every re-arm below (addendum 4 §2.2): no retry fires before
+        // boot + base (30 s shipped; the test seam shortens both together), whatever a collect-path
+        // outcome does to the shared backoff in the meantime.
+        let remit_boot_floor = tokio::time::Instant::now() + self.remit_pacing_lock().base();
         let remit_retry = tokio::time::sleep(self.remit_pacing_lock().boot_delay());
         tokio::pin!(remit_retry);
         let mut remit_retry_pending: Option<
@@ -4690,7 +4740,8 @@ impl SellerNodeRunner {
                         // nothing to observe, so the pacing is unchanged; sleep another jittered
                         // delay at the current streak.
                         remit_retry.as_mut().reset(
-                            tokio::time::Instant::now() + self.remit_pacing_lock().next_delay(),
+                            (tokio::time::Instant::now() + self.remit_pacing_lock().next_delay())
+                                .max(remit_boot_floor),
                         );
                     }
                 }
@@ -4700,7 +4751,9 @@ impl SellerNodeRunner {
                     if remit_retry_pending.is_some() => {
                     remit_retry_pending = None;
                     let next = self.settle_retry_remit(report.ok());
-                    remit_retry.as_mut().reset(tokio::time::Instant::now() + next);
+                    remit_retry
+                        .as_mut()
+                        .reset((tokio::time::Instant::now() + next).max(remit_boot_floor));
                 }
                 // Addendum 3 §3: a SHARED outcome (the collect thread's attempt) moved the backoff;
                 // make the live timer follow — a success pulls the pending sleep back to base, a
@@ -4715,6 +4768,7 @@ impl SellerNodeRunner {
                         tokio::time::Instant::now(),
                         streak,
                         drawn,
+                        remit_boot_floor,
                     );
                     remit_retry.as_mut().reset(deadline);
                     opline_verbose!(
@@ -14748,14 +14802,43 @@ mod tests {
                 .starts_with("melt failed: insufficient funds for melt")
         );
 
-        // The next attempt (the next collect, or the operator) reconciles the planned row (the
-        // wallet never raised a quote ⇒ released) and pays once, on a FRESH invoice — the same
-        // scripted effects continue their invoice sequence, as a real LNURL host would never hand
-        // out the failed invoice twice; the receipt and the job are still exactly as the collect
-        // left them.
-        fake.status = Ok(None);
-        fake.melt_results = vec![Ok((9, 1))];
+        // The next attempt (the next collect, or the operator) reconciles the SPENDING row. While
+        // the mint says only UNPAID it HOLDS (addendum 4 §1.2: the melt that errored may have
+        // reached the mint) — nothing paid, nothing released, the job untouched…
+        fake.status = Ok(Some(crate::wallet_ops::MeltQuoteStatus {
+            mint_url: "https://mint.example".to_owned(),
+            quote_id: "paid-quote-lnbc-fake-9-2".to_owned(),
+            state: crate::wallet_ops::MeltQuoteState::Unpaid,
+            amount_sats: 9,
+            fee_reserve_sats: 1,
+            expiry_unix: u64::MAX,
+        }));
         let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 5003);
+        assert!(
+            matches!(
+                report.outcome,
+                Ok(RemitOutcome::Refused(
+                    crate::fee_remit::Refusal::SpendingHeld { .. }
+                ))
+            ),
+            "{report:?}"
+        );
+        assert_eq!(store.job_state(&job).expect("state"), Some(JobState::Paid));
+        assert_eq!(store.accrued_fees().expect("read").remitted_fee_sats, 0);
+        // …and once the mint reports the quote FAILED (terminal) the row is released and the same
+        // run pays once, on a FRESH invoice — the same scripted effects continue their invoice
+        // sequence, as a real LNURL host would never hand out the failed invoice twice; the receipt
+        // and the job are still exactly as the collect left them.
+        fake.status = Ok(Some(crate::wallet_ops::MeltQuoteStatus {
+            mint_url: "https://mint.example".to_owned(),
+            quote_id: "paid-quote-lnbc-fake-9-2".to_owned(),
+            state: crate::wallet_ops::MeltQuoteState::Failed,
+            amount_sats: 9,
+            fee_reserve_sats: 1,
+            expiry_unix: u64::MAX,
+        }));
+        fake.melt_results = vec![Ok((9, 1))];
+        let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 5004);
         assert!(
             matches!(report.outcome, Ok(RemitOutcome::Paid { .. })),
             "{report:?}"
@@ -15558,10 +15641,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_shared_outcome_re_arms_the_live_retry_timer() {
         let now = tokio::time::Instant::now();
+        // A boot floor already behind us: the re-arm rule alone is under test here.
+        let floor = now;
         let sleep = tokio::time::sleep(Duration::from_secs(900));
         tokio::pin!(sleep);
         // Success (streak 0): reset to the drawn delay, however far away the old deadline was.
-        let deadline = rearm_deadline(sleep.deadline(), now, 0, Duration::from_secs(12));
+        let deadline = rearm_deadline(sleep.deadline(), now, 0, Duration::from_secs(12), floor);
         assert_eq!(deadline, now + Duration::from_secs(12));
         sleep.as_mut().reset(deadline);
         assert!(
@@ -15583,7 +15668,8 @@ mod tests {
                 now + Duration::from_secs(600),
                 now,
                 2,
-                Duration::from_secs(90)
+                Duration::from_secs(90),
+                floor
             ),
             now + Duration::from_secs(600)
         );
@@ -15592,10 +15678,183 @@ mod tests {
                 now + Duration::from_secs(5),
                 now,
                 2,
-                Duration::from_secs(90)
+                Duration::from_secs(90),
+                floor
             ),
             now + Duration::from_secs(90)
         );
+    }
+
+    /// Addendum 4 §2.2 (RULING 1 under re-arm): the node boots, its first retry is armed in
+    /// [30 s, 60 s]; a collect SUCCEEDS at 5 s and the shared backoff (streak 0) draws 8 s. Without
+    /// the floor the re-arm would fire the first retry at 13 s after boot. With it, the re-armed
+    /// `Sleep` — a real one, under Tokio's paused clock — fires at 30 s after boot and not one
+    /// second sooner. A failure re-arm inside the first 30 s is floored the same way.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_retry_never_fires_before_thirty_seconds_after_boot_even_after_a_collect_success()
+     {
+        let boot = tokio::time::Instant::now();
+        let floor = boot + crate::fee_remit::RETRY_BASE;
+        assert_eq!(crate::fee_remit::RETRY_BASE, Duration::from_secs(30));
+        // Boot draw, as `run_loop` arms it: somewhere in [30 s, 60 s]; take 45 s.
+        let sleep = tokio::time::sleep(Duration::from_secs(45));
+        tokio::pin!(sleep);
+        // 5 s after boot a collect-path attempt succeeds; the shared backoff draws 8 s.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let now = tokio::time::Instant::now();
+        let deadline = rearm_deadline(sleep.deadline(), now, 0, Duration::from_secs(8), floor);
+        assert_eq!(
+            deadline, floor,
+            "8 s after a success at 5 s would be 13 s after boot: clamped to boot + 30 s"
+        );
+        sleep.as_mut().reset(deadline);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(24), sleep.as_mut())
+                .await
+                .is_err(),
+            "the first retry must not fire at 29 s after boot"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), sleep.as_mut())
+                .await
+                .is_ok(),
+            "the first retry fires at 30 s after boot"
+        );
+        // A failure re-arm inside the first 30 s is floored too: a 12 s draw at 10 s after boot,
+        // against a pending 45 s boot deadline, keeps 45 s (never shortens) — and a pending 20 s
+        // deadline would be pushed to the floor, not to 22 s.
+        let boot = tokio::time::Instant::now();
+        let floor = boot + crate::fee_remit::RETRY_BASE;
+        let at_ten = boot + Duration::from_secs(10);
+        assert_eq!(
+            rearm_deadline(
+                boot + Duration::from_secs(45),
+                at_ten,
+                1,
+                Duration::from_secs(12),
+                floor
+            ),
+            boot + Duration::from_secs(45)
+        );
+        assert_eq!(
+            rearm_deadline(
+                boot + Duration::from_secs(20),
+                at_ten,
+                1,
+                Duration::from_secs(12),
+                floor
+            ),
+            floor
+        );
+        // Past the floor the rule is exactly addendum 3's: the floor changes nothing.
+        let later = boot + Duration::from_secs(600);
+        assert_eq!(
+            rearm_deadline(
+                later + Duration::from_secs(900),
+                later,
+                0,
+                Duration::from_secs(12),
+                floor
+            ),
+            later + Duration::from_secs(12)
+        );
+    }
+
+    /// Addendum 4 §2.1: every attempt logs at most ONE line, the first failure included. A first
+    /// DNS failure (the payout host unreachable) used to log the attempt's lines and then a summary;
+    /// now the detail — destination, the balance it saw, the error — is folded into the one line.
+    /// Every other pacing outcome is one line too.
+    #[test]
+    fn a_first_failure_logs_exactly_one_line_with_its_detail_folded_in() {
+        use crate::fee_remit::test_support::Fake;
+        use crate::fee_remit::{Pacing, RemitBackoff, RemitTrigger, remit_best_effort};
+        use crate::seller_node::store::{ReceiptFees, SellerStore};
+        let root = std::env::temp_dir().join(format!(
+            "maxplayer-remit-one-line-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("mk root");
+        let store = SellerStore::open(root.join(crate::seller_node::STATE_DB_FILE)).expect("open");
+        store
+            .collect_receipt(
+                "r1",
+                "job-1",
+                100,
+                ReceiptFees {
+                    mint_fee_sats: 1,
+                    fee_bps: 1000,
+                    fee_sats: 10,
+                },
+                1,
+            )
+            .expect("collect");
+        let mut fake = Fake::new(|_| 1);
+        fake.pay_request_error = Some("agi.cash: dns failure".to_owned());
+        let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 100);
+        assert_eq!(report.outcome, Err("agi.cash: dns failure".to_owned()));
+        assert!(
+            !report.lines.is_empty(),
+            "the attempt printed its balance before the host failed: {report:?}"
+        );
+        let mut backoff = RemitBackoff::new();
+        let pacing = backoff.observe(&report, 100);
+        assert_eq!(pacing, Pacing::FirstFailure);
+        let (volume, lines) = remit_outcome_lines(
+            "remit (after job_id=job-1)",
+            &report,
+            &pacing,
+            None,
+            backoff.computed_delay(),
+        );
+        assert_eq!(volume, RemitLogVolume::Normal);
+        assert_eq!(lines.len(), 1, "one line for the first failure: {lines:#?}");
+        let line = &lines[0];
+        assert!(line.contains("agi.cash: dns failure"), "the error: {line}");
+        assert!(
+            line.contains("destination maxplayer@agi.cash"),
+            "the destination: {line}"
+        );
+        assert!(
+            line.contains("10 sats unremitted"),
+            "the balance it saw: {line}"
+        );
+        assert!(line.contains("streak 1"), "{line}");
+        assert!(
+            line.contains("next attempt on the retry tick, re-armed to within 60s"),
+            "the backoff this failure started (streak 1 ⇒ base × 2): {line}"
+        );
+        assert!(!line.contains('\n'), "one line means one line: {line:?}");
+        // Every other outcome is one line as well.
+        let second = backoff.observe(&report, 200);
+        assert!(matches!(second, Pacing::RepeatFailure { streak: 2, .. }));
+        for (pacing, expected_volume) in [
+            (second, RemitLogVolume::Normal),
+            (Pacing::Paid, RemitLogVolume::Normal),
+            (
+                Pacing::Recovered {
+                    failed_attempts: 2,
+                    owed_for_secs: 100,
+                },
+                RemitLogVolume::Normal,
+            ),
+            (Pacing::Idle, RemitLogVolume::Verbose),
+        ] {
+            let (volume, lines) = remit_outcome_lines(
+                "retry",
+                &report,
+                &pacing,
+                Some(Duration::from_secs(41)),
+                Duration::from_secs(60),
+            );
+            assert_eq!(volume, expected_volume, "{pacing:?}");
+            assert_eq!(lines.len(), 1, "{pacing:?}: {lines:#?}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// RED ON REVERT: drop the `self.publish_retraction().await` from `run_loop` (or the
