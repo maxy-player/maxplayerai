@@ -272,8 +272,8 @@ pub struct DockerPolicy {
 /// `SCOPED_TOKEN_MAX_LIFETIME` (`docs/superpowers/briefs/2026-08-31-relay-scoped-token-lifetime.md`).
 pub const DEFAULT_CONTAINER_DELIVERY_TOKEN_CAP_SECS: u64 = 21_600;
 
-/// The resolved container-side delivery settings of a docker seat whose `[sandbox]
-/// container_delivery = true`. Absent from a seat on the host delivery path.
+/// The resolved container-side delivery settings of a docker seat that delivers from inside the
+/// container — the default for `mode = "docker"`. Absent from a seat on the host delivery path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContainerDeliveryPolicy {
     /// How the container obtains its branch-scoped push token.
@@ -384,13 +384,23 @@ impl SandboxPolicy {
                 // The container-delivery keys name a container that launcher mode never creates. A
                 // seat that sets them under `launcher` has a config that says two different things
                 // about where git runs, so it is refused here rather than read as "host path".
-                if config.container_delivery
+                //
+                // `container_delivery = false` is the ONE exception, and it is not a courtesy: since
+                // the docker default moved to the container path, that value is how an operator
+                // writes down "the host path". Under launcher mode it names the path the mode already
+                // takes, so it contradicts nothing and refusing it would refuse a true statement.
+                // The ABSENT key is the same case, and it is every launcher seat: the flipped default
+                // must never make one of them refuse to boot.
+                if config.container_delivery == Some(true)
                     || config.container_delivery_token.is_some()
                     || config.container_delivery_token_cap_secs.is_some()
                 {
                     return Err(ExecError::Config(
-                        "[sandbox] container_delivery, container_delivery_token and \
-                         container_delivery_token_cap_secs require mode = \"docker\""
+                        "[sandbox] container_delivery = true, container_delivery_token and \
+                         container_delivery_token_cap_secs require mode = \"docker\", because \
+                         launcher mode creates no container to run the git steps in \
+                         (container_delivery = false is accepted: it names the path launcher mode \
+                         already takes)"
                             .into(),
                     ));
                 }
@@ -532,11 +542,17 @@ impl SandboxPolicy {
                         "[sandbox] container_delivery_token_cap_secs must be greater than zero".into(),
                     ));
                 }
-                let container_delivery = config.container_delivery.then(|| ContainerDeliveryPolicy {
-                    token: config.container_delivery_token.unwrap_or_default(),
-                    token_cap_secs: config
-                        .container_delivery_token_cap_secs
-                        .unwrap_or(DEFAULT_CONTAINER_DELIVERY_TOKEN_CAP_SECS),
+                // ON unless the operator wrote `container_delivery = false`. The absent key
+                // resolves to ON, so a docker seat adopts the container path on upgrade.
+                // `container_delivery_enabled` is the one place that reads the default, and the
+                // seller boot line reports what it decided.
+                let container_delivery = config.container_delivery_enabled().then(|| {
+                    ContainerDeliveryPolicy {
+                        token: config.container_delivery_token.unwrap_or_default(),
+                        token_cap_secs: config
+                            .container_delivery_token_cap_secs
+                            .unwrap_or(DEFAULT_CONTAINER_DELIVERY_TOKEN_CAP_SECS),
+                    }
                 });
                 let mut policy = Self::docker(DockerPolicy {
                     image,
@@ -628,8 +644,10 @@ impl SandboxPolicy {
         }
     }
 
-    /// The container-side delivery settings, `Some` only for a docker policy whose `[sandbox]
-    /// container_delivery = true`. `None` ⇒ the host delivery path, which is the shipped behaviour.
+    /// The container-side delivery settings, `Some` for a docker policy that delivers from inside
+    /// the container — which is the DEFAULT for `mode = "docker"`. `None` ⇒ the host delivery path:
+    /// a launcher or pass-through policy, or a docker seat with `[sandbox] container_delivery =
+    /// false`.
     pub fn container_delivery(&self) -> Option<ContainerDeliveryPolicy> {
         match &self.kind {
             PolicyKind::Docker(policy) => policy.container_delivery,
@@ -5373,35 +5391,88 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    // The container-delivery switch (Track B). Off by default: a docker seat that never names the
-    // key stays on the host delivery path, and the two companion keys take their documented
-    // defaults once the switch is on.
+    // The container-delivery switch (Track B). ON by default under `docker` — a docker seat that
+    // never names the key delivers from inside its container — and the two companion keys take
+    // their documented defaults.
+    //
+    // ⛔ THE DEFAULT MOVES ONLY WHERE A CONTAINER EXISTS. `SandboxMode::Launcher` is the `#[default]`
+    // mode, so a blanket "on" would turn every seat that never opted into docker into a seat that
+    // refuses to boot. That is why the field is `Option<bool>`: the absent key means ON under docker
+    // and means nothing at all under launcher.
     #[test]
-    fn container_delivery_is_off_by_default_and_resolves_under_docker() {
+    fn container_delivery_defaults_on_under_docker_and_never_under_launcher() {
         use crate::home::{ContainerDeliveryToken, SandboxConfig, SandboxMode};
-        let off = SandboxConfig { mode: SandboxMode::Docker, ..Default::default() };
-        let policy = SandboxPolicy::from_config(Some(&off)).expect("docker policy");
-        assert_eq!(policy.container_delivery(), None, "the switch defaults to the host path");
 
+        let fresh_default = Some(ContainerDeliveryPolicy {
+            token: ContainerDeliveryToken::FreshAfterAgent,
+            token_cap_secs: DEFAULT_CONTAINER_DELIVERY_TOKEN_CAP_SECS,
+        });
+
+        // ROW 1 — docker, key ABSENT ⇒ the container path. This is the new default, and it is the
+        // row that every existing docker seat lands on when it upgrades.
+        let defaulted = SandboxConfig { mode: SandboxMode::Docker, ..Default::default() };
+        assert_eq!(defaulted.container_delivery, None, "the fixture must not name the key");
+        let policy = SandboxPolicy::from_config(Some(&defaulted)).expect("docker policy");
+        assert_eq!(
+            policy.container_delivery(),
+            fresh_default,
+            "a docker seat that never named the key delivers from the container"
+        );
+        assert!(defaulted.container_delivery_enabled(), "and the config helper agrees");
+
+        // ROW 2 — docker, `true` ⇒ the container path, said out loud. Same verdict as row 1.
         let on = SandboxConfig {
             mode: SandboxMode::Docker,
-            container_delivery: true,
+            container_delivery: Some(true),
             ..Default::default()
         };
         let policy = SandboxPolicy::from_config(Some(&on)).expect("docker policy");
         assert_eq!(
             policy.container_delivery(),
-            Some(ContainerDeliveryPolicy {
-                token: ContainerDeliveryToken::FreshAfterAgent,
-                token_cap_secs: DEFAULT_CONTAINER_DELIVERY_TOKEN_CAP_SECS,
-            }),
+            fresh_default,
             "on ⇒ fresh-after-agent tokens and the 6 h cap"
         );
+        assert!(on.container_delivery_enabled());
         assert_eq!(DEFAULT_CONTAINER_DELIVERY_TOKEN_CAP_SECS, 6 * 60 * 60);
 
+        // ROW 3 — docker, `false` ⇒ the HOST path. The explicit opt-out, which must keep working:
+        // it is the only way a docker seat stays on the path it had before the default moved.
+        let opted_out = SandboxConfig {
+            mode: SandboxMode::Docker,
+            container_delivery: Some(false),
+            ..Default::default()
+        };
+        let policy = SandboxPolicy::from_config(Some(&opted_out)).expect("docker policy");
+        assert_eq!(
+            policy.container_delivery(),
+            None,
+            "container_delivery = false keeps the host delivery path"
+        );
+        assert!(!opted_out.container_delivery_enabled());
+
+        // ROW 4 — launcher, key ABSENT ⇒ the host path, and NO refusal. The most important row of
+        // the seven: this is every seat that never opted into docker.
+        let launcher = SandboxConfig { mode: SandboxMode::Launcher, ..Default::default() };
+        let policy = SandboxPolicy::from_config(Some(&launcher))
+            .expect("an absent key under launcher must never refuse");
+        assert_eq!(policy.container_delivery(), None);
+        assert!(!launcher.container_delivery_enabled(), "launcher mode has no container");
+
+        // ROW 6 — launcher, `false` ⇒ the host path, and no refusal: it names the path launcher
+        // mode already takes, so it contradicts nothing.
+        let launcher_off = SandboxConfig {
+            mode: SandboxMode::Launcher,
+            container_delivery: Some(false),
+            ..Default::default()
+        };
+        let policy = SandboxPolicy::from_config(Some(&launcher_off))
+            .expect("container_delivery = false under launcher must never refuse");
+        assert_eq!(policy.container_delivery(), None);
+        assert!(!launcher_off.container_delivery_enabled());
+
+        // The companion keys resolve on top of the default, with no switch named at all.
         let long_lived = SandboxConfig {
             mode: SandboxMode::Docker,
-            container_delivery: true,
             container_delivery_token: Some(ContainerDeliveryToken::LongLived),
             container_delivery_token_cap_secs: Some(3_600),
             ..Default::default()
@@ -5415,29 +5486,37 @@ mod tests {
             })
         );
 
-        // The companion keys without the switch are inert, not an error: an operator may stage
-        // them before flipping the switch.
+        // ...and they are INERT under the explicit opt-out, rather than an error: an operator may
+        // stage the token mode before dropping `container_delivery = false`.
         let staged = SandboxConfig {
             mode: SandboxMode::Docker,
+            container_delivery: Some(false),
             container_delivery_token: Some(ContainerDeliveryToken::LongLived),
             ..Default::default()
         };
         let policy = SandboxPolicy::from_config(Some(&staged)).expect("docker policy");
         assert_eq!(policy.container_delivery(), None);
 
-        // A pass-through policy has no container to deliver from.
+        // A pass-through policy — no `[sandbox]` section at all — has no container to deliver from.
         assert_eq!(SandboxPolicy::passthrough().container_delivery(), None);
+        assert_eq!(
+            SandboxPolicy::from_config(None).expect("no section").container_delivery(),
+            None,
+            "a seat with no [sandbox] section keeps the host path"
+        );
     }
 
-    // The three keys are refused under `launcher` mode — each on its own — because launcher mode
-    // creates no container to move the git steps into.
+    // ROWS 5 and 7 — refused under `launcher` mode, each key on its own, because launcher mode
+    // creates no container to move the git steps into. `container_delivery = true` is a config that
+    // says two different things about where git runs; the two token keys describe a token only a
+    // container ever asks for.
     #[test]
     fn container_delivery_keys_are_refused_outside_docker_mode() {
         use crate::home::{ContainerDeliveryToken, SandboxConfig, SandboxMode};
         let cases = [
             SandboxConfig {
                 mode: SandboxMode::Launcher,
-                container_delivery: true,
+                container_delivery: Some(true),
                 ..Default::default()
             },
             SandboxConfig {
@@ -5448,6 +5527,14 @@ mod tests {
             SandboxConfig {
                 mode: SandboxMode::Launcher,
                 container_delivery_token_cap_secs: Some(60),
+                ..Default::default()
+            },
+            // A token key still refuses even next to the accepted `container_delivery = false`:
+            // the value that is accepted is the switch, never the token keys.
+            SandboxConfig {
+                mode: SandboxMode::Launcher,
+                container_delivery: Some(false),
+                container_delivery_token: Some(ContainerDeliveryToken::LongLived),
                 ..Default::default()
             },
         ];
@@ -5475,7 +5562,7 @@ mod tests {
         use crate::home::{SandboxConfig, SandboxMode};
         let error = SandboxPolicy::from_config(Some(&SandboxConfig {
             mode: SandboxMode::Docker,
-            container_delivery: true,
+            container_delivery: Some(true),
             container_delivery_token_cap_secs: Some(0),
             ..Default::default()
         }))
@@ -5484,10 +5571,15 @@ mod tests {
     }
 
     // The keys parse from the TOML an operator writes, in the documented spelling, and a config
-    // that never names them serialises without them — so a seat on the host path writes back a
-    // `[sandbox]` section byte-identical to before this switch existed.
+    // that never names the switch serialises WITHOUT it.
+    //
+    // ⛔ THE WRITE-BACK IS WHAT MAKES THE DEFAULT REACHABLE. `maxplayer` rewrites `config.toml`
+    // whenever it saves; if an absent switch were written back as `container_delivery = false`, the
+    // first save after the upgrade would pin every docker seat to the host path for ever, and the
+    // new default would reach nobody. `skip_serializing_if = "Option::is_none"` is that guarantee,
+    // and this is the test that holds it.
     #[test]
-    fn container_delivery_keys_parse_from_toml_and_stay_absent_when_off() {
+    fn container_delivery_keys_parse_from_toml_and_an_unset_switch_stays_unset() {
         use crate::home::{ContainerDeliveryToken, SandboxConfig, SandboxMode};
         let parsed: SandboxConfig = toml::from_str(
             "mode = \"docker\"\n\
@@ -5496,9 +5588,20 @@ mod tests {
              container_delivery_token_cap_secs = 7200\n",
         )
         .expect("the documented spelling parses");
-        assert!(parsed.container_delivery);
+        assert_eq!(parsed.container_delivery, Some(true));
         assert_eq!(parsed.container_delivery_token, Some(ContainerDeliveryToken::LongLived));
         assert_eq!(parsed.container_delivery_token_cap_secs, Some(7_200));
+        // The opt-out parses as `Some(false)`, never as "absent": the difference between the two is
+        // the difference between the host path and the new default.
+        let opted_out: SandboxConfig =
+            toml::from_str("mode = \"docker\"\ncontainer_delivery = false\n").expect("parses");
+        assert_eq!(opted_out.container_delivery, Some(false));
+        assert!(!opted_out.container_delivery_enabled());
+        // ...and a config that names no switch parses as absent, which resolves to ON under docker.
+        let silent: SandboxConfig = toml::from_str("mode = \"docker\"\n").expect("parses");
+        assert_eq!(silent.container_delivery, None);
+        assert!(silent.container_delivery_enabled());
+
         let fresh: SandboxConfig =
             toml::from_str("mode = \"docker\"\ncontainer_delivery_token = \"fresh-after-agent\"\n")
                 .expect("parses");
@@ -5509,12 +5612,34 @@ mod tests {
             "an unknown token mode is refused, never defaulted"
         );
 
-        let off = SandboxConfig { mode: SandboxMode::Docker, ..Default::default() };
-        let written = toml::to_string(&off).expect("serialises");
+        // A config that never set the switch does not GAIN it on write-back.
+        let unset = SandboxConfig { mode: SandboxMode::Docker, ..Default::default() };
+        let written = toml::to_string(&unset).expect("serialises");
         assert!(
             !written.contains("container_delivery"),
             "an unset switch leaves no trace in the written config: {written}"
         );
+        // Round-trip: the written config still resolves to the default, so a save cannot silently
+        // move a seat off the container path.
+        let reread: SandboxConfig = toml::from_str(&written).expect("re-parses");
+        assert_eq!(reread, unset);
+        assert!(reread.container_delivery_enabled());
+
+        // The explicit opt-out, by contrast, MUST survive a write-back: an operator who chose the
+        // host path keeps it across every save.
+        let kept = SandboxConfig {
+            mode: SandboxMode::Docker,
+            container_delivery: Some(false),
+            ..Default::default()
+        };
+        let written = toml::to_string(&kept).expect("serialises");
+        assert!(
+            written.contains("container_delivery = false"),
+            "the opt-out must be written back verbatim: {written}"
+        );
+        let reread: SandboxConfig = toml::from_str(&written).expect("re-parses");
+        assert_eq!(reread, kept);
+        assert!(!reread.container_delivery_enabled());
     }
 
     // from_config threads the runtime through, and a blank string is treated as unset rather than

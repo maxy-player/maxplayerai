@@ -2501,8 +2501,8 @@ mod container_delivery_tests {
         })
     }
 
-    /// The shipped default reads NOTHING over the network. A gate that probed here would add an HTTP
-    /// GET to every seller boot for a feature that is off.
+    /// The host delivery path reads NOTHING over the network. A gate that probed here would add an
+    /// HTTP GET to every seller boot for a feature the seat does not use.
     #[test]
     fn container_delivery_off_reads_no_relay_document() {
         assert_eq!(
@@ -2510,6 +2510,88 @@ mod container_delivery_tests {
                 .expect("gate"),
             TokenModeGate::Skip(None)
         );
+    }
+
+    /// ⛔ THE FLIPPED DEFAULT MUST NOT ADD A NETWORK READ TO BOOT. A docker seat that never named
+    /// `container_delivery` now delivers from its container, so it reaches this gate where it used
+    /// to skip it — and it must still come out `Skip`, because the default token mode is
+    /// `fresh-after-agent`, which depends on no relay feature. Resolved through `from_config`, the
+    /// same call a booting seat makes, so the default itself is under test rather than a hand-built
+    /// policy.
+    ///
+    /// RED ON REVERT: default `container_delivery_token` to `long-lived` and this returns `Probe`.
+    #[test]
+    fn the_defaulted_docker_seat_still_reads_no_relay_document_at_boot() {
+        use crate::home::{SandboxConfig, SandboxMode};
+        use crate::seller_exec::SandboxPolicy;
+
+        let defaulted = SandboxConfig { mode: SandboxMode::Docker, ..Default::default() };
+        let policy = SandboxPolicy::from_config(Some(&defaulted)).expect("docker policy");
+        let delivery = policy
+            .container_delivery()
+            .expect("a docker seat that never named the key delivers from the container");
+        assert_eq!(delivery.token, ContainerDeliveryToken::FreshAfterAgent);
+        assert_eq!(
+            container_delivery_token_gate("wss://relay.example", RELAY_GIT_REMOTE, Some(delivery))
+                .expect("gate"),
+            TokenModeGate::Skip(None),
+            "the new default must not put an HTTP GET on the boot path"
+        );
+    }
+
+    /// The ONE boot line an operator reads the delivery path off. Every state of the switch, in both
+    /// modes, and each line names the path AND the reason — a seat whose path moved on upgrade has
+    /// to be able to say which config state moved it.
+    #[test]
+    fn the_boot_line_names_the_delivery_path_and_the_reason() {
+        use crate::home::{SandboxConfig, SandboxMode};
+
+        let docker = |switch| SandboxConfig {
+            mode: SandboxMode::Docker,
+            container_delivery: switch,
+            ..Default::default()
+        };
+        let launcher = |switch| SandboxConfig {
+            mode: SandboxMode::Launcher,
+            container_delivery: switch,
+            ..Default::default()
+        };
+
+        // docker + absent ⇒ CONTAINER, and the line says the default is what decided it.
+        let line = delivery_path_line(Some(&docker(None)));
+        assert!(line.contains("CONTAINER"), "{line}");
+        assert!(line.contains("default"), "the reason is the default: {line}");
+        assert!(line.contains("container_delivery = false"), "names the way back: {line}");
+
+        // docker + true ⇒ CONTAINER, and the line credits the config, not the default.
+        let line = delivery_path_line(Some(&docker(Some(true))));
+        assert!(line.contains("CONTAINER"), "{line}");
+        assert!(line.contains("container_delivery = true"), "{line}");
+        assert!(!line.contains("default for"), "an explicit true is not the default: {line}");
+
+        // docker + false ⇒ HOST, named as the opt-out it is.
+        let line = delivery_path_line(Some(&docker(Some(false))));
+        assert!(line.contains("HOST"), "{line}");
+        assert!(line.contains("container_delivery = false"), "{line}");
+
+        // launcher, in every state ⇒ HOST, and the reason is the mode rather than the switch.
+        for config in [launcher(None), launcher(Some(false))] {
+            let line = delivery_path_line(Some(&config));
+            assert!(line.contains("HOST"), "{line}");
+            assert!(line.contains("launcher"), "the reason is the mode: {line}");
+        }
+
+        // No `[sandbox]` section at all ⇒ HOST.
+        let line = delivery_path_line(None);
+        assert!(line.contains("HOST"), "{line}");
+        assert!(line.contains("no [sandbox] section"), "{line}");
+
+        // Every line is one operator line: it names the seat and carries no newline.
+        for config in [Some(docker(None)), Some(docker(Some(false))), Some(launcher(None)), None] {
+            let line = delivery_path_line(config.as_ref());
+            assert!(line.starts_with("seller node delivery path: "), "{line}");
+            assert!(!line.contains('\n'), "one line, never two: {line}");
+        }
     }
 
     /// `fresh-after-agent` needs no relay feature, so it must never be blocked — and must never even
@@ -3178,6 +3260,48 @@ async fn probe_one_harness(
 /// operator and a seat that will refuse either way.
 const RELAY_TOKEN_POLICY_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The ONE boot line that names this seat's delivery path and the reason for it.
+///
+/// ⛔ WHY THIS LINE EXISTS. Container delivery is the DEFAULT for a docker seat, so a seat that
+/// upgrades changes where its git runs without anyone changing its config. That must not be silent:
+/// the operator has to be able to read the path off a boot scroll, and has to be told which of the
+/// three states of `[sandbox] container_delivery` decided it. `maxplayer doctor` reports the same
+/// answer in its `relay token policy` row.
+///
+/// Pure, and it reads the CONFIG rather than the resolved policy, so it can name the reason. The
+/// policy keeps only the verdict: `Some(false)` and a launcher seat both resolve to `None`, and the
+/// operator needs to know which one this seat is.
+fn delivery_path_line(sandbox: Option<&crate::home::SandboxConfig>) -> String {
+    use crate::home::SandboxMode;
+
+    let Some(sandbox) = sandbox else {
+        return "seller node delivery path: HOST — this seat has no [sandbox] section, so there is \
+                no container to run the git steps in"
+            .to_owned();
+    };
+    match (sandbox.mode, sandbox.container_delivery) {
+        (SandboxMode::Docker, None) => "seller node delivery path: CONTAINER — one container runs \
+                                        the agent and every git step. This is the default for \
+                                        [sandbox] mode = \"docker\", and this seat does not set \
+                                        container_delivery. Set container_delivery = false for the \
+                                        host path."
+            .to_owned(),
+        (SandboxMode::Docker, Some(true)) => "seller node delivery path: CONTAINER — one container \
+                                              runs the agent and every git step. This seat sets \
+                                              [sandbox] container_delivery = true."
+            .to_owned(),
+        (SandboxMode::Docker, Some(false)) => "seller node delivery path: HOST — the host clones, \
+                                               commits and pushes. This seat sets [sandbox] \
+                                               container_delivery = false, which opts out of the \
+                                               docker default."
+            .to_owned(),
+        (SandboxMode::Launcher, _) => "seller node delivery path: HOST — the host clones, commits \
+                                       and pushes. [sandbox] mode = \"launcher\" creates no \
+                                       container, so container delivery cannot apply to this seat."
+            .to_owned(),
+    }
+}
+
 /// What the boot gate must do about `[sandbox] container_delivery_token`, decided from config alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TokenModeGate {
@@ -3201,7 +3325,7 @@ fn container_delivery_token_gate(
 ) -> Result<TokenModeGate, NodeError> {
     use crate::home::ContainerDeliveryToken;
 
-    // Container delivery off (the shipped default) ⇒ the host delivery path, nothing to ask.
+    // The host delivery path — a launcher seat, or `container_delivery = false` — asks nothing.
     let Some(delivery) = delivery else {
         return Ok(TokenModeGate::Skip(None));
     };
@@ -3309,6 +3433,11 @@ pub async fn probe_configured_harnesses(
     // under a pass-through fallback would prove a harness the awarded job will never run under.
     let sandbox = SandboxPolicy::from_config(home.config.sandbox.as_ref())
         .map_err(|error| NodeError::Sandbox(error.to_string()))?;
+    // Say WHERE this seat's git runs, and why, before the token gate reads anything. Container
+    // delivery is the default for a docker seat, so an upgrade moves the path with no config change;
+    // this line is what stops that being silent. Emitted every boot, not once: the condition is a
+    // standing state of the config, and a seat can be restarted long after the upgrade.
+    opline!("{}", delivery_path_line(home.config.sandbox.as_ref()));
     // Track B, `long-lived` token mode only: prove the relay honours a scoped token's expiration tag
     // BEFORE any harness runs, or refuse to boot. Reads nothing over the network in the default
     // `fresh-after-agent` mode. See `gate_container_delivery_token_mode`.
@@ -6375,23 +6504,25 @@ impl SellerNodeRunner {
         let seller_pubkey = self.seller_pubkey.to_hex();
         let identity = DeliveryAgentIdentity::for_seller(&seller_pubkey);
         let workdir = job_workdir(self.node.home(), job_id);
-        // Track B — container-side delivery, behind `[sandbox] container_delivery`. When it is on, ONE
+        // Track B — container-side delivery, the DEFAULT for a docker seat. When it is on, ONE
         // sandbox container runs the agent AND every git step (clone, gate, commit, push), and this
         // host runs no git and drives no ACP for the job: it launches the container, hands it a
         // branch-scoped push token, and reads back the pushed oid. When it is off, the host path
-        // below runs exactly as before. The raw flag is read here — before any provisioning — because
+        // below runs exactly as before. The config is read here — before any provisioning — because
         // the host path's own `SandboxPolicy::from_config` below must keep its place and its failure
         // ordering; a `container_delivery = true` under `launcher` mode reads as off here and is then
         // refused by that same parse (and by the boot gate) as an invalid `[sandbox]`.
+        //
+        // `container_delivery_enabled` carries the default and the mode together. Reading the field
+        // raw would answer "host path" for the commonest docker seat there is: one that never wrote
+        // the key.
         let container_delivery = self
             .node
             .home()
             .config
             .sandbox
             .as_ref()
-            .is_some_and(|sandbox| {
-                sandbox.mode == crate::home::SandboxMode::Docker && sandbox.container_delivery
-            });
+            .is_some_and(crate::home::SandboxConfig::container_delivery_enabled);
         let (commit, branch, usage, wall_time_ms) = if container_delivery {
             let deadline = offer.deadline_unix.max(0) as u64;
             let memory_section = job_memory_section(

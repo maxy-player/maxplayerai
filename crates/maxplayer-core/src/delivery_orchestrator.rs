@@ -31,9 +31,10 @@
 //! tree) and force-stages the sentinel. This module provisions, runs the agent, gates, and pushes.
 //!
 //! ## One container, driven from inside (Task B9 + B2)
-//! Behind `[sandbox] container_delivery = true` the seller host launches ONE container whose command
-//! is `maxplayer __deliver phase1 <inputs>`. [`run_phase1_entry`] then, in order: reads the inputs and
-//! DELETES the file (C3, fail closed); provisions the workdir; DRIVES the ACP agent itself through
+//! On the container delivery path — the default for `[sandbox] mode = "docker"` — the seller host
+//! launches ONE container whose command is `maxplayer __deliver phase1 <inputs>`.
+//! [`run_phase1_entry`] then, in order: reads the inputs and DELETES the file (C3, fail closed);
+//! provisions the workdir; DRIVES the ACP agent itself through
 //! [`crate::seller_exec::run_agent_with_retry`] under a pass-through policy (the container is the
 //! sandbox — no nested docker), with an explicit environment allowlist (C4); gates and commits; reaps
 //! every other process in the container; writes the [`AGENT_DONE_MARKER`]; obtains the push token per
