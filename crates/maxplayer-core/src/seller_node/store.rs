@@ -200,13 +200,15 @@ pub struct FeeRemittance {
     pub receipts: usize,
 }
 
-/// Who attempted a remittance — the two callers of `crate::fee_remit::remit` that pay.
+/// Who attempted a remittance — the three callers of `crate::fee_remit::remit` that pay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemitAttemptTrigger {
     /// The seller node, after a receipt was journaled `Collected::New`.
     Collect,
     /// `maxplayer seller fees remit --confirm`, run by an operator.
     Command,
+    /// The seller node's retry tick (stage 2a, addendum 2): the loop's own backoff clock.
+    Retry,
 }
 
 impl RemitAttemptTrigger {
@@ -214,6 +216,7 @@ impl RemitAttemptTrigger {
         match self {
             Self::Collect => "collect",
             Self::Command => "command",
+            Self::Retry => "retry",
         }
     }
 
@@ -221,6 +224,7 @@ impl RemitAttemptTrigger {
         match raw {
             "collect" => Ok(Self::Collect),
             "command" => Ok(Self::Command),
+            "retry" => Ok(Self::Retry),
             other => Err(StoreError(format!(
                 "unknown remit attempt trigger {other:?}"
             ))),
@@ -780,7 +784,10 @@ impl SellerStore {
              -- v10 (stage 2a, addendum 1): every ATTEMPT to pay the accrued platform fee, whether it
              -- paid, was refused, or failed — the record an operator reads when the automatic payout
              -- is not landing. `trigger` says who attempted ('collect' = the seller node after a
-             -- receipt was journaled New; 'command' = `maxplayer seller fees remit --confirm`);
+             -- receipt was journaled New; 'retry' = the seller node's backoff tick, addendum 2;
+             -- 'command' = `maxplayer seller fees remit --confirm`). The table is new in v10, which
+             -- has not shipped, so widening the CHECK here is the table's first definition on every
+             -- store that will ever have it — no existing table is rebuilt;
              -- `unremitted_sats` is the balance the attempt saw; `remittance_id` names the
              -- fee_remittances row it planned, if it got that far. Attempts that stop at the threshold
              -- (nothing unremitted, or below the destination's minimum) are the expected steady state
@@ -788,7 +795,7 @@ impl SellerStore {
              CREATE TABLE IF NOT EXISTS fee_remit_attempts (
                  attempt_id       INTEGER PRIMARY KEY AUTOINCREMENT,
                  started_at_unix  INTEGER NOT NULL,
-                 trigger          TEXT NOT NULL CHECK (trigger IN ('collect','command')),
+                 trigger          TEXT NOT NULL CHECK (trigger IN ('collect','command','retry')),
                  unremitted_sats  INTEGER NOT NULL CHECK (unremitted_sats >= 0),
                  outcome          TEXT NOT NULL CHECK (outcome IN ('paid','refused','failed')),
                  detail           TEXT NOT NULL,

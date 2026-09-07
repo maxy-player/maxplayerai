@@ -14,7 +14,8 @@
 //! automatically**: once the receipt is journaled new, the node makes a best-effort attempt to pay
 //! the whole unremitted balance to [`PLATFORM_FEE_ADDRESS`] from the seller's ecash (`fee_remit`,
 //! reached from `seller_node::run`). That attempt cannot affect the collect — the job is already
-//! paid — and a failed attempt leaves the balance unremitted for the next collect to try again;
+//! paid — and a failed attempt leaves the balance unremitted for the node's retry tick to try again
+//! (base 30 s, doubling to a 30-minute cap, full jitter, for as long as the node runs; addendum 2);
 //! balances below the destination's minimum accrue until they clear it. `maxplayer seller fees
 //! remit` is the operator's inspection and recovery path (dry run by default, `--confirm` to pay
 //! now), not the mechanism. The one operational switch, `[platform_fee] auto_remit`, stops the

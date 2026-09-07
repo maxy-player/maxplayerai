@@ -9,8 +9,9 @@
 //! to money: it opens `seller.sqlite` (applying the store's additive schema migration if the file
 //! predates the current version), reads, prints, and exits.
 //!
-//! `seller fees remit` is the second of the two callers of `maxplayer_core::fee_remit::remit` (the
-//! first is the seller node's collect path). It prints the recent remittance attempts and their
+//! `seller fees remit` is the third of the three callers of `maxplayer_core::fee_remit::remit` (the
+//! other two are the seller node's: its collect path, and the retry tick that backs a failed
+//! remittance off and tries again while the node runs). It prints the recent remittance attempts and their
 //! outcomes, reconciles an attempt interrupted mid-payment, resolves the platform's Lightning
 //! address over LNURL-pay, takes a melt quote for the unremitted balance, and prints the plan.
 //! **Without `--confirm` that is all it does** (a dry run is the default). With `--confirm` it forces
@@ -354,7 +355,7 @@ pub(crate) fn platform_fee_by_rate(
 
 /// `maxplayer seller fees remit`: the operator's inspection and recovery path over the ONE remit
 /// entry point in the product, [`maxplayer_core::fee_remit::remit`] — the same function the seller
-/// node calls automatically after every collected payment. Here it runs against the shipped effects
+/// node calls automatically after every collected payment and on its retry tick. Here it runs against the shipped effects
 /// (LNURL over https, the packaged wallet at `home`, the home's default mint), as a dry run unless
 /// `--confirm` was passed, and maps the outcome to an exit code so a script cannot read a refusal
 /// as a payment. Note that `--confirm` pays regardless of `[platform_fee] auto_remit`: that switch

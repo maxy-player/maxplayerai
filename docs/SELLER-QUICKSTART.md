@@ -1250,11 +1250,22 @@ its own:
 - **It cannot affect the payment it followed.** Your receipt is written and the job is marked paid
   before the attempt starts. If the attempt fails — the mint is down, the payout host is unreachable,
   the wallet is short, no route — the failure is written to the node log and journaled
-  (`fee_remit_attempts`), and the balance stays unremitted, so the next collected payment simply
-  tries again with the whole accumulated balance. An attempt interrupted mid-payment is reconciled with
-  the mint on the next attempt (settled if the payment landed, released if it did not), never repeated.
-  Two payments landing at the same moment cannot pay the fee twice: at most one remittance can be in
-  flight, and the receipts it covers are pinned to it.
+  (`fee_remit_attempts`), and the balance stays unremitted. **The node then retries on its own clock,
+  for as long as it runs**: 30 seconds after the failure, then doubling — 1, 2, 4, 8, 16 minutes — up
+  to once every 30 minutes, each delay randomised between zero and that figure so a fleet of sellers
+  does not hit a recovering host in the same second. A success resets the clock to 30 seconds; a
+  balance under the destination's minimum is not a failure and does not lengthen it. The retries
+  live inside the node's main loop, so stopping the node stops them — nothing keeps running after it
+  exits, and nothing runs at startup (the first check is 30 seconds in). The next collected payment
+  also tries again with the whole accumulated balance. An attempt interrupted mid-payment is
+  reconciled with the mint on the next attempt (settled if the payment landed, released if it did
+  not), never repeated. Two payments landing at the same moment cannot pay the fee twice: at most one
+  remittance can be in flight, and the receipts it covers are pinned to it.
+- **The log stays readable while it retries.** The first failure is logged in full with its error;
+  later attempts in the same streak get one line each (how many have failed, when the next is); the
+  moment the delay reaches its 30-minute cap gets one line; and the success that ends a streak says
+  how many attempts failed and for how long the fee sat owed — the line to look for when you ask
+  "did it ever go out?".
 
 **The off switch.** If you need to stop the automatic payout — a misbehaving mint, an incident — set
 
@@ -1263,10 +1274,12 @@ its own:
 auto_remit = false      # or MAXPLAYER_PLATFORM_FEE__AUTO_REMIT=false
 ```
 
-and restart the node. This is an **operational valve, not a waiver**: the fee keeps accruing on every
-payment, stays owed, and stays visible in `maxplayer seller fees`; when you turn the switch back on
-the next collect remits the whole accumulated balance. The switch cannot change the rate or the
-address — the `[platform_fee]` table has no key for either.
+and restart the node. One flag covers both automatic paths — the attempt after each payment and the
+retry clock. This is an **operational valve, not a waiver**: the fee keeps accruing on every payment,
+stays owed, and stays visible in `maxplayer seller fees`; when you turn the switch back on the next
+attempt (a collect, or the retry clock's first check) remits the whole accumulated balance. The switch
+cannot change the rate or the address — the `[platform_fee]` table has no key for either.
+`maxplayer seller fees remit --confirm` still pays by hand while it is off.
 
 **Inspecting and forcing a remittance by hand.** `maxplayer seller fees remit` is the operator's
 window onto the automatic path, and its recovery lever:

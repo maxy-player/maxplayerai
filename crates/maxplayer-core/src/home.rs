@@ -1194,7 +1194,8 @@ pub fn default_boot_push_preflight() -> bool {
 /// a payment is collected (see `seller_node::run` and `fee_remit`), so an operator needs a way to
 /// stop those outbound payments without patching a binary — a mint that is misbehaving, a payout
 /// host that is down, an incident. `auto_remit = false` (or `MAXPLAYER_PLATFORM_FEE__AUTO_REMIT=false`)
-/// does exactly one thing: the collect path stops ATTEMPTING a remittance.
+/// does exactly one thing: the node stops ATTEMPTING a remittance — on BOTH of its paths, the
+/// collect path's attempt and the run loop's retry tick (stage 2a, addendum 2). One flag, both paths.
 ///
 /// ## What this is NOT
 ///
@@ -1212,9 +1213,10 @@ pub fn default_boot_push_preflight() -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlatformFeeConfig {
-    /// Attempt to remit the accrued platform fee automatically after each collected payment.
-    /// Default **true**. Set false (or the env override `MAXPLAYER_PLATFORM_FEE__AUTO_REMIT=false`)
-    /// to stop the automatic attempt; the fee keeps accruing and the balance stays owed and visible.
+    /// Attempt to remit the accrued platform fee automatically — after each collected payment, and
+    /// on the node's retry tick while a remittance is failing. Default **true**. Set false (or the
+    /// env override `MAXPLAYER_PLATFORM_FEE__AUTO_REMIT=false`) to stop both automatic attempts; the
+    /// fee keeps accruing and the balance stays owed and visible.
     #[serde(default = "default_auto_remit")]
     pub auto_remit: bool,
 }

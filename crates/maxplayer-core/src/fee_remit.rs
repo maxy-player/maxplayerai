@@ -3,23 +3,30 @@
 //!
 //! ## Who calls this, and when
 //!
-//! [`remit`] has exactly two callers, and both are named here so a grep confirms it:
+//! [`remit`] has exactly three callers, and all three are named here so a grep confirms it:
 //!
 //! 1. **The seller node's collect path** (`seller_node::run`, the `Collected::New` arm of the
-//!    receipt write), through [`remit_after_collect_live`] → [`remit_best_effort`]. This is the
-//!    mechanism: a fee the seller had to remember to pay would not be a fee, so the node remits as a
-//!    consequence of collecting. It fires only when a receipt was journaled **New** — never on a
+//!    receipt write), through [`remit_live_best_effort`] → [`remit_best_effort`] under
+//!    [`RemitTrigger::Collect`]. This is the mechanism, and the fast path: a fee the seller had to
+//!    remember to pay would not be a fee, so the node remits as a consequence of collecting, normally
+//!    within a second of the sale. It fires only when a receipt was journaled **New** — never on a
 //!    replayed wrap (`Duplicate`), never on an error — and it is **best-effort**: whatever happens
 //!    here is logged and journaled; it cannot fail the collect, delay the job being marked paid, or
-//!    change what the seller received. A failed attempt leaves the balance unremitted, so the next
-//!    collect tries again. The `[platform_fee] auto_remit` switch
-//!    ([`crate::home::PlatformFeeConfig`]) turns this caller off; it does not touch accrual.
-//! 2. **`maxplayer seller fees remit`** (`crates/maxplayer/src/seller_fees.rs`): inspection (the
+//!    change what the seller received.
+//! 2. **The seller node's retry tick** (`seller_node::run`, an arm of the live loop's `select!`),
+//!    through the same two functions under [`RemitTrigger::Retry`]. This is the safety net behind
+//!    the fast path (stage 2a, addendum 2): a failed remittance retries on the node's own clock — base
+//!    30 s, doubling to a 30-minute cap, full jitter — for as long as the node runs, and stops with
+//!    the loop. [`RemitBackoff`] is the pacing; [`RemitFlight`] keeps the two node paths to one
+//!    attempt in flight.
+//! 3. **`maxplayer seller fees remit`** (`crates/maxplayer/src/seller_fees.rs`): inspection (the
 //!    default dry run resolves, quotes, prints the plan and the recent attempts, and moves nothing),
 //!    recovery (`--confirm` forces an attempt now, for an operator whose automatic path has been
 //!    failing), and reconciliation (an interrupted attempt is settled or released against the mint).
 //!
-//! There is no timer, no startup sweep and no other call site.
+//! The `[platform_fee] auto_remit` switch ([`crate::home::PlatformFeeConfig`]) turns BOTH node
+//! paths off — the collect path's attempt and the retry tick — and does not touch accrual;
+//! `--confirm` pays regardless. There is no startup sweep, no detached task, and no other call site.
 //!
 //! ## What one attempt does
 //!
@@ -40,6 +47,9 @@
 
 use std::fmt;
 use std::io::Write;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use crate::home::MaxplayerHome;
 use crate::lnurl_pay::{self, HttpsFetch, LightningAddress, PayRequest, ResolvedInvoice};
@@ -118,6 +128,9 @@ pub enum RemitTrigger {
     Command,
     /// The seller node, after a receipt was journaled `Collected::New`. Pays.
     Collect,
+    /// The seller node's retry tick (addendum 2): the loop's own clock, paced by [`RemitBackoff`].
+    /// Pays.
+    Retry,
 }
 
 impl RemitTrigger {
@@ -132,6 +145,7 @@ impl RemitTrigger {
             Self::DryRun => None,
             Self::Command => Some(RemitAttemptTrigger::Command),
             Self::Collect => Some(RemitAttemptTrigger::Collect),
+            Self::Retry => Some(RemitAttemptTrigger::Retry),
         }
     }
 }
@@ -641,6 +655,7 @@ fn print_recent_attempts(store: &SellerStore, out: &mut dyn Write) -> Result<(),
             attempt.started_at_unix,
             match attempt.trigger {
                 RemitAttemptTrigger::Collect => "automatic (after collect)",
+                RemitAttemptTrigger::Retry => "automatic (retry tick)",
                 RemitAttemptTrigger::Command => "operator (--confirm)",
             },
             attempt.unremitted_sats,
@@ -693,23 +708,42 @@ impl RemitReport {
                 "melt FAILED ({error}); remittance {remittance_id} stays planned and is reconciled on the next attempt"
             ),
             Err(error) => format!(
-                "attempt FAILED ({error}); the balance stays unremitted and the next collect tries again"
+                "attempt FAILED ({error}); the balance stays unremitted and the node retries with backoff while it runs"
             ),
+        }
+    }
+
+    /// Whether this attempt counts as a FAILURE for pacing ([`RemitBackoff::observe`]): it meant to
+    /// pay and did not, for a reason that is not the steady state. `Err` (an effect failed),
+    /// `MeltFailed`, and every refusal that is not at the threshold — the balance stays owed and
+    /// hammering the same host or mint every 30 s would not change that. A threshold refusal, a
+    /// payment and a dry run are not failures.
+    pub fn is_failure(&self) -> bool {
+        match &self.outcome {
+            Err(_) | Ok(RemitOutcome::MeltFailed { .. }) => true,
+            Ok(RemitOutcome::Refused(refusal)) => !refusal.is_threshold(),
+            Ok(RemitOutcome::Paid { .. }) | Ok(RemitOutcome::DryRun) => false,
         }
     }
 }
 
-/// **The collect path's attempt** — [`remit`] under [`RemitTrigger::Collect`], with every error
-/// caught into the report. Nothing here can fail the caller: the receipt is already journaled and
-/// the job already marked paid before this runs, and a failure leaves the balance unremitted for the
-/// next collect to try again.
+/// **The node's attempt** — [`remit`] under a paying node trigger ([`RemitTrigger::Collect`] or
+/// [`RemitTrigger::Retry`]), with every error caught into the report. Nothing here can fail the
+/// caller: on the collect path the receipt is already journaled and the job already marked paid
+/// before this runs; a failure leaves the balance unremitted for the retry tick (and the next
+/// collect) to try again.
 pub fn remit_best_effort(
     store: &SellerStore,
     effects: &mut dyn RemitEffects,
+    trigger: RemitTrigger,
     now_unix: i64,
 ) -> RemitReport {
+    debug_assert!(
+        matches!(trigger, RemitTrigger::Collect | RemitTrigger::Retry),
+        "the node's best-effort attempt runs under a node trigger, never the operator's"
+    );
     let mut out = Vec::new();
-    let outcome = remit(store, effects, RemitTrigger::Collect, now_unix, &mut out);
+    let outcome = remit(store, effects, trigger, now_unix, &mut out);
     let lines = String::from_utf8_lossy(&out)
         .lines()
         .map(str::to_owned)
@@ -718,15 +752,17 @@ pub fn remit_best_effort(
 }
 
 /// [`remit_best_effort`] over the shipped [`LiveEffects`] — what the seller node runs, on a thread
-/// of its own, after a receipt is journaled `Collected::New`. A failure to build the https client is
-/// itself journaled as a failed attempt, so even that is visible in the read-out.
-pub fn remit_after_collect_live(
+/// of its own, after a receipt is journaled `Collected::New` and on each retry tick. A failure to
+/// build the https client is itself journaled as a failed attempt, so even that is visible in the
+/// read-out.
+pub fn remit_live_best_effort(
     store: &SellerStore,
     home: MaxplayerHome,
+    trigger: RemitTrigger,
     now_unix: i64,
 ) -> RemitReport {
     match LiveEffects::new(home) {
-        Ok(mut effects) => remit_best_effort(store, &mut effects, now_unix),
+        Ok(mut effects) => remit_best_effort(store, &mut effects, trigger, now_unix),
         Err(error) => {
             let error = format!("build https client for LNURL: {error}");
             let unremitted = store
@@ -736,7 +772,7 @@ pub fn remit_after_collect_live(
             let journaled = store.record_remit_attempt(&RemitAttempt {
                 attempt_id: 0,
                 started_at_unix: now_unix,
-                trigger: RemitAttemptTrigger::Collect,
+                trigger: trigger.journal_as().unwrap_or(RemitAttemptTrigger::Collect),
                 unremitted_sats: unremitted,
                 outcome: RemitAttemptOutcome::Failed,
                 detail: error.clone(),
@@ -751,6 +787,217 @@ pub fn remit_after_collect_live(
                 lines,
             }
         }
+    }
+}
+
+// ---- retry pacing (stage 2a, addendum 2) ------------------------------------------------------
+
+/// The retry tick's base delay: the first attempt after boot waits this long (jittered), and a streak
+/// of failures doubles it from here.
+pub const RETRY_BASE: Duration = Duration::from_secs(30);
+/// The ceiling the doubling stops at. A node whose payout host is down keeps trying at most this
+/// often, for as long as it runs.
+pub const RETRY_CAP: Duration = Duration::from_secs(30 * 60);
+
+/// How one observed attempt moved the pacing — what the loop logs, and how loudly (addendum 2 §5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pacing {
+    /// The steady state: nothing owed, or not enough to clear the destination's minimum. Not a
+    /// failure — the streak is untouched and nothing is logged at full volume.
+    Idle,
+    /// A payment with no failure streak behind it.
+    Paid,
+    /// The first failure of a streak — the one to log in full, with its error.
+    FirstFailure,
+    /// Another failure in the same streak. `entered_cap` marks the transition into the 30-minute
+    /// ceiling — a line an operator wants once, not every half hour.
+    RepeatFailure { streak: u32, entered_cap: bool },
+    /// A payment that ended a streak: how many attempts failed first, and for how long the fee sat
+    /// owed while they did. The line an operator wants when they ask "did it ever go out?".
+    Recovered {
+        failed_attempts: u32,
+        owed_for_secs: i64,
+    },
+}
+
+/// The retry tick's backoff: **base 30 s, doubling on consecutive failures, capped at 30 minutes,
+/// with full jitter**; reset to base by a successful remittance and by nothing else.
+///
+/// One instance per node, shared by the loop's tick and the collect path's thread, so a success on
+/// either path resets it and a failure on either escalates it: both back off against the same LNURL
+/// host and the same mint.
+///
+/// **Why full jitter, and why nobody may "simplify" it away:** every seller's node backs off against
+/// the same payout host and the same mint. If they all slept the computed delay, an outage would end
+/// with every node in the fleet retrying in the same second — the correlated burst that turns a
+/// recovered host back into a failed one. So the delay actually slept is a uniform random value in
+/// `[0, computed_delay]`, not the delay plus a small wobble ([`Self::next_delay`]), and the first
+/// attempt after boot draws from `[0, base]` for the same reason: a fleet restarting together must
+/// not all attempt at once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemitBackoff {
+    base: Duration,
+    cap: Duration,
+    /// Consecutive failures observed since the last success.
+    streak: u32,
+    /// When the current streak began (unix seconds), for the recovery line.
+    streak_since_unix: Option<i64>,
+}
+
+impl Default for RemitBackoff {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RemitBackoff {
+    /// The shipped bounds: [`RETRY_BASE`] doubling to [`RETRY_CAP`].
+    pub fn new() -> Self {
+        Self::with_bounds(RETRY_BASE, RETRY_CAP)
+    }
+
+    /// Explicit bounds — for tests that must not sleep 30 minutes. `cap` below `base` is clamped
+    /// to `base`.
+    pub fn with_bounds(base: Duration, cap: Duration) -> Self {
+        Self {
+            base,
+            cap: cap.max(base),
+            streak: 0,
+            streak_since_unix: None,
+        }
+    }
+
+    /// Consecutive failures so far (0 = healthy).
+    pub fn streak(&self) -> u32 {
+        self.streak
+    }
+
+    /// The delay the current streak computes to, BEFORE jitter: `base × 2^streak`, capped.
+    pub fn computed_delay(&self) -> Duration {
+        let mut delay = self.base;
+        for _ in 0..self.streak {
+            if delay >= self.cap {
+                break;
+            }
+            delay = delay.saturating_mul(2);
+        }
+        delay.min(self.cap)
+    }
+
+    /// Whether the doubling has reached the cap.
+    pub fn at_cap(&self) -> bool {
+        self.computed_delay() >= self.cap
+    }
+
+    /// The delay to actually sleep before the next attempt: full jitter over
+    /// [`Self::computed_delay`], drawn from the OS RNG. Never above the computed delay, never below
+    /// zero. If the RNG is unavailable (it should never be), sleeps the full computed delay — later
+    /// is the safe direction.
+    pub fn next_delay(&self) -> Duration {
+        let mut bytes = [0u8; 8];
+        let entropy = match getrandom::fill(&mut bytes) {
+            Ok(()) => u64::from_le_bytes(bytes),
+            Err(_) => u64::MAX,
+        };
+        jittered(self.computed_delay(), entropy)
+    }
+
+    /// Fold one finished attempt into the pacing and say what changed. Failures
+    /// ([`RemitReport::is_failure`]) lengthen the streak; a payment resets it to base; the steady
+    /// state ([`Pacing::Idle`]) leaves it exactly as it was — a balance under the threshold neither
+    /// escalates nor resets.
+    pub fn observe(&mut self, report: &RemitReport, now_unix: i64) -> Pacing {
+        if report.is_failure() {
+            let was_at_cap = self.at_cap();
+            self.streak = self.streak.saturating_add(1);
+            if self.streak == 1 {
+                self.streak_since_unix = Some(now_unix);
+                return Pacing::FirstFailure;
+            }
+            return Pacing::RepeatFailure {
+                streak: self.streak,
+                entered_cap: !was_at_cap && self.at_cap(),
+            };
+        }
+        match &report.outcome {
+            Ok(RemitOutcome::Paid { .. }) => {
+                let failed_attempts = self.streak;
+                let owed_for_secs = self
+                    .streak_since_unix
+                    .map(|since| now_unix.saturating_sub(since).max(0))
+                    .unwrap_or(0);
+                self.streak = 0;
+                self.streak_since_unix = None;
+                if failed_attempts == 0 {
+                    Pacing::Paid
+                } else {
+                    Pacing::Recovered {
+                        failed_attempts,
+                        owed_for_secs,
+                    }
+                }
+            }
+            _ => Pacing::Idle,
+        }
+    }
+}
+
+/// Full jitter: a uniform point in `[0, computed]` chosen by `entropy` (`0` ⇒ zero, `u64::MAX` ⇒
+/// the whole computed delay). Pure, so the bound is tested without a clock or an RNG.
+pub fn jittered(computed: Duration, entropy: u64) -> Duration {
+    // Integer arithmetic, scaled in two parts so nothing overflows even at `Duration::MAX`:
+    // `secs × entropy` and `subsec_nanos × entropy` each fit u128 (u64 × u64), and the remainder
+    // of the seconds part becomes nanoseconds.
+    let scale = u128::from(u64::MAX);
+    let entropy = u128::from(entropy);
+    let secs_scaled = u128::from(computed.as_secs()) * entropy;
+    let whole_secs = secs_scaled / scale;
+    let carry_nanos = (secs_scaled % scale) * 1_000_000_000 / scale;
+    let subsec_nanos = u128::from(computed.subsec_nanos()) * entropy / scale;
+    let nanos = carry_nanos + subsec_nanos;
+    let secs = Duration::from_secs(u64::try_from(whole_secs).unwrap_or(u64::MAX));
+    secs.checked_add(Duration::from_nanos(
+        u64::try_from(nanos).unwrap_or(u64::MAX),
+    ))
+    .unwrap_or(computed)
+    .min(computed)
+}
+
+/// **Single-flight for the node's two paths** (addendum 2 §3): one remittance attempt in flight per
+/// process, ever. The collect thread and the loop's tick can reach the entry point at the same time;
+/// whichever cannot take the permit **skips and returns** — it does not queue, block or fail. This is
+/// a liveness device, not the correctness argument: the store's one-`planned`-row rule is what makes
+/// a double payment impossible, including against `maxplayer seller fees remit --confirm` in another
+/// process, which this guard cannot see.
+#[derive(Debug, Clone, Default)]
+pub struct RemitFlight(Arc<AtomicBool>);
+
+/// Held by the one attempt in flight; the slot frees when it drops (including on a panic).
+#[derive(Debug)]
+pub struct RemitPermit(Arc<AtomicBool>);
+
+impl RemitFlight {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Take the slot if it is free. `None` means an attempt is already in flight: skip.
+    pub fn try_acquire(&self) -> Option<RemitPermit> {
+        self.0
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| RemitPermit(Arc::clone(&self.0)))
+    }
+
+    /// Whether an attempt holds the slot right now.
+    pub fn in_flight(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for RemitPermit {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
     }
 }
 
@@ -1574,7 +1821,7 @@ mod tests {
         let (store, root) = store_with_fees("best-effort-fails", &[10]);
         let mut fake = Fake::new(|_| 1);
         fake.pay_request_error = Some("agi.cash: connection refused".to_owned());
-        let report = remit_best_effort(&store, &mut fake, 100);
+        let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 100);
         assert_eq!(
             report.outcome,
             Err("agi.cash: connection refused".to_owned())
@@ -1582,7 +1829,11 @@ mod tests {
         assert!(!report.is_quiet());
         assert_eq!(
             report.summary(),
-            "attempt FAILED (agi.cash: connection refused); the balance stays unremitted and the next collect tries again"
+            "attempt FAILED (agi.cash: connection refused); the balance stays unremitted and the node retries with backoff while it runs"
+        );
+        assert!(
+            report.is_failure(),
+            "an unreachable host is a pacing failure"
         );
         assert!(
             report.lines.iter().any(|line| line
@@ -1600,7 +1851,8 @@ mod tests {
         assert_eq!(attempts[0].unremitted_sats, 10);
         assert_eq!(attempts[0].detail, "agi.cash: connection refused");
 
-        // The next collect tries again and succeeds: the whole balance, old and new, is paid once.
+        // The next attempt (a collect here; the retry tick is the other trigger) succeeds: the whole
+        // balance, old and new, is paid once.
         store
             .collect_receipt(
                 "receipt-next",
@@ -1616,7 +1868,7 @@ mod tests {
             .expect("collect");
         let mut fake = Fake::new(|_| 1);
         fake.melt_results = vec![Ok((14, 1))];
-        let report = remit_best_effort(&store, &mut fake, 102);
+        let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 102);
         assert_eq!(
             report.outcome,
             Ok(RemitOutcome::Paid {
@@ -1644,7 +1896,7 @@ mod tests {
             )
             .expect("collect");
         let mut fake = Fake::new(|_| 1);
-        let report = remit_best_effort(&store, &mut fake, 104);
+        let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 104);
         assert_eq!(
             report.outcome,
             Ok(RemitOutcome::Refused(Refusal::NothingUnremitted))
@@ -1770,5 +2022,252 @@ mod tests {
             "{text}"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- retry pacing (addendum 2, gate 2d) ----------------------------------------------------
+
+    fn failed(error: &str) -> RemitReport {
+        RemitReport {
+            outcome: Err(error.to_owned()),
+            lines: Vec::new(),
+        }
+    }
+
+    fn paid(net_sats: u64) -> RemitReport {
+        RemitReport {
+            outcome: Ok(RemitOutcome::Paid {
+                remittance_id: "r".to_owned(),
+                net_sats,
+                melt_fee_sats: 1,
+            }),
+            lines: Vec::new(),
+        }
+    }
+
+    fn refused(refusal: Refusal) -> RemitReport {
+        RemitReport {
+            outcome: Ok(RemitOutcome::Refused(refusal)),
+            lines: Vec::new(),
+        }
+    }
+
+    // Gate 2d: consecutive failures GROW the delay from the base, doubling, and it is CAPPED; the
+    // jittered delay never exceeds the computed delay for that streak and never falls below zero; a
+    // success RESETS it to base. Driven on the pure computation — nothing here sleeps.
+    #[test]
+    fn retry_backoff_doubles_from_base_caps_at_thirty_minutes_and_resets_on_success() {
+        let mut pacing = RemitBackoff::new();
+        assert_eq!(pacing.computed_delay(), Duration::from_secs(30));
+        assert_eq!(RETRY_BASE, Duration::from_secs(30));
+        assert_eq!(RETRY_CAP, Duration::from_secs(30 * 60));
+
+        assert_eq!(
+            pacing.observe(&failed("host down"), 1_000),
+            Pacing::FirstFailure
+        );
+        let mut expected = vec![Duration::from_secs(30)];
+        let mut seen_cap_transition = 0;
+        for attempt in 2..=16u32 {
+            let delay = pacing.computed_delay();
+            expected.push(delay);
+            // Never above the computed delay, never below zero, for the extremes and the middle.
+            for entropy in [0, 1, u64::MAX / 3, u64::MAX / 2, u64::MAX - 1, u64::MAX] {
+                let slept = pacing_jitter_probe(&pacing, entropy);
+                assert!(
+                    slept <= delay,
+                    "streak {}: {slept:?} > {delay:?}",
+                    pacing.streak()
+                );
+                assert!(slept >= Duration::ZERO);
+            }
+            assert_eq!(pacing_jitter_probe(&pacing, u64::MAX), delay);
+            assert_eq!(pacing_jitter_probe(&pacing, 0), Duration::ZERO);
+            let drawn = pacing.next_delay();
+            assert!(
+                drawn <= delay,
+                "the RNG draw stays under the computed delay"
+            );
+            match pacing.observe(&failed("host down"), 1_000 + i64::from(attempt) * 60) {
+                Pacing::RepeatFailure {
+                    streak,
+                    entered_cap,
+                } => {
+                    assert_eq!(streak, attempt);
+                    if entered_cap {
+                        seen_cap_transition += 1;
+                    }
+                }
+                other => panic!("attempt {attempt}: expected a repeat failure, got {other:?}"),
+            }
+        }
+        // 30, 60, 120, 240, 480, 960, 1800 (cap), 1800, 1800, ...
+        assert_eq!(
+            expected
+                .iter()
+                .take(8)
+                .map(Duration::as_secs)
+                .collect::<Vec<_>>(),
+            vec![30, 60, 120, 240, 480, 960, 1800, 1800]
+        );
+        assert!(
+            expected.iter().all(|delay| *delay <= RETRY_CAP),
+            "the doubling is capped: {expected:?}"
+        );
+        assert!(
+            expected.iter().skip(6).all(|delay| *delay == RETRY_CAP),
+            "once capped it stays capped: {expected:?}"
+        );
+        assert_eq!(
+            seen_cap_transition, 1,
+            "the transition into the cap is reported exactly once"
+        );
+        assert!(pacing.at_cap());
+
+        // A success resets to base and reports the streak it ended.
+        assert_eq!(
+            pacing.observe(&paid(10), 1_000 + 17 * 60),
+            Pacing::Recovered {
+                failed_attempts: 16,
+                owed_for_secs: 17 * 60,
+            }
+        );
+        assert_eq!(pacing.streak(), 0);
+        assert_eq!(pacing.computed_delay(), RETRY_BASE);
+        assert!(!pacing.at_cap());
+        // A success with no streak behind it is just a payment.
+        assert_eq!(pacing.observe(&paid(10), 2_000), Pacing::Paid);
+        assert_eq!(pacing.computed_delay(), RETRY_BASE);
+    }
+
+    fn pacing_jitter_probe(pacing: &RemitBackoff, entropy: u64) -> Duration {
+        jittered(pacing.computed_delay(), entropy)
+    }
+
+    // Rules 4 and 5: below the threshold is NOT a failure, and a zero balance is not one either —
+    // neither escalates the streak, neither resets it, and neither is logged as a failure.
+    #[test]
+    fn a_balance_under_the_threshold_or_at_zero_neither_escalates_nor_resets_the_backoff() {
+        let mut pacing = RemitBackoff::new();
+        let below = refused(Refusal::BelowMinimum {
+            unremitted: 0,
+            min_sats: 1,
+        });
+        let zero = refused(Refusal::NothingUnremitted);
+        assert!(!below.is_failure() && !zero.is_failure());
+        assert!(below.is_quiet() && zero.is_quiet());
+
+        // Healthy node: idle at the base interval.
+        assert_eq!(pacing.observe(&below, 1), Pacing::Idle);
+        assert_eq!(pacing.observe(&zero, 2), Pacing::Idle);
+        assert_eq!(pacing.computed_delay(), RETRY_BASE);
+        assert_eq!(pacing.streak(), 0);
+
+        // Mid-streak: the threshold outcomes leave the streak exactly where it was — they are not a
+        // success, so they do not reset it (rule 3: success and nothing else), and they are not a
+        // failure, so they do not lengthen it.
+        pacing.observe(&failed("a"), 10);
+        pacing.observe(&failed("b"), 11);
+        let before = pacing.clone();
+        assert_eq!(pacing.observe(&below, 12), Pacing::Idle);
+        assert_eq!(pacing.observe(&zero, 13), Pacing::Idle);
+        assert_eq!(pacing, before);
+        assert_eq!(pacing.computed_delay(), Duration::from_secs(120));
+
+        // A refusal that is NOT at the threshold left the fee owed for a reason retrying every 30 s
+        // cannot fix: it paces like a failure.
+        let reserve = refused(Refusal::ReserveDoesNotFit {
+            gross: 2,
+            reserve: 2,
+        });
+        assert!(reserve.is_failure());
+        assert_eq!(
+            pacing.observe(&reserve, 14),
+            Pacing::RepeatFailure {
+                streak: 3,
+                entered_cap: false
+            }
+        );
+        // A melt that failed after the plan is a failure too.
+        let melt_failed = RemitReport {
+            outcome: Ok(RemitOutcome::MeltFailed {
+                remittance_id: "r".to_owned(),
+                error: "mint timeout".to_owned(),
+            }),
+            lines: Vec::new(),
+        };
+        assert!(melt_failed.is_failure());
+        // A dry run is nothing to the pacing.
+        let dry = RemitReport {
+            outcome: Ok(RemitOutcome::DryRun),
+            lines: Vec::new(),
+        };
+        assert!(!dry.is_failure());
+        assert_eq!(pacing.observe(&dry, 15), Pacing::Idle);
+    }
+
+    // Explicit bounds (for the loop test that cannot sleep 30 minutes): the cap clamps to the base,
+    // and the arithmetic is the same.
+    #[test]
+    fn retry_backoff_honours_explicit_bounds() {
+        let mut pacing =
+            RemitBackoff::with_bounds(Duration::from_millis(20), Duration::from_millis(50));
+        assert_eq!(pacing.computed_delay(), Duration::from_millis(20));
+        pacing.observe(&failed("x"), 0);
+        assert_eq!(pacing.computed_delay(), Duration::from_millis(40));
+        pacing.observe(&failed("x"), 0);
+        assert_eq!(pacing.computed_delay(), Duration::from_millis(50));
+        assert!(pacing.at_cap());
+        let clamped = RemitBackoff::with_bounds(Duration::from_secs(5), Duration::from_secs(1));
+        assert_eq!(clamped.computed_delay(), Duration::from_secs(5));
+        assert!(clamped.at_cap());
+    }
+
+    // Full jitter is a uniform point in [0, computed]: the two extremes are exact, and a huge
+    // computed delay does not overflow.
+    #[test]
+    fn full_jitter_stays_inside_zero_to_computed() {
+        let computed = Duration::from_secs(1800);
+        assert_eq!(jittered(computed, 0), Duration::ZERO);
+        assert_eq!(jittered(computed, u64::MAX), computed);
+        let half = jittered(computed, u64::MAX / 2);
+        assert!(half > Duration::from_secs(899) && half < Duration::from_secs(901));
+        assert!(jittered(Duration::MAX, u64::MAX) <= Duration::MAX);
+        assert_eq!(jittered(Duration::ZERO, u64::MAX), Duration::ZERO);
+    }
+
+    // Addendum 2 §3: one attempt in flight, ever; a second taker skips (gets `None`) and does not
+    // block; the slot frees when the permit drops.
+    #[test]
+    fn single_flight_admits_one_attempt_and_frees_the_slot_on_drop() {
+        let flight = RemitFlight::new();
+        assert!(!flight.in_flight());
+        let permit = flight.try_acquire().expect("the slot starts free");
+        assert!(flight.in_flight());
+        assert!(
+            flight.try_acquire().is_none(),
+            "a second taker skips while the first holds the slot"
+        );
+        let sibling = flight.clone();
+        assert!(
+            sibling.try_acquire().is_none(),
+            "clones share the one slot — the loop and the collect thread see the same guard"
+        );
+        drop(permit);
+        assert!(!flight.in_flight());
+        let again = sibling.try_acquire();
+        assert!(
+            again.is_some(),
+            "the slot is free again once the permit dropped"
+        );
+        // A permit dropped by a panicking thread frees the slot too: Drop runs on unwind.
+        let flight_for_thread = flight.clone();
+        drop(again);
+        let outcome = std::thread::spawn(move || {
+            let _permit = flight_for_thread.try_acquire().expect("free");
+            panic!("attempt died");
+        })
+        .join();
+        assert!(outcome.is_err());
+        assert!(!flight.in_flight(), "the slot is not leaked by a panic");
     }
 }
