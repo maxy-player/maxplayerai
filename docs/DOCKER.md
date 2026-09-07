@@ -465,6 +465,11 @@ mode = "docker"
 `container_delivery = false` is the opt-out. The host then clones the base, the container runs the
 agent, and the host commits and pushes, as before.
 
+**Root posture.** A seat whose daemon runs as root (uid 0) runs the job as root inside the
+container, where the boundary between the job and the delivery orchestrator is weakest. Such a seat
+does not get container delivery by default. It must set `container_delivery = true` to opt in, and
+the boot line warns when it does. Run the seller as a non-root user.
+
 A seat with `mode = "launcher"` is not affected, and cannot use this mode: launcher mode creates no
 container to run the git steps in. Such a seat always delivers from the host. It may write
 `container_delivery = false`, which changes nothing, but `container_delivery = true` is REFUSED at
