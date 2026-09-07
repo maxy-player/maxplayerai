@@ -40,13 +40,17 @@ use crate::gateway::EventDraft;
 /// compare-and-set immediately before the melt, it marks the planned row SPENDING — admitted to the
 /// irreversible spend — and a spending row is never released on lease expiry, only on a quote the
 /// mint reports terminal.
-pub const SCHEMA_VERSION: i64 = 12;
+/// v13 (stage 2a, addendum 5) added one nullable column, `spending_quote_id`: the melt quote the
+/// compare-and-set BOUND to the row at admission. The payer pays exactly that quote, by id, and never
+/// raises another for the row; reconciliation of a spending row asks the mint about that quote by id
+/// and releases the row only on a transition naming it ([`SellerStore::release_remittance`]).
+pub const SCHEMA_VERSION: i64 = 13;
 
 /// The platform fee as journaled so far: what is owed on paper, what has been remitted, and the
 /// figures around them. Returned by [`SellerStore::accrued_fees`]. A query and nothing more — the
 /// only things that move the unremitted balance are the remittance writes
 /// [`SellerStore::plan_remittance`] / [`SellerStore::settle_remittance`] /
-/// [`SellerStore::fail_remittance`], driven by `crate::fee_remit` (automatically after a collect,
+/// [`SellerStore::release_remittance`], driven by `crate::fee_remit` (automatically after a collect,
 /// or by `maxplayer seller fees remit --confirm`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AccruedFees {
@@ -154,9 +158,11 @@ pub enum RemittanceState {
     /// Journaled before the melt: the receipts it covers are pinned to it and the invoice is known.
     /// The melt has NOT been admitted: nothing has been spent against this row.
     Planned,
-    /// The owner's compare-and-set admitted the melt ([`SellerStore::admit_remittance_spend`]): the
-    /// payer may be mid-melt, so the row is released only on a quote the mint reports terminal —
-    /// never on lease expiry (addendum 4 §1.2).
+    /// The owner's compare-and-set admitted the melt ([`SellerStore::admit_remittance_spend`]) and
+    /// BOUND the one quote the payer may pay (`spending_quote_id`): the payer may be mid-melt on that
+    /// quote, so the row is released only when the mint reports THAT quote terminal — never on lease
+    /// expiry, never on the state of some other quote for the same invoice (addendum 4 §1.2,
+    /// addendum 5 §1).
     Spending,
     /// The melt settled; the receipts stay discharged.
     Settled,
@@ -306,6 +312,12 @@ pub struct FeeRemittance {
     /// When the owner's compare-and-set admitted the melt (addendum 4 §1): `Some` exactly on a
     /// [`RemittanceState::Spending`] row. `None` on every row written before v12.
     pub spending_since_unix: Option<i64>,
+    /// The melt quote the compare-and-set bound to this row at admission (addendum 5 §1, rule 1) —
+    /// the ONLY quote its owner pays, by id, and the quote reconciliation asks the mint about to
+    /// resolve a spending row. `Some` exactly on a row admitted by a v13 binary; `None` on every
+    /// planned row, and on a spending row admitted before v13 (which reconciliation resolves by the
+    /// invoice's quotes, as before).
+    pub spending_quote_id: Option<String>,
     /// How many receipt rows are pinned to this remittance.
     pub receipts: usize,
 }
@@ -328,6 +340,47 @@ impl FeeRemittance {
     }
 }
 
+/// The REASON a release is being written, which is also its SQL predicate
+/// ([`SellerStore::release_remittance`], addendum 5 §1 rule 2): every release is a conditional
+/// state transition that changes zero rows if the row is no longer as the reason found it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseOn<'a> {
+    /// A SPENDING row whose BOUND quote (`spending_quote_id`) the mint reports terminal — FAILED,
+    /// or UNPAID and expired past the spending margin. Names the quote observed, so the release
+    /// lands only if that is still the row's bound quote.
+    TerminalBoundQuote { quote_id: &'a str },
+    /// A PLANNED row (never admitted: nothing spent against it) whose invoice's quote the mint
+    /// reports terminal.
+    TerminalQuotePlanned,
+    /// A PLANNED row whose owner's lease has run out at `now_unix` — the owner is provably not
+    /// spending: its fence refuses inside the margin and, past the lease, changes zero rows. Never
+    /// applies to a spending row.
+    LeaseExpired { now_unix: i64 },
+    /// This process's own PLANNED row: its earlier attempt is over (a process runs one attempt at
+    /// a time), or this attempt refused before spending.
+    OwnPlanned { owner: &'a str },
+}
+
+impl ReleaseOn<'_> {
+    /// The reason in a phrase, for messages.
+    pub fn describe(self) -> String {
+        match self {
+            Self::TerminalBoundQuote { quote_id } => {
+                format!("its bound melt quote {quote_id} is terminal at the mint")
+            }
+            Self::TerminalQuotePlanned => {
+                "planned, never admitted, and its quote is terminal at the mint".to_owned()
+            }
+            Self::LeaseExpired { now_unix } => {
+                format!("planned, never admitted, and its owner's lease had run out at unix {now_unix}")
+            }
+            Self::OwnPlanned { owner } => {
+                format!("planned, never admitted, and this process's own ({owner})")
+            }
+        }
+    }
+}
+
 /// Why the pre-spend compare-and-set changed zero rows ([`SellerStore::admit_remittance_spend`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OwnershipLost {
@@ -338,9 +391,10 @@ pub enum OwnershipLost {
     NotPlanned { state: RemittanceState },
     /// The row is planned but owned by someone else (or by nobody: a pre-v11 row).
     OtherOwner { owner: Option<String> },
-    /// The row is this caller's, but too little of its lease remains to start a payment safely:
-    /// another process is entitled to release it at `lease_until_unix`, and a spend that began
-    /// this close to that instant could land after the release.
+    /// The row is this caller's and still planned, but too little of its lease remains to start a
+    /// payment safely: another process is entitled to release a PLANNED row once its lease ends
+    /// ([`ReleaseOn::LeaseExpired`]), and an admission that landed this close to that instant would
+    /// race the release. (Once admitted, the row is spending and no lease releases it.)
     LeaseTooShort {
         lease_until_unix: Option<i64>,
         now_unix: i64,
@@ -964,6 +1018,11 @@ impl SellerStore {
              -- A column rather than a fourth `state` value because SQLite cannot widen this
              -- table's CHECK on an existing store; the one-in-flight index is unchanged, since a
              -- spending row is still the one `planned` row. Nullable, additive, ALTER-added below.
+             -- v13 (addendum 5): `spending_quote_id` is the melt quote the compare-and-set BOUND to
+             -- the row at admission — the only quote the owner pays (by id, never re-quoting), and
+             -- the quote reconciliation checks by id to resolve a spending row. Every release is a
+             -- conditional UPDATE carrying its reason's predicate (`release_remittance`); a release
+             -- of a spending row must name this quote. Nullable, additive, ALTER-added below.
              CREATE TABLE IF NOT EXISTS fee_remittances (
                  remittance_id   TEXT PRIMARY KEY,
                  gross_sats      INTEGER NOT NULL CHECK (gross_sats >= 0),
@@ -980,7 +1039,8 @@ impl SellerStore {
                  lease_until_unix INTEGER,
                  melt_fee_reserve_sats INTEGER CHECK (melt_fee_reserve_sats IS NULL OR melt_fee_reserve_sats >= 0),
                  settled_by      TEXT CHECK (settled_by IS NULL OR settled_by IN ('melt','reconciliation')),
-                 spending_since_unix INTEGER
+                 spending_since_unix INTEGER,
+                 spending_quote_id TEXT
              );
              CREATE UNIQUE INDEX IF NOT EXISTS fee_remittances_one_planned
                  ON fee_remittances (state) WHERE state = 'planned';
@@ -1121,6 +1181,14 @@ impl SellerStore {
             conn.execute_batch(
                 "ALTER TABLE fee_remittances ADD COLUMN spending_since_unix INTEGER;",
             )?;
+        }
+        // v13 — the quote BOUND to the in-flight row at admission (addendum 5 §1). Nullable, no
+        // default: every pre-existing row reads NULL — a planned row has no bound quote yet (the
+        // fence sets it), and a spending row admitted by a v12 binary was admitted without one, so
+        // reconciliation resolves it by the invoice's quotes as v12 did. Nothing rewritten, the
+        // `state` CHECK and the one-in-flight index unchanged. Additive + idempotent.
+        if !Self::column_exists(conn, "fee_remittances", "spending_quote_id")? {
+            conn.execute_batch("ALTER TABLE fee_remittances ADD COLUMN spending_quote_id TEXT;")?;
         }
         Ok(())
     }
@@ -1938,6 +2006,7 @@ impl SellerStore {
                 .map(|reserve| u64::try_from(reserve).unwrap_or(0)),
             settled_by,
             spending_since_unix,
+            spending_quote_id: row.get(17)?,
         })
     }
 
@@ -1945,7 +2014,8 @@ impl SellerStore {
         "f.remittance_id, f.gross_sats, f.melt_fee_sats, f.net_sats, f.destination, f.melt_quote_id,
          f.payment_hash, f.bolt11, f.state, f.created_at_unix, f.settled_at_unix,
          (SELECT COUNT(*) FROM receipts r WHERE r.remittance_id = f.remittance_id),
-         f.owner, f.lease_until_unix, f.melt_fee_reserve_sats, f.settled_by, f.spending_since_unix";
+         f.owner, f.lease_until_unix, f.melt_fee_reserve_sats, f.settled_by, f.spending_since_unix,
+         f.spending_quote_id";
 
     fn in_flight_remittance_in(conn: &Connection) -> Result<Option<FeeRemittance>, StoreError> {
         let found = conn
@@ -2070,23 +2140,32 @@ impl SellerStore {
         Ok(row)
     }
 
-    /// **The pre-spend fence** (addendum 4 §1.1): advance the row `planned → spending` by ONE
-    /// conditional update, immediately before the irreversible spend —
+    /// **The pre-spend fence** (addendum 4 §1.1, addendum 5 §1 rule 1): advance the row
+    /// `planned → spending` and BIND the quote the payer will pay, by ONE conditional update,
+    /// immediately before the irreversible spend —
     ///
     /// ```sql
-    /// UPDATE fee_remittances SET spending_since_unix = :now
+    /// UPDATE fee_remittances SET spending_since_unix = :now, spending_quote_id = :quote
     ///  WHERE remittance_id = :id AND state = 'planned' AND spending_since_unix IS NULL
     ///    AND owner = :owner AND lease_until_unix > :now + :margin
     /// ```
     ///
-    /// `now_unix` MUST be read by the caller at the instant of this call, never carried from the
-    /// attempt's entry: the whole point is that time elapsed since the plan counts. **Zero rows
-    /// changed ⇒ `Err(OwnershipLost)`**, diagnosed from the row as it stands: it is gone, no longer
-    /// planned (another process reconciled it, or it is already spending), owned by someone else,
-    /// or ours with `margin_secs` or less of lease left — another process is entitled to release a
-    /// planned row the instant its lease ends, and a spend begun that close could land after the
-    /// release. `Ok(row)` is the admitted row, now [`RemittanceState::Spending`]: from here on it is
-    /// released only on a quote the mint reports terminal, never on time (§1.2).
+    /// `:now` is read from `clock` INSIDE this call, after the store's lock is held and the
+    /// `IMMEDIATE` transaction has begun — never a value the caller sampled earlier, however
+    /// recently: a payer descheduled between sampling and the lock would otherwise be admitted on a
+    /// clock that is no longer now (addendum 5 §1, B2). `clock` is called exactly once; a caller
+    /// that wants the instant used reads it from the admitted row's `spending_since_unix` or from
+    /// [`OwnershipLost::LeaseTooShort`]. `quote_id` is the melt quote raised for the row's invoice
+    /// before this call and checked against the ceiling; from here on the owner pays THAT quote by
+    /// id and never raises another for this row.
+    ///
+    /// **Zero rows changed ⇒ `Err(OwnershipLost)`**, diagnosed from the row as it stands: it is
+    /// gone, no longer planned (another process reconciled it, or it is already spending), owned by
+    /// someone else, or ours with `margin_secs` or less of lease left — another process is entitled
+    /// to release a PLANNED row once its lease ends, and an admission that close would race the
+    /// release. `Ok(row)` is the admitted row, now [`RemittanceState::Spending`] with the quote
+    /// bound: from here on it is released only when the mint reports that quote terminal, never on
+    /// time (§1.2).
     ///
     /// One `IMMEDIATE` transaction, so two processes cannot both pass: the second sees the first's
     /// mark and changes zero rows.
@@ -2094,13 +2173,22 @@ impl SellerStore {
         &self,
         remittance_id: &str,
         owner: &str,
-        now_unix: i64,
+        quote_id: &str,
         margin_secs: i64,
+        clock: &mut dyn FnMut() -> i64,
     ) -> Result<Result<FeeRemittance, OwnershipLost>, StoreError> {
+        if quote_id.trim().is_empty() {
+            return Err(StoreError(
+                "a remittance is admitted to spend only against a named melt quote".to_owned(),
+            ));
+        }
         let mut conn = self.lock()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // The clock, read now: the lock is held and the write transaction has begun, so nothing can
+        // change the row between this instant and the UPDATE below.
+        let now_unix = clock();
         let changed = tx.execute(
-            "UPDATE fee_remittances SET spending_since_unix = ?3
+            "UPDATE fee_remittances SET spending_since_unix = ?3, spending_quote_id = ?6
              WHERE remittance_id = ?1 AND state = ?5 AND spending_since_unix IS NULL
                AND owner = ?2 AND lease_until_unix > ?3 + ?4",
             params![
@@ -2109,6 +2197,7 @@ impl SellerStore {
                 now_unix,
                 margin_secs,
                 RemittanceState::Planned.column_value(),
+                quote_id,
             ],
         )?;
         let row = tx
@@ -2198,30 +2287,72 @@ impl SellerStore {
         Ok(row)
     }
 
-    /// Mark a `planned` remittance failed — the mint reports the quote unpaid/failed, or no quote
-    /// was ever raised for its invoice — and release its receipts back to unremitted so the next
-    /// attempt pays them. Refused if the row is not `planned`.
-    pub fn fail_remittance(
+    /// **Release** the in-flight remittance — mark it failed and return its receipts to unremitted
+    /// so the next attempt pays them — by ONE conditional update whose predicate is the REASON for
+    /// the release ([`ReleaseOn`]), in one `IMMEDIATE` transaction (addendum 5 §1, rule 2). The
+    /// decision to release is taken on a snapshot of the row and the mint's answer; by the time
+    /// the UPDATE runs, the row may have moved — its owner may have been admitted (it is now
+    /// spending, bound to a quote), or another process may have resolved it. Each predicate
+    /// requires the row to still be in the state the reason was decided on, so a stale decision
+    /// changes ZERO rows rather than revoking a newer admission. **Zero rows changed ⇒ `Ok(None)`:
+    /// HOLD** — nothing written, and the caller prints that the row changed under it; never an
+    /// error that aborts the run.
+    ///
+    /// The predicates, each on top of `remittance_id = :id AND state = 'planned'`:
+    /// - [`ReleaseOn::TerminalBoundQuote`] — a SPENDING row whose bound quote the mint reports
+    ///   terminal: `AND spending_since_unix IS NOT NULL AND spending_quote_id = :quote`. The only
+    ///   release a spending row has, and it names the quote observed terminal, so a release decided
+    ///   on some other quote's state changes nothing.
+    /// - [`ReleaseOn::TerminalQuotePlanned`] — a PLANNED row (never admitted) whose invoice's quote
+    ///   the mint reports terminal: `AND spending_since_unix IS NULL`.
+    /// - [`ReleaseOn::LeaseExpired`] — a PLANNED row whose owner's lease has run out:
+    ///   `AND spending_since_unix IS NULL AND lease_until_unix <= :now`. Lease expiry never touches
+    ///   a spending row (addendum 4 §1.2), and the clock is compared IN the predicate, so an
+    ///   admission that landed first (fresh clock, inside its own lock) is not revoked by a release
+    ///   decided on a snapshot taken before it.
+    /// - [`ReleaseOn::OwnPlanned`] — this process's own PLANNED row (its earlier attempt is over,
+    ///   or it refused before spending): `AND spending_since_unix IS NULL AND owner = :owner`.
+    ///
+    /// A missing lease (pre-v11 row) is read as expired by [`ReleaseOn::LeaseExpired`]
+    /// (`lease_until_unix IS NULL` counts), matching [`FeeRemittance::lease_expired`].
+    pub fn release_remittance(
         &self,
         remittance_id: &str,
+        on: ReleaseOn<'_>,
         now_unix: i64,
-    ) -> Result<FeeRemittance, StoreError> {
+    ) -> Result<Option<FeeRemittance>, StoreError> {
         let mut conn = self.lock()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed = tx.execute(
-            "UPDATE fee_remittances SET state = ?3, settled_at_unix = ?2
-             WHERE remittance_id = ?1 AND state = ?4",
-            params![
-                remittance_id,
-                now_unix,
-                RemittanceState::Failed.column_value(),
-                RemittanceState::Planned.column_value(),
-            ],
-        )?;
+        let failed = RemittanceState::Failed.column_value();
+        let planned = RemittanceState::Planned.column_value();
+        let changed = match on {
+            ReleaseOn::TerminalBoundQuote { quote_id } => tx.execute(
+                "UPDATE fee_remittances SET state = ?3, settled_at_unix = ?2
+                 WHERE remittance_id = ?1 AND state = ?4
+                   AND spending_since_unix IS NOT NULL AND spending_quote_id = ?5",
+                params![remittance_id, now_unix, failed, planned, quote_id],
+            )?,
+            ReleaseOn::TerminalQuotePlanned => tx.execute(
+                "UPDATE fee_remittances SET state = ?3, settled_at_unix = ?2
+                 WHERE remittance_id = ?1 AND state = ?4 AND spending_since_unix IS NULL",
+                params![remittance_id, now_unix, failed, planned],
+            )?,
+            ReleaseOn::LeaseExpired { now_unix: at } => tx.execute(
+                "UPDATE fee_remittances SET state = ?3, settled_at_unix = ?2
+                 WHERE remittance_id = ?1 AND state = ?4 AND spending_since_unix IS NULL
+                   AND (lease_until_unix IS NULL OR lease_until_unix <= ?5)",
+                params![remittance_id, now_unix, failed, planned, at],
+            )?,
+            ReleaseOn::OwnPlanned { owner } => tx.execute(
+                "UPDATE fee_remittances SET state = ?3, settled_at_unix = ?2
+                 WHERE remittance_id = ?1 AND state = ?4 AND spending_since_unix IS NULL
+                   AND owner = ?5",
+                params![remittance_id, now_unix, failed, planned, owner],
+            )?,
+        };
         if changed == 0 {
-            return Err(StoreError(format!(
-                "remittance {remittance_id} is not planned; refusing to fail it"
-            )));
+            // The row is not as the reason found it: HOLD, touch nothing (not even the receipts).
+            return Ok(None);
         }
         tx.execute(
             "UPDATE receipts SET remittance_id = NULL WHERE remittance_id = ?1",
@@ -2236,7 +2367,7 @@ impl SellerStore {
             Self::read_remittance,
         )?;
         tx.commit()?;
-        Ok(row)
+        Ok(Some(row))
     }
 
     /// Journal one remittance attempt and its outcome (see `fee_remit_attempts`). Returns the
