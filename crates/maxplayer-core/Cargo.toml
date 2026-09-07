@@ -25,7 +25,10 @@ gateway = ["dep:nostr-sdk", "tokio/time"]
 # planted in its own workdir cannot run on the host-side legs. A leg that ever shells out to a
 # `git` CLI must neutralise hook lookup itself. `tests/no_system_git.rs` is the guard — tripwire
 # `git` on PATH, required-features `git-delivery`, so it runs only in the money-path job (#826).
-git-delivery = ["gateway", "dep:git2", "dep:reqwest", "dep:base64"]
+# `libc` rides with `git-delivery` for two reasons that both live in `delivery_orchestrator`: the
+# `O_NOFOLLOW`/`O_NONBLOCK` flags the host uses to read job-writable exchange files without following
+# a symlink or parking on a FIFO, and the `kill` the container-side reap sends.
+git-delivery = ["gateway", "dep:git2", "dep:reqwest", "dep:base64", "dep:libc"]
 # The `wallet` feature also brings up the persistent buyer daemon (crate::buyer): the
 # exclusive home lock (libc flock), the durable state DB (rusqlite, bundled sqlite so
 # there is no system dependency), and the async unix-socket surface (tokio net + io-util).
@@ -81,7 +84,8 @@ cdk = { version = "=0.17.2", default-features = false, features = ["wallet"], op
 cdk-sqlite = { version = "=0.17.2", optional = true }
 getrandom = "0.3"
 hex = "0.4.3"
-# Exclusive home lock (flock) for the buyer daemon; unix-only, gated to `wallet`.
+# Exclusive home lock (flock) for the buyer daemon, and the exchange-file open flags and the process
+# reap of the delivery orchestrator. Gated to `git-delivery` (which `wallet` composes).
 libc = { version = "0.2", optional = true }
 # Durable buyer state DB (buyer.sqlite). `bundled` compiles sqlite from source so the
 # buyer needs no system libsqlite3. Gated to `wallet`.

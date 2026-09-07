@@ -7109,6 +7109,17 @@ impl SellerNodeRunner {
                 Ok(None) => {}
                 Err(error) => break Err(Fail::Setup(format!("wait on container: {error}"))),
             }
+            // The deadline is checked BEFORE the marker read, never after it. The marker is a file
+            // the job can write while it lives, so the loop must not depend on that read returning
+            // for the deadline to be seen (the reader is non-blocking and capped; the order stands
+            // on its own). Every `break Err` in this loop lands on the same teardown as a timeout:
+            // the client is killed, the container is captured and removed, the exchange dir is gone.
+            if now_unix().max(0) as u64 > hard_deadline {
+                break Err(Fail::Timeout(format!(
+                    "container still running {}s past the job deadline; killed",
+                    orch::PUSH_MARGIN_SECS + orch::CONTAINER_EXIT_GRACE_SECS
+                )));
+            }
             if marker.is_none() {
                 match orch::read_agent_done_marker(&io_dir, &nonce) {
                     Ok(None) => {}
@@ -7136,15 +7147,10 @@ impl SellerNodeRunner {
                         }
                         marker = Some(seen);
                     }
-                    // A forged or malformed marker: no token, no delivery.
+                    // A forged, planted (FIFO, symlink, over-cap) or malformed marker: no token,
+                    // no delivery. The break lands on the teardown below.
                     Err(error) => break Err(Fail::Delivery(error.to_string())),
                 }
-            }
-            if now_unix().max(0) as u64 > hard_deadline {
-                break Err(Fail::Timeout(format!(
-                    "container still running {}s past the job deadline; killed",
-                    orch::PUSH_MARGIN_SECS + orch::CONTAINER_EXIT_GRACE_SECS
-                )));
             }
             if last_alive_line.elapsed() >= Duration::from_secs(300) {
                 opline!(

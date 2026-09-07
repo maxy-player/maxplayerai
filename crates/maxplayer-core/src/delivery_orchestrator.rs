@@ -48,6 +48,14 @@
 //! and, in the fresh-after-agent mode, [`PUSH_TOKEN_FILE`] (mode `0600`) after the marker appears. The
 //! container writes [`AGENT_DONE_MARKER`], [`DELIVERY_OID_FILE`] and [`OUTCOME_FILE`].
 //!
+//! Every file one side reads out of this directory goes through [`read_exchange_file`]: the open
+//! follows no symlink and never blocks, the OPENED descriptor must be a regular file, and the read
+//! stops at a small per-file cap ([`EXCHANGE_MARKER_MAX_BYTES`] and its siblings). The host polls the
+//! marker WHILE the agent lives, so without this a job could plant, under the marker's name, a FIFO
+//! (a following, blocking read parks the host past every deadline check) or a symlink to `/dev/zero`
+//! (the host reads until allocation fails) — no container escape and no nonce needed. The host's
+//! writes refuse any entry that already exists at the name, a symlink included.
+//!
 //! ⚠ Who can read what, and when. The container runs every process as ONE uid (`--user`, no
 //! capabilities), so the agent and the orchestrator share file permissions inside the container. The
 //! contract therefore rests on TIME, not on modes: the inputs file (`job_hash`, and in long-lived mode
@@ -220,10 +228,13 @@ pub fn write_delivery_oid(out_dir: &Path, oid: &str) -> Result<(), OrchestratorE
 
 /// Read the delivery oid the host will name in the kind-3403, validating it is a plausible git oid
 /// (40 hex chars). Fails closed on anything else, so a truncated or garbage file never becomes a
-/// published commit reference.
+/// published commit reference. Reads through [`read_exchange_file`]: the file sits on the mount the
+/// job could write, so no symlink is followed and no more than [`EXCHANGE_OID_MAX_BYTES`] is read.
 pub fn read_delivery_oid(out_dir: &Path) -> Result<String, OrchestratorError> {
-    let raw = std::fs::read_to_string(out_dir.join(DELIVERY_OID_FILE))
-        .map_err(|error| OrchestratorError::Io(format!("read delivery oid: {error}")))?;
+    let raw = read_exchange_file(out_dir, DELIVERY_OID_FILE, EXCHANGE_OID_MAX_BYTES)?
+        .ok_or_else(|| OrchestratorError::Io("read delivery oid: the file is absent".into()))?;
+    let raw = String::from_utf8(raw)
+        .map_err(|_| OrchestratorError::Io("delivery oid file is not UTF-8".into()))?;
     let oid = raw.trim().to_owned();
     if oid.len() == 40 && oid.bytes().all(|b| b.is_ascii_hexdigit()) {
         Ok(oid)
@@ -719,6 +730,23 @@ pub const AGENT_DONE_MARKER: &str = "agent-done";
 pub const PUSH_TOKEN_FILE: &str = "push-token";
 /// The orchestrator's account of the run, written on every exit ([`Phase1Outcome`]).
 pub const OUTCOME_FILE: &str = "outcome.json";
+/// Size caps, in bytes, for the files one side reads out of the exchange directory
+/// ([`read_exchange_file`]). The host reads the marker WHILE the job agent lives and shares the
+/// mount, so the cap is what bounds the host's allocation for a job-controlled file. Each cap is far
+/// above the honest size: a marker is about 130 bytes, the oid file is 41.
+pub const EXCHANGE_MARKER_MAX_BYTES: usize = 4 * 1024;
+/// Cap for [`DELIVERY_OID_FILE`]: 40 hex chars and a newline.
+pub const EXCHANGE_OID_MAX_BYTES: usize = 4 * 1024;
+/// Cap for [`OUTCOME_FILE`]. The two free-text fields of a [`Phase1Outcome`] are each bounded to
+/// [`OUTCOME_TEXT_MAX_BYTES`] before the write, and JSON escaping expands a byte at most six-fold, so
+/// an honest outcome always fits.
+pub const EXCHANGE_OUTCOME_MAX_BYTES: usize = 64 * 1024;
+/// Cap for [`PUSH_TOKEN_FILE`]: one NIP-98 `Authorization` header, about 1 KiB.
+pub const EXCHANGE_TOKEN_MAX_BYTES: usize = 64 * 1024;
+/// The bound on each free-text field of a [`Phase1Outcome`] (`detail`, `agent.last_agent_message`)
+/// as written. The agent authors its last message, so without this bound a hostile agent could make
+/// its own honest outcome exceed [`EXCHANGE_OUTCOME_MAX_BYTES`] and be refused.
+pub const OUTCOME_TEXT_MAX_BYTES: usize = 4 * 1024;
 /// Seconds past the job deadline the delivery may still take (gate + push). The long-lived token
 /// expires at `deadline + PUSH_MARGIN_SECS`, and the host waits at most that long plus
 /// [`CONTAINER_EXIT_GRACE_SECS`] for the container.
@@ -796,7 +824,7 @@ impl Phase1Outcome {
         elapsed: Duration,
     ) -> Self {
         let wall_time_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
-        match result {
+        let mut outcome = match result {
             Ok(output) => Self {
                 status: Phase1Status::Delivered,
                 detail: String::new(),
@@ -829,8 +857,38 @@ impl Phase1Outcome {
                     wall_time_ms,
                 }
             }
+        };
+        outcome.bound_text();
+        outcome
+    }
+
+    /// Cap `detail` and `agent.last_agent_message` at [`OUTCOME_TEXT_MAX_BYTES`] each, on a char
+    /// boundary, so the written file always fits under [`EXCHANGE_OUTCOME_MAX_BYTES`]. The host
+    /// refuses a longer file as planted; an agent that talks too much must not make its own honest
+    /// outcome unreadable.
+    fn bound_text(&mut self) {
+        truncate_to_char_boundary(&mut self.detail, OUTCOME_TEXT_MAX_BYTES);
+        if let Some(message) = self
+            .agent
+            .as_mut()
+            .and_then(|agent| agent.last_agent_message.as_mut())
+        {
+            truncate_to_char_boundary(message, OUTCOME_TEXT_MAX_BYTES);
         }
     }
+}
+
+/// Truncate `text` to at most `max_bytes`, cutting back to a char boundary so the result is valid
+/// UTF-8. A no-op when the text already fits.
+fn truncate_to_char_boundary(text: &mut String, max_bytes: usize) {
+    if text.len() <= max_bytes {
+        return;
+    }
+    let mut cut = max_bytes;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    text.truncate(cut);
 }
 
 /// Write the outcome file (container side). Replaces any file already there: this is written on
@@ -872,19 +930,19 @@ fn remove_planted_exchange_files(out_dir: &Path) {
     }
 }
 
-/// Read the outcome file (host side). `Ok(None)` when the container never wrote one.
+/// Read the outcome file (host side). `Ok(None)` when the container never wrote one. Reads through
+/// [`read_exchange_file`] under the [`EXCHANGE_OUTCOME_MAX_BYTES`] cap: the file sits on the mount
+/// the job could write.
 pub fn read_outcome(out_dir: &Path) -> Result<Option<Phase1Outcome>, OrchestratorError> {
-    let path = out_dir.join(OUTCOME_FILE);
-    match std::fs::read_to_string(&path) {
-        Ok(raw) => serde_json::from_str(&raw).map(Some).map_err(|error| {
-            OrchestratorError::Io(format!("parse outcome {}: {error}", path.display()))
-        }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(OrchestratorError::Io(format!(
-            "read outcome {}: {error}",
-            path.display()
-        ))),
-    }
+    let Some(raw) = read_exchange_file(out_dir, OUTCOME_FILE, EXCHANGE_OUTCOME_MAX_BYTES)? else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&raw).map(Some).map_err(|error| {
+        OrchestratorError::Io(format!(
+            "parse outcome {}: {error}",
+            out_dir.join(OUTCOME_FILE).display()
+        ))
+    })
 }
 
 /// The marker the orchestrator writes after the agent is dead and the delivery commit is gated.
@@ -914,22 +972,19 @@ pub fn write_agent_done_marker(
 /// Read and verify the marker (host side). `Ok(None)` while it has not appeared. A marker that does
 /// not parse, carries the wrong nonce, or names a malformed oid is [`OrchestratorError::Tampered`]:
 /// only a job process could have written it, and the host must not mint a token for it.
+///
+/// The host polls this WHILE the job agent lives, on a mount the agent shares, so the read goes
+/// through [`read_exchange_file`]: a FIFO cannot park the poll loop, a symlink is not followed, and
+/// no more than [`EXCHANGE_MARKER_MAX_BYTES`] is read — all BEFORE the nonce is looked at.
 pub fn read_agent_done_marker(
     out_dir: &Path,
     expected_nonce: &str,
 ) -> Result<Option<AgentDoneMarker>, OrchestratorError> {
-    let path = out_dir.join(AGENT_DONE_MARKER);
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(raw) => raw,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(OrchestratorError::Io(format!(
-                "read marker {}: {error}",
-                path.display()
-            )));
-        }
+    let Some(raw) = read_exchange_file(out_dir, AGENT_DONE_MARKER, EXCHANGE_MARKER_MAX_BYTES)?
+    else {
+        return Ok(None);
     };
-    let marker: AgentDoneMarker = serde_json::from_str(&raw).map_err(|error| {
+    let marker: AgentDoneMarker = serde_json::from_slice(&raw).map_err(|error| {
         OrchestratorError::Tampered(format!(
             "marker does not parse ({error}); not minting a token"
         ))
@@ -951,9 +1006,10 @@ pub fn read_agent_done_marker(
 }
 
 /// Wait for the fresh push token (container side, fresh-after-agent mode): poll for
-/// [`PUSH_TOKEN_FILE`] up to `wait`, then read it and DELETE it, so the token does not stay on the
-/// shared volume. Called only after the agent and every other process are dead. The returned header
-/// goes straight into the push and is never logged.
+/// [`PUSH_TOKEN_FILE`] up to `wait`, then read it (through [`read_exchange_file`], like every other
+/// exchange file) and DELETE it, so the token does not stay on the shared volume. Called only after
+/// the agent and every other process are dead. The returned header goes straight into the push and
+/// is never logged.
 fn await_push_token(out_dir: &Path, wait: Duration) -> Result<String, OrchestratorError> {
     let path = out_dir.join(PUSH_TOKEN_FILE);
     if !wait_for_file(&path, wait, TOKEN_POLL) {
@@ -962,12 +1018,16 @@ fn await_push_token(out_dir: &Path, wait: Duration) -> Result<String, Orchestrat
             wait.as_secs()
         )));
     }
-    let raw = std::fs::read_to_string(&path).map_err(|error| {
-        OrchestratorError::TokenUnavailable(format!("read token file: {error}"))
-    })?;
+    let raw = read_exchange_file(out_dir, PUSH_TOKEN_FILE, EXCHANGE_TOKEN_MAX_BYTES)
+        .map_err(|error| OrchestratorError::TokenUnavailable(format!("read token file: {error}")))?
+        .ok_or_else(|| {
+            OrchestratorError::TokenUnavailable("token file vanished before it was read".into())
+        })?;
     if let Err(error) = std::fs::remove_file(&path) {
         eprintln!("sandbox orchestrator: could not delete the consumed token file: {error}");
     }
+    let raw = String::from_utf8(raw)
+        .map_err(|_| OrchestratorError::TokenUnavailable("token file is not UTF-8".into()))?;
     let header = raw.trim();
     if !header.starts_with("Nostr ") {
         return Err(OrchestratorError::TokenUnavailable(
@@ -1119,7 +1179,8 @@ pub fn write_secret_file(path: &Path, contents: &str) -> Result<(), Orchestrator
 
 /// Create `path` atomically: write a sibling temp file (with `mode`, when given, applied at creation),
 /// then rename it into place, so a reader on the other side of the bind mount never sees a partial
-/// file. Refuses when `path` already exists.
+/// file. Refuses when ANY entry already exists at `path` — the check does not follow a symlink, so a
+/// link a job process planted at the name is a refusal, never a write to wherever it points.
 fn write_file_atomically(
     path: &Path,
     contents: &str,
@@ -1137,11 +1198,18 @@ fn write_file_atomically(
         .ok_or_else(|| OrchestratorError::Io(format!("{} has no file name", path.display())))?;
     let tmp = path.with_file_name(format!("{name}.tmp"));
     let mut options = std::fs::OpenOptions::new();
+    // `create_new` (`O_CREAT | O_EXCL`) refuses any entry already at the temp name, a symlink
+    // included. `O_NOFOLLOW` states the same intent on the open itself.
     options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
     if let Some(mode) = mode {
         #[cfg(unix)]
         {
-            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::fs::OpenOptionsExt as _;
             options.mode(mode);
         }
         #[cfg(not(unix))]
@@ -1169,6 +1237,88 @@ fn write_file_atomically(
         )));
     }
     Ok(())
+}
+
+/// Read `name` out of the exchange directory `dir`: the ONE reader for every file the other side of
+/// the mount wrote. `Ok(None)` when the file does not exist yet.
+///
+/// The host calls this while the job agent lives, and the agent shares the mount, so the read trusts
+/// nothing about the entry it finds:
+/// - the open does not follow a symlink at the final component (`O_NOFOLLOW`): a link to
+///   `/dev/zero`, or to any host file, is refused rather than read;
+/// - the open does not block (`O_NONBLOCK`): a FIFO with no writer returns at once instead of
+///   parking the host's poll loop past every deadline check;
+/// - the OPENED descriptor must be a regular file (`fstat`, not a stat of the path, so a swap between
+///   a check and the open cannot slip a FIFO, a device or a directory through);
+/// - at most `max_bytes` are read (`Read::take`): a longer file is refused, so the host never
+///   allocates more than the cap for a file the job controls.
+///
+/// A symlink, a non-regular file or an over-cap file is [`OrchestratorError::Tampered`] — only a job
+/// process could have planted it. Every other failure is [`OrchestratorError::Io`]. The callers treat
+/// both as a refusal; nothing is retried. Off unix the flags cannot be set, so the read is refused.
+pub fn read_exchange_file(
+    dir: &Path,
+    name: &str,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>, OrchestratorError> {
+    let path = dir.join(name);
+    #[cfg(not(unix))]
+    {
+        let _ = max_bytes;
+        Err(OrchestratorError::Io(format!(
+            "cannot open {} with O_NOFOLLOW | O_NONBLOCK on this platform; refusing to read it",
+            path.display()
+        )))
+    }
+    #[cfg(unix)]
+    {
+        use std::io::Read as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+        let file = match options.open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+                return Err(OrchestratorError::Tampered(format!(
+                    "{} is a symlink; only a job process could have planted it; not following it",
+                    path.display()
+                )));
+            }
+            Err(error) => {
+                return Err(OrchestratorError::Io(format!(
+                    "open {}: {error}",
+                    path.display()
+                )));
+            }
+        };
+        let metadata = file.metadata().map_err(|error| {
+            OrchestratorError::Io(format!("stat {}: {error}", path.display()))
+        })?;
+        if !metadata.file_type().is_file() {
+            return Err(OrchestratorError::Tampered(format!(
+                "{} is not a regular file ({:?}); only a job process could have planted it; \
+                 refusing to read it",
+                path.display(),
+                metadata.file_type()
+            )));
+        }
+        let limit = max_bytes as u64 + 1;
+        let mut bytes = Vec::with_capacity(metadata.len().min(limit) as usize);
+        file.take(limit).read_to_end(&mut bytes).map_err(|error| {
+            OrchestratorError::Io(format!("read {}: {error}", path.display()))
+        })?;
+        if bytes.len() > max_bytes {
+            return Err(OrchestratorError::Tampered(format!(
+                "{} exceeds {max_bytes} bytes; only a job process would write that; refusing to \
+                 read it",
+                path.display()
+            )));
+        }
+        Ok(Some(bytes))
+    }
 }
 
 /// Set `mode` on `path`, failing closed off unix.
@@ -2284,6 +2434,228 @@ mod tests {
         )
         .expect("write");
         assert_eq!(read_delivery_oid(&root).expect("valid"), "a".repeat(40));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // ─── F2: the host reads job-writable exchange files through one hardened reader ──────────────
+
+    /// Plant a FIFO with no writer at `path`. A following, blocking reader parks on it forever.
+    #[cfg(unix)]
+    fn plant_fifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt as _;
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("no NUL in path");
+        // SAFETY: `mkfifo` reads a NUL-terminated path and a mode, and touches no memory of ours.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// The three files the host reads: each with its reader and a VALID content for it, so a
+    /// symlink test can point at a valid target and prove the reader refused the LINK, not the
+    /// content behind it.
+    #[cfg(unix)]
+    fn host_readers() -> Vec<(&'static str, fn(&Path) -> Result<(), OrchestratorError>, String)> {
+        let valid_marker = serde_json::to_string(&AgentDoneMarker {
+            nonce: NONCE.to_owned(),
+            expected_oid: "c".repeat(40),
+        })
+        .expect("encode marker");
+        let valid_outcome = serde_json::to_string(&Phase1Outcome {
+            status: Phase1Status::Delivered,
+            detail: String::new(),
+            delivery_oid: Some("c".repeat(40)),
+            agent: None,
+            wall_time_ms: 1,
+        })
+        .expect("encode outcome");
+        vec![
+            (
+                AGENT_DONE_MARKER,
+                |io| read_agent_done_marker(io, NONCE).map(|_| ()),
+                valid_marker,
+            ),
+            (
+                DELIVERY_OID_FILE,
+                |io| read_delivery_oid(io).map(|_| ()),
+                format!("{}\n", "c".repeat(40)),
+            ),
+            (OUTCOME_FILE, |io| read_outcome(io).map(|_| ()), valid_outcome),
+        ]
+    }
+
+    // Attack A on the exchange channel: while it is alive, the job plants a FIFO with no writer
+    // under the marker's name. A following, blocking read parks the host's poll loop on it forever,
+    // past every deadline check. The hardened reader opens non-blocking, sees a FIFO on the OPENED
+    // descriptor, and refuses at once. The oid and outcome readers get the same attack.
+    #[cfg(unix)]
+    #[test]
+    fn readers_refuse_a_planted_fifo_without_blocking() {
+        let root = fresh_root("fifo");
+        let io = root.join("io");
+        for (name, read, _) in host_readers() {
+            plant_fifo(&io.join(name));
+            let started = std::time::Instant::now();
+            let err = read(&io).expect_err("a FIFO is never read");
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "{name}: the read took {elapsed:?}"
+            );
+            assert!(matches!(err, OrchestratorError::Tampered(_)), "{name}: {err}");
+            assert!(
+                err.to_string().contains("not a regular file"),
+                "{name}: {err}"
+            );
+            fs::remove_file(io.join(name)).expect("rm fifo");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // Attack B: the job plants a symlink under the marker's name. The target here is a VALID file
+    // of the right shape, so a reader that followed the link would return Ok — the refusal proves
+    // the link itself was refused, whatever it points at (`/dev/zero` in the real attack, which a
+    // following reader consumes until allocation fails). The same content in a regular file reads.
+    #[cfg(unix)]
+    #[test]
+    fn readers_refuse_a_planted_symlink_without_following_it() {
+        let root = fresh_root("symlink");
+        let io = root.join("io");
+        let elsewhere = root.join("elsewhere");
+        fs::create_dir_all(&elsewhere).expect("mkdir");
+        for (name, read, valid) in host_readers() {
+            let target = elsewhere.join(name);
+            fs::write(&target, &valid).expect("write target");
+            std::os::unix::fs::symlink(&target, io.join(name)).expect("symlink");
+            let started = std::time::Instant::now();
+            let err = read(&io).expect_err("a symlink is never followed");
+            assert!(started.elapsed() < Duration::from_secs(1), "{name}");
+            assert!(matches!(err, OrchestratorError::Tampered(_)), "{name}: {err}");
+            assert!(err.to_string().contains("symlink"), "{name}: {err}");
+            fs::remove_file(io.join(name)).expect("rm link");
+        }
+        for (name, read, valid) in host_readers() {
+            fs::write(io.join(name), &valid).expect("write regular");
+            read(&io).unwrap_or_else(|err| panic!("{name}: a valid regular file reads: {err}"));
+            fs::remove_file(io.join(name)).expect("rm");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // A regular file over its cap is refused before it is parsed, so the host never allocates more
+    // than the cap for a file the job wrote. One cap per file.
+    #[cfg(unix)]
+    #[test]
+    fn readers_refuse_an_oversized_regular_file() {
+        let root = fresh_root("oversize");
+        let io = root.join("io");
+        let caps = [
+            (AGENT_DONE_MARKER, EXCHANGE_MARKER_MAX_BYTES),
+            (DELIVERY_OID_FILE, EXCHANGE_OID_MAX_BYTES),
+            (OUTCOME_FILE, EXCHANGE_OUTCOME_MAX_BYTES),
+        ];
+        for (name, read, _) in host_readers() {
+            let cap = caps.iter().find(|(n, _)| *n == name).expect("a cap per file").1;
+            fs::write(io.join(name), "a".repeat(cap + 1)).expect("write");
+            let err = read(&io).expect_err("over the cap");
+            assert!(matches!(err, OrchestratorError::Tampered(_)), "{name}: {err}");
+            assert!(err.to_string().contains("exceeds"), "{name}: {err}");
+            fs::remove_file(io.join(name)).expect("rm");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // The reader's own contract: absent is `None`, exactly the cap reads, one byte more is refused,
+    // and a directory under the name is not a regular file.
+    #[cfg(unix)]
+    #[test]
+    fn exchange_reader_caps_at_exactly_max_bytes() {
+        let root = fresh_root("reader");
+        let io = root.join("io");
+        assert_eq!(read_exchange_file(&io, "f", 8).expect("absent"), None);
+        fs::write(io.join("f"), [b'x'; 8]).expect("write");
+        assert_eq!(
+            read_exchange_file(&io, "f", 8)
+                .expect("fits")
+                .expect("present")
+                .len(),
+            8
+        );
+        fs::write(io.join("f"), [b'x'; 9]).expect("write");
+        assert!(matches!(
+            read_exchange_file(&io, "f", 8),
+            Err(OrchestratorError::Tampered(_))
+        ));
+        fs::remove_file(io.join("f")).expect("rm");
+        fs::create_dir(io.join("f")).expect("mkdir");
+        let err = read_exchange_file(&io, "f", 8).expect_err("a directory is refused");
+        assert!(matches!(err, OrchestratorError::Tampered(_)), "{err}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // The host's token write never follows a link the job planted: a symlink at the token's name is
+    // a refusal, and so is one at the temp name the write goes through. Nothing is written to the
+    // link target, and no token file appears.
+    #[cfg(unix)]
+    #[test]
+    fn token_write_refuses_a_planted_symlink_at_either_name() {
+        let root = fresh_root("token-link");
+        let io = root.join("io");
+        let victim = root.join("victim");
+        fs::write(&victim, "untouched").expect("write victim");
+        for planted in [PUSH_TOKEN_FILE.to_owned(), format!("{PUSH_TOKEN_FILE}.tmp")] {
+            std::os::unix::fs::symlink(&victim, io.join(&planted)).expect("symlink");
+            let err = write_secret_file(&io.join(PUSH_TOKEN_FILE), "Nostr secret")
+                .expect_err("a planted link refuses the write");
+            assert!(matches!(err, OrchestratorError::Io(_)), "{planted}: {err}");
+            assert_eq!(
+                fs::read_to_string(&victim).expect("read victim"),
+                "untouched",
+                "{planted}: the link target must not be written through"
+            );
+            let at_name = io.join(PUSH_TOKEN_FILE).symlink_metadata();
+            assert!(
+                at_name.map(|m| m.file_type().is_symlink()).unwrap_or(true),
+                "{planted}: no token file may appear at the token's name"
+            );
+            // The writer's own cleanup may already have unlinked the link at the temp name (an
+            // `unlink`, which never follows it); the target above is the proof that matters.
+            let _ = fs::remove_file(io.join(&planted));
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // The outcome's free text is bounded at the write, on a char boundary, so an agent that says
+    // too much cannot make its own honest outcome exceed the host's read cap.
+    #[test]
+    fn outcome_text_is_bounded_so_the_file_fits_the_read_cap() {
+        let root = fresh_root("outcome-bound");
+        let io = root.join("io");
+        let agent = Some(AgentOutcome {
+            usage: None,
+            last_agent_message: Some("é".repeat(EXCHANGE_OUTCOME_MAX_BYTES)),
+        });
+        let failed: Result<Phase1Output, OrchestratorError> =
+            Err(OrchestratorError::Agent("x".repeat(EXCHANGE_OUTCOME_MAX_BYTES)));
+        let outcome = Phase1Outcome::from_result(&failed, agent, Duration::from_secs(1));
+        assert!(outcome.detail.len() <= OUTCOME_TEXT_MAX_BYTES);
+        let message = outcome
+            .agent
+            .as_ref()
+            .and_then(|a| a.last_agent_message.as_deref())
+            .expect("the message is kept, shortened");
+        assert!(message.len() <= OUTCOME_TEXT_MAX_BYTES);
+        assert!(!message.is_empty());
+        assert!(message.chars().all(|c| c == 'é'), "cut on a char boundary");
+        write_outcome(&io, &outcome).expect("write");
+        assert_eq!(
+            read_outcome(&io).expect("under the cap").as_ref(),
+            Some(&outcome)
+        );
         let _ = fs::remove_dir_all(&root);
     }
 }
