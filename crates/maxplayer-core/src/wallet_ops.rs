@@ -848,11 +848,13 @@ pub async fn melt_async(
 }
 
 /// [`melt_async`] with an optional hard [`MeltCeiling`], checked against the quote the mint raises
-/// here — at payment time — and BEFORE `prepare_melt` selects a single proof. The seller fee
-/// remittance (stage 2a, addendum 3 §1) pays through this with the unremitted accrued gross as the
-/// ceiling; a fee reserve that grew between the plan's estimate and this quote is refused as
-/// [`WalletOpsError::MeltExceedsCeiling`] and nothing leaves the wallet. Same mint resolution, same
-/// `allow_real_mints` gate, same effect boundary as the unbounded form: this IS the one melt.
+/// here — at payment time — and BEFORE `prepare_melt` selects a single proof: quote, then the same
+/// pay step [`pay_melt_quote_async`] uses. The operator's `maxplayer wallet melt` composes it. The
+/// seller fee remittance does NOT pay through this (it did in stage 2a rounds 2–3): since
+/// addendum 5 it raises its payment quote with [`melt_quote_async`], binds the id in the store, and
+/// pays exactly that quote with [`pay_melt_quote_async`]. A fee reserve that does not fit the
+/// ceiling is refused as [`WalletOpsError::MeltExceedsCeiling`] and nothing leaves the wallet. Same
+/// mint resolution, same `allow_real_mints` gate, same effect boundary as the unbounded form.
 pub async fn melt_within_async(
     home: &MaxplayerHome,
     bolt11: &str,
@@ -885,11 +887,15 @@ pub async fn melt_within_async(
 
 /// **Pay a melt quote the wallet already holds, by id, and never raise another.** The seller fee
 /// remittance's spending call (addendum 5 §1, rule 1): the quote was raised by [`melt_quote_async`]
-/// before the plan, its id was bound to the row by the store fence, and this pays exactly that
-/// quote — `prepare_melt(quote_id)` / `confirm` — after re-checking the ceiling against the quote's
-/// STORED amount and fee reserve immediately before `prepare_melt`. An unknown quote id is refused
-/// before the wallet touches a proof; a quote the mint no longer accepts (expired, failed) fails in
-/// `prepare_melt`/`confirm` and is reported as the wallet's error — the caller never re-quotes.
+/// AFTER the plan was journaled (the estimate quote predates the plan; this payment quote does
+/// not), its id was bound to the row by the store fence, and this pays exactly that quote —
+/// `prepare_melt(quote_id)` / `confirm` — after re-checking the ceiling against the quote's STORED
+/// amount and fee reserve immediately before `prepare_melt`. An unknown quote id is refused before
+/// the wallet touches a proof. `prepare_melt` refuses a quote whose expiry has passed on THIS
+/// wallet's clock; past that check nothing here re-checks expiry or state, and the mint (CDK
+/// 0.17.2) pays an UNPAID or FAILED quote regardless of its expiry — which is why the caller never
+/// treats "expired" or "FAILED" as proof that a prepared payment cannot still land, never
+/// re-quotes, and holds its row until the mint reports PAID (addendum 6 §1.2).
 /// Same mint resolution and `allow_real_mints` gate as every melt here.
 pub async fn pay_melt_quote_async(
     home: &MaxplayerHome,
@@ -1087,9 +1093,14 @@ pub async fn melt_status_for_invoice_async(
     }
     // The invoice may have several quotes (the remittance raises an estimate quote at plan time and
     // a payment quote at melt time). Report the one that is MOST alive: PAID over settling over a
-    // live UNPAID over anything terminal — and among live UNPAID quotes the one expiring last — so
-    // that a caller reading "UNPAID and expired" or "FAILED" knows NO quote for this invoice can
-    // still be paid, and never releases a row while a later quote is live or mid-payment.
+    // live UNPAID over anything else — and among live UNPAID quotes the one expiring last. This is a
+    // snapshot of the quotes this wallet holds NOW; it cannot speak for a quote raised later, and it
+    // does not prove that an expired or FAILED quote cannot still be paid (the mint may accept it).
+    // The remitter therefore uses it only for rows with no quote bound — a `planned` row, or a
+    // legacy `spending` row from before quotes were bound — and reconciles a bound `spending` row by
+    // its exact quote id through `melt_status_for_quote_async`, releasing nothing on this ranking
+    // (addendum 5 §1 rule 2; addendum 6 §1.2). The fake mint's test ranking is similar in spirit
+    // but not identical to this one.
     let now_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())

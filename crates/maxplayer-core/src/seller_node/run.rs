@@ -15624,7 +15624,8 @@ mod tests {
 
     /// Addendum 3 RULING 2, the other half: the drain's wait is BOUNDED. When the pending payment
     /// does not finish inside the bound, `run` returns anyway — after the bound, not before — with
-    /// the attempt still pending (its row Planned), and the attempt is abandoned by the WAIT only:
+    /// the attempt still pending (its row Spending, bound to its quote), and the attempt is
+    /// abandoned by the WAIT only:
     /// its thread finishes on its own once the mint answers, and the row settles.
     ///
     /// RED ON REVERT: drop the bound from `drain_remit_in_flight` and the join times out.

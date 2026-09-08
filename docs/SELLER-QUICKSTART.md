@@ -1269,21 +1269,30 @@ its own:
   mid-payment), and if that wait runs out it logs one incident line and exits while the attempt
   finishes on its own. The next collected payment also tries again with the whole accumulated
   balance. An attempt interrupted mid-payment is reconciled with the mint on the next attempt:
-  settled if the mint reports the payment landed; released if the mint reports the quote failed or
-  expired, or — for an attempt that never reached the point of spending — if the process that owned
-  it is provably gone; and otherwise **held**, however long, because a payment that may have reached
-  the mint is never paid again on a guess. Two processes sharing one store — the node and a hand-run
+  settled if the mint reports the payment landed. An attempt that never reached the point of
+  spending is released if its quote failed or expired, or if the process that owned it is provably
+  gone. An attempt that DID reach the point of spending — the store admitted it and bound the one
+  mint quote it may pay — is **held**, however long, on anything but the mint saying PAID: not
+  released on "expired", not on "failed", not on any clock. We do not infer that a payment is dead
+  from a clock, because the mint pays a quote it calls unpaid or failed regardless of its expiry,
+  and a payment prepared before the expiry can land after it; releasing on either would let the
+  same balance be paid twice. Two processes sharing one store — the node and a hand-run
   `maxplayer seller fees remit --confirm`, say — pay an accrued balance once, not twice: at most one
-  remittance can be in flight, the receipts it covers are pinned to it, only the process that
-  planned it may pay it, it passes a single compare-and-set in the store immediately before
-  spending which also fixes the one mint quote it may pay, and it never pays under any other quote;
-  a second process asks the mint about that exact quote and holds off while it may still be paid,
-  and every release is written as a condition on the row, so a release decided on a stale reading
-  changes nothing. This is what the module's two-process tests prove, and its bound: two processes
-  on one host clock, one store, one mint (pauses before and after the quote, before and after the
-  gate, between a release decision and its write; the lease and the quote expiring while paused;
-  distinct invoices; actual melts counted). What they do not cover is a mint whose clock runs more
-  than 60 seconds ahead of the host's — the margin inside which a payer refuses its own quote.
+  remittance can be in flight (a second cannot even be planned while one exists), the receipts it
+  covers are pinned to it, only the process that planned it may pay it, it passes a single
+  compare-and-set in the store immediately before spending which also fixes the one mint quote it
+  may pay, and it never pays under any other quote; a second process asks the mint about that exact
+  quote and holds off unless it is PAID, and every release is written as a condition on the row, so
+  a release decided on a stale reading changes nothing. A held attempt is visible, not silent:
+  `maxplayer seller fees remit` prints one `HELD:` line naming the row, the quote, what the mint said
+  and how many sats are pinned, and exits 3 — on the dry run too. Clearing it is an operator's
+  decision, and there is no command for it yet; until then the node's later attempts are refused and
+  the balance accumulates unremitted behind the held row. This is what the module's two-process tests
+  prove, and its bound: two processes on one host clock, one store, one fake mint that accepts unpaid
+  or failed quotes regardless of expiry as the real one does (pauses after the plan, after the quote,
+  after the gate, inside the payment after the wallet's last local check, and between a release
+  decision and its write; the lease and the quote expiring while paused; distinct invoices; funds for
+  a second payment present; actual melts counted). They do not run a real mint or a real wallet.
 - **The log stays readable while it retries.** Every attempt gets at most one line. The first
   failure's line carries its detail — the destination, the balance it saw, the error — and the
   backoff it starts; later attempts in the same streak get one line each (how many have failed,
