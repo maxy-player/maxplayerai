@@ -132,7 +132,7 @@
 //!
 //! Every effect on the world goes through [`RemitEffects`], so the decision logic is tested against
 //! scripted effects without a network or a mint. Exactly one method of that trait spends:
-//! [`RemitEffects::pay_melt_quote`].
+//! [`RemitEffects::confirm_melt`] (on a melt [`RemitEffects::prepare_melt`] prepared and bounded).
 
 use std::fmt;
 use std::io::Write;
@@ -169,19 +169,66 @@ pub const REMIT_LEASE: Duration = Duration::from_secs(5 * 60);
 /// clock (the store is a local file); the margin covers scheduling pauses on that clock.
 pub const SPEND_MARGIN: Duration = Duration::from_secs(60);
 
-/// Why [`RemitEffects::pay_melt_quote`] did not pay.
+/// Why [`RemitEffects::prepare_melt`] or [`RemitEffects::confirm_melt`] did not pay.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MeltFailure {
-    /// The payment was refused BEFORE any proof was selected, prepared or sent — the bound quote's
-    /// stored amount and reserve did not fit the [`MeltCeiling`] on the re-check immediately before
-    /// `prepare_melt`. Nothing left the wallet. (The same figures were checked against the same
-    /// ceiling before the fence, so this is a belt behind braces; the row, already spending, is
-    /// left for reconciliation of its bound quote rather than released on a typed promise.)
+    /// The payment was refused by the wallet layer with NOTHING posted to the mint: the quote's
+    /// stored amount and reserve did not fit the [`MeltCeiling`], or — after `prepare_melt`
+    /// selected and reserved proofs in the wallet's own database — the TOTAL debit (invoice + fee
+    /// reserve + proof-input fee + swap fee, the SDK's own figures) did not fit it and the prepared
+    /// melt was cancelled (addendum 8 §1.1). Raised by [`RemitEffects::prepare_melt`], which the
+    /// remittance calls BEFORE the fence, so the row is still Planned and is released. Nothing left
+    /// the wallet.
     RefusedBeforeSpending(String),
-    /// The payment failed somewhere the caller cannot see: proofs may or may not have reached the
-    /// mint, or the mint refused the bound quote (expired, failed). The spending row stays for
-    /// reconciliation of its bound quote against the mint; the payer never re-quotes.
+    /// The payment failed somewhere the caller cannot see: from `prepare_melt` (unknown or expired
+    /// quote, proofs short — still nothing posted, see the caller) or from `confirm_melt` (proofs may
+    /// or may not have reached the mint, or the mint refused the bound quote). After the fence the
+    /// spending row stays for reconciliation of its bound quote against the mint; the payer never
+    /// re-quotes.
     Failed(String),
+}
+
+/// A melt PREPARED by [`RemitEffects::prepare_melt`] and not yet decided: proofs selected and
+/// reserved in the wallet's own store, the SDK's fee figures known and already admitted by the
+/// ceiling, nothing posted to the mint. The remittance holds it across the fence, then
+/// [`RemitEffects::confirm_melt`]s it (the payment) or [`RemitEffects::cancel_melt`]s it (nothing
+/// to undo at the mint).
+#[derive(Debug)]
+pub struct PreparedMelt {
+    pub preparation: wallet_ops::MeltPreparation,
+    token: PreparedToken,
+}
+
+#[derive(Debug)]
+enum PreparedToken {
+    Live(wallet_ops::PreparedMeltPayment),
+    #[cfg(test)]
+    Fake(u64),
+}
+
+impl PreparedMelt {
+    fn live(payment: wallet_ops::PreparedMeltPayment) -> Self {
+        Self {
+            preparation: payment.preparation.clone(),
+            token: PreparedToken::Live(payment),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fake(preparation: wallet_ops::MeltPreparation, token: u64) -> Self {
+        Self {
+            preparation,
+            token: PreparedToken::Fake(token),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fake_token(&self) -> Option<u64> {
+        match self.token {
+            PreparedToken::Fake(token) => Some(token),
+            PreparedToken::Live(_) => None,
+        }
+    }
 }
 
 impl fmt::Display for MeltFailure {
@@ -195,7 +242,8 @@ impl fmt::Display for MeltFailure {
 
 /// The remit path's effects on the world, behind a trait so the decision logic — what is paid,
 /// when, and what is refused — is tested without a network or a mint. Exactly one method moves
-/// money: [`Self::pay_melt_quote`]. Everything else reads (raising a quote spends nothing).
+/// money: [`Self::confirm_melt`]. Everything else reads or writes the wallet's own database
+/// (raising a quote spends nothing; preparing a melt reserves proofs locally and posts nothing).
 pub trait RemitEffects {
     /// This process's opaque owner token for the rows it plans (addendum 3 §2): stable for the
     /// life of the process, distinct across processes. The node's attempts and the command's run
@@ -210,17 +258,29 @@ pub trait RemitEffects {
     fn melt_estimate(&mut self, bolt11: &str) -> Result<MeltEstimate, String>;
     /// **The payment quote** for the planned invoice (addendum 5 §1, rule 1 step 1): raised after
     /// the plan is journaled, checked against the ceiling, then BOUND to the row by the fence — the
-    /// one quote [`Self::pay_melt_quote`] pays. Raising it spends nothing. The same wallet call as
-    /// [`Self::melt_estimate`], distinguished so the two quotes' roles are told apart in the ledger.
+    /// one quote [`Self::prepare_melt`] prepares and [`Self::confirm_melt`] pays. Raising it spends
+    /// nothing. The same wallet call as [`Self::melt_estimate`], distinguished so the two quotes'
+    /// roles are told apart in the ledger.
     fn melt_quote(&mut self, bolt11: &str) -> Result<MeltEstimate, String>;
-    /// **The payment.** Pays the bound quote, BY ID, from the seller's ecash: re-checks the quote's
-    /// stored amount and reserve against the ceiling immediately before `prepare_melt`, then
-    /// `prepare_melt(quote_id)` / `confirm`. Never raises a quote. The only method here that spends.
-    fn pay_melt_quote(
+    /// **Prepare the payment, bounded on its total** (addendum 8 §1.1): re-checks the quote's stored
+    /// amount and reserve against the ceiling, then `prepare_melt(quote_id)` — the wallet selects
+    /// and RESERVES proofs in its own database and states the proof-input fee and any pre-melt swap
+    /// fee — then refuses unless invoice + reserve + input fee + swap fee ≤ the ceiling, cancelling
+    /// the prepared melt on refusal. Posts nothing to the mint; spends nothing. Called BEFORE the
+    /// fence, so a refusal leaves a Planned row, never a held one.
+    fn prepare_melt(
         &mut self,
         quote_id: &str,
         ceiling: &MeltCeiling,
-    ) -> Result<MeltOutcome, MeltFailure>;
+    ) -> Result<PreparedMelt, MeltFailure>;
+    /// **The payment.** `confirm` on the prepared melt: the pre-melt swap if one is required, then
+    /// the melt request for the bound quote, BY ID. Never raises a quote. The only method here that
+    /// spends.
+    fn confirm_melt(&mut self, prepared: PreparedMelt) -> Result<MeltOutcome, MeltFailure>;
+    /// Release a prepared melt the fence (or the pay-time margin) refused: proofs back to Unspent
+    /// in the wallet's database, quote released. Nothing was posted, so nothing is undone at the
+    /// mint.
+    fn cancel_melt(&mut self, prepared: PreparedMelt) -> Result<(), MeltFailure>;
     /// What the mint says about the melt quote(s) this wallet raised for the invoice, if any —
     /// used to reconcile a PLANNED row (no quote bound yet) and a spending row admitted before
     /// quotes were bound.
@@ -313,21 +373,48 @@ impl RemitEffects for LiveEffects {
         wallet_ops::melt_quote_blocking(&self.home, bolt11, None).map_err(|error| error.to_string())
     }
 
-    fn pay_melt_quote(
+    fn prepare_melt(
         &mut self,
         quote_id: &str,
         ceiling: &MeltCeiling,
-    ) -> Result<MeltOutcome, MeltFailure> {
-        wallet_ops::pay_melt_quote_blocking(&self.home, quote_id, None, ceiling).map_err(|error| {
-            match error {
-                // The one error the payment raises BEFORE selecting a proof, typed: nothing left the
-                // wallet. Every other error is opaque as to how far it got.
-                refused @ WalletOpsError::MeltExceedsCeiling { .. } => {
+    ) -> Result<PreparedMelt, MeltFailure> {
+        wallet_ops::prepare_melt_payment_blocking(&self.home, quote_id, None, ceiling)
+            .map(PreparedMelt::live)
+            .map_err(|error| match error {
+                // The two typed refusals: the quote's own figures over the ceiling (before a proof
+                // was selected) or the prepared melt's total over it (prepared melt cancelled).
+                // Both: nothing posted, nothing left the wallet. Every other error from this step
+                // also posted nothing (the wallet layer prepares locally) but is opaque as to why.
+                refused @ (WalletOpsError::MeltExceedsCeiling { .. }
+                | WalletOpsError::MeltTotalExceedsCeiling { .. }) => {
                     MeltFailure::RefusedBeforeSpending(refused.to_string())
                 }
                 other => MeltFailure::Failed(other.to_string()),
-            }
-        })
+            })
+    }
+
+    fn confirm_melt(&mut self, prepared: PreparedMelt) -> Result<MeltOutcome, MeltFailure> {
+        match prepared.token {
+            PreparedToken::Live(payment) => payment
+                .confirm()
+                .map_err(|error| MeltFailure::Failed(error.to_string())),
+            #[cfg(test)]
+            PreparedToken::Fake(_) => Err(MeltFailure::Failed(
+                "a fake prepared melt reached the live effects".to_owned(),
+            )),
+        }
+    }
+
+    fn cancel_melt(&mut self, prepared: PreparedMelt) -> Result<(), MeltFailure> {
+        match prepared.token {
+            PreparedToken::Live(payment) => payment
+                .cancel()
+                .map_err(|error| MeltFailure::Failed(error.to_string())),
+            #[cfg(test)]
+            PreparedToken::Fake(_) => Err(MeltFailure::Failed(
+                "a fake prepared melt reached the live effects".to_owned(),
+            )),
+        }
     }
 
     fn melt_status(&mut self, bolt11: &str) -> Result<Option<MeltQuoteStatus>, String> {
@@ -1147,18 +1234,27 @@ fn remit_inner(
     );
     effects.after_plan(&planned);
 
-    // The spend, in the order addendum 5 §1 rule 1 fixes:
+    // The spend, in the order addendum 5 §1 rule 1 fixes, with addendum 8 §1.2's bound inserted
+    // BEFORE the fence:
     //   1. raise the PAYMENT quote Q (spends nothing) and check the ceiling against Q's amount and
     //      reserve — before any proof is selected; refused ⇒ release our own planned row, journal
     //      failed, nothing spent;
+    //   1b. PREPARE the melt of Q: the wallet selects and reserves proofs in its OWN database and
+    //      states the SDK's proof-input fee and pre-melt swap fee; the ceiling is then taken on the
+    //      TOTAL (invoice + reserve + input fee + swap fee). Over ⇒ the prepared melt is cancelled
+    //      (proofs released locally — the mint never heard of it: pinned CDK 0.17.2
+    //      melt/saga/mod.rs:286–460 writes only the local store; the swap :687–697 and the melt
+    //      request :907–911 both live inside `confirm`) and this is refused exactly like step 1:
+    //      own planned row released, nothing spent, no bound Spending row is ever held for a fee;
     //   2. the fence — ONE compare-and-set in the store advances the row planned → spending AND
     //      BINDS Q to it, only if it is still planned, still ours, and its lease ends more than
     //      SPEND_MARGIN after the clock as read INSIDE the store call, after its lock (however long
     //      we paused between the plan and this line, that time counts, and no pause between reading
-    //      the clock and the write can make it stale). Zero rows changed ⇒ refuse, no spend. Once
-    //      admitted, the row is released by nobody on time: only the mint's verdict on Q resolves it;
-    //   3. pay Q BY ID — never a second quote for a row we hold — re-checking the ceiling against
-    //      Q's stored figures immediately before `prepare_melt`.
+    //      the clock and the write can make it stale). Zero rows changed ⇒ cancel the prepared melt,
+    //      refuse, no spend. Once admitted, the row is released by nobody on time: only the mint's
+    //      verdict on Q resolves it;
+    //   3. CONFIRM the prepared melt of Q — never a second quote for a row we hold; the swap (if
+    //      any) and the melt request happen here and nowhere else.
     let ceiling = MeltCeiling {
         max_debit_sats: gross,
         invoice_sats: net,
@@ -1277,6 +1373,41 @@ fn remit_inner(
         quote.fee_reserve_sats,
         quote.expiry_unix
     );
+
+    // 1b. Prepare, and bound the TOTAL. Either refusal here happened in the wallet's own database:
+    //     nothing was posted, nothing left the wallet, the row is still ours and planned.
+    let prepared = match effects.prepare_melt(&quote.quote_id, &ceiling) {
+        Ok(prepared) => prepared,
+        Err(MeltFailure::RefusedBeforeSpending(reason)) => {
+            return refuse_before_fence(reason, store, out);
+        }
+        Err(MeltFailure::Failed(reason)) => {
+            return refuse_before_fence(
+                format!(
+                    "wallet could not prepare the melt of quote {}: {reason}; nothing was posted to the mint and nothing left the wallet",
+                    quote.quote_id
+                ),
+                store,
+                out,
+            );
+        }
+    };
+    let preparation = prepared.preparation.clone();
+    let _ = writeln!(
+        out,
+        "Prepared melt of quote {}: proof input fee {} sats, swap fee {} sats{}; total debit {} sats ({} invoice + {} reserve + fees) fits the ceiling of {gross} sats; proofs reserved in this wallet only, nothing posted yet",
+        preparation.quote_id,
+        preparation.input_fee_sats,
+        preparation.swap_fee_sats,
+        if preparation.requires_swap {
+            " (the wallet's proofs do not fit: a pre-melt swap will be performed)"
+        } else {
+            ""
+        },
+        preparation.total_debit_sats,
+        preparation.invoice_sats,
+        preparation.fee_reserve_sats
+    );
     effects.after_quote(&planned, &quote);
 
     // 2. The fence: clock read inside the store call, Q bound.
@@ -1302,6 +1433,15 @@ fn remit_inner(
     let admitted = match admitted {
         Ok(admitted) => admitted,
         Err(lost) => {
+            // The prepared melt first: release its proofs in the wallet's database. It posted
+            // nothing, so a failed cancel changes nothing at the mint either — the wallet's saga
+            // recovery releases a stale reservation on its next open; say so.
+            if let Err(error) = effects.cancel_melt(prepared) {
+                let _ = writeln!(
+                    out,
+                    "  (cancelling the prepared melt failed: {error}; nothing was posted; the wallet releases its reserved proofs on its next open)"
+                );
+            }
             // Ours, still planned, but too little lease left: nothing was spent, so release our own
             // row (conditionally). Not ours, gone, or no longer planned: another process holds or
             // resolved it — touch nothing.
@@ -1336,18 +1476,25 @@ fn remit_inner(
     );
     effects.after_admit(&admitted);
 
-    // 3. Pay Q by id. First the local refusal of a quote inside its margin of expiry, on a fresh
-    //    clock — to avoid a pointless attempt, not as a safety bound: the row is spending and stays
-    //    so, held until the mint reports Q PAID, and this process never re-quotes for it.
+    // 3. Confirm the prepared melt of Q. First the local refusal of a quote inside its margin of
+    //    expiry, on a fresh clock — to avoid a pointless attempt, not as a safety bound: the row is
+    //    spending and stays so, held until the mint reports Q PAID, and this process never
+    //    re-quotes for it. The prepared melt is cancelled (local; nothing was posted).
     let pay_now_unix = effects.now_unix();
     if quote_inside_margin(pay_now_unix) {
         let error = format!(
             "bound melt quote {} expires at unix {}, within {margin_secs} s of now (unix {pay_now_unix}); not paid",
             quote.quote_id, quote.expiry_unix
         );
+        let cancel_note = match effects.cancel_melt(prepared) {
+            Ok(()) => String::new(),
+            Err(cancel_error) => format!(
+                " (cancelling the prepared melt failed: {cancel_error}; nothing was posted; the wallet releases its reserved proofs on its next open)"
+            ),
+        };
         let _ = writeln!(
             out,
-            "not paid: {error}.\n  remittance {} stays journaled as spending, bound to that quote; this process raises no other quote for it. The next attempt asks the mint about that quote: settled if it shows PAID, otherwise HELD with its receipts — no clock releases a spending row. Nothing else was attempted.",
+            "not paid: {error}.{cancel_note}\n  remittance {} stays journaled as spending, bound to that quote; this process raises no other quote for it. The next attempt asks the mint about that quote: settled if it shows PAID, otherwise HELD with its receipts — no clock releases a spending row. Nothing else was attempted.",
             planned.remittance_id
         );
         return Ok(RemitOutcome::MeltFailed {
@@ -1355,7 +1502,7 @@ fn remit_inner(
             error,
         });
     }
-    match effects.pay_melt_quote(&quote.quote_id, &ceiling) {
+    match effects.confirm_melt(prepared) {
         Ok(outcome) => {
             let settlement = RemitSettlement {
                 net_paid_sats: Some(outcome.paid_sats),
@@ -1373,15 +1520,21 @@ fn remit_inner(
                         outcome.paid_sats, outcome.fee_sats, outcome.quote_id, planned.remittance_id
                     )
                 })?;
-            let debit = outcome.paid_sats.saturating_add(outcome.fee_sats);
+            let debit = outcome
+                .paid_sats
+                .saturating_add(outcome.fee_sats)
+                .saturating_add(outcome.input_fee_sats)
+                .saturating_add(outcome.swap_fee_sats);
             let _ = writeln!(
                 out,
-                "PAID — remittance {} settled\n  gross discharged: {} sats\n  melt fee taken by the mint: {} sats (quote {} reserved {} sats; ceiling {gross} sats held at the moment of spending)\n  net paid to {}: {} sats\n  stays in your wallet (unused reserve): {} sats\n  wallet balance now: {} sats at {}\n  receipts discharged: {}",
+                "PAID — remittance {} settled\n  gross discharged: {} sats\n  melt fee taken by the mint: {} sats (quote {} reserved {} sats; ceiling {gross} sats held at the moment of spending)\n  proof input fee: {} sats; swap fee: {} sats (the SDK's prepared figures, bounded together with the invoice and the reserve under that ceiling before the fence)\n  net paid to {}: {} sats\n  stays in your wallet (unused reserve): {} sats\n  wallet balance now: {} sats at {}\n  receipts discharged: {}",
                 settled.remittance_id,
                 settled.gross_sats,
                 outcome.fee_sats,
                 outcome.quote_id,
                 outcome.fee_reserve_sats,
+                outcome.input_fee_sats,
+                outcome.swap_fee_sats,
                 settled.destination,
                 outcome.paid_sats,
                 gross.saturating_sub(debit),
@@ -1390,11 +1543,14 @@ fn remit_inner(
                 settled.receipts
             );
             if debit > gross {
-                // Belt behind the braces: the melt refuses a quote over the ceiling before spending,
-                // and the mint's fee is at most its reserve, so this line should never print.
+                // Belt behind the braces: the prepared melt's total (invoice + reserve + input fee
+                // + swap fee) was bounded by the ceiling before the fence, and the mint's fee is at
+                // most its reserve, so this line should never print. If it does, the SDK's actual
+                // input fee on the swapped proofs exceeded its prepared estimate.
                 let _ = writeln!(
                     out,
-                    "WARNING: the mint debited {debit} sats against {gross} sats accrued — above the ceiling the melt was admitted under. Recorded as settled; report this."
+                    "WARNING: the wallet lost {debit} sats ({} net + {} melt fee + {} proof input fee + {} swap fee) against {gross} sats accrued — above the ceiling the melt was admitted under. Recorded as settled; report this.",
+                    outcome.paid_sats, outcome.fee_sats, outcome.input_fee_sats, outcome.swap_fee_sats
                 );
             }
             Ok(RemitOutcome::Paid {
@@ -1404,10 +1560,10 @@ fn remit_inner(
             })
         }
         Err(MeltFailure::RefusedBeforeSpending(reason)) => {
-            // The re-check immediately before `prepare_melt` refused the bound quote's stored
-            // figures — figures this run already checked against the same ceiling before the fence,
-            // so this does not happen unless the wallet's stored quote differs from the one raised.
-            // Nothing left the wallet, but the row is SPENDING and bound: it is not released on a
+            // Since addendum 8 the ceiling is taken at `prepare_melt`, before the fence, so a
+            // confirm cannot refuse on it: this arm is unreachable through the live effects and
+            // kept only so a future effects impl that does refuse here is handled the safe way —
+            // nothing left the wallet, but the row is SPENDING and bound: it is not released on a
             // typed promise — reconciliation asks the mint about its bound quote, settles on PAID
             // and otherwise holds; this process never re-quotes for it.
             let error = format!("refused before spending: {reason}");
@@ -1853,11 +2009,11 @@ pub(crate) mod test_support {
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
 
-    use super::{MeltFailure, Reconcile, RemitEffects, host_now_unix};
+    use super::{MeltFailure, PreparedMelt, Reconcile, RemitEffects, host_now_unix};
     use crate::lnurl_pay::{LightningAddress, PayRequest, ResolvedInvoice, Url};
     use crate::seller_node::store::FeeRemittance;
     use crate::wallet_ops::{
-        MeltCeiling, MeltEstimate, MeltOutcome, MeltQuoteState, MeltQuoteStatus,
+        MeltCeiling, MeltEstimate, MeltOutcome, MeltPreparation, MeltQuoteState, MeltQuoteStatus,
     };
 
     /// A rendezvous a test uses to PAUSE one attempt at a chosen point (after the plan is journaled,
@@ -1926,6 +2082,15 @@ pub(crate) mod test_support {
     /// A Fake without a registry answers status queries from its scripted `status` instead.
     pub(crate) type QuoteRegistry = Arc<Mutex<BTreeMap<String, FakeQuote>>>;
 
+    /// A melt the fake wallet has PREPARED: the quote as loaded, the proofs taken out of the pool
+    /// and held for it. Confirm spends them; cancel returns them.
+    #[derive(Debug, Clone)]
+    pub(crate) struct FakePrepared {
+        pub(crate) quote_id: String,
+        pub(crate) quote: FakeQuote,
+        pub(crate) selected: Vec<u64>,
+    }
+
     pub(crate) fn quote_registry() -> QuoteRegistry {
         Arc::new(Mutex::new(BTreeMap::new()))
     }
@@ -1984,12 +2149,13 @@ pub(crate) mod test_support {
     /// Quote ids: the estimate for `bolt11` is `quote-{bolt11}`, the payment quote is
     /// `paid-quote-{bolt11}` — two quotes, two ids, as the wallet raises them. With a `registry`
     /// every quote raised is recorded there (UNPAID, expiring at `quote_expiry_unix`) and every
-    /// status query reads it. [`Self::pay_melt_quote`] is shaped like the checksum-pinned CDK
-    /// 0.17.2 path the verdict at 6fc77e1 read (§4 B3), in two halves around `melt_gate`: the
-    /// WALLET half (ceiling, funds, and `prepare_melt`'s `expiry > now` check on the wallet's
-    /// clock) and the MINT half, which accepts an UNPAID **or FAILED** quote with NO expiry check
-    /// and rejects PENDING / PAID / UNKNOWN. A fake mint stricter than the dependency is what let
-    /// the round-4 defect through; this one is not.
+    /// status query reads it. [`Self::prepare_melt`] + [`Self::confirm_melt`] are shaped like the
+    /// checksum-pinned CDK 0.17.2 path the verdict at 6fc77e1 read (§4 B3), in two halves around
+    /// `melt_gate`: the WALLET half (ceiling, funds, and `prepare_melt`'s `expiry > now` check on
+    /// the wallet's clock) is `prepare_melt`; the MINT half, which accepts an UNPAID **or FAILED**
+    /// quote with NO expiry check and rejects PENDING / PAID / UNKNOWN, is `confirm_melt`, which
+    /// pauses at `melt_gate` first. A fake mint stricter than the dependency is what let the
+    /// round-4 defect through; this one is not.
     pub(crate) struct Fake {
         pub(crate) owner: String,
         pub(crate) invoice_tag: String,
@@ -2004,6 +2170,11 @@ pub(crate) mod test_support {
         pub(crate) proofs: Option<FakeProofs>,
         /// The exact proofs each debit spent, in order (empty inner vec when `proofs` is `None`).
         pub(crate) proofs_spent: Vec<Vec<u64>>,
+        /// Melts prepared (proofs selected and held) and not yet confirmed or cancelled, by token.
+        pub(crate) prepared: BTreeMap<u64, FakePrepared>,
+        pub(crate) next_token: u64,
+        /// Prepared melts the caller cancelled (quote ids), in order — proofs went back to the pool.
+        pub(crate) cancels: Vec<String>,
         /// Expiry stamped on every quote this Fake raises (registry or not). Far future by default.
         pub(crate) quote_expiry_unix: u64,
         pub(crate) pay_request_error: Option<String>,
@@ -2062,6 +2233,9 @@ pub(crate) mod test_support {
                 registry: None,
                 proofs: None,
                 proofs_spent: Vec::new(),
+                prepared: BTreeMap::new(),
+                next_token: 1,
+                cancels: Vec::new(),
                 quote_expiry_unix: u64::MAX,
                 pay_request_error: None,
                 pay_requests: 0,
@@ -2316,27 +2490,19 @@ pub(crate) mod test_support {
             })
         }
 
-        /// The payment, BY QUOTE ID, in the shape of the shipped path
-        /// (`wallet_ops::pay_quote_on_wallet` over CDK 0.17.2, as the verdict at 6fc77e1 §4 read
-        /// it) — two halves around `melt_gate`:
-        ///
-        /// **Wallet half** (nothing has left the wallet; a refusal here is not a debit): the quote
-        /// must be one this wallet raised; its STORED amount and reserve are re-checked against the
-        /// ceiling; the proofs must cover amount + reserve (exact denominations are selected and
-        /// reserved, as CDK selects them); `prepare_melt` refuses a quote whose `expiry` has passed
-        /// on the WALLET's clock, read now. Then the payer may pause at `melt_gate` — after its
-        /// last local check, before the request reaches the mint.
-        ///
-        /// **Mint half** (CDK mint `setup_melt`): the request is accepted when the quote is UNPAID
-        /// **or FAILED** — with NO expiry check, however long ago the quote expired — and rejected
-        /// when it is PENDING, PAID or UNKNOWN (reserved proofs return to the wallet). Accepted ⇒
-        /// the debit is counted, the quote is PAID for everyone reading the registry.
-        fn pay_melt_quote(
+        /// The WALLET half of the payment, BY QUOTE ID, in the shape of the shipped path
+        /// (`wallet_ops::prepare_melt_payment_blocking` over CDK 0.17.2, as the verdict at 6fc77e1
+        /// §4 read `prepare_melt`) — nothing has left the wallet; a refusal here is not a debit:
+        /// the quote must be one this wallet raised; its STORED amount and reserve are re-checked
+        /// against the ceiling; the proofs must cover amount + reserve (exact denominations are
+        /// selected and HELD, as CDK reserves them); `prepare_melt` refuses a quote whose `expiry`
+        /// has passed on the WALLET's clock, read now; then the prepared melt's TOTAL is bounded
+        /// (addendum 8 §1.1). The prepared melt waits in `self.prepared` for the verdict.
+        fn prepare_melt(
             &mut self,
             quote_id: &str,
             ceiling: &MeltCeiling,
-        ) -> Result<MeltOutcome, MeltFailure> {
-            // ---- wallet half ----
+        ) -> Result<PreparedMelt, MeltFailure> {
             let quote = match self.registered(quote_id) {
                 Some(quote) => quote,
                 None => {
@@ -2400,10 +2566,76 @@ pub(crate) mod test_support {
                 self.pay_refusals.push(reason.clone());
                 return Err(MeltFailure::Failed(reason));
             }
+            // The total bound on the prepared figures (fees are 0 until the fee-bearing fake lands;
+            // the shape is the shipped one).
+            let input_fee_sats = 0;
+            let swap_fee_sats = 0;
+            let total_debit_sats = MeltCeiling::total_debit(
+                quote.amount_sats,
+                quote.fee_reserve_sats,
+                input_fee_sats,
+                swap_fee_sats,
+            );
+            if !ceiling.admits_total(
+                quote.amount_sats,
+                quote.fee_reserve_sats,
+                input_fee_sats,
+                swap_fee_sats,
+            ) {
+                self.return_proofs(&selected);
+                let reason = format!(
+                    "melt refused before spending: mint https://mint.example quote {quote_id} would debit {total_debit_sats} sats in total ({} sats invoice + {} sats fee reserve + {input_fee_sats} sats proof input fee + {swap_fee_sats} sats swap fee) against a ceiling of {} sats; the prepared melt was cancelled and its proofs released; nothing was posted to the mint",
+                    quote.amount_sats, quote.fee_reserve_sats, ceiling.max_debit_sats
+                );
+                self.ceiling_refusals.push(reason.clone());
+                return Err(MeltFailure::RefusedBeforeSpending(reason));
+            }
+            let token = self.next_token;
+            self.next_token += 1;
+            let preparation = MeltPreparation {
+                mint_url: "https://mint.example".to_owned(),
+                quote_id: quote_id.to_owned(),
+                invoice_sats: quote.amount_sats,
+                fee_reserve_sats: quote.fee_reserve_sats,
+                input_fee_sats,
+                swap_fee_sats,
+                requires_swap: false,
+                total_debit_sats,
+                expiry_unix: quote.expiry_unix,
+            };
+            self.prepared.insert(
+                token,
+                FakePrepared {
+                    quote_id: quote_id.to_owned(),
+                    quote,
+                    selected,
+                },
+            );
+            Ok(PreparedMelt::fake(preparation, token))
+        }
+
+        /// The MINT half (CDK mint `setup_melt`), on a prepared melt: the payer first pauses at
+        /// `melt_gate` — after its last local check, before the request reaches the mint — then the
+        /// request is accepted when the quote is UNPAID **or FAILED** — with NO expiry check,
+        /// however long ago the quote expired — and rejected when it is PENDING, PAID or UNKNOWN
+        /// (held proofs return to the wallet). Accepted ⇒ the debit is counted, the quote is PAID
+        /// for everyone reading the registry.
+        fn confirm_melt(&mut self, prepared: PreparedMelt) -> Result<MeltOutcome, MeltFailure> {
+            let token = prepared
+                .fake_token()
+                .expect("the Fake confirms only melts it prepared");
+            let FakePrepared {
+                quote_id,
+                quote,
+                selected,
+            } = self
+                .prepared
+                .remove(&token)
+                .expect("a prepared melt is confirmed or cancelled once");
+            let quote_id = quote_id.as_str();
             if let Some(gate) = &self.melt_gate {
                 gate.arrive_and_wait();
             }
-            // ---- mint half ----
             // The quote's state as the mint holds it NOW (the registry), not as the wallet loaded
             // it before the pause: another process may have moved it meanwhile.
             let state_at_mint = self
@@ -2445,6 +2677,22 @@ pub(crate) mod test_support {
                 input_fee_sats: 0,
                 swap_fee_sats: 0,
             })
+        }
+
+        /// Release a prepared melt: its held proofs go back to the pool; nothing was posted.
+        fn cancel_melt(&mut self, prepared: PreparedMelt) -> Result<(), MeltFailure> {
+            let token = prepared
+                .fake_token()
+                .expect("the Fake cancels only melts it prepared");
+            let FakePrepared {
+                quote_id, selected, ..
+            } = self
+                .prepared
+                .remove(&token)
+                .expect("a prepared melt is confirmed or cancelled once");
+            self.return_proofs(&selected);
+            self.cancels.push(quote_id);
+            Ok(())
         }
 
         /// By invoice: the most alive of the quotes raised for it (registry), else the script.
