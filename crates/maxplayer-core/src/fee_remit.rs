@@ -1774,9 +1774,7 @@ fn remit_inner(
                 let _ = writeln!(
                     out,
                     "WARNING: the wallet lost {debit} sats ({} net + {} melt fee incl. actual proof input fee + {} swap fee) against {gross} sats accrued — above the ceiling the melt was admitted under. Recorded as settled; report this.",
-                    outcome.paid_sats,
-                    outcome.fee_sats,
-                    outcome.swap_fee_sats
+                    outcome.paid_sats, outcome.fee_sats, outcome.swap_fee_sats
                 );
             }
             Ok(RemitOutcome::Paid {
@@ -2304,7 +2302,10 @@ pub(crate) fn plan_confirmable_invoice(
 /// Bound, disclosed not solved (§1.5): fee metadata can change between prepare and confirm and the
 /// SDK takes no caller maximum; a change there is what the bound-Spending hold after the fence
 /// covers.
-pub(crate) fn confirm_would_succeed(preparation: &MeltPreparation, gross: u64) -> Result<u64, String> {
+pub(crate) fn confirm_would_succeed(
+    preparation: &MeltPreparation,
+    gross: u64,
+) -> Result<u64, String> {
     let need = preparation
         .invoice_sats
         .saturating_add(preparation.fee_reserve_sats);
@@ -4473,8 +4474,16 @@ mod tests {
         );
         assert_eq!(plan_confirmable_invoice(20, 3, 1, 1000), Some(12));
         assert_eq!(plan_confirmable_invoice(3, 1, 1, 1000), None, "never fits");
-        assert_eq!(plan_confirmable_invoice(20, 2, 0, 0), Some(18), "fee-free: gross − reserve");
-        assert_eq!(plan_confirmable_invoice(2, 2, 0, 0), None, "reserve eats the gross");
+        assert_eq!(
+            plan_confirmable_invoice(20, 2, 0, 0),
+            Some(18),
+            "fee-free: gross − reserve"
+        );
+        assert_eq!(
+            plan_confirmable_invoice(2, 2, 0, 0),
+            None,
+            "reserve eats the gross"
+        );
         assert_eq!(post_swap_figures(15, Some(4), 1000), (19, 3));
         assert_eq!(post_swap_figures(16, None, 1000), (17, 2));
         let mut fake = Fake::new(|_| 0);
@@ -4516,8 +4525,8 @@ mod tests {
         );
         assert_eq!(fake.proofs_spent, vec![vec![32]], "the 32 went to the swap");
         // And §1.1 says so BEFORE the fence, from the same figures.
-        let refused = confirm_would_succeed(&fake_preparation(12, 0, 2, 1, 1000), 20)
-            .expect_err("predicted");
+        let refused =
+            confirm_would_succeed(&fake_preparation(12, 0, 2, 1, 1000), 20).expect_err("predicted");
         assert!(
             refused.contains("swap to 14 sats ([8, 4, 2])")
                 && refused.contains("actual proof input fee on those proofs is 3 sats")
@@ -4550,16 +4559,28 @@ mod tests {
         );
         let outcome = fake.confirm_melt(prepared).expect("confirmable");
         assert_eq!(outcome.paid_sats, 13);
-        assert_eq!(outcome.fee_sats, 4, "fee_paid = Lightning 1 + actual input 3");
-        assert_eq!(outcome.input_fee_sats, 4, "the PREPARED estimate, as the SDK reports it");
+        assert_eq!(
+            outcome.fee_sats, 4,
+            "fee_paid = Lightning 1 + actual input 3"
+        );
+        assert_eq!(
+            outcome.input_fee_sats, 4,
+            "the PREPARED estimate, as the SDK reports it"
+        );
         assert_eq!(outcome.swap_fee_sats, 1);
         assert_eq!(fake.swaps.len(), 1);
         assert_eq!(fake.swaps[0].received, vec![16, 2, 1]);
         assert_eq!(fake.swaps[0].change, vec![8, 4]);
         assert_eq!(fake.melts.len(), 1, "one melt");
-        assert_eq!(fake.pool_value(), Some(14), "32 − 13 − 1 − 3 − 1");
-        assert_eq!(32 - 14, 13 + 1 + 3 + 1, "the whole-wallet delta is the four terms");
-        assert!(32 - 14 <= 20, "≤ gross");
+        let after = fake.pool_value().expect("pool");
+        assert_eq!(after, 14, "32 − 13 − 1 − 3 − 1");
+        let delta = 32 - after;
+        assert_eq!(
+            delta,
+            13 + 1 + 3 + 1,
+            "the whole-wallet delta is the four terms"
+        );
+        assert!(delta <= 20, "≤ gross");
     }
 
     /// A `MeltPreparation` with the four fee figures and the keyset ppk, for the arithmetic tests.
@@ -4646,7 +4667,11 @@ mod tests {
             "no false overspend warning from double-counting the input fee:\n{out}"
         );
         let after = fake.pool_value().expect("pool");
-        assert_eq!((before, after), (32, 15), "measured: change [8, 4] from the swap + [2, 1] from the melt");
+        assert_eq!(
+            (before, after),
+            (32, 15),
+            "measured: change [8, 4] from the swap + [2, 1] from the melt"
+        );
         let delta = before - after;
         assert_eq!(
             delta,
@@ -4707,10 +4732,15 @@ mod tests {
         );
         assert!(!out.contains("WARNING"), "{out}");
         assert!(
-            !out.contains("wallet balance now: 9 sats") && !out.contains("wallet balance now: 15 sats"),
+            !out.contains("wallet balance now: 9 sats")
+                && !out.contains("wallet balance now: 15 sats"),
             "no computed residual is printed:\n{out}"
         );
-        assert_eq!(fake.pool_value(), Some(15), "the payment itself is unaffected");
+        assert_eq!(
+            fake.pool_value(),
+            Some(15),
+            "the payment itself is unaffected"
+        );
         let rows = store.remittances().expect("rows");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].state, RemittanceState::Settled);
@@ -4761,8 +4791,14 @@ mod tests {
             "the prepared melt was cancelled by the caller, before the fence"
         );
         assert!(fake.prepared.is_empty());
-        assert!(fake.ceiling_refusals.is_empty(), "the total bound admitted it");
-        assert!(fake.pay_refusals.is_empty(), "the wallet never got to refuse");
+        assert!(
+            fake.ceiling_refusals.is_empty(),
+            "the total bound admitted it"
+        );
+        assert!(
+            fake.pay_refusals.is_empty(),
+            "the wallet never got to refuse"
+        );
         assert_eq!(
             fake.pool_value(),
             Some(32),
