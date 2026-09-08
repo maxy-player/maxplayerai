@@ -5328,8 +5328,8 @@ mod tests {
                 accrued.in_flight_fee_sats,
                 accrued.unremitted_fee_sats
             ),
-            (0, 0, 20),
-            "the accrued balance is exactly what it was"
+            (0, 20, 0),
+            "nothing paid; the gross is in flight on the planned row until the next attempt reconciles it (addendum 10 §2)"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -5421,8 +5421,8 @@ mod tests {
                 accrued.in_flight_fee_sats,
                 accrued.unremitted_fee_sats
             ),
-            (0, 0, 20),
-            "the accrued balance is exactly what it was"
+            (0, 20, 0),
+            "nothing paid; the gross is in flight on the planned row until the next attempt reconciles it (addendum 10 §2)"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -5635,12 +5635,27 @@ mod tests {
         let (outcome, out) = run_remit(&store, &mut fake, RemitTrigger::Retry, 101);
         assert!(is_paid(&outcome), "{out}");
         assert_eq!(fake.melts.len(), 1, "exactly one debit, ever");
+        // Addendum 10 §2: the next attempt FIRST reconciles the refused row — released as this
+        // process's own earlier attempt (planned → failed, receipts back) — THEN plans a new row
+        // and pays it: [Failed, Settled], the receipts discharged by the second.
+        let release_at = out
+            .find("the row is this process's own earlier attempt, which is over")
+            .unwrap_or_else(|| panic!("the refused row is reconciled first:\n{out}"));
+        let plan_at = out
+            .find("Journaled remittance hash-13-4")
+            .unwrap_or_else(|| panic!("a new row is planned:\n{out}"));
+        assert!(release_at < plan_at, "release before the new plan:\n{out}");
         assert!(
             out.contains("melt fee taken by the mint: 1 sats (quote paid-quote-lnbc-fake-13-4 reserved 2 sats; ceiling 15 sats held at the moment of spending; this is the SDK's fee_paid = Lightning fee + actual proof input fee)"),
             "{out}"
         );
         let rows = store.remittances().expect("rows");
         assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].remittance_id, "hash-13-2");
+        assert_eq!(rows[0].state, RemittanceState::Failed, "released by reconciliation");
+        assert_eq!(rows[0].receipts, 0);
+        assert_eq!(rows[1].remittance_id, "hash-13-4");
+        assert_eq!(rows[1].receipts, 2);
         assert_eq!(rows[1].state, RemittanceState::Settled);
         assert_eq!(rows[1].melt_fee_sats, Some(1));
         assert_eq!(rows[1].melt_fee_reserve_sats, Some(2));
