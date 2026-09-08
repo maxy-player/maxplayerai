@@ -36,7 +36,7 @@ reports-only commit the runner saw is `.rs`-identical to 08c476c.
 | run | result line | failures (names) | fee_remit tests | exit / log |
 |---|---|---|---|---|
 | 1 | `FAILED. 1434 passed; 1 failed; 2 ignored` in 142.25s | **1, and it is the known flake**: `credential_proxy::tests::a_declared_over_cap_body_is_refused_before_the_upstream_sees_it` — `reqwest` `ConnectionReset` (os 54) writing the body to its own loopback stub at `credential_proxy.rs:3520`, no fee/remit code on the path | 44 named `fee_remit` tests ran, all in the 1,434 passed | exit=101 · `money-path-ci-1-08c476c.log` 130,874 B `2c80da572f6daaf3` · line 1 `a44c0be` |
-| 2 | pending | pending | pending | pending |
+| 2 | `FAILED. 1434 passed; 1 failed; 2 ignored` in 145.56s | **1, the same known flake as run 1**: `credential_proxy::tests::a_declared_over_cap_body_is_refused_before_the_upstream_sees_it` — same `reqwest` `ConnectionReset` (os 54) at `credential_proxy.rs:3520` writing the body to its own loopback stub (port 62805 this run), no fee/remit code on the path | 44 named `fee_remit` tests ran, all in the 1,434 passed | exit=101 · `money-path-ci-2-08c476c.log` 130,762 B `e6d895882833bee5` · line 1 `a44c0be` |
 | 3 | pending | pending | pending | pending |
 
 ## 3. fmt / clippy mapped onto the added set a6217328..08c476c
