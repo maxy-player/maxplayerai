@@ -4529,65 +4529,75 @@ mod tests {
         }
     }
 
-    // Regression (i), addendum 8 §1.5: fee-bearing mint (1000 ppk), surplus funds in a layout that
-    // does not fit (one 32-sat proof), total within the gross ⇒ pays ONCE and the WALLET — measured,
-    // not counted — loses at most the gross. Gross 20 (two 10-sat fees); the estimate's reserve is 3
-    // and the probe on 20 expects popcount(23) = 4 sats of input fee + 1 sat of swap fee, so the plan
-    // invoices 20 − 3 − 5 = 12 under a 20-sat ceiling (re-estimate on 15: 4 + 1 again, 12 + 3 + 5 =
-    // 20 ≤ 20). The payment quote's reserve is 0 (a reserve that shrank between estimate and payment,
-    // as addendum 3 §1 allows), so need = 12 = 8+4 ⇒ two output proofs ⇒ input fee 2; selection 14 ⇒
-    // the 32 is swapped ⇒ swap fee 1; total 12 + 0 + 2 + 1 = 15 ≤ 20: admitted. The mint takes a
-    // 0-sat Lightning fee. Wallet before 32, after 32 − 1 (swap fee) − 12 − 2 − 0 = 17: delta 15 ≤ 20.
+    // Regression (i), addendum 9 §1.4: fee-bearing mint (1000 ppk), surplus funds in a layout that
+    // does not fit (one 32-sat proof), reserve 3 at estimate AND payment; the PREPARED input fee
+    // differs from the ACTUAL one and the payment still fits ⇒ pays ONCE, swap counted once, melt
+    // counted once, and the WALLET — measured, not counted — loses at most the gross. Gross 20 (two
+    // 10-sat fees). Planning (§1.2) searches down from 17: 12 is the first invoice whose post-swap
+    // arithmetic holds (need 15 = 8+4+2+1 ⇒ prepared input 4 ⇒ target 19 = [16, 2, 1] ⇒ actual 3;
+    // 19 ≥ 18; 15 + 3 + 1 = 19 ≤ 20). Payment: prepared 12 + 3 + 4 + 1 = 20 ≤ 20 admitted; confirm
+    // swaps the 32 to 19 (swap fee 1, change [8, 4]), recomputes 3, needs 18 ≤ 19, melts; the mint
+    // takes a 1-sat Lightning fee and returns 19 − 12 − 1 − 3 = 3 as change. `fee_paid` = 19 − 12 −
+    // 3 = 4 = Lightning 1 + actual input 3 (inclusive, CDK `melt/saga/mod.rs:139–148`). Wallet 32 →
+    // 12 + 3 = 15: delta 17 = 12 + 1 + 3 + 1 ≤ 20.
     #[test]
-    fn a_fee_bearing_mint_with_a_swap_required_layout_pays_once_and_the_wallet_loses_at_most_the_gross()
+    fn a_fee_bearing_payment_whose_prepared_input_fee_differs_from_the_actual_pays_once_and_the_wallet_loses_at_most_the_gross()
      {
         let (store, root) = store_with_fees("fee-bearing-fits", &[10, 10]);
         let mut fake = Fake::new(|_| 3);
-        fake.live_reserve_for = Some(Box::new(|_| 0));
         fake.input_fee_ppk = 1000;
         fake.proofs = Some(fake_proofs(&[32]));
         fake.registry = Some(quote_registry());
-        fake.melt_results = vec![Ok((12, 0))];
+        fake.melt_results = vec![Ok((12, 1))];
         let before = fake.pool_value().expect("pool");
         let (outcome, out) = run_remit(&store, &mut fake, RemitTrigger::Command, 100);
         assert!(is_paid(&outcome), "{out}");
         assert!(
-            out.contains("expected proof fees (SDK estimate, bounded exactly at payment): 5 sats"),
+            out.contains("invoice amount (maxplayer@agi.cash receives): 12 sats"),
+            "{out}"
+        );
+        assert!(
+            out.contains("expected proof fees (SDK estimate, bounded exactly at payment): 5 sats; actual proof input fee the SDK recomputes on the swapped proofs: 3 sats ⇒ worst case 19 sats leaves the wallet (≤ 20)"),
             "{out}"
         );
         assert_eq!(
             fake.melts,
             vec!["lnbc-fake-12-2".to_owned()],
-            "exactly one debit"
+            "exactly one melt"
         );
+        assert_eq!(fake.swaps.len(), 1, "exactly one swap");
+        assert_eq!(fake.swaps[0].sent, vec![32]);
+        assert_eq!(fake.swaps[0].target_sats, 19);
+        assert_eq!(fake.swaps[0].swap_fee_sats, 1);
+        assert_eq!(fake.swaps[0].received, vec![16, 2, 1]);
+        assert_eq!(fake.swaps[0].change, vec![8, 4]);
         assert!(
-            out.contains("Prepared melt of quote paid-quote-lnbc-fake-12-2: proof input fee 2 sats, swap fee 1 sats (the wallet's proofs do not fit: a pre-melt swap will be performed); total debit 15 sats (12 invoice + 0 reserve + fees) fits the ceiling of 20 sats; proofs reserved in this wallet only, nothing posted yet"),
+            out.contains("Prepared melt of quote paid-quote-lnbc-fake-12-2: proof input fee 4 sats (estimate; actual on the swapped proofs 3 sats), swap fee 1 sats (the wallet's proofs do not fit: a pre-melt swap will be performed); total debit 20 sats (12 invoice + 3 reserve + fees) fits the ceiling of 20 sats; proofs reserved in this wallet only, nothing posted yet"),
             "{out}"
         );
-        assert!(
-            out.contains("proof input fee: 2 sats; swap fee: 1 sats"),
-            "{out}"
-        );
-        assert!(!out.contains("WARNING"), "{out}");
         let after = fake.pool_value().expect("pool");
-        assert_eq!((before, after), (32, 17));
+        assert_eq!((before, after), (32, 15), "measured: change [8, 4] from the swap + [2, 1] from the melt");
         let delta = before - after;
         assert_eq!(
             delta,
-            12 + 2 + 1,
-            "amount + input fee + swap fee (the mint took no fee: fee paid 0)"
+            12 + 1 + 3 + 1,
+            "invoice + Lightning fee + ACTUAL input fee + swap fee (not the prepared 4)"
         );
         assert!(
             delta <= 20,
             "the wallet lost {delta} sats against 20 accrued"
         );
-        assert_eq!(fake.proofs_spent, vec![vec![32]]);
+        assert_eq!(fake.proofs_spent, vec![vec![32]], "the 32 went to the swap");
         let rows = store.remittances().expect("rows");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].state, RemittanceState::Settled);
         assert_eq!((rows[0].gross_sats, rows[0].net_sats), (20, 12));
-        assert_eq!(rows[0].melt_fee_sats, Some(0));
-        assert_eq!(rows[0].melt_fee_reserve_sats, Some(0));
+        assert_eq!(
+            rows[0].melt_fee_sats,
+            Some(4),
+            "`fee_paid`, inclusive: Lightning 1 + actual input 3"
+        );
+        assert_eq!(rows[0].melt_fee_reserve_sats, Some(3));
         let accrued = store.accrued_fees().expect("read");
         assert_eq!(
             (
@@ -4600,7 +4610,113 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // Regression (ii), addendum 8 §1.5: the same seller, mint and layout (plan: invoice 12, ceiling
+    // Regression (ii), addendum 9 §1.4: the prepared figures FIT but the post-swap arithmetic does
+    // not. Same seller, mint and layout; the payment quote's reserve shrank 3 → 0 (addendum 3 §1
+    // allows it), so need = 12 = 8+4 ⇒ prepared input 2, swap 1, total 12 + 0 + 2 + 1 = 15 ≤ 20 —
+    // the total bound ADMITS it. But confirm would swap to 14 = [8, 4, 2] ⇒ actual input 3 ⇒ needs
+    // 15 > 14: pinned CDK refuses AFTER paying the swap (`melt/saga/mod.rs:704–712`) — and on this
+    // path that would land after the fence, leaving a bound Spending row held. The §1.1 check runs
+    // that arithmetic BEFORE the fence: refused, the prepared melt cancelled (local), no swap, no
+    // melt, wallet delta exactly 0, no request posted (the quote is still UNPAID), the row released
+    // (Planned → Failed, receipts back), one REFUSED line naming the target, the actual fee and the
+    // estimate. Until round 8 the fake let this schedule "succeed" (verdict da0ee92 §4.4).
+    #[test]
+    fn a_fee_bearing_schedule_whose_prepared_figures_fit_but_post_swap_arithmetic_does_not_is_refused_before_the_fence()
+     {
+        let (store, root) = store_with_fees("fee-bearing-post-swap", &[10, 10]);
+        let mut fake = Fake::new(|_| 3);
+        fake.live_reserve_for = Some(Box::new(|_| 0));
+        fake.input_fee_ppk = 1000;
+        fake.proofs = Some(fake_proofs(&[32]));
+        let registry = quote_registry();
+        fake.registry = Some(Arc::clone(&registry));
+        fake.melt_results = vec![Ok((12, 0))];
+        let (outcome, out) = run_remit(&store, &mut fake, RemitTrigger::Command, 100);
+        match &outcome {
+            RemitOutcome::MeltRefused {
+                remittance_id,
+                reason,
+            } => {
+                assert_eq!(remittance_id, "hash-12-2");
+                assert_eq!(
+                    reason,
+                    "melt refused before spending: the wallet would swap to 14 sats ([8, 4, 2]) for quote paid-quote-lnbc-fake-12-2 and the mint's actual proof input fee on those proofs is 3 sats (prepared estimate 2 sats at 1000 ppk), so 12 sats invoice + 0 sats fee reserve + 3 sats would need 15 sats and the SDK would refuse AFTER paying the 1 sats swap fee; the prepared melt was cancelled before any fee-bearing request"
+                );
+            }
+            other => panic!("expected MeltRefused, got {other:?}\n{out}"),
+        }
+        assert!(fake.swaps.is_empty(), "no swap was posted");
+        assert!(fake.melts.is_empty(), "no melt was posted");
+        assert_eq!(
+            fake.cancels,
+            vec!["paid-quote-lnbc-fake-12-2".to_owned()],
+            "the prepared melt was cancelled by the caller, before the fence"
+        );
+        assert!(fake.prepared.is_empty());
+        assert!(fake.ceiling_refusals.is_empty(), "the total bound admitted it");
+        assert!(fake.pay_refusals.is_empty(), "the wallet never got to refuse");
+        assert_eq!(
+            fake.pool_value(),
+            Some(32),
+            "wallet delta exactly 0: no swap, no melt"
+        );
+        assert!(fake.proofs_spent.is_empty());
+        assert_eq!(
+            fake.melt_results.len(),
+            1,
+            "the scripted payment was never consumed"
+        );
+        assert!(fake.admitted_seen.is_empty(), "refused before the fence");
+        assert_eq!(
+            out.matches("REFUSED before spending").count(),
+            1,
+            "exactly one refusal line:\n{out}"
+        );
+        assert!(
+            out.contains("Nothing left the wallet; released 20 sats back to unremitted."),
+            "{out}"
+        );
+        assert!(
+            !out.contains("Prepared melt of quote"),
+            "refused before the prepared line:\n{out}"
+        );
+        assert!(!out.contains("WARNING"), "{out}");
+        let quote = registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get("paid-quote-lnbc-fake-12-2")
+            .cloned()
+            .expect("the payment quote was raised");
+        assert_eq!(
+            quote.state,
+            MeltQuoteState::Unpaid,
+            "no request reached the mint"
+        );
+        let rows = store.remittances().expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, RemittanceState::Failed);
+        assert_eq!(rows[0].receipts, 0, "released");
+        assert_eq!(
+            rows[0].melt_quote_id.as_deref(),
+            Some("quote-lnbc-fake-12-2")
+        );
+        let attempts = store.recent_remit_attempts(10).expect("attempts");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].outcome, RemitAttemptOutcome::Failed);
+        let accrued = store.accrued_fees().expect("read");
+        assert_eq!(
+            (
+                accrued.remitted_fee_sats,
+                accrued.in_flight_fee_sats,
+                accrued.unremitted_fee_sats
+            ),
+            (0, 0, 20),
+            "the accrued balance is exactly what it was"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Fee-exceeds refusal (addendum 8 §1.5 (ii), kept by addendum 9 §1.4 (iii)): the same seller, mint and layout (plan: invoice 12, ceiling
     // 20), but the payment quote's reserve grew to 7: 12 + 7 = 19 passes the two-figure check
     // (≤ 20), yet need = 19 = 16+2+1 ⇒ three output proofs ⇒ input fee 3; selection 22 ⇒ swap fee 1;
     // total 19 + 3 + 1 = 23 > 20 — over, by the fees. The total bound refuses BEFORE any swap or
@@ -4702,14 +4818,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // Addendum 8 §1.3, fee-aware planning: the same fee-bearing mint and layout with NO reserve
+    // Addendum 9 §1.2, fee-aware planning: the same fee-bearing mint and layout with NO reserve
     // slack (estimate reserve 2, payment reserve 2). Without the fees in the plan the invoice would
-    // be 18 and the payment total 18 + 2 + 2 + 1 = 23 > 20 — refused every time, forever. With them:
-    // the probe on 20 expects popcount(20+2 = 22) = 3 output proofs ⇒ input fee 3, the 32 swapped ⇒
-    // swap fee 1 ⇒ expected 4 ⇒ net = 20 − 2 − 4 = 14; the re-estimate on 14 + 2 = 16 = one output
-    // proof ⇒ input fee 1, swap fee 1 ⇒ 14 + 2 + 2 = 18 ≤ 20: planned. Payment: need 16 ⇒ input fee
-    // 1, swap fee 1 ⇒ total 18 ≤ 20 ⇒ pays; the mint takes its full 2-sat reserve; wallet
-    // 32 → 32 − 1 − 14 − 1 − 2 = 14: delta 18 ≤ 20, measured.
+    // be 18 and the payment total 18 + 2 + 2 + 1 = 23 > 20 — refused every time, forever. Round 7
+    // planned 14 (20 − 2 − probe's 4): its prepared figures 14 + 2 + 1 + 1 = 18 fit, but confirm would
+    // swap to 17 = [16, 1] ⇒ actual input 2 ⇒ 18 > 17 — CDK refuses after the swap (verdict da0ee92
+    // §4.4). Planning now searches down from 18 for the first invoice whose post-swap arithmetic
+    // holds: 13 (need 15 = 8+4+2+1 ⇒ prepared 4 ⇒ target 19 = [16, 2, 1] ⇒ actual 3; 19 ≥ 18; worst
+    // 15 + 3 + 1 = 19 ≤ 20). Re-estimate on 15: input 4 + swap 1 = 5 ⇒ the old ceiling line says 20.
+    // Payment: prepared 13 + 2 + 4 + 1 = 20 ≤ 20 admitted; swap to 19 (fee 1, change [8, 4]),
+    // actual 3, needs 18 ≤ 19, melts; the mint takes its full 2-sat reserve and returns 19 − 13 − 2 −
+    // 3 = 1 as change; `fee_paid` = 19 − 13 − 1 = 5 = Lightning 2 + actual input 3. Wallet 32 → 12 +
+    // 1 = 13: delta 19 = 13 + 2 + 3 + 1 ≤ 20, measured.
     #[test]
     fn fee_aware_planning_sizes_the_invoice_so_a_fee_bearing_payment_fits_without_reserve_slack() {
         let (store, root) = store_with_fees("fee-aware-plan", &[10, 10]);
@@ -4717,45 +4837,54 @@ mod tests {
         fake.input_fee_ppk = 1000;
         fake.proofs = Some(fake_proofs(&[32]));
         fake.registry = Some(quote_registry());
-        fake.melt_results = vec![Ok((14, 2))];
+        fake.melt_results = vec![Ok((13, 2))];
         let (outcome, out) = run_remit(&store, &mut fake, RemitTrigger::DryRun, 100);
         assert_eq!(outcome, RemitOutcome::DryRun, "{out}");
         for needle in [
             "unremitted platform fee (gross): 20 sats",
             "mint melt fee reserve (ceiling): 2 sats — taken out of the gross, never on top",
-            "invoice amount (maxplayer@agi.cash receives): 14 sats",
-            "leaves your wallet: at most 18 sats (≤ 20); unused reserve returns as change",
-            "expected proof fees (SDK estimate, bounded exactly at payment): 2 sats",
-            "DRY RUN — nothing moved. Re-run with --confirm to pay 14 sats to maxplayer@agi.cash.",
+            "invoice amount (maxplayer@agi.cash receives): 13 sats",
+            "leaves your wallet: at most 20 sats (≤ 20); unused reserve returns as change",
+            "expected proof fees (SDK estimate, bounded exactly at payment): 5 sats; actual proof input fee the SDK recomputes on the swapped proofs: 3 sats ⇒ worst case 19 sats leaves the wallet (≤ 20)",
+            "DRY RUN — nothing moved. Re-run with --confirm to pay 13 sats to maxplayer@agi.cash.",
         ] {
             assert!(out.contains(needle), "missing {needle:?} in:\n{out}");
         }
         assert_eq!(
             fake.invoices,
-            vec![20, 14],
-            "probe on the gross, then the net"
+            vec![20, 13],
+            "probe on the gross, then the invoice planning chose — not 14"
         );
         assert_eq!(fake.pool_value(), Some(32), "estimating reserves nothing");
+        assert!(fake.swaps.is_empty() && fake.melts.is_empty());
 
         let (outcome, out) = run_remit(&store, &mut fake, RemitTrigger::Command, 101);
         assert!(is_paid(&outcome), "{out}");
-        assert_eq!(fake.melts, vec!["lnbc-fake-14-4".to_owned()]);
+        assert_eq!(fake.melts, vec!["lnbc-fake-13-4".to_owned()], "one melt");
+        assert_eq!(fake.swaps.len(), 1, "one swap");
+        assert_eq!(fake.swaps[0].received, vec![16, 2, 1]);
+        assert_eq!(fake.swaps[0].change, vec![8, 4]);
         assert!(
-            out.contains("Prepared melt of quote paid-quote-lnbc-fake-14-4: proof input fee 1 sats, swap fee 1 sats (the wallet's proofs do not fit: a pre-melt swap will be performed); total debit 18 sats (14 invoice + 2 reserve + fees) fits the ceiling of 20 sats"),
+            out.contains("Prepared melt of quote paid-quote-lnbc-fake-13-4: proof input fee 4 sats (estimate; actual on the swapped proofs 3 sats), swap fee 1 sats (the wallet's proofs do not fit: a pre-melt swap will be performed); total debit 20 sats (13 invoice + 2 reserve + fees) fits the ceiling of 20 sats"),
             "{out}"
         );
         assert_eq!(
             fake.pool_value(),
-            Some(14),
-            "32 − 1 swap fee − 14 − 1 input fee − 2 fee paid"
+            Some(13),
+            "32 − 1 swap fee − 13 − 2 Lightning fee − 3 ACTUAL input fee"
         );
         let lost = 32 - fake.pool_value().expect("pool");
+        assert_eq!(lost, 13 + 2 + 3 + 1);
         assert!(lost <= 20, "the wallet lost {lost} sats against 20 accrued");
         let rows = store.remittances().expect("rows");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].state, RemittanceState::Settled);
-        assert_eq!((rows[0].gross_sats, rows[0].net_sats), (20, 14));
-        assert_eq!(rows[0].melt_fee_sats, Some(2));
+        assert_eq!((rows[0].gross_sats, rows[0].net_sats), (20, 13));
+        assert_eq!(
+            rows[0].melt_fee_sats,
+            Some(5),
+            "`fee_paid`, inclusive: Lightning 2 + actual input 3"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
