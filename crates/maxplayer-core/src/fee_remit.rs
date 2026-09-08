@@ -3126,7 +3126,10 @@ mod tests {
                 out.contains("HELD: remittance hash-9-2 is SPENDING (admitted by fake-owner at unix 100), bound to melt quote paid-quote-lnbc-fake-9-2; mint https://mint.example reports melt quote paid-quote-lnbc-fake-9-2 UNPAID (expiry unix 2000); 10 sats of receipts stay pinned to it"),
                 "at {now}: {out}"
             );
-            assert!(!out.contains("DRY RUN"), "no fresh plan on a held row: {out}");
+            assert!(
+                !out.contains("DRY RUN"),
+                "no fresh plan on a held row: {out}"
+            );
             assert_eq!(
                 out.lines()
                     .filter(|line| line.starts_with("  HELD: remittance"))
@@ -3191,7 +3194,9 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains("this wallet holds no such melt quote; 10 sats of receipts stay pinned to it"),
+            out.contains(
+                "this wallet holds no such melt quote; 10 sats of receipts stay pinned to it"
+            ),
             "{out}"
         );
         assert_eq!(

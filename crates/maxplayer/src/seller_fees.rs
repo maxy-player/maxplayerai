@@ -1041,7 +1041,11 @@ mod tests {
             held_sats: 15,
         });
         assert_eq!(exit_code_for(&held), REFUSED);
-        assert_ne!(exit_code_for(&held), SUCCESS, "a dry run that finds a held row is not clean");
+        assert_ne!(
+            exit_code_for(&held),
+            SUCCESS,
+            "a dry run that finds a held row is not clean"
+        );
         let line = match &held {
             RemitOutcome::Refused(refusal) => refusal.to_string(),
             _ => unreachable!(),

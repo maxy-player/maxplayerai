@@ -14852,7 +14852,11 @@ mod tests {
             "{report:?}"
         );
         assert_eq!(fake.melts.len(), 1, "no second melt on FAILED");
-        assert_eq!(fake.melt_results.len(), 1, "the scripted payment was never reached");
+        assert_eq!(
+            fake.melt_results.len(),
+            1,
+            "the scripted payment was never reached"
+        );
         assert_eq!(store.job_state(&job).expect("state"), Some(JobState::Paid));
         let accrued = store.accrued_fees().expect("read");
         assert_eq!(
