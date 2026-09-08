@@ -1,0 +1,11 @@
+1a5c7c55665b5c207a98eb2a003b164de9641189
+$ cargo test -p maxplayer --features acp,wallet --bin maxplayer -- --exact seller_fees::tests::a_held_spending_row_exits_refused_on_dry_run_and_confirm
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s
+     Running unittests src/main.rs (target/debug/deps/maxplayer-5ed8b0e66d5491aa)
+
+running 1 test
+test seller_fees::tests::a_held_spending_row_exits_refused_on_dry_run_and_confirm ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 180 filtered out; finished in 0.01s
+
+exit=0

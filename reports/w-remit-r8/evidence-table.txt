@@ -1,0 +1,91 @@
+# Round 8 evidence table — PR #979, branch feat/seller-fee-remit
+
+Executable head: 1a5c7c5 (1a5c7c55665b5c207a98eb2a003b164de9641189) — the last commit touching any .rs file. Base: a6217328.
+Every exec2-*.log, money-path-ci-*-1a5c7c5.log and exact-*-1a5c7c5.log carries `git rev-parse HEAD` = 1a5c7c55665b5c207a98eb2a003b164de9641189 as line 1: VERIFIED (loop over all 46 files, zero mismatches). step14-fmt.log / step14-clippy.log carry b1c702a as line 1 by construction: they ran on the lint-fixed WORKING TREE before it was committed as 1a5c7c5 (git status line 2 shows the modified fee_remit.rs); they are the fix's pre-commit check and are superseded by exec2-fmt.log / exec2-clippy.log at 1a5c7c5.
+Superseded (executable head moved by the step-14 lint fix, kept as first-attempt records): exec-core-wallet.log, exec-core-wallet-nff.log, exec-cli-default.log, exec-cli-acp-wallet.log, exec-fmt.log, exec-clippy.log, clippy-mapping.md, added-ranges.diff (all at b1c702a).
+
+## Suites at 1a5c7c5
+- core `cargo test -p maxplayer-core --features wallet --no-fail-fast` (exec2-core-wallet-nff.log): lib FAILED. 1422 passed; 1 failed; 2 ignored; 0 measured; 0 filtered out; finished in 140.27s — FAILED: credential_proxy::tests::a_declared_over_cap_body_is_refused_before_the_upstream_sees_it (known out-of-diff loopback flake; credential_proxy.rs has no line in a6217328..1a5c7c5); integration binaries collect_integrity 8/0, free_post_no_wallet 1/0, git_config_isolation 1/0, hostile_local_git_config 1/0, no_system_git 1/0, relay_git_http_auth 2/0, acp_concurrency/sandbox_netns_live/doc-tests 0 tests. exit 101 from the one lib failure.
+- CLI default `cargo test -p maxplayer --no-fail-fast` (exec2-cli-default.log): 143/0, cli_e2e 2/0, mcp_daemon 3/0, seller_declared_output 3/0, seller_memory_read_on_start 6/0; exit 0.
+- CLI `cargo test -p maxplayer --features acp,wallet --no-fail-fast` (exec2-cli-acp-wallet.log): 180/0 (1 ignored), cli_e2e 2/0, mcp_daemon 3/0, sandbox_reap_dry_run 5/0, seller_declared_output 3/0, seller_memory_read_on_start 6/0; exit 0.
+- clippy `cargo clippy --workspace --all-targets --features wallet` (exec2-clippy.log, exec2-lint-mapping.md): exit 0; 125 diagnostics, 0 inside the a6217328..1a5c7c5 added set, 17 in touched files on lines not added, 108 elsewhere.
+- fmt `cargo fmt --all -- --check` (exec2-fmt.log, exec2-lint-mapping.md): exit 1 (repo fmt-dirty at base); 2106 blocks; 3 start inside our hunks; 0 of the lines rustfmt would rewrite are this branch's (git blame: home.rs:1448 orveth; lib.rs:60–63 orveth; lib.rs:47 pure reorder target).
+- money-path CI `cargo test -p maxplayer-core --release --no-default-features --features gateway,git-delivery,wallet,live-mints --locked` ×3:
+  - run 1 (money-path-ci-1-1a5c7c5.log): ok. 1427 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 142.11s; exit 0.
+  - run 2 (money-path-ci-2-1a5c7c5.log): FAILED. 1424 passed; 3 failed; 2 ignored; 0 measured; 0 filtered out; finished in 152.79s; FAILED: credential_proxy::tests::a_declared_over_cap_body_is_refused_before_the_upstream_sees_it, job_lifecycle::tests::a_wait_resolves_on_arrival_rather_than_on_the_safety_recheck, job_lifecycle::tests::get_job_default_skips_kind_zero_fetch.
+  - run 3 (money-path-ci-3-1a5c7c5.log): FAILED. 1424 passed; 3 failed; 2 ignored; 0 measured; 0 filtered out; finished in 141.27s; FAILED: credential_proxy::tests::a_declared_over_cap_body_is_refused_before_the_upstream_sees_it, job_lifecycle::tests::a_wait_resolves_on_arrival_rather_than_on_the_safety_recheck, job_lifecycle::tests::get_job_default_skips_kind_zero_fetch.
+  The failing names are the round-7-known out-of-diff flakes (credential_proxy loopback "Connection reset by peer"; job_lifecycle live mint `mint_unreachable: https://mint.minibits.cash/Bitcoin … fee query exceeded 5s`). Reported as FAILED counts, never as green.
+- exact records (exact-records.txt, 38 lines `NN-tag|command`): 38/38 logs show `test result: ok. 1 passed`. 36 round-7 records with their own commands (24/25 are `-p maxplayer --features acp,wallet --bin maxplayer`), record 28 re-pointed to the renamed fitting test, 37 and 38 new (post-swap refusal before the fence; balance unknown, no false warning).
+
+## Files · bytes · sha256
+added-ranges.diff · 760231 · a6d69376351ce1fc9fe76ed085bb07f335bba88e6a074591d1dd887998aba60b
+clippy-mapping.md · 27889 · 898514fccac7019e802875d82443aa40506ccfebc517e01191bdb2d75264ae31
+exact-01-2b-node-1a5c7c5.log · 3583 · bef79b4a6c3a468e4d90fbf9bdf724fde8368146e1bef9afb377a698556e5448
+exact-02-2c-race-1a5c7c5.log · 3549 · 266405cee2c4b60f9e2784ddd2b3777dbd21735471b00231ac7bcecbef1271fe
+exact-03-2d-backoff-1a5c7c5.log · 3553 · 0fa2acdf50c5d7da071b4c83708591cb65768f887b875a3ccb3b569319fde42e
+exact-04-2d-bootdelay-1a5c7c5.log · 3527 · d45823c5eaca3c2362c29a95104bd34448beb267b2e524813366e312a98b9c36
+exact-05-2d-jitter-1a5c7c5.log · 3483 · 59ba33a8f5fc1572220aef363f5d8b1a7512e262d307de1fe0e15f8cac6c017f
+exact-06-2d-singleflight-1a5c7c5.log · 3519 · c24b1746a08f2abc31207db3b26d7cbdfcc09c97d9e4f541e67430e25a63284f
+exact-07-2d-threshold-1a5c7c5.log · 3563 · f078d6e8a3c2f48c1832f6051acb699562472da6a529b7885a59df76578b814d
+exact-08-2e-drain-bound-1a5c7c5.log · 3567 · 0b7d90b99e5798b38861f902cf56d9658c10c11f87be4fa053409f35fba03e80
+exact-09-2e-rearm-1a5c7c5.log · 3505 · d7e4551633f9ea65f319b31b77c67b89b5b60e6b806dcf39d4c20c9d8a25fd72
+exact-10-2e-retract-1a5c7c5.log · 3529 · aadaab1c507cf8058ee237c40abd4e77b71179e752b29974a028a147ccc97b1c
+exact-11-2e-shutdown-drain-1a5c7c5.log · 3559 · 3b1326dd69f83dc8ba02e71555fdaf5dd76ab87e93a105a50d1b5154bad060be
+exact-12-2e-shutdown-retries-1a5c7c5.log · 3515 · 55705777032f386d4100cdf4c4cd999afd78ae832b15e1c46abf72189bbb7b0c
+exact-13-2f-ceiling-1a5c7c5.log · 3541 · bd805bf73cea3eb99906678fc2ab855b23289a2880c52f0d932fce2d76dd4074
+exact-14-2f-reserve-1a5c7c5.log · 3553 · 5e6e3e2b7b3bff9e02c9c708465466b6d58778e356e3af6a8175022db8a5c478
+exact-15-2g-B2-stale-snapshot-1a5c7c5.log · 3555 · bc02f61d069f88462a0d47aa449f95915c8b8b7e1bb9045b3f2faaffef6694d2
+exact-16-2g-a-1a5c7c5.log · 3575 · 7d43edf05fbfd600bddc07a9d4044214bdb3019a613c1f81e028cbfd2ebfeb8a
+exact-17-2g-b1-1a5c7c5.log · 3549 · 76cf85a3d623675b565f99c3229fef392cb439251dc90046bb32c2f99a1362cb
+exact-18-2g-b2-expired-held-1a5c7c5.log · 3555 · 24b0f5a1f40025e9df17d1fa3b78e229a9786014e37a89a540a152d7d8d08208
+exact-19-2g-c-1a5c7c5.log · 3577 · 7de9e12def5974e1fdea2757b36522a113f49fdf1c72f307fdc4c2232ce39756
+exact-20-2g-d-1a5c7c5.log · 3529 · 9991d2608424f14690b6c27eddcc8a299c0a87f0b31f9bf1d29a917c8dd780c0
+exact-21-2g-delayed-1a5c7c5.log · 3545 · 47c1bcdd850ca8a6966fefbecd511d235d377b54bc3228b6aa576b09a3be91cb
+exact-22-E-first-retry-1a5c7c5.log · 3593 · 30f522589e89f57d836d9b5013159b82f62f7d8833f56d1d8b5557a74df97a4d
+exact-23-E-one-line-1a5c7c5.log · 3541 · 7c9e57fb8b3ba15a93f284111a5bfbca4b929eac0ea7303f90508159b7e5d877
+exact-24-cli-exit-map-1a5c7c5.log · 558 · e2e8b813fbec6ff7e4c701fe67f0ca84b5ff3bcb4c5a720da96df3bb89071e0e
+exact-25-cli-invocation-1a5c7c5.log · 608 · b2b5a7cc452105222ebb656f3901c9eb3f5171ffc2a451050879e4de8963fab9
+exact-26-2a-remit-follows-receipt-1a5c7c5.log · 3549 · 139aa40609e75f1b065fc917aa5f1ea4312add034a232cc1a0c41f2569519a90
+exact-27-v13-migration-1a5c7c5.log · 3571 · cd5efe510448fb9a5983b9cb3cca42e03150cee3b5a6b6131191ab4b4b83fc4c
+exact-28-r8-i-fee-fits-actual-differs-1a5c7c5.log · 3639 · fcbd74f421020706882a84717840a2d5c36ace407304d1e035a7d5935af72b0f
+exact-29-r7-ii-fee-exceeds-1a5c7c5.log · 3577 · 11d54356c688d15d913dda04944b44656399d446a7eb01133e9941e1a06637b2
+exact-30-r7-iiib-fee-aware-plan-1a5c7c5.log · 3577 · 230568c85ca9488c37f838c038107c71b51a129748460756bac1e43aa1469872
+exact-31-r7-never-fits-1a5c7c5.log · 3525 · ca0b2b6805ee6813f44b04ba6dead88848a7870320a0149661d1ab8c61200eb8
+exact-32-r7-fake-selfcheck-1a5c7c5.log · 3581 · 9b17c8ca318b9f85453c2faf6919bdfb8f41fd8d5850ff2bd49235876093509a
+exact-33-r7-admits-total-1a5c7c5.log · 3549 · 29497368f1bc6756efa073ac8c264580bcdb0991f3b55309aad4075c6b225301
+exact-34-r7-total-display-1a5c7c5.log · 3533 · 50d030d9ab7481ca200884f55189dbf25f4d68d1679ffe6f0577580521adc691
+exact-35-r7-relay-1a5c7c5.log · 3509 · 619de1bc3c1587c11618b75df44c0e4bbcf028468c1b91090fd44976f8311e3e
+exact-36-r7-drop-cancels-1a5c7c5.log · 3543 · dff0c96f2af2a8ab8192e71976e26bd6fa3fca25b7dd65a1c212054d04e6a4cb
+exact-37-r8-ii-post-swap-refused-before-fence-1a5c7c5.log · 3623 · d44ab349f9b719d3ccea7551b070702d5880eac634c91dc8a4d8cd696847484c
+exact-38-r8-balance-unknown-no-false-warning-1a5c7c5.log · 3571 · 2912dd6dc98a57436032beb28d3043761fa4464ee5eaf20fb67141905ba4babc
+exact-records-r7.txt · 3934 · 0c497541c10dacc6815669c8c915a09aab1b07fd387d6dd50017fe2457596ecb
+exact-records.txt · 6736 · 7de6110f16c526aa1d15bf10f447fea4008f318e19fc4685fa647826a190a84d
+exec-cli-acp-wallet.log · 18565 · 73284d92f37d71423d089139a490a5c82cb777a031b438b4aeef2d9031d31781
+exec-cli-default.log · 16846 · df5773a738830f3dcc0c1e0250d9cd84d4858dfe17a3ff85c59290c2760523b1
+exec-clippy.log · 77316 · 0435fa2c25b9358052fad752e5d893df3ca779df19829e32fc378e187598df6b
+exec-core-wallet-nff.log · 136186 · 395ac5d141b01de97dd356a95008b159b8a3405a1d36eb87bf4347335a602e96
+exec-core-wallet.log · 130504 · 14c96b8affed0c94867d498181525baa1c26963f7cbaec9521923abb424d45ff
+exec-fmt.log · 1478021 · e4019abfc9e749c30d088532f1c1596edcd27c23be0458604b98da89b580d2db
+exec2-added-ranges.diff · 760683 · a45648399123d3f15a2f7954331ff2b0ea89c3728da466775f81f2cee86e176d
+exec2-cli-acp-wallet.log · 18559 · c97b420f22f42c257a9af158d5ca90af41244ba569ce72c6ce22428655068d48
+exec2-cli-default.log · 16846 · ead094aed82503796c94e9bbd863d334942d62b534c52f4f0a4f9c693b25b8aa
+exec2-clippy.log · 76608 · 8cfae96c7c2d26c8beda0b76eedd407d516b4a2cf5c44983c1bb9429fcd55aba
+exec2-core-wallet-nff.log · 136297 · 797b325d634f729c0a0bf639c184119deee999d78506b8613487b445c9ee9f95
+exec2-fmt.log · 1471480 · bf714cf02c958e28022dd4e7006db04c6e44ad04923735759fd700076b46e289
+exec2-lint-mapping.md · 4151 · f5fe1619f870b4294f93d2afde27f759fff2c3be797ca80147a079fc52b94c74
+fmt-inside-blocks.txt · 8531 · bc93142908df398e5b7576fc1db712d770d1702feef8cb9c12b795572f0e44b6
+money-path-ci-1-1a5c7c5.log · 134735 · 0103e44c84e21cc7e2f9e1aa5fb01cbbd1e5585ee490b18382f322188f4b0a6e
+money-path-ci-2-1a5c7c5.log · 130802 · 3d89320d6ac0e88675f8c2d8d06752775836871f18662a97504ff40ab1fd84b4
+money-path-ci-3-1a5c7c5.log · 130805 · 808320f23fe1ed6d17b223c222a272fecd063bb305d461828028484127319600
+plan.md · 10661 · 7aac574b998991a4a660ee8524401e7575c1761dc275956db3387a5f3c17338b
+step14-added-ranges.diff · 760683 · a45648399123d3f15a2f7954331ff2b0ea89c3728da466775f81f2cee86e176d
+step14-clippy.log · 76991 · e1b7bc6cb2ab8addb3ee63b9adb1577e75c3e9fe7a0c80a08517f967d9e10a9a
+step14-fmt.log · 1471522 · 2f92f7336647b3181b6bde445c094c33ceaffbe572316d38617d0238ed9f776d
+step14-lint-mapping.md · 1778 · 8a75d6dd0bfdc827611cd50d02f540513b77ffb9a9f723aace4325883d0b6f3f
+step2-build.log · 5286 · 98ae754668fb9312f3adbaabb7ef4f0a2434424ecf9cbfa2af860097c4fcd7a9
+step3-selfcheck.log · 6467 · 4d65fc4242cff0adcf3b8766cd0b76e1f1bd8175ec03e65291018caecc46bac5
+step4-fee-bearing.log · 8653 · 359d70d1f0d4b1f1d600f3365b93fb6272e3fb68f23f76c0e6b423ef4c6f521c
+step5-fee.log · 14025 · eba3ceaf2faae29c37e8a8438bbccaf16235075a97633768122ddfd507db2b42
+step6-fee.log · 14141 · 2a7fd9bfb150e84c8bede7741813582e0f0b736f4908d901ef1a360b02abe74b
+step7-build.log · 5327 · b2f1a7e034382eaed3403434021d4e5c8c0eb64d2e6da7cfe642a3fcf6157c5d
+step8-build.log · 5326 · bc6c94a8e9dba7e7c2dfce0b3cc9d4a88f910984d3a6afa054e9ff5a502bf76d

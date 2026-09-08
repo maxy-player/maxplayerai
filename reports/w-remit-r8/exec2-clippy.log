@@ -1,0 +1,1759 @@
+1a5c7c55665b5c207a98eb2a003b164de9641189
+?? reports/
+$ cargo clippy --workspace --all-targets --features wallet 2>&1
+warning: empty line after doc comment
+    --> crates/maxplayer-core/src/job_lifecycle.rs:2721:1
+     |
+2721 | / /// (already-delivered / live-claimed-by-another) without duplicating the relay read.
+2722 | |
+     | |_^
+2723 |   pub(crate) async fn fetch_job_view_async(
+     |   ---------------------------------------- the comment documents this function
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#empty_line_after_doc_comments
+     = note: `#[warn(clippy::empty_line_after_doc_comments)]` on by default
+     = help: if the empty line is unintentional, remove it
+
+warning: struct `AgentMessageCapture` is never constructed
+   --> crates/maxplayer-core/src/engine.rs:246:19
+    |
+246 | pub(crate) struct AgentMessageCapture {
+    |                   ^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: methods `observe` and `into_last_message` are never used
+   --> crates/maxplayer-core/src/engine.rs:255:19
+    |
+250 | impl AgentMessageCapture {
+    | ------------------------ methods in this implementation
+...
+255 |     pub(crate) fn observe(&mut self, event: RunEvent<'_>) {
+    |                   ^^^^^^^
+...
+268 |     pub(crate) fn into_last_message(self) -> Option<String> {
+    |                   ^^^^^^^^^^^^^^^^^
+
+warning: associated function `adopt` is never used
+  --> crates/maxplayer-core/src/sandbox_netns.rs:75:8
+   |
+72 | impl NetnsHolder {
+   | ---------------- associated function in this implementation
+...
+75 |     fn adopt(name: String) -> Self {
+   |        ^^^^^
+
+warning: function `job_diagnostics_dir` is never used
+    --> crates/maxplayer-core/src/seller_exec.rs:1337:4
+     |
+1337 | fn job_diagnostics_dir(workdir: &Path) -> Option<PathBuf> {
+     |    ^^^^^^^^^^^^^^^^^^^
+
+warning: fields `base_url_env`, `default_upstream`, `placeholder_prefix`, and `placeholder_random_len` are never read
+    --> crates/maxplayer-core/src/seller_exec.rs:2518:5
+     |
+2514 | struct ContainedCred {
+     |        ------------- fields in this struct
+...
+2518 |     base_url_env: &'static str,
+     |     ^^^^^^^^^^^^
+2519 |     /// The vendor default upstream, used when the operator set no `base_url_env`.
+2520 |     default_upstream: &'static str,
+     |     ^^^^^^^^^^^^^^^^
+2521 |     /// The placeholder's vendor prefix (so a client that shape-validates locally does not refuse).
+2522 |     placeholder_prefix: &'static str,
+     |     ^^^^^^^^^^^^^^^^^^
+2523 |     /// Random characters after the prefix, chosen to match the vendor credential's length.
+2524 |     placeholder_random_len: usize,
+     |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: this `if` statement can be collapsed
+   --> crates/maxplayer-core/src/budget.rs:295:9
+    |
+295 | /         if let Some(id) = attempt_id {
+296 | |             if self.counted_attempts.contains(id) {
+297 | |                 // Already counted and persisted — do not re-add.
+298 | |                 return Ok(());
+299 | |             }
+300 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+    = note: `#[warn(clippy::collapsible_if)]` on by default
+help: collapse nested if block
+    |
+295 ~         if let Some(id) = attempt_id
+296 ~             && self.counted_attempts.contains(id) {
+297 |                 // Already counted and persisted — do not re-add.
+298 |                 return Ok(());
+299 ~             }
+    |
+
+warning: this `if` statement can be collapsed
+   --> crates/maxplayer-core/src/budget.rs:451:5
+    |
+451 | /     if !ledger_existed {
+452 | |         if let Some(parent) = path.parent() {
+453 | |             crate::durable::sync_dir(parent)
+454 | |                 .map_err(|error| BudgetRefuse::Persist(error.to_string()))?;
+455 | |         }
+456 | |     }
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+451 ~     if !ledger_existed
+452 ~         && let Some(parent) = path.parent() {
+453 |             crate::durable::sync_dir(parent)
+454 |                 .map_err(|error| BudgetRefuse::Persist(error.to_string()))?;
+455 ~         }
+    |
+
+warning: this `if` statement can be collapsed
+   --> crates/maxplayer-core/src/capability.rs:246:5
+    |
+246 | /     if let Some(family) = requested_harness_family {
+247 | |         if !crate::agent_presets::HARNESS_FAMILIES.contains(&family) {
+248 | |             return Err(RequestDefect::UnknownHarnessFamily { requested: family.to_owned() });
+249 | |         }
+250 | |     }
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+246 ~     if let Some(family) = requested_harness_family
+247 ~         && !crate::agent_presets::HARNESS_FAMILIES.contains(&family) {
+248 |             return Err(RequestDefect::UnknownHarnessFamily { requested: family.to_owned() });
+249 ~         }
+    |
+
+warning: unnecessary closure used to substitute value for `Option::None`
+   --> crates/maxplayer-core/src/checks.rs:313:25
+    |
+313 |               let bytes = base_tree
+    |  _________________________^
+314 | |                 .blob_at(&path)?
+315 | |                 .ok_or_else(|| ChecksError::MissingEnvLock(path))?;
+    | |_________________________________________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#unnecessary_lazy_evaluations
+    = note: `#[warn(clippy::unnecessary_lazy_evaluations)]` on by default
+help: use `ok_or` instead
+    |
+315 -                 .ok_or_else(|| ChecksError::MissingEnvLock(path))?;
+315 +                 .ok_or(ChecksError::MissingEnvLock(path))?;
+    |
+
+warning: doc list item without indentation
+  --> crates/maxplayer-core/src/collect.rs:16:5
+   |
+16 | //!   2/3. verify integrity + pay: the buyer's tip-match commitment is the oid it accepted
+   |     ^^
+   |
+   = help: if this is supposed to be its own paragraph, add a blank line
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#doc_lazy_continuation
+   = note: `#[warn(clippy::doc_lazy_continuation)]` on by default
+help: indent this line
+   |
+16 | //!      2/3. verify integrity + pay: the buyer's tip-match commitment is the oid it accepted
+   |       +++
+
+warning: doc list item overindented
+  --> crates/maxplayer-core/src/collect.rs:17:5
+   |
+17 | //!        (`bind.commit_oid`); the machine tip-match (fetch the delivered branch, compare its tip to
+   |     ^^^^^^^ help: try using `     ` (5 spaces)
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#doc_overindented_list_items
+   = note: `#[warn(clippy::doc_overindented_list_items)]` on by default
+
+warning: doc list item overindented
+  --> crates/maxplayer-core/src/collect.rs:18:5
+   |
+18 | //!        that oid) runs inside `authorize_pay` BEFORE any spend, so a delivered-oid ≠ bound-oid
+   |     ^^^^^^^ help: try using `     ` (5 spaces)
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#doc_overindented_list_items
+
+warning: doc list item overindented
+  --> crates/maxplayer-core/src/collect.rs:19:5
+   |
+19 | //!        mismatch — and the pre-pay seller co-signature check — refuse with ZERO spend and NO
+   |     ^^^^^^^ help: try using `     ` (5 spaces)
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#doc_overindented_list_items
+
+warning: doc list item overindented
+  --> crates/maxplayer-core/src/collect.rs:20:5
+   |
+20 | //!        materialize;
+   |     ^^^^^^^ help: try using `     ` (5 spaces)
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#doc_overindented_list_items
+
+warning: this `if` statement can be collapsed
+   --> crates/maxplayer-core/src/collect.rs:488:9
+    |
+488 | /         if let Some(parent) = path.parent() {
+489 | |             if let Err(error) = std::fs::create_dir_all(parent) {
+490 | |                 walk_err = Some(error.to_string());
+491 | |                 return git2::TreeWalkResult::Abort;
+492 | |             }
+493 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+488 ~         if let Some(parent) = path.parent()
+489 ~             && let Err(error) = std::fs::create_dir_all(parent) {
+490 |                 walk_err = Some(error.to_string());
+491 |                 return git2::TreeWalkResult::Abort;
+492 ~             }
+    |
+
+warning: this `if` statement can be collapsed
+    --> crates/maxplayer-core/src/job_lifecycle.rs:1085:5
+     |
+1085 | /     if let Some(target) = &offer.seller_pubkey {
+1086 | |         if target != &claim.seller_pubkey {
+1087 | |             return Err(JobLifecycleError::Targeting(format!(
+1088 | |                 "offer targets seller {target}, claim seller is {}",
+...    |
+1092 | |     }
+     | |_____^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+     |
+1085 ~     if let Some(target) = &offer.seller_pubkey
+1086 ~         && target != &claim.seller_pubkey {
+1087 |             return Err(JobLifecycleError::Targeting(format!(
+ ...
+1090 |             )));
+1091 ~         }
+     |
+
+warning: this `if` statement can be collapsed
+    --> crates/maxplayer-core/src/job_lifecycle.rs:1301:5
+     |
+1301 | /     if let Some(target) = &offer.seller_pubkey {
+1302 | |         if target != &claim.seller_pubkey {
+1303 | |             return Err(JobLifecycleError::Targeting(format!(
+1304 | |                 "offer targets seller {target}, claim seller is {}",
+...    |
+1308 | |     }
+     | |_____^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+     |
+1301 ~     if let Some(target) = &offer.seller_pubkey
+1302 ~         && target != &claim.seller_pubkey {
+1303 |             return Err(JobLifecycleError::Targeting(format!(
+ ...
+1306 |             )));
+1307 ~         }
+     |
+
+warning: this `if` statement can be collapsed
+    --> crates/maxplayer-core/src/job_lifecycle.rs:1928:5
+     |
+1928 | /     if let Some(existing) = existing {
+1929 | |         if existing.result_id != new_result_id {
+1930 | |             return Err(JobLifecycleError::Input(format!(
+1931 | |                 "job {job_id} already accepted result {}; refusing to bind a different result \
+...    |
+1936 | |     }
+     | |_____^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+     |
+1928 ~     if let Some(existing) = existing
+1929 ~         && existing.result_id != new_result_id {
+1930 |             return Err(JobLifecycleError::Input(format!(
+ ...
+1934 |             )));
+1935 ~         }
+     |
+
+warning: this `if` statement can be collapsed
+   --> crates/maxplayer-core/src/profile.rs:278:13
+    |
+278 | /             if let Ok(value) = serde_json::from_str::<serde_json::Value>(&existing.content) {
+279 | |                 if let Some(about) = value
+280 | |                     .get("about")
+281 | |                     .and_then(|v| v.as_str())
+...   |
+286 | |             }
+    | |_____________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+278 ~             if let Ok(value) = serde_json::from_str::<serde_json::Value>(&existing.content)
+279 ~                 && let Some(about) = value
+280 |                     .get("about")
+...
+284 |                     metadata = metadata.about(about);
+285 ~                 }
+    |
+
+warning: this returns a `Result<_, ()>`
+   --> crates/maxplayer-core/src/contribution.rs:633:5
+    |
+633 | /     pub fn verify_tuple_sig(
+634 | |         tuple: &AuthorshipTuple,
+635 | |         sig_hex: &str,
+636 | |         seller: &NostrPublicKey,
+637 | |     ) -> Result<(), ()> {
+    | |_______________________^
+    |
+    = help: use a custom `Error` type instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#result_unit_err
+    = note: `#[warn(clippy::result_unit_err)]` on by default
+
+warning: doc list item without indentation
+   --> crates/maxplayer-core/src/crossmint_hop.rs:949:9
+    |
+949 |     /// [`Self::plan_quotes`], so a superseding quote is compared against the already-buffered
+    |         ^
+    |
+    = help: if this is supposed to be its own paragraph, add a blank line
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#doc_lazy_continuation
+help: indent this line
+    |
+949 |     ///   [`Self::plan_quotes`], so a superseding quote is compared against the already-buffered
+    |         ++
+
+warning: doc list item without indentation
+   --> crates/maxplayer-core/src/crossmint_hop.rs:950:9
+    |
+950 |     /// record rather than growing the ceiling. The full [`HopCost`] is returned so the caller can
+    |         ^
+    |
+    = help: if this is supposed to be its own paragraph, add a blank line
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#doc_lazy_continuation
+help: indent this line
+    |
+950 |     ///   record rather than growing the ceiling. The full [`HopCost`] is returned so the caller can
+    |         ++
+
+warning: doc list item without indentation
+   --> crates/maxplayer-core/src/crossmint_hop.rs:951:9
+    |
+951 |     /// journal `fee_reserve` and `input_fee` for the post-melt reconciliation (#186).
+    |         ^
+    |
+    = help: if this is supposed to be its own paragraph, add a blank line
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#doc_lazy_continuation
+help: indent this line
+    |
+951 |     ///   journal `fee_reserve` and `input_fee` for the post-melt reconciliation (#186).
+    |         ++
+
+warning: doc list item without indentation
+   --> crates/maxplayer-core/src/delivery_git.rs:443:9
+    |
+443 |     /// Returns the store proof + LOCAL store ref for the later merge. Authorship (the seller's
+    |         ^
+    |
+    = help: if this is supposed to be its own paragraph, add a blank line
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#doc_lazy_continuation
+help: indent this line
+    |
+443 |     ///      Returns the store proof + LOCAL store ref for the later merge. Authorship (the seller's
+    |         +++++
+
+warning: doc list item without indentation
+   --> crates/maxplayer-core/src/delivery_git.rs:444:9
+    |
+444 |     /// signed tuple) + echo-equality are checked by the caller at the pre-pay seam; pay then binds
+    |         ^
+    |
+    = help: if this is supposed to be its own paragraph, add a blank line
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#doc_lazy_continuation
+help: indent this line
+    |
+444 |     ///      signed tuple) + echo-equality are checked by the caller at the pre-pay seam; pay then binds
+    |         +++++
+
+warning: doc list item without indentation
+   --> crates/maxplayer-core/src/delivery_git.rs:445:9
+    |
+445 |     /// the fork-tip `commit_oid` via the unchanged money path.
+    |         ^
+    |
+    = help: if this is supposed to be its own paragraph, add a blank line
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#doc_lazy_continuation
+help: indent this line
+    |
+445 |     ///      the fork-tip `commit_oid` via the unchanged money path.
+    |         +++++
+
+warning: this function has too many arguments (8/7)
+   --> crates/maxplayer-core/src/delivery_orchestrator.rs:113:1
+    |
+113 | / pub fn run_phase1(
+114 | |     agent_workdir: &Path,
+115 | |     identity: &DeliveryAgentIdentity,
+116 | |     base: Option<Phase1Base<'_>>,
+...   |
+121 | |     spawn_agent: impl FnOnce(&Path) -> Result<(), OrchestratorError>,
+122 | | ) -> Result<Phase1Output, OrchestratorError> {
+    | |____________________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#too_many_arguments
+    = note: `#[warn(clippy::too_many_arguments)]` on by default
+
+warning: redundant closure
+   --> crates/maxplayer-core/src/delivery_orchestrator.rs:461:9
+    |
+461 |         |wait| std::thread::sleep(wait),
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace the closure with the function itself: `std::thread::sleep`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#redundant_closure
+    = note: `#[warn(clippy::redundant_closure)]` on by default
+
+warning: this function has too many arguments (9/7)
+   --> crates/maxplayer-core/src/gateway.rs:897:1
+    |
+897 | / pub fn result_draft(
+898 | |     offer_id: &str,
+899 | |     buyer_pubkey: &str,
+900 | |     output: &str,
+...   |
+906 | |     exec_metadata: &[TagSpec],
+907 | | ) -> EventDraft {
+    | |_______________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#too_many_arguments
+
+warning: this function has too many arguments (10/7)
+   --> crates/maxplayer-core/src/gateway.rs:933:1
+    |
+933 | / pub fn git_result_draft(
+934 | |     offer_id: &str,
+935 | |     buyer_pubkey: &str,
+936 | |     repo: &str,
+...   |
+943 | |     exec_metadata: &[TagSpec],
+944 | | ) -> EventDraft {
+    | |_______________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#too_many_arguments
+
+warning: this function has too many arguments (12/7)
+    --> crates/maxplayer-core/src/gateway.rs:1105:1
+     |
+1105 | / pub fn receipt_draft(
+1106 | |     offer_id: &str,
+1107 | |     result_id: &str,
+1108 | |     buyer_pubkey: &str,
+...    |
+1117 | |     exec_metadata: &[TagSpec],
+1118 | | ) -> EventDraft {
+     | |_______________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#too_many_arguments
+
+warning: this function has too many arguments (8/7)
+   --> crates/maxplayer-core/src/heartbeat.rs:865:1
+    |
+865 | / pub fn heartbeat_for_state(
+866 | |     in_flight: u32,
+867 | |     anything_serving: bool,
+868 | |     rate_sats: u64,
+...   |
+873 | |     admission: crate::home::AdmissionPolicy,
+874 | | ) -> HeartbeatDraft {
+    | |___________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#too_many_arguments
+
+warning: this `if` statement can be collapsed
+    --> crates/maxplayer-core/src/home.rs:1776:5
+     |
+1776 | /     if !agents_present {
+1777 | |         if let Some(label) = legacy_agent.as_ref().and_then(toml::Value::as_str) {
+1778 | |             seller.insert(
+1779 | |                 "agents".to_owned(),
+...    |
+1783 | |     }
+     | |_____^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+     |
+1776 ~     if !agents_present
+1777 ~         && let Some(label) = legacy_agent.as_ref().and_then(toml::Value::as_str) {
+1778 |             seller.insert(
+ ...
+1781 |             );
+1782 ~         }
+     |
+
+warning: this `if` statement can be collapsed
+   --> crates/maxplayer-core/src/buyer/lifecycle.rs:263:5
+    |
+263 | /     if let Some(requested) = filters.requested_harness_family {
+264 | |         if !crate::agent_presets::HARNESS_FAMILIES.contains(&requested) {
+265 | |             return Err(CapabilityRefusal::UnknownHarnessFamily {
+266 | |                 requested: requested.to_owned(),
+...   |
+269 | |     }
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+263 ~     if let Some(requested) = filters.requested_harness_family
+264 ~         && !crate::agent_presets::HARNESS_FAMILIES.contains(&requested) {
+265 |             return Err(CapabilityRefusal::UnknownHarnessFamily {
+266 |                 requested: requested.to_owned(),
+267 |             });
+268 ~         }
+    |
+
+warning: this `if` statement can be collapsed
+   --> crates/maxplayer-core/src/buyer/lifecycle.rs:279:5
+    |
+279 | /     if let Some(requested_model) = filters.requested_model {
+280 | |         if preset.is_none() {
+281 | |             return Err(CapabilityRefusal::ModelWithoutHarnessPreset {
+282 | |                 requested: requested_model.to_owned(),
+...   |
+285 | |     }
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+279 ~     if let Some(requested_model) = filters.requested_model
+280 ~         && preset.is_none() {
+281 |             return Err(CapabilityRefusal::ModelWithoutHarnessPreset {
+282 |                 requested: requested_model.to_owned(),
+283 |             });
+284 ~         }
+    |
+
+warning: this `if` statement can be collapsed
+   --> crates/maxplayer-core/src/buyer/lifecycle.rs:297:13
+    |
+297 | /             if let Some(requested) = filters.requested_harness_family {
+298 | |                 if requested != preset_family {
+299 | |                     return Err(CapabilityRefusal::HarnessFamilyContradictsPreset {
+300 | |                         preset: preset_name.to_owned(),
+...   |
+305 | |             }
+    | |_____________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+297 ~             if let Some(requested) = filters.requested_harness_family
+298 ~                 && requested != preset_family {
+299 |                     return Err(CapabilityRefusal::HarnessFamilyContradictsPreset {
+...
+303 |                     });
+304 ~                 }
+    |
+
+warning: this `if` statement can be collapsed
+   --> crates/maxplayer-core/src/buyer/lifecycle.rs:318:5
+    |
+318 | /     if let Some(requested) = effective_family {
+319 | |         if !advertised.harness_families.iter().any(|family| family == requested) {
+320 | |             return Err(CapabilityRefusal::HarnessFamily { requested: requested.to_owned() });
+321 | |         }
+322 | |     }
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+318 ~     if let Some(requested) = effective_family
+319 ~         && !advertised.harness_families.iter().any(|family| family == requested) {
+320 |             return Err(CapabilityRefusal::HarnessFamily { requested: requested.to_owned() });
+321 ~         }
+    |
+
+warning: file opened with `create`, but `truncate` behavior not defined
+  --> crates/maxplayer-core/src/buyer/lock.rs:65:14
+   |
+65 |             .create(true)
+   |              ^^^^^^^^^^^^- help: add: `.truncate(true)`
+   |
+   = help: if you intend to overwrite an existing file entirely, call `.truncate(true)`
+   = help: if you instead know that you may want to keep some parts of the old file, call `.truncate(false)`
+   = help: alternatively, use `.append(true)` to append to the file instead of overwriting it
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#suspicious_open_options
+   = note: `#[warn(clippy::suspicious_open_options)]` on by default
+
+warning: large size difference between variants
+    --> crates/maxplayer-core/src/buyer/store.rs:1186:1
+     |
+1186 | / pub enum BeginAttempt {
+1187 | |     /// The attempt was inserted — this call's signed event is the job's pinned award.
+1188 | |     Pinned,
+     | |     ------ the second-largest variant carries no data at all
+1189 | |     /// An attempt already existed (any state) — NOTHING was written. The caller must drive the
+1190 | |     /// returned attempt (re-send ITS bytes / honor its terminal state), never its own candidate.
+1191 | |     Existing(AwardAttempt),
+     | |     ---------------------- the largest variant contains at least 224 bytes
+1192 | | }
+     | |_^ the entire enum is at least 224 bytes
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#large_enum_variant
+     = note: `#[warn(clippy::large_enum_variant)]` on by default
+help: consider boxing the large fields or introducing indirection in some other way to reduce the total size of the enum
+     |
+1191 -     Existing(AwardAttempt),
+1191 +     Existing(Box<AwardAttempt>),
+     |
+
+warning: this `if` statement can be collapsed
+    --> crates/maxplayer-core/src/buyer/mod.rs:1504:5
+     |
+1504 | /     if let Ok(Some(current)) = context.store.award_attempt(job_id) {
+1505 | |         if resume_crossed_deadline(&current, now_unix()) {
+1506 | |             return Err(format!(
+1507 | |                 "offer deadline for {job_id} crossed while awaiting the money lock; the pinned \
+...    |
+1511 | |     }
+     | |_____^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+     |
+1504 ~     if let Ok(Some(current)) = context.store.award_attempt(job_id)
+1505 ~         && resume_crossed_deadline(&current, now_unix()) {
+1506 |             return Err(format!(
+ ...
+1509 |             ));
+1510 ~         }
+     |
+
+warning: this `if` statement can be collapsed
+    --> crates/maxplayer-core/src/buyer/mod.rs:2483:9
+     |
+2483 | /         if let Some(event) = wake {
+2484 | |             if !job_lifecycle::event_references_job(event, &job_id) {
+2485 | |                 continue;
+2486 | |             }
+2487 | |         }
+     | |_________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+     |
+2483 ~         if let Some(event) = wake
+2484 ~             && !job_lifecycle::event_references_job(event, &job_id) {
+2485 |                 continue;
+2486 ~             }
+     |
+
+warning: this `if` statement can be collapsed
+   --> crates/maxplayer-core/src/wallet_ops.rs:903:13
+    |
+903 | /             if let Some(amount) = amount_override {
+904 | |                 if amount != stored.amount_sats {
+905 | |                     return Err(WalletOpsError::Wallet(format!(
+906 | |                         "amount {amount} != stored quote amount {} for quote {quote_id} (refusing mismatched completion)",
+...   |
+910 | |             }
+    | |_____________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+903 ~             if let Some(amount) = amount_override
+904 ~                 && amount != stored.amount_sats {
+905 |                     return Err(WalletOpsError::Wallet(format!(
+...
+908 |                     )));
+909 ~                 }
+    |
+
+warning: this `if` statement can be collapsed
+   --> crates/maxplayer-core/src/payment.rs:885:9
+    |
+885 | /         if matches!(state, Some(PaymentState::Locked { .. })) {
+886 | |             if recovered_locked {
+887 | |                 return Err(PaymentError::AmbiguousSendRefused);
+888 | |             }
+889 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+885 ~         if matches!(state, Some(PaymentState::Locked { .. }))
+886 ~             && recovered_locked {
+887 |                 return Err(PaymentError::AmbiguousSendRefused);
+888 ~             }
+    |
+
+warning: this function has too many arguments (8/7)
+   --> crates/maxplayer-core/src/payment.rs:907:5
+    |
+907 | /     fn drive_settlement_legs<G: PaymentJournalGuard, E: PaymentEffects>(
+908 | |         &self,
+909 | |         guard: &mut G,
+910 | |         key: &PaymentKey,
+...   |
+915 | |         locked_payment: Option<LockedPayment>,
+916 | |     ) -> Result<PaymentState, PaymentError> {
+    | |___________________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#too_many_arguments
+
+warning: this `if` statement can be collapsed
+   --> crates/maxplayer-core/src/sandbox_net.rs:577:17
+    |
+577 | /                 if let Some((start, end)) = range.split_once(':') {
+578 | |                     if start == end {
+579 | |                         acceptable.push(start.to_owned());
+580 | |                     }
+581 | |                 }
+    | |_________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+577 ~                 if let Some((start, end)) = range.split_once(':')
+578 ~                     && start == end {
+579 |                         acceptable.push(start.to_owned());
+580 ~                     }
+    |
+
+warning: this function has too many arguments (10/7)
+   --> crates/maxplayer-core/src/seller.rs:477:5
+    |
+477 | /     pub fn append_receipt(
+478 | |         &self,
+479 | |         local_job_id: &str,
+480 | |         local_result_id: &str,
+...   |
+487 | |         swap_ok: bool,
+488 | |     ) -> Result<(), SellerError> {
+    | |________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#too_many_arguments
+
+warning: this `if` statement can be collapsed
+   --> crates/maxplayer-core/src/seller_exec.rs:392:17
+    |
+392 | /                 if let Some(codex) = &config.codex_chatgpt {
+393 | |                     if !codex.auth_file.is_absolute() {
+394 | |                         return Err(ExecError::Config(format!(
+395 | |                             "[sandbox] codex_chatgpt: auth_file must be absolute, got {}",
+...   |
+399 | |                 }
+    | |_________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+392 ~                 if let Some(codex) = &config.codex_chatgpt
+393 ~                     && !codex.auth_file.is_absolute() {
+394 |                         return Err(ExecError::Config(format!(
+...
+397 |                         )));
+398 ~                     }
+    |
+
+warning: this function has too many arguments (9/7)
+    --> crates/maxplayer-core/src/credential_proxy.rs:1743:1
+     |
+1743 | / async fn relay(
+1744 | |     client: &reqwest::Client,
+1745 | |     method: &hyper::Method,
+1746 | |     upstream: &str,
+...    |
+1752 | |     host: &str,
+1753 | | ) -> Result<Response<ProxyBody>, String> {
+     | |________________________________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#too_many_arguments
+
+warning: file opened with `create`, but `truncate` behavior not defined
+  --> crates/maxplayer-core/src/seller_node/lock.rs:65:14
+   |
+65 |             .create(true)
+   |              ^^^^^^^^^^^^- help: add: `.truncate(true)`
+   |
+   = help: if you intend to overwrite an existing file entirely, call `.truncate(true)`
+   = help: if you instead know that you may want to keep some parts of the old file, call `.truncate(false)`
+   = help: alternatively, use `.append(true)` to append to the file instead of overwriting it
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#suspicious_open_options
+
+warning: field assignment outside of initializer for an instance created with Default::default()
+  --> crates/maxplayer-core/src/seller_node/outbox.rs:46:5
+   |
+46 |     report.expired = store.expire_outbox(now_unix)?;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+note: consider initializing the variable with `seller_node::outbox::DrainReport { expired: store.expire_outbox(now_unix)?, ..Default::default() }` and removing relevant reassignments
+  --> crates/maxplayer-core/src/seller_node/outbox.rs:45:5
+   |
+45 |     let mut report = DrainReport::default();
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#field_reassign_with_default
+   = note: `#[warn(clippy::field_reassign_with_default)]` on by default
+
+warning: this `if` statement can be collapsed
+   --> crates/maxplayer-core/src/seller_node/run.rs:588:9
+    |
+588 | /         if self.order.len() >= self.offers_cap {
+589 | |             if let Some(evicted) = self.order.pop_front() {
+590 | |                 self.by_offer.remove(&evicted);
+591 | |             }
+592 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+588 ~         if self.order.len() >= self.offers_cap
+589 ~             && let Some(evicted) = self.order.pop_front() {
+590 |                 self.by_offer.remove(&evicted);
+591 ~             }
+    |
+
+warning: this `if` statement can be collapsed
+   --> crates/maxplayer-core/src/seller_node/run.rs:708:9
+    |
+708 | /         if self.order.len() >= self.cap {
+709 | |             if let Some(evicted) = self.order.pop_front() {
+710 | |                 self.seen.remove(&evicted);
+711 | |             }
+712 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+708 ~         if self.order.len() >= self.cap
+709 ~             && let Some(evicted) = self.order.pop_front() {
+710 |                 self.seen.remove(&evicted);
+711 ~             }
+    |
+
+warning: this `if` statement can be collapsed
+    --> crates/maxplayer-core/src/seller_node/run.rs:4333:21
+     |
+4333 | /                     if probe_ok {
+4334 | |                         if stalled_since_recovery {
+4335 | |                             if manual_recovery_succeeded {
+4336 | |                                 opline!(
+...    |
+4355 | |                     }
+     | |_____________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+     |
+4333 ~                     if probe_ok
+4334 ~                         && stalled_since_recovery {
+4335 |                             if manual_recovery_succeeded {
+ ...
+4353 |                         // here — the exact 2691s blind spot. The clock now moves only when both legs
+4354 ~                         // confirm.
+     |
+
+warning: this function has too many arguments (8/7)
+    --> crates/maxplayer-core/src/seller_node/run.rs:5376:5
+     |
+5376 | /     async fn claim_offer(
+5377 | |         &self,
+5378 | |         job_id: &str,
+5379 | |         buyer_pubkey: &str,
+...    |
+5384 | |         contribution: Option<&ContributionOffer>,
+5385 | |     ) {
+     | |_____^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#too_many_arguments
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+    --> crates/maxplayer-core/src/seller_node/run.rs:5497:58
+     |
+5497 |                 Some(creq) => gateway::ClaimPayment::Sat(&creq),
+     |                                                          ^^^^^ help: change this to: `creq`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_borrow
+     = note: `#[warn(clippy::needless_borrow)]` on by default
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+    --> crates/maxplayer-core/src/seller_node/run.rs:5557:60
+     |
+5557 |                 let finished = self.node.store().job_state(&job_id).ok().flatten();
+     |                                                            ^^^^^^^ help: change this to: `job_id`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_borrow
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+    --> crates/maxplayer-core/src/seller_node/run.rs:5558:49
+     |
+5558 |                 match already_handled_skip_line(&job_id, finished) {
+     |                                                 ^^^^^^^ help: change this to: `job_id`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_borrow
+
+warning: this `if` statement can be collapsed
+  --> crates/maxplayer-core/src/telemetry.rs:93:5
+   |
+93 | /     if let Some(path) = &config.mirror_file {
+94 | |         if let Err(error) = append_mirror(path, &json) {
+95 | |             eprintln!("telemetry: mirror_file append failed (non-fatal, ignored): {error}");
+96 | |         }
+97 | |     }
+   | |_____^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+   |
+93 ~     if let Some(path) = &config.mirror_file
+94 ~         && let Err(error) = append_mirror(path, &json) {
+95 |             eprintln!("telemetry: mirror_file append failed (non-fatal, ignored): {error}");
+96 ~         }
+   |
+
+warning: this `if` statement can be collapsed
+   --> crates/maxplayer-core/src/telemetry.rs:122:5
+    |
+122 | /     if let Some(parent) = path.parent() {
+123 | |         if !parent.as_os_str().is_empty() {
+124 | |             fs::create_dir_all(parent)?;
+125 | |         }
+126 | |     }
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+122 ~     if let Some(parent) = path.parent()
+123 ~         && !parent.as_os_str().is_empty() {
+124 |             fs::create_dir_all(parent)?;
+125 ~         }
+    |
+
+warning: `maxplayer-core` (lib) generated 60 warnings (run `cargo clippy --fix --lib -p maxplayer-core -- ` to apply 29 suggestions)
+   Compiling maxplayer v0.5.7 (/Users/forge/forge/v2/wt/w-seller-fee-stage2a-remit/crates/maxplayer)
+warning: unused import: `PaymentState`
+    --> crates/maxplayer-core/src/payment_wallet.rs:2334:9
+     |
+2334 |         PaymentState, ReceiptAuthority, ResultId,
+     |         ^^^^^^^^^^^^
+     |
+     = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `EMFILE_LEG_ENV` is never used
+   --> crates/maxplayer-core/src/delivery_git.rs:667:11
+    |
+667 |     const EMFILE_LEG_ENV: &str = "MAXPLAYER_EMFILE_LEG";
+    |           ^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `EMFILE_FD_CEILING` is never used
+   --> crates/maxplayer-core/src/delivery_git.rs:671:11
+    |
+671 |     const EMFILE_FD_CEILING: usize = 64;
+    |           ^^^^^^^^^^^^^^^^^
+
+warning: constant `EMFILE_DELIVERIES` is never used
+   --> crates/maxplayer-core/src/delivery_git.rs:676:11
+    |
+676 |     const EMFILE_DELIVERIES: usize = 80;
+    |           ^^^^^^^^^^^^^^^^^
+
+warning: constant `RAISE_CHILD_ENV` is never used
+    --> crates/maxplayer-core/src/buyer/mod.rs:3171:11
+     |
+3171 |     const RAISE_CHILD_ENV: &str = "MAXPLAYER_RAISE_NOFILE_CHILD";
+     |           ^^^^^^^^^^^^^^^
+
+warning: struct `AcceptDelivery` is never constructed
+    --> crates/maxplayer-core/src/payment_wallet.rs:2340:12
+     |
+2340 |     struct AcceptDelivery;
+     |            ^^^^^^^^^^^^^^
+
+warning: function `git_delivery_for_key` is never used
+    --> crates/maxplayer-core/src/payment_wallet.rs:4390:8
+     |
+4390 |     fn git_delivery_for_key(key: &PaymentKey) -> GitDelivery {
+     |        ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `odd_secret_key` is never used
+    --> crates/maxplayer-core/src/payment_wallet.rs:4495:8
+     |
+4495 |     fn odd_secret_key() -> SecretKey {
+     |        ^^^^^^^^^^^^^^
+
+warning: struct `NostrRecipientSend` is never constructed
+    --> crates/maxplayer-core/src/payment_wallet.rs:4527:12
+     |
+4527 |     struct NostrRecipientSend;
+     |            ^^^^^^^^^^^^^^^^^^
+
+warning: this `if` statement can be collapsed
+   --> crates/maxplayer-core/src/announce.rs:414:17
+    |
+414 | /                 if let Ok(body) = std::fs::read_to_string(&out) {
+415 | |                     if body.ends_with('\n') {
+416 | |                         lines =
+417 | |                             body.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
+...   |
+422 | |                 }
+    | |_________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+    = note: `#[warn(clippy::collapsible_if)]` on by default
+help: collapse nested if block
+    |
+414 ~                 if let Ok(body) = std::fs::read_to_string(&out)
+415 ~                     && body.ends_with('\n') {
+416 |                         lines =
+...
+420 |                         }
+421 ~                     }
+    |
+
+warning: the borrowed expression implements the required traits
+    --> crates/maxplayer-core/src/authorize_pay.rs:1836:49
+     |
+1836 |                 DeliveryIntegrityHash::from_hex(&"11".repeat(32)).expect("oid"),
+     |                                                 ^^^^^^^^^^^^^^^^ help: change this to: `"11".repeat(32)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_borrows_for_generic_args
+     = note: `#[warn(clippy::needless_borrows_for_generic_args)]` on by default
+
+warning: the borrowed expression implements the required traits
+    --> crates/maxplayer-core/src/authorize_pay.rs:1837:35
+     |
+1837 |                 JobHash::from_hex(&"22".repeat(32)).expect("job hash"),
+     |                                   ^^^^^^^^^^^^^^^^ help: change this to: `"22".repeat(32)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_borrows_for_generic_args
+
+warning: the borrowed expression implements the required traits
+    --> crates/maxplayer-core/src/authorize_pay.rs:1886:49
+     |
+1886 |                 DeliveryIntegrityHash::from_hex(&"11".repeat(32)).expect("oid"),
+     |                                                 ^^^^^^^^^^^^^^^^ help: change this to: `"11".repeat(32)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_borrows_for_generic_args
+
+warning: the borrowed expression implements the required traits
+    --> crates/maxplayer-core/src/authorize_pay.rs:1887:35
+     |
+1887 |                 JobHash::from_hex(&"22".repeat(32)).expect("job hash"),
+     |                                   ^^^^^^^^^^^^^^^^ help: change this to: `"22".repeat(32)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_borrows_for_generic_args
+
+warning: this `if` statement can be collapsed
+   --> crates/maxplayer-core/src/budget.rs:295:9
+    |
+295 | /         if let Some(id) = attempt_id {
+296 | |             if self.counted_attempts.contains(id) {
+297 | |                 // Already counted and persisted — do not re-add.
+298 | |                 return Ok(());
+299 | |             }
+300 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+295 ~         if let Some(id) = attempt_id
+296 ~             && self.counted_attempts.contains(id) {
+297 |                 // Already counted and persisted — do not re-add.
+298 |                 return Ok(());
+299 ~             }
+    |
+
+warning: file opened with `create`, but `truncate` behavior not defined
+   --> crates/maxplayer-core/src/budget.rs:910:14
+    |
+910 |             .create(true)
+    |              ^^^^^^^^^^^^- help: add: `.truncate(true)`
+    |
+    = help: if you intend to overwrite an existing file entirely, call `.truncate(true)`
+    = help: if you instead know that you may want to keep some parts of the old file, call `.truncate(false)`
+    = help: alternatively, use `.append(true)` to append to the file instead of overwriting it
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#suspicious_open_options
+    = note: `#[warn(clippy::suspicious_open_options)]` on by default
+
+warning: unnecessary use of `clone` to create a slice from a reference
+    --> crates/maxplayer-core/src/job_lifecycle.rs:3157:77
+     |
+3157 |         let good = crate::gateway::creq::build_seller_creq("job", 7, "sat", &[mint.clone()], &seller)
+     |                                                                             ^^^^^^^^^^^^^^^ help: try: `std::slice::from_ref(&mint)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#cloned_ref_to_slice_refs
+     = note: `#[warn(clippy::cloned_ref_to_slice_refs)]` on by default
+
+warning: unnecessary use of `clone` to create a slice from a reference
+    --> crates/maxplayer-core/src/job_lifecycle.rs:3183:76
+     |
+3183 |         let usd = crate::gateway::creq::build_seller_creq("job", 7, "usd", &[mint.clone()], &seller)
+     |                                                                            ^^^^^^^^^^^^^^^ help: try: `std::slice::from_ref(&mint)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#cloned_ref_to_slice_refs
+
+warning: this assertion has a constant value
+    --> crates/maxplayer-core/src/crossmint_hop.rs:2459:9
+     |
+2459 | /         assert!(
+2460 | |             WITHIN_BUFFER_REPLACEMENT > QUOTED_HOP_COST,
+2461 | |             "the replacement must be dearer than the quote, or this does not prove a buffer"
+2462 | |         );
+     | |_________^
+     |
+     = help: consider moving this into a const block: `const { assert!(..) }`
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#assertions_on_constants
+     = note: `#[warn(clippy::assertions_on_constants)]` on by default
+
+warning: the borrowed expression implements the required traits
+    --> crates/maxplayer-core/src/gateway.rs:2106:62
+     |
+2106 |         OfferDraft::new("t", "text/plain", 0, 2_000_000_000, &"s".repeat(64))
+     |                                                              ^^^^^^^^^^^^^^^ help: change this to: `"s".repeat(64)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_borrows_for_generic_args
+
+warning: the borrowed expression implements the required traits
+    --> crates/maxplayer-core/src/gateway.rs:2119:79
+     |
+2119 |         let old_format = OfferDraft::new("t", "text/plain", 0, 2_000_000_000, &"s".repeat(64));
+     |                                                                               ^^^^^^^^^^^^^^^ help: change this to: `"s".repeat(64)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_borrows_for_generic_args
+
+warning: the borrowed expression implements the required traits
+    --> crates/maxplayer-core/src/gateway.rs:2158:66
+     |
+2158 |             OfferDraft::new("t", "text/plain", 0, 2_000_000_000, &"s".repeat(64)).to_event_draft();
+     |                                                                  ^^^^^^^^^^^^^^^ help: change this to: `"s".repeat(64)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_borrows_for_generic_args
+
+warning: this let-binding has unit value
+    --> crates/maxplayer-core/src/buyer/lifecycle.rs:3564:13
+     |
+3564 |             let _ = settle.await.expect("settle task");
+     |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#let_unit_value
+     = note: `#[warn(clippy::let_unit_value)]` on by default
+help: omit the `let` binding
+     |
+3564 -             let _ = settle.await.expect("settle task");
+3564 +             settle.await.expect("settle task");
+     |
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+    --> crates/maxplayer-core/src/buyer/lifecycle.rs:4140:21
+     |
+4140 |         let shapes: Vec<(Option<&str>, Option<&str>, Option<&str>, &[String])> = vec![
+     |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#type_complexity
+     = note: `#[warn(clippy::type_complexity)]` on by default
+
+warning: file opened with `create`, but `truncate` behavior not defined
+  --> crates/maxplayer-core/src/buyer/lock.rs:65:14
+   |
+65 |             .create(true)
+   |              ^^^^^^^^^^^^- help: add: `.truncate(true)`
+   |
+   = help: if you intend to overwrite an existing file entirely, call `.truncate(true)`
+   = help: if you instead know that you may want to keep some parts of the old file, call `.truncate(false)`
+   = help: alternatively, use `.append(true)` to append to the file instead of overwriting it
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#suspicious_open_options
+
+warning: this `if` statement can be collapsed
+   --> crates/maxplayer-core/src/buyer/relay.rs:704:17
+    |
+704 | /                 if let Ok(event) = events.recv().await {
+705 | |                     if event.id == first_id {
+706 | |                         return true;
+707 | |                     }
+708 | |                 }
+    | |_________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+704 ~                 if let Ok(event) = events.recv().await
+705 ~                     && event.id == first_id {
+706 |                         return true;
+707 ~                     }
+    |
+
+warning: this `if` statement can be collapsed
+   --> crates/maxplayer-core/src/buyer/relay.rs:732:17
+    |
+732 | /                 if let Ok(event) = events.recv().await {
+733 | |                     if event.id == second_id {
+734 | |                         return true;
+735 | |                     }
+736 | |                 }
+    | |_________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+732 ~                 if let Ok(event) = events.recv().await
+733 ~                     && event.id == second_id {
+734 |                         return true;
+735 ~                     }
+    |
+
+warning: this `if` statement can be collapsed
+  --> crates/maxplayer-core/src/buyer/ingest_sig_it.rs:87:13
+   |
+87 | /             if let RelayPoolNotification::Event { event, .. } = n {
+88 | |                 if event.kind == Kind::Custom(crate::kinds::JOB_FEEDBACK_KIND) {
+89 | |                     sink.lock().unwrap_or_else(|e| e.into_inner()).insert(event.id.to_hex());
+90 | |                 }
+91 | |             }
+   | |_____________^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+   |
+87 ~             if let RelayPoolNotification::Event { event, .. } = n
+88 ~                 && event.kind == Kind::Custom(crate::kinds::JOB_FEEDBACK_KIND) {
+89 |                     sink.lock().unwrap_or_else(|e| e.into_inner()).insert(event.id.to_hex());
+90 ~                 }
+   |
+
+warning: unnecessary use of `clone` to create a slice from a reference
+    --> crates/maxplayer-core/src/buyer/mod.rs:3516:13
+     |
+3516 |             &[job.clone()],
+     |             ^^^^^^^^^^^^^^ help: try: `std::slice::from_ref(&job)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#cloned_ref_to_slice_refs
+
+warning: unnecessary use of `clone` to create a slice from a reference
+    --> crates/maxplayer-core/src/buyer/mod.rs:4990:13
+     |
+4990 |             &[job.clone()],
+     |             ^^^^^^^^^^^^^^ help: try: `std::slice::from_ref(&job)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#cloned_ref_to_slice_refs
+
+warning: unnecessary use of `clone` to create a slice from a reference
+    --> crates/maxplayer-core/src/buyer/mod.rs:6307:43
+     |
+6307 | ...   let dispositions = plan_reconcile(&[job.clone()], &BTreeMap::new(), &BTreeMap::new(), &std::collections::BTreeSet::new(), &B...
+     |                                         ^^^^^^^^^^^^^^ help: try: `std::slice::from_ref(&job)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#cloned_ref_to_slice_refs
+
+warning: the borrowed expression implements the required traits
+    --> crates/maxplayer-core/src/buyer/mod.rs:6352:90
+     |
+6352 |         let draft = crate::gateway::OfferDraft::new("t", "text/plain", 7, 2_000_000_000, &"s".repeat(64))
+     |                                                                                          ^^^^^^^^^^^^^^^ help: change this to: `"s".repeat(64)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_borrows_for_generic_args
+
+warning: using `contains()` instead of `iter().any()` is more efficient
+   --> crates/maxplayer-core/src/sandbox_net.rs:643:23
+    |
+643 |           let covered = DENIED_DESTINATIONS
+    |  _______________________^
+644 | |             .iter()
+645 | |             .any(|cidr| *cidr == "172.16.0.0/12");
+    | |_________________________________________________^ help: try: `DENIED_DESTINATIONS.contains(&"172.16.0.0/12")`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#manual_contains
+    = note: `#[warn(clippy::manual_contains)]` on by default
+
+warning: unnecessary use of `clone` to create a slice from a reference
+    --> crates/maxplayer-core/src/credential_proxy.rs:2404:66
+     |
+2404 |         let running = start_with_legs(Arc::clone(&engine), None, &[leg_authority.clone()])
+     |                                                                  ^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `std::slice::from_ref(&leg_authority)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#cloned_ref_to_slice_refs
+
+warning: you seem to be trying to use `match` for destructuring a single pattern. Consider using `if let`
+    --> crates/maxplayer-core/src/credential_proxy.rs:3570:9
+     |
+3570 | /         match response {
+3571 | |             Ok(response) => assert_eq!(
+3572 | |                 response.status(),
+3573 | |                 502,
+...    |
+3576 | |             Err(_) => {}
+3577 | |         }
+     | |_________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#single_match
+     = note: `#[warn(clippy::single_match)]` on by default
+help: try
+     |
+3570 ~         if let Ok(response) = response { assert_eq!(
+3571 +             response.status(),
+3572 +             502,
+3573 +             "an over-cap chunked body must fail, not relay"
+3574 +         ) }
+     |
+
+warning: unnecessary use of `get(&nostr_sdk::SingleLetterTag::lowercase(nostr_sdk::Alphabet::P))
+                         .is_none()`
+    --> crates/maxplayer-core/src/seller_node/run.rs:9785:18
+     |
+9785 |                   .get(&nostr_sdk::SingleLetterTag::lowercase(nostr_sdk::Alphabet::P))
+     |  __________________^
+9786 | |                 .is_none(),
+     | |__________________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#unnecessary_get_then_check
+     = note: `#[warn(clippy::unnecessary_get_then_check)]` on by default
+help: replace it with
+     |
+9783 ~             !open_pool[1]
+9784 ~                 .generic_tags.contains_key(&nostr_sdk::SingleLetterTag::lowercase(nostr_sdk::Alphabet::P)),
+     |
+
+warning: this `if` statement can be collapsed
+     --> crates/maxplayer-core/src/seller_node/run.rs:10340:13
+      |
+10340 | /             if let Ok(Ok(RelayPoolNotification::Event { event, .. })) = tokio::time::timeout(
+10341 | |                 remaining.min(Duration::from_millis(150)),
+10342 | |                 notifications.recv(),
+...     |
+10349 | |             }
+      | |_____________^
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+      |
+10344 ~             .await
+10345 ~                 && event.kind.as_u16() == JOB_OFFER_KIND {
+10346 |                     runner.on_offer(&event).await;
+10347 ~                 }
+      |
+
+warning: this `if` statement can be collapsed
+     --> crates/maxplayer-core/src/seller_node/run.rs:10369:13
+      |
+10369 | /             if let Ok(Ok(RelayPoolNotification::Event { event, .. })) = tokio::time::timeout(
+10370 | |                 remaining.min(Duration::from_millis(150)),
+10371 | |                 notifications.recv(),
+...     |
+10378 | |             }
+      | |_____________^
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+      |
+10373 ~             .await
+10374 ~                 && event.kind.as_u16() == JOB_AWARD_KIND {
+10375 |                     runner.on_award(&event).await;
+10376 ~                 }
+      |
+
+warning: this `if` statement can be collapsed
+     --> crates/maxplayer-core/src/seller_node/run.rs:11005:13
+      |
+11005 | /             if let Ok(Ok(RelayPoolNotification::Event { event, .. })) = tokio::time::timeout(
+11006 | |                 remaining.min(Duration::from_millis(150)),
+11007 | |                 notifications.recv(),
+...     |
+11014 | |             }
+      | |_____________^
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+      |
+11009 ~             .await
+11010 ~                 && event.kind.as_u16() == JOB_RECEIPT_KIND {
+11011 |                     runner.on_receipt(&event).await;
+11012 ~                 }
+      |
+
+warning: this `if` statement can be collapsed
+     --> crates/maxplayer-core/src/seller_node/run.rs:11575:13
+      |
+11575 | /             if let Ok(Ok(RelayPoolNotification::Event { event, .. })) = tokio::time::timeout(
+11576 | |                 remaining.min(Duration::from_millis(150)),
+11577 | |                 notifications.recv(),
+...     |
+11584 | |             }
+      | |_____________^
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+      |
+11579 ~             .await
+11580 ~                 && event.kind.as_u16() == JOB_ACCEPT_KIND {
+11581 |                     runner.on_accept(&event).await;
+11582 ~                 }
+      |
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+     --> crates/maxplayer-core/src/seller_node/run.rs:12938:96
+      |
+12938 |         let draft = claim_draft(job, buyer, &"s".repeat(64), crate::gateway::ClaimPayment::Sat(&creq), &[], &Default::default());
+      |                                                                                                ^^^^^ help: change this to: `creq`
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_borrow
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+     --> crates/maxplayer-core/src/seller_node/run.rs:13094:97
+      |
+13094 |                 let draft = claim_draft(job, &buyer, &seller, crate::gateway::ClaimPayment::Sat(&creq), &[], &Default::default());
+      |                                                                                                 ^^^^^ help: change this to: `creq`
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_borrow
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+     --> crates/maxplayer-core/src/seller_node/run.rs:13107:101
+      |
+13107 | ...r, &seller, crate::gateway::ClaimPayment::Sat(&creq), &[], &Default::default());
+      |                                                  ^^^^^ help: change this to: `creq`
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_borrow
+
+warning: this `if` statement can be collapsed
+   --> crates/maxplayer-core/src/telemetry.rs:288:13
+    |
+288 | /             if let Ok(body) = fs::read_to_string(&mirror) {
+289 | |                 if body.lines().filter(|l| !l.is_empty()).count() == 1 {
+290 | |                     mirrored = true;
+291 | |                     break;
+292 | |                 }
+293 | |             }
+    | |_____________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+288 ~             if let Ok(body) = fs::read_to_string(&mirror)
+289 ~                 && body.lines().filter(|l| !l.is_empty()).count() == 1 {
+290 |                     mirrored = true;
+291 |                     break;
+292 ~                 }
+    |
+
+warning: useless use of `vec!`
+    --> crates/maxplayer-core/src/seller_exec.rs:6586:23
+     |
+6586 |         let summary = vec![word; 6].join(" "); // 47 chars, 71 bytes
+     |                       ^^^^^^^^^^^^^ help: you can use an array directly: `[word; 6]`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#useless_vec
+     = note: `#[warn(clippy::useless_vec)]` on by default
+
+warning: useless use of `vec!`
+    --> crates/maxplayer-core/src/seller_exec.rs:6616:28
+     |
+6616 |         assert_eq!(capped, vec![word; 4].join(" "));
+     |                            ^^^^^^^^^^^^^ help: you can use an array directly: `[word; 4]`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#useless_vec
+
+warning: `maxplayer-core` (lib test) generated 100 warnings (54 duplicates) (run `cargo clippy --fix --lib -p maxplayer-core --tests -- ` to apply 33 suggestions)
+warning: doc list item overindented
+  --> crates/maxplayer-core/tests/no_system_git.rs:28:5
+   |
+28 | //!      transport) — also exercises the smart-HTTP transport REGISTRATION (`ensure_registered`).
+   |     ^^^^^ help: try using `  ` (2 spaces)
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#doc_overindented_list_items
+   = note: `#[warn(clippy::doc_overindented_list_items)]` on by default
+
+warning: doc list item overindented
+  --> crates/maxplayer-core/tests/no_system_git.rs:30:5
+   |
+30 | //!      store→working-clone fetch + fast-forward merge of a retained contribution.
+   |     ^^^^^ help: try using `  ` (2 spaces)
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#doc_overindented_list_items
+
+warning: doc list item without indentation
+  --> crates/maxplayer-core/tests/no_system_git.rs:31:5
+   |
+31 | //! The allowlisted HTTPS push/verify legs are https-only (the transport allowlist refuses `file`),
+   |     ^
+   |
+   = help: if this is supposed to be its own paragraph, add a blank line
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#doc_lazy_continuation
+   = note: `#[warn(clippy::doc_lazy_continuation)]` on by default
+help: indent this line
+   |
+31 | //!   The allowlisted HTTPS push/verify legs are https-only (the transport allowlist refuses `file`),
+   |     ++
+
+warning: doc list item without indentation
+  --> crates/maxplayer-core/tests/no_system_git.rs:32:5
+   |
+32 | //! so they are covered by the loopback-TLS integration tests (`relay_git_http_auth`,
+   |     ^
+   |
+   = help: if this is supposed to be its own paragraph, add a blank line
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#doc_lazy_continuation
+help: indent this line
+   |
+32 | //!   so they are covered by the loopback-TLS integration tests (`relay_git_http_auth`,
+   |     ++
+
+warning: doc list item without indentation
+  --> crates/maxplayer-core/tests/no_system_git.rs:33:5
+   |
+33 | //! `collect_integrity`, `git_config_isolation`); A5 adds the PATH-scrubbed no-system-git proof for
+   |     ^
+   |
+   = help: if this is supposed to be its own paragraph, add a blank line
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#doc_lazy_continuation
+help: indent this line
+   |
+33 | //!   `collect_integrity`, `git_config_isolation`); A5 adds the PATH-scrubbed no-system-git proof for
+   |     ++
+
+warning: doc list item without indentation
+  --> crates/maxplayer-core/tests/no_system_git.rs:34:5
+   |
+34 | //! the in-process legs those cannot reach without a `git`-built fixture.
+   |     ^
+   |
+   = help: if this is supposed to be its own paragraph, add a blank line
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#doc_lazy_continuation
+help: indent this line
+   |
+34 | //!   the in-process legs those cannot reach without a `git`-built fixture.
+   |     ++
+
+warning: using `Result.and_then(|x| Ok(y))`, which is more succinctly expressed as `map(|x| y)`
+   --> crates/maxplayer-relay-write-policy/src/main.rs:116:12
+    |
+116 |         if serde_json::to_writer(&mut out, &verdict).and_then(|()| Ok(out.write_all(b"\n"))).is_err() {
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `serde_json::to_writer(&mut out, &verdict).map(|()| out.write_all(b"\n"))`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#bind_instead_of_map
+    = note: `#[warn(clippy::bind_instead_of_map)]` on by default
+
+warning: this `if` statement can be collapsed
+   --> crates/maxplayer-relay-write-policy/src/main.rs:179:5
+    |
+179 | /     if let Some(content) = event["content"].as_str() {
+180 | |         if content.len() > MAX_NIP17_CONTENT_BYTES {
+181 | |             return Err("nip-17 event exceeds size ceiling");
+182 | |         }
+183 | |     }
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+    = note: `#[warn(clippy::collapsible_if)]` on by default
+help: collapse nested if block
+    |
+179 ~     if let Some(content) = event["content"].as_str()
+180 ~         && content.len() > MAX_NIP17_CONTENT_BYTES {
+181 |             return Err("nip-17 event exceeds size ceiling");
+182 ~         }
+    |
+
+warning: `maxplayer-core` (test "no_system_git") generated 6 warnings
+warning: `maxplayer-relay-write-policy` (bin "maxplayer-write-policy" test) generated 2 warnings (run `cargo clippy --fix --bin "maxplayer-write-policy" -p maxplayer-relay-write-policy --tests -- ` to apply 2 suggestions)
+warning: `maxplayer-relay-write-policy` (bin "maxplayer-write-policy") generated 2 warnings (2 duplicates)
+warning: doc list item overindented
+  --> crates/maxplayer/tests/seller_declared_output.rs:26:5
+   |
+26 | //!       pass — it is the reopened row that goes empty, not the prompt composition.
+   |     ^^^^^^ help: try using `    ` (4 spaces)
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#doc_overindented_list_items
+   = note: `#[warn(clippy::doc_overindented_list_items)]` on by default
+
+warning: doc list item overindented
+  --> crates/maxplayer/tests/seller_memory_read_on_start.rs:22:5
+   |
+22 | //!       `the_golden_invariant_holds_no_memory_is_byte_identical` FAIL; the other three pass.
+   |     ^^^^^^ help: try using `    ` (4 spaces)
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#doc_overindented_list_items
+   = note: `#[warn(clippy::doc_overindented_list_items)]` on by default
+
+warning: `maxplayer` (test "seller_declared_output") generated 1 warning
+warning: `maxplayer` (test "seller_memory_read_on_start") generated 1 warning
+warning: variant `AllowList` is never constructed
+   --> crates/maxplayer/src/sandbox_probe.rs:109:5
+    |
+106 | pub enum ContainmentModel {
+    |          ---------------- variant in this enum
+...
+109 |     AllowList,
+    |     ^^^^^^^^^
+    |
+    = note: `ContainmentModel` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: this `if` statement can be collapsed
+   --> crates/maxplayer/src/accept_cli.rs:122:5
+    |
+122 | /     if let Ok(secret) = home::read_secret_key_hex(&home) {
+123 | |         if !secret.is_empty() && rendered.contains(&secret) {
+124 | |             let _ = writeln!(err, "accept refused: response would echo secret key");
+125 | |             return RUNTIME_ERROR;
+126 | |         }
+127 | |     }
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+    = note: `#[warn(clippy::collapsible_if)]` on by default
+help: collapse nested if block
+    |
+122 ~     if let Ok(secret) = home::read_secret_key_hex(&home)
+123 ~         && !secret.is_empty() && rendered.contains(&secret) {
+124 |             let _ = writeln!(err, "accept refused: response would echo secret key");
+125 |             return RUNTIME_ERROR;
+126 ~         }
+    |
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+  --> crates/maxplayer/src/buyer.rs:25:27
+   |
+25 |     let (dispatch, rest): (fn(&mut dyn Write, &mut dyn Write) -> i32, &[String]) =
+   |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#type_complexity
+   = note: `#[warn(clippy::type_complexity)]` on by default
+
+warning: this `if` statement can be collapsed
+   --> crates/maxplayer/src/collect_cli.rs:119:5
+    |
+119 | /     if let Ok(secret) = home::read_secret_key_hex(&home) {
+120 | |         if !secret.is_empty() && rendered.contains(&secret) {
+121 | |             let _ = writeln!(err, "collect refused: response would echo secret key");
+122 | |             return RUNTIME_ERROR;
+123 | |         }
+124 | |     }
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+119 ~     if let Ok(secret) = home::read_secret_key_hex(&home)
+120 ~         && !secret.is_empty() && rendered.contains(&secret) {
+121 |             let _ = writeln!(err, "collect refused: response would echo secret key");
+122 |             return RUNTIME_ERROR;
+123 ~         }
+    |
+
+warning: this `if` statement can be collapsed
+  --> crates/maxplayer/src/daemon.rs:41:9
+   |
+41 | /         if let Ok(response) = client::status(&sock) {
+42 | |             if let Some(pid) = response.result.as_ref().and_then(|result| result["pid"].as_u64()) {
+...  |
+49 | |         }
+   | |_________^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+   |
+41 ~         if let Ok(response) = client::status(&sock)
+42 ~             && let Some(pid) = response.result.as_ref().and_then(|result| result["pid"].as_u64()) {
+43 |                 // Announce only on the path where this invocation spawned, after a daemon is ready.
+...
+47 |                 return Ok(sock);
+48 ~             }
+   |
+
+warning: this `if` statement can be collapsed
+   --> crates/maxplayer/src/mcp.rs:392:5
+    |
+392 | /     if let Ok(secret) = home::read_secret_key_hex(&state.home) {
+393 | |         if !secret.is_empty() && body.to_string().contains(&secret) {
+394 | |             return Err(format!("{tool} refused: response would echo secret key"));
+395 | |         }
+396 | |     }
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+392 ~     if let Ok(secret) = home::read_secret_key_hex(&state.home)
+393 ~         && !secret.is_empty() && body.to_string().contains(&secret) {
+394 |             return Err(format!("{tool} refused: response would echo secret key"));
+395 ~         }
+    |
+
+warning: this `if` statement can be collapsed
+   --> crates/maxplayer/src/profile_cli.rs:191:5
+    |
+191 | /     if let Ok(secret) = home::read_secret_key_hex(&home) {
+192 | |         if !secret.is_empty() && rendered.contains(&secret) {
+193 | |             let _ = writeln!(err, "profile set refused: response would echo secret key");
+194 | |             return RUNTIME_ERROR;
+195 | |         }
+196 | |     }
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+191 ~     if let Ok(secret) = home::read_secret_key_hex(&home)
+192 ~         && !secret.is_empty() && rendered.contains(&secret) {
+193 |             let _ = writeln!(err, "profile set refused: response would echo secret key");
+194 |             return RUNTIME_ERROR;
+195 ~         }
+    |
+
+warning: this `if` statement can be collapsed
+   --> crates/maxplayer/src/wallet_cli.rs:240:9
+    |
+240 | /         if let Some(filter) = filter.as_deref() {
+241 | |             if row.mint_url != filter {
+242 | |                 continue;
+243 | |             }
+244 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+240 ~         if let Some(filter) = filter.as_deref()
+241 ~             && row.mint_url != filter {
+242 |                 continue;
+243 ~             }
+    |
+
+warning: this `if` statement can be collapsed
+   --> crates/maxplayer/src/wallet_cli.rs:307:5
+    |
+307 | /     if let Some(raw) = opts.mint.as_deref() {
+308 | |         if let Err(error) = wallet_ops::add_mint(&mut home, raw) {
+309 | |             let _ = writeln!(err, "{error}");
+310 | |             return RUNTIME_ERROR;
+311 | |         }
+312 | |     }
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+307 ~     if let Some(raw) = opts.mint.as_deref()
+308 ~         && let Err(error) = wallet_ops::add_mint(&mut home, raw) {
+309 |             let _ = writeln!(err, "{error}");
+310 |             return RUNTIME_ERROR;
+311 ~         }
+    |
+
+warning: `maxplayer` (bin "maxplayer") generated 9 warnings (run `cargo clippy --fix --bin "maxplayer" -p maxplayer -- ` to apply 7 suggestions)
+warning: `maxplayer` (bin "maxplayer" test) generated 8 warnings (8 duplicates)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.49s
+exit=0
