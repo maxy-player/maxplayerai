@@ -1,0 +1,2 @@
+clippy map at d0be4a0930f0dd27615ec751f041af72e6771fc9 over exec2-clippy.log
+diagnostics on lines added a6217328..HEAD: 0  elsewhere: 125

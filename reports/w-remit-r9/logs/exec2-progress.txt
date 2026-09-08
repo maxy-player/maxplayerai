@@ -1,0 +1,53 @@
+17:31:27Z done reports/w-remit-r9/logs/exec2-core-wallet-nff.log exit=0
+17:32:22Z done reports/w-remit-r9/logs/exec2-cli-default.log exit=0
+17:33:21Z done reports/w-remit-r9/logs/exec2-cli-acp-wallet.log exit=0
+17:33:22Z done reports/w-remit-r9/logs/exec2-fmt.log exit=1
+17:33:26Z done reports/w-remit-r9/logs/exec2-clippy.log exit=0
+17:33:27Z STAGE1 gates 1-6 + maps done
+17:33:27Z exact 01-2b-node test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.01s
+17:33:27Z exact 02-2c-race test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.10s
+17:33:27Z exact 03-2d-backoff test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.00s
+17:33:28Z exact 04-2d-bootdelay test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.00s
+17:33:28Z exact 05-2d-jitter test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.00s
+17:33:28Z exact 06-2d-singleflight test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.00s
+17:33:28Z exact 07-2d-threshold test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.00s
+17:33:29Z exact 08-2e-drain-bound test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.69s
+17:33:29Z exact 09-2e-rearm test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.00s
+17:33:30Z exact 10-2e-retract test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.24s
+17:33:31Z exact 11-2e-shutdown-drain test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 1.59s
+17:33:33Z exact 12-2e-shutdown-retries test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 1.64s
+17:33:33Z exact 13-2f-ceiling test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.00s
+17:33:34Z exact 14-2f-reserve test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.01s
+17:33:34Z exact 15-2g-B2-stale-snapshot test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.06s
+17:33:34Z exact 16-2g-a test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.03s
+17:33:34Z exact 17-2g-b1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.01s
+17:33:34Z exact 18-2g-b2-expired-held test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.01s
+17:33:35Z exact 19-2g-c test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.01s
+17:33:35Z exact 20-2g-d test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.08s
+17:33:35Z exact 21-2g-delayed test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.03s
+17:33:35Z exact 22-E-first-retry test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.00s
+17:33:35Z exact 23-E-one-line test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.00s
+17:33:36Z exact 24-cli-exit-map test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 180 filtered out; finished in 0.00s
+17:33:36Z exact 25-cli-invocation test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 180 filtered out; finished in 0.59s
+17:33:37Z exact 26-2a-remit-follows-receipt test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.00s
+17:33:37Z exact 27-v13-migration test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.01s
+17:33:37Z exact 28-r8-i-fee-fits-actual-differs test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.01s
+17:33:37Z exact 29-r7-ii-fee-exceeds test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.00s
+17:33:37Z exact 30-r7-iiib-fee-aware-plan test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.01s
+17:33:38Z exact 31-r7-never-fits test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.00s
+17:33:38Z exact 32-r7-fake-selfcheck test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.00s
+17:33:38Z exact 33-r7-admits-total test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1429 filtered out; finished in 0.00s
+17:33:38Z exact 34-r7-total-display test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.00s
+17:33:38Z exact 35-r7-relay test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.00s
+17:33:39Z exact 36-r7-drop-cancels test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.00s
+17:33:39Z exact 37-r9-ii-fee-metadata-drift-refused-before-fence test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.01s
+17:33:39Z exact 38-r8-balance-unknown-no-false-warning test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.00s
+17:33:39Z exact 39-r9-1.3-gross-19-pays-13 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.01s
+17:33:39Z exact 40-r9-1.4a-shrunk-reserve-replanned-pays-15 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.01s
+17:33:40Z exact 41-r9-store-replan test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.01s
+17:33:40Z exact 42-r9-confirm-bound-search test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.00s
+17:33:40Z exact 43-r9-admits-confirmable test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.00s
+17:33:40Z exact 44-r9-N3-paid-label test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1428 filtered out; finished in 0.01s
+17:33:40Z STAGE2 exact x44 done
+17:37:50Z done reports/w-remit-r9/logs/money-path-ci-1-240240c.log exit=0
+17:40:17Z done reports/w-remit-r9/logs/money-path-ci-2-240240c.log exit=101

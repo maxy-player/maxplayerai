@@ -30,7 +30,7 @@
 30-r7-iiib-fee-aware-plan|cargo test -p maxplayer-core --features wallet --lib -- --exact fee_remit::tests::fee_aware_planning_sizes_the_invoice_so_a_fee_bearing_payment_fits_without_reserve_slack
 31-r7-never-fits|cargo test -p maxplayer-core --features wallet --lib -- --exact fee_remit::tests::fees_that_can_never_fit_are_refused_at_planning_not_at_payment
 32-r7-fake-selfcheck|cargo test -p maxplayer-core --features wallet --lib -- --exact fee_remit::tests::the_fake_wallet_models_the_sdks_proof_input_and_swap_fees_and_the_total_bound_refuses_them
-33-r7-admits-total|cargo test -p maxplayer-core --features wallet --lib -- --exact wallet_ops::tests::a_melt_ceiling_bounds_the_total_debit_including_proof_input_and_swap_fees
+#33-r7-admits-total RETIRED in c9cce6c (round 9 commit A): a_melt_ceiling_bounds_the_total_debit_including_proof_input_and_swap_fees was renamed a_melt_ceiling_admits_a_prepared_melt_by_what_confirm_will_actually_debit = record 43; the 240240c run of the old name matched 0 tests (exact-33-*-240240c.log)
 34-r7-total-display|cargo test -p maxplayer-core --features wallet --lib -- --exact wallet_ops::tests::a_total_ceiling_refusal_names_the_parts_the_total_and_the_ceiling
 35-r7-relay|cargo test -p maxplayer-core --features wallet --lib -- --exact wallet_ops::tests::a_prepared_payment_relays_confirm_and_cancel_verdicts
 36-r7-drop-cancels|cargo test -p maxplayer-core --features wallet --lib -- --exact wallet_ops::tests::dropping_an_undecided_prepared_payment_cancels_it_and_joins_its_thread

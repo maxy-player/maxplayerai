@@ -1,0 +1,12 @@
+fmt overlap at d0be4a0930f0dd27615ec751f041af72e6771fc9 over exec2-fmt.log
+crates/maxplayer-core/src/fee_remit.rs: added=8089 my-hunks=1 fmt-diffs-in-file=0 OVERLAPS=[] STARTS-ON-ADDED-LINE=[]
+crates/maxplayer-core/src/home.rs: added=144 my-hunks=6 fmt-diffs-in-file=35 OVERLAPS=[(1445, 1450)] STARTS-ON-ADDED-LINE=[(1445, 1450)]
+crates/maxplayer-core/src/lib.rs: added=14 my-hunks=3 fmt-diffs-in-file=8 OVERLAPS=[(47, 51), (55, 63), (68, 96)] STARTS-ON-ADDED-LINE=[(47, 51), (55, 63)]
+crates/maxplayer-core/src/lnurl_pay.rs: added=1287 my-hunks=1 fmt-diffs-in-file=0 OVERLAPS=[] STARTS-ON-ADDED-LINE=[]
+crates/maxplayer-core/src/platform_fee.rs: added=66 my-hunks=12 fmt-diffs-in-file=0 OVERLAPS=[] STARTS-ON-ADDED-LINE=[]
+crates/maxplayer-core/src/seller_node/run.rs: added=1314 my-hunks=17 fmt-diffs-in-file=321 OVERLAPS=[] STARTS-ON-ADDED-LINE=[]
+crates/maxplayer-core/src/seller_node/store.rs: added=2571 my-hunks=30 fmt-diffs-in-file=55 OVERLAPS=[] STARTS-ON-ADDED-LINE=[]
+crates/maxplayer-core/src/wallet_ops.rs: added=1640 my-hunks=33 fmt-diffs-in-file=0 OVERLAPS=[] STARTS-ON-ADDED-LINE=[]
+crates/maxplayer/src/sell.rs: added=5 my-hunks=2 fmt-diffs-in-file=21 OVERLAPS=[] STARTS-ON-ADDED-LINE=[]
+crates/maxplayer/src/seller_fees.rs: added=754 my-hunks=67 fmt-diffs-in-file=0 OVERLAPS=[] STARTS-ON-ADDED-LINE=[]
+Rust added lines a6217328..HEAD: 15884  fmt blocks total: 2087  overlapping my hunks: 4  starting on an added line: 3
