@@ -2211,9 +2211,34 @@ pub(crate) mod test_support {
         pub(crate) requires_swap: bool,
     }
 
-    /// NUT-02 (pinned `cdk/src/wallet/mod.rs:369`): fee = ceil(ppk × count / 1000).
+    /// NUT-02 (pinned `cdk/src/fees.rs:35–48`, reached from `wallet/mod.rs:319–352` and `:356`):
+    /// fee = ceil(ppk × count / 1000).
     pub(crate) fn fee_for(input_fee_ppk: u64, count: usize) -> u64 {
         (input_fee_ppk * count as u64).div_ceil(1000)
+    }
+
+    /// The denominations a power-of-two keyset hands back for `amount` under `SplitTarget::None`
+    /// (CDK `Amount::split`, the split the swap uses for the melt's proofs at `swap/saga/mod.rs:
+    /// 285–301` and for the change) — one proof per set bit, largest first.
+    pub(crate) fn binary_split(amount: u64) -> Vec<u64> {
+        (0..64)
+            .rev()
+            .map(|bit| 1u64 << bit)
+            .filter(|denomination| amount & denomination != 0)
+            .collect()
+    }
+
+    /// One pre-melt swap the fake wallet performed inside `confirm` (CDK `melt/saga/mod.rs:
+    /// 678–697` → `swap_no_reserve`): what it sent, what the mint kept as swap fee, what came back
+    /// as the melt's proofs (the binary split of the target) and as change.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct FakeSwap {
+        pub(crate) quote_id: String,
+        pub(crate) sent: Vec<u64>,
+        pub(crate) target_sats: u64,
+        pub(crate) swap_fee_sats: u64,
+        pub(crate) received: Vec<u64>,
+        pub(crate) change: Vec<u64>,
     }
 
     /// The SDK's two prepare branches, on a snapshot of the pool (nothing removed):
@@ -2377,6 +2402,9 @@ pub(crate) mod test_support {
         pub(crate) input_fee_ppk: u64,
         /// The exact proofs each debit spent, in order (empty inner vec when `proofs` is `None`).
         pub(crate) proofs_spent: Vec<Vec<u64>>,
+        /// Every pre-melt swap performed inside `confirm_melt`, in order — a swap is a mint effect
+        /// that charges its fee whether or not the melt after it succeeds (addendum 9 §1.3).
+        pub(crate) swaps: Vec<FakeSwap>,
         /// Melts prepared (proofs selected and held) and not yet confirmed or cancelled, by token.
         pub(crate) prepared: BTreeMap<u64, FakePrepared>,
         pub(crate) next_token: u64,
@@ -2441,6 +2469,7 @@ pub(crate) mod test_support {
                 proofs: None,
                 input_fee_ppk: 0,
                 proofs_spent: Vec::new(),
+                swaps: Vec::new(),
                 prepared: BTreeMap::new(),
                 next_token: 1,
                 cancels: Vec::new(),
@@ -2867,12 +2896,35 @@ pub(crate) mod test_support {
             Ok(PreparedMelt::fake(preparation, token))
         }
 
-        /// The MINT half (CDK mint `setup_melt`), on a prepared melt: the payer first pauses at
-        /// `melt_gate` — after its last local check, before the request reaches the mint — then the
-        /// request is accepted when the quote is UNPAID **or FAILED** — with NO expiry check,
-        /// however long ago the quote expired — and rejected when it is PENDING, PAID or UNKNOWN
-        /// (held proofs return to the wallet). Accepted ⇒ the debit is counted, the quote is PAID
-        /// for everyone reading the registry.
+        /// `confirm`, in the shape of pinned CDK 0.17.2 `MeltSaga::request_melt_with_options`
+        /// (`melt/saga/mod.rs:647–760`), then the MINT half (CDK mint `setup_melt`).
+        ///
+        /// Swap branch first (`requires_swap`, the positive-ppk layout): the selected proofs are
+        /// POSTED to the mint's swap (`:678–697` → `swap_no_reserve`, `swap/saga/mod.rs:223–227`)
+        /// for a target of invoice + reserve + the PREPARED input fee (`:678`); the mint keeps the
+        /// swap fee — recomputed on the proofs actually sent (`swap/saga/mod.rs:108–145`), which
+        /// under fixed fee metadata equals the prepared `swap_fee` — and hands back the target in
+        /// its binary split (`swap/saga/mod.rs:285–301`) plus the rest as change
+        /// (`swap/mod.rs:146–175`, `include_fees = false`). **The swap fee is charged at this point
+        /// whether or not the melt after it succeeds.** Then the wallet RECOMPUTES the input fee on
+        /// the proofs it now holds for the melt (`:704`) and refuses with `InsufficientFunds`
+        /// (`:706–712`) when they do not cover invoice + reserve + that ACTUAL input fee: no melt
+        /// is posted, the swapped proofs stay in the wallet, the swap fee is gone. Only then does
+        /// the payer pause at `melt_gate` — after its last local check, before the melt request
+        /// reaches the mint — and the mint accepts the request when the quote is UNPAID **or
+        /// FAILED** — with NO expiry check, however long ago the quote expired — and rejects it
+        /// when PENDING, PAID or UNKNOWN (the melt's proofs return to the wallet). Accepted ⇒ the
+        /// debit is counted, the quote is PAID for everyone reading the registry, and the mint
+        /// returns as change what the proofs exceeded invoice + its Lightning fee + the actual
+        /// input fee by. `fee_sats` is CDK `FinalizedMelt::fee_paid` (`melt/saga/mod.rs:139–148`):
+        /// proofs sent − invoice − change returned = Lightning fee + ACTUAL input fee, inclusive; it
+        /// does not contain the swap fee. The scripted `(paid, fee)` is the mint's (invoice,
+        /// Lightning fee) — the Lightning fee alone, never above the reserve.
+        ///
+        /// Exact-fit branch (a fee-free mint, every test written before addendum 8): no swap, the
+        /// established conservative model stands — the exact set for amount + reserve is spent
+        /// whole and the unused reserve is NOT returned (overstating the loss, never understating
+        /// it), so the two-process tests' proof-set assertions hold.
         fn confirm_melt(&mut self, prepared: PreparedMelt) -> Result<MeltOutcome, MeltFailure> {
             let token = prepared
                 .fake_token()
@@ -2882,13 +2934,76 @@ pub(crate) mod test_support {
                 quote,
                 selected,
                 input_fee_sats,
-                swap_fee_sats,
+                swap_fee_sats: prepared_swap_fee_sats,
                 requires_swap,
             } = self
                 .prepared
                 .remove(&token)
                 .expect("a prepared melt is confirmed or cancelled once");
             let quote_id = quote_id.as_str();
+            let ppk = self.input_fee_ppk;
+            // What the melt request will carry, and what the swap (if any) charged.
+            let (melt_proofs, melt_total_sats, actual_input_fee_sats, swap_fee_sats) =
+                if requires_swap {
+                    let target_sats = quote.amount_sats + quote.fee_reserve_sats + input_fee_sats;
+                    // `swap_fee` recomputed on the proofs actually sent; `selected` is empty only for
+                    // a pool-less Fake, whose one notional proof pays the prepared figure.
+                    let swap_fee_sats = if selected.is_empty() {
+                        prepared_swap_fee_sats
+                    } else {
+                        fee_for(ppk, selected.len())
+                    };
+                    let sent_sats = selected.iter().sum::<u64>();
+                    if !selected.is_empty() && sent_sats < target_sats + swap_fee_sats {
+                        // CDK `swap/mod.rs:146–157`: `checked_sub` refuses BEFORE the swap POST.
+                        // Unreachable from `layout` (its selection covers target + own fee); kept
+                        // so the fake never fabricates value.
+                        self.return_proofs(&selected);
+                        let reason = format!(
+                            "wallet refuses to swap for melt quote {quote_id}: {sent_sats} sats of proofs do not cover the {target_sats} sats target plus {swap_fee_sats} sats swap fee"
+                        );
+                        self.pay_refusals.push(reason.clone());
+                        return Err(MeltFailure::Failed(reason));
+                    }
+                    let received = binary_split(target_sats);
+                    let change = if selected.is_empty() {
+                        Vec::new()
+                    } else {
+                        binary_split(sent_sats - target_sats - swap_fee_sats)
+                    };
+                    // The swap is POSTED: the selected proofs are spent at the mint, the swap fee is
+                    // gone, the target and the change are the wallet's new proofs.
+                    self.swaps.push(FakeSwap {
+                        quote_id: quote_id.to_owned(),
+                        sent: selected.clone(),
+                        target_sats,
+                        swap_fee_sats,
+                        received: received.clone(),
+                        change: change.clone(),
+                    });
+                    self.proofs_spent.push(selected);
+                    self.return_proofs(&change);
+                    // `:704–712`: the ACTUAL input fee on the proofs the melt will send.
+                    let actual_input_fee_sats = fee_for(ppk, received.len());
+                    let needed_sats =
+                        quote.amount_sats + quote.fee_reserve_sats + actual_input_fee_sats;
+                    if target_sats < needed_sats {
+                        // `InsufficientFunds` after the swap: compensations revert proof STATES
+                        // (the swapped proofs stay spendable in the wallet); nothing reaches the
+                        // melt endpoint; the swap fee is not refunded.
+                        self.return_proofs(&received);
+                        let reason = format!(
+                            "wallet refuses to melt quote {quote_id} after its swap: {target_sats} sats of proofs ({received:?}) do not cover {} sats invoice + {} sats fee reserve + {actual_input_fee_sats} sats actual proof input fee (prepared estimate {input_fee_sats} sats); the {swap_fee_sats} sats swap fee was charged",
+                            quote.amount_sats, quote.fee_reserve_sats
+                        );
+                        self.pay_refusals.push(reason.clone());
+                        return Err(MeltFailure::Failed(reason));
+                    }
+                    (received, target_sats, actual_input_fee_sats, swap_fee_sats)
+                } else {
+                    let total = selected.iter().sum::<u64>();
+                    (selected, total, 0, 0)
+                };
             if let Some(gate) = &self.melt_gate {
                 gate.arrive_and_wait();
             }
@@ -2902,7 +3017,7 @@ pub(crate) mod test_support {
                 state_at_mint,
                 MeltQuoteState::Unpaid | MeltQuoteState::Failed
             ) {
-                self.return_proofs(&selected);
+                self.return_proofs(&melt_proofs);
                 let reason = format!(
                     "mint https://mint.example refuses to pay melt quote {quote_id}: it is {state_at_mint}"
                 );
@@ -2913,32 +3028,27 @@ pub(crate) mod test_support {
             if let Some(counter) = &self.melt_counter {
                 counter.fetch_add(1, Ordering::SeqCst);
             }
-            let (paid, fee) = self.melt_results.remove(0).map_err(MeltFailure::Failed)?;
-            // Swap branch: the wallet's value drops by exactly amount + fee paid + input fee + swap
-            // fee — the picked proofs are gone (swapped, then melted) and what is left of them comes
-            // back as change, one proof as far as this fake is concerned. Exact-fit branch (a
-            // fee-free mint): the established conservative model stands — the exact set for
-            // amount + reserve is spent whole and the unused reserve is NOT returned (overstating
-            // the loss, never understating it), so the two-process tests' proof-set assertions hold.
-            if requires_swap
-                && let Some(proofs) = &self.proofs
-                && !selected.is_empty()
-            {
-                let change = selected
-                    .iter()
-                    .sum::<u64>()
-                    .saturating_sub(swap_fee_sats)
+            let (paid, lightning_fee) = self.melt_results.remove(0).map_err(MeltFailure::Failed)?;
+            // Swap branch: the mint consumes the melt's proofs, pays the invoice, keeps its
+            // Lightning fee and the actual input fee, and returns the rest as change (CDK
+            // `melt/saga/mod.rs:136–148`: `fee_paid` = proofs − invoice − change). Exact-fit
+            // branch: no change is modelled (see above); `fee_paid` is the scripted Lightning fee,
+            // the input fee being 0 on a fee-free mint.
+            let fee_paid_sats = if requires_swap {
+                let change_sats = melt_total_sats
                     .saturating_sub(paid)
-                    .saturating_sub(input_fee_sats)
-                    .saturating_sub(fee);
-                if change > 0 {
-                    proofs
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push(change);
+                    .saturating_sub(lightning_fee)
+                    .saturating_sub(actual_input_fee_sats);
+                if self.proofs.is_some() && change_sats > 0 {
+                    self.return_proofs(&binary_split(change_sats));
                 }
-            }
-            self.proofs_spent.push(selected);
+                melt_total_sats
+                    .saturating_sub(paid)
+                    .saturating_sub(change_sats)
+            } else {
+                self.proofs_spent.push(melt_proofs);
+                lightning_fee
+            };
             if let Some(registry) = &self.registry
                 && let Some(entry) = registry
                     .lock()
@@ -2950,7 +3060,7 @@ pub(crate) mod test_support {
             Ok(MeltOutcome {
                 mint_url: "https://mint.example".to_owned(),
                 paid_sats: paid,
-                fee_sats: fee,
+                fee_sats: fee_paid_sats,
                 balance_sats: 1_000,
                 quote_id: quote_id.to_owned(),
                 fee_reserve_sats: quote.fee_reserve_sats,
