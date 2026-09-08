@@ -25,7 +25,10 @@ gateway = ["dep:nostr-sdk", "tokio/time"]
 # planted in its own workdir cannot run on the host-side legs. A leg that ever shells out to a
 # `git` CLI must neutralise hook lookup itself. `tests/no_system_git.rs` is the guard — tripwire
 # `git` on PATH, required-features `git-delivery`, so it runs only in the money-path job (#826).
-git-delivery = ["gateway", "dep:git2", "dep:reqwest", "dep:base64"]
+# `libc` rides with `git-delivery` for two reasons that both live in `delivery_orchestrator`: the
+# `O_NOFOLLOW`/`O_NONBLOCK` flags the host uses to read job-writable exchange files without following
+# a symlink or parking on a FIFO, and the `kill` the container-side reap sends.
+git-delivery = ["gateway", "dep:git2", "dep:reqwest", "dep:base64", "dep:libc"]
 # The `wallet` feature also brings up the persistent buyer daemon (crate::buyer): the
 # exclusive home lock (libc flock), the durable state DB (rusqlite, bundled sqlite so
 # there is no system dependency), and the async unix-socket surface (tokio net + io-util).
@@ -81,7 +84,8 @@ cdk = { version = "=0.17.2", default-features = false, features = ["wallet"], op
 cdk-sqlite = { version = "=0.17.2", optional = true }
 getrandom = "0.3"
 hex = "0.4.3"
-# Exclusive home lock (flock) for the buyer daemon; unix-only, gated to `wallet`.
+# Exclusive home lock (flock) for the buyer daemon, and the exchange-file open flags and the process
+# reap of the delivery orchestrator. Gated to `git-delivery` (which `wallet` composes).
 libc = { version = "0.2", optional = true }
 # Durable buyer state DB (buyer.sqlite). `bundled` compiles sqlite from source so the
 # buyer needs no system libsqlite3. Gated to `wallet`.
@@ -117,6 +121,22 @@ required-features = ["git-delivery"]
 [[test]]
 name = "relay_canary"
 required-features = ["git-delivery"]
+
+# F1 destination binding: the seller's push token must never follow a repo-config URL rewrite. An
+# "evil" HTTPS endpoint (the rustls fixture) records what arrives; the push must send it nothing.
+# Gated like above.
+[[test]]
+name = "push_destination_binding"
+required-features = ["git-delivery"]
+
+# The container reap against a REAL zombie-leader survivor: a thread group whose leader exited while a
+# sibling thread lives. `#[ignore]`d, because it runs the production reaper, which SIGKILLs every
+# process but pid 1 and itself. It must be the only process tree of a fresh container; run it through
+# `scripts/reap-isolated-test.sh`, and see the file header. Linux-only inside the file; gated on
+# `wallet`, which carries the reaper and `libc`.
+[[test]]
+name = "reap_isolated_linux"
+required-features = ["wallet"]
 
 [dev-dependencies]
 async-trait = "0.1.89"

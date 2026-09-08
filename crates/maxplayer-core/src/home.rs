@@ -650,15 +650,36 @@ pub struct SandboxConfig {
     pub codex_chatgpt: Option<CodexChatgptConfig>,
     /// `docker` mode: run the job's git delivery INSIDE the sandbox container (Track B).
     ///
-    /// `false` (the default) keeps the host path: the host clones the base, the container runs the
-    /// agent, and the host commits and pushes. `true` moves the clone, the completion gate, the commit
-    /// and the push into ONE container, so the host never opens a git repository the job agent could
-    /// write. The host then reads back only the commit oid and publishes it.
+    /// **The DEFAULT for a docker seat, since the container path was proven live.** Container
+    /// delivery moves the clone, the completion gate, the commit and the push into ONE container, so
+    /// the host never opens a git repository the job agent could write. The host then reads back only
+    /// the commit oid and publishes it.
     ///
-    /// Refused under `launcher` mode: there is no container to move the git steps into.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub container_delivery: bool,
-    /// `docker` mode, with `container_delivery = true`: how the container obtains the branch-scoped
+    /// Three states, and the absent one is what makes the default a default:
+    ///
+    /// * Absent under `docker` ⇒ **container delivery is ON** for a seat whose container runs as a
+    ///   non-root uid. A docker seat that never named the key adopts the container path on upgrade.
+    ///   A ROOT seat (daemon uid 0) resolves the absent key to the HOST path instead; see
+    ///   [`Self::container_delivery_enabled`]. The seller boot line says which.
+    /// * `Some(true)` under `docker` ⇒ ON, said out loud.
+    /// * `Some(false)` under `docker` ⇒ the HOST path: the host clones the base, the container runs
+    ///   the agent, and the host commits and pushes. This is the explicit opt-out, and it keeps
+    ///   working.
+    ///
+    /// Under `launcher` mode there is no container to move the git steps into, so:
+    ///
+    /// * Absent ⇒ the host path, and no refusal. This is every launcher seat, and the flip of the
+    ///   docker default must not make one of them refuse to boot.
+    /// * `Some(true)` ⇒ REFUSED. The config says two different things about where git runs.
+    /// * `Some(false)` ⇒ the host path, and no refusal: it names the path launcher mode already
+    ///   takes, so it contradicts nothing.
+    ///
+    /// `Option<bool>` rather than `bool` for exactly one reason: `bool` cannot tell "the operator
+    /// asked for the host path" apart from "the operator never wrote the key". The default may only
+    /// move where a container exists, and that needs the difference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_delivery: Option<bool>,
+    /// `docker` mode, with container delivery on: how the container obtains the branch-scoped
     /// push token. Omitted ⇒ [`ContainerDeliveryToken::FreshAfterAgent`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_delivery_token: Option<ContainerDeliveryToken>,
@@ -669,6 +690,34 @@ pub struct SandboxConfig {
     /// relay brief's default). Must be greater than zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_delivery_token_cap_secs: Option<u64>,
+}
+
+impl SandboxConfig {
+    /// Whether this seat runs the job's git delivery inside the sandbox container.
+    ///
+    /// ONE place answers the question, because two places answered it differently and disagreed the
+    /// moment the default moved. Reading `container_delivery` raw now gives the wrong answer for the
+    /// commonest seat there is: a docker seat that never wrote the key.
+    ///
+    /// The mode is part of the answer, not a separate check. Launcher mode creates no container, so
+    /// it is always the host path here; a `Some(true)` under launcher is refused by
+    /// [`crate::seller_exec::SandboxPolicy::from_config`], which is where a config contradiction
+    /// belongs.
+    ///
+    /// `container_uid` is the uid the container will run as — the daemon's own, what `docker run
+    /// --user` gets. Under uid 0 the job is ROOT inside the container: it can unlink any file the
+    /// delivery orchestrator shares with it, and the same-uid boundary between the two is at its
+    /// weakest. Such a seat does not get the container path by default: the absent key resolves to
+    /// the HOST path there, and only an explicit `container_delivery = true` selects the container
+    /// (the operator chose it; the seller boot line still warns). A non-root uid keeps the docker
+    /// default. Injected rather than read here so the resolution is testable for a root seat.
+    pub fn container_delivery_enabled(&self, container_uid: u32) -> bool {
+        matches!(self.mode, SandboxMode::Docker)
+            && match self.container_delivery {
+                Some(explicit) => explicit,
+                None => container_uid != 0,
+            }
+    }
 }
 
 /// How a container-side delivery obtains its branch-scoped push token (`[sandbox]
@@ -2763,6 +2812,96 @@ mod tests {
         assert_eq!(buzz.name, "legacy-buzz");
         assert_eq!(buzz.heartbeat_secs, 30);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// ⛔ AN ABSENT `container_delivery` MUST SURVIVE A REAL SAVE. Container delivery is the default
+    /// for a docker seat, and the default is reachable only while the key stays out of the file. A
+    /// `save_config` that wrote `container_delivery = false` for an unset switch would pin every
+    /// docker seat to the host path on its next save, and the new default would reach nobody.
+    ///
+    /// Goes through `save_config` and `write_config` — `toml::to_string_pretty`, not the
+    /// `toml::to_string` the `seller_exec` unit test uses — and then re-reads the file, so the
+    /// guarantee is measured on the writer an operator's seat actually runs.
+    ///
+    /// RED ON REVERT: drop `skip_serializing_if = "Option::is_none"` from the field and this fails.
+    #[test]
+    fn an_unset_container_delivery_switch_is_never_written_back() {
+        let root = temp_home("container-delivery-writeback");
+        let _ = fs::remove_dir_all(&root);
+        let mut home = bootstrap(&root).expect("bootstrap");
+
+        // A docker seat that names the mode and nothing about delivery.
+        save_config(&mut home, |config| {
+            config.sandbox = Some(SandboxConfig {
+                mode: SandboxMode::Docker,
+                image: Some("maxplayer-sandbox:test".into()),
+                ..Default::default()
+            });
+        })
+        .expect("save");
+
+        let raw = fs::read_to_string(home.root.join(CONFIG_FILE)).expect("read config.toml");
+        assert!(
+            raw.contains("mode = \"docker\""),
+            "the fixture must really have written a docker seat: {raw}"
+        );
+        assert!(
+            !raw.contains("container_delivery"),
+            "an unset switch must leave no trace in config.toml: {raw}"
+        );
+        let on_disk = load_config(&home.root.join(CONFIG_FILE)).expect("reload file");
+        let sandbox = on_disk.sandbox.expect("the [sandbox] section survived");
+        assert_eq!(sandbox.container_delivery, None);
+        assert!(
+            sandbox.container_delivery_enabled(1000),
+            "and the re-read config still resolves to the container path"
+        );
+
+        // The explicit opt-out, by contrast, is written and re-read.
+        save_config(&mut home, |config| {
+            if let Some(sandbox) = config.sandbox.as_mut() {
+                sandbox.container_delivery = Some(false);
+            }
+        })
+        .expect("save the opt-out");
+        let raw = fs::read_to_string(home.root.join(CONFIG_FILE)).expect("read config.toml");
+        assert!(raw.contains("container_delivery = false"), "{raw}");
+        let on_disk = load_config(&home.root.join(CONFIG_FILE)).expect("reload file");
+        let sandbox = on_disk.sandbox.expect("the [sandbox] section survived");
+        assert_eq!(sandbox.container_delivery, Some(false));
+        assert!(!sandbox.container_delivery_enabled(1000));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The root posture of the container-delivery default: an absent key is ON for a non-root
+    /// container uid and OFF for uid 0; an explicit value wins under either uid; launcher mode is
+    /// always off. RED ON REVERT: `unwrap_or(true)` made root + absent resolve to the container.
+    #[test]
+    fn container_delivery_default_depends_on_the_container_uid() {
+        let absent = SandboxConfig { mode: SandboxMode::Docker, ..Default::default() };
+        assert!(absent.container_delivery_enabled(1000));
+        assert!(!absent.container_delivery_enabled(0), "root + absent ⇒ the host path");
+        let on = SandboxConfig {
+            mode: SandboxMode::Docker,
+            container_delivery: Some(true),
+            ..Default::default()
+        };
+        assert!(on.container_delivery_enabled(0), "root + true ⇒ the operator chose the container");
+        assert!(on.container_delivery_enabled(1000));
+        let off = SandboxConfig {
+            mode: SandboxMode::Docker,
+            container_delivery: Some(false),
+            ..Default::default()
+        };
+        assert!(!off.container_delivery_enabled(0));
+        assert!(!off.container_delivery_enabled(1000));
+        let launcher = SandboxConfig {
+            mode: SandboxMode::Launcher,
+            container_delivery: Some(true),
+            ..Default::default()
+        };
+        assert!(!launcher.container_delivery_enabled(1000));
     }
 
     #[test]

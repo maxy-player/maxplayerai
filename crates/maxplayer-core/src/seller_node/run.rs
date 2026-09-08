@@ -47,7 +47,8 @@ use crate::seller::rate_gate_allows;
 use crate::seller_agents::AgentRegistry;
 use crate::seller_exec::{
     cleanup_job_container, compose_agent_prompt, delivery_message, job_container_name, job_id_of,
-    job_workdir, prepare_launch, run_agent_job, run_agent_with_retry, seller_delivery_kind,
+    job_identity, job_workdir, prepare_launch, run_agent_job, run_agent_with_retry,
+    seller_delivery_kind,
     seller_exec_metadata, unified_job_timeout, AgentRunTimeout, CleanupPolicy, ExecError,
     JobContainer, JobLaunch, SandboxPolicy, CONTAINER_WORKDIR,
 };
@@ -2492,6 +2493,11 @@ mod container_delivery_tests {
         ContainerDeliveryPolicy, DEFAULT_CONTAINER_DELIVERY_TOKEN_CAP_SECS as DEFAULT_CAP,
     };
 
+    /// The uid of an ordinary seller seat's container.
+    const NON_ROOT_UID: u32 = 1000;
+    /// A seat whose daemon — and so whose container — runs as root.
+    const ROOT_UID: u32 = 0;
+
     const RELAY_GIT_REMOTE: &str = "https://relay.example/git/abc/m0123.git";
 
     fn policy(token: ContainerDeliveryToken) -> Option<ContainerDeliveryPolicy> {
@@ -2501,8 +2507,8 @@ mod container_delivery_tests {
         })
     }
 
-    /// The shipped default reads NOTHING over the network. A gate that probed here would add an HTTP
-    /// GET to every seller boot for a feature that is off.
+    /// The host delivery path reads NOTHING over the network. A gate that probed here would add an
+    /// HTTP GET to every seller boot for a feature the seat does not use.
     #[test]
     fn container_delivery_off_reads_no_relay_document() {
         assert_eq!(
@@ -2510,6 +2516,107 @@ mod container_delivery_tests {
                 .expect("gate"),
             TokenModeGate::Skip(None)
         );
+    }
+
+    /// ⛔ THE FLIPPED DEFAULT MUST NOT ADD A NETWORK READ TO BOOT. A docker seat that never named
+    /// `container_delivery` now delivers from its container, so it reaches this gate where it used
+    /// to skip it — and it must still come out `Skip`, because the default token mode is
+    /// `fresh-after-agent`, which depends on no relay feature. Resolved through `from_config_as`, the
+    /// resolution a booting seat makes, so the default itself is under test rather than a hand-built
+    /// policy. The uid is pinned to a non-root seat: the docker default applies only there, and this
+    /// test must not depend on who runs the test binary.
+    ///
+    /// RED ON REVERT: default `container_delivery_token` to `long-lived` and this returns `Probe`.
+    #[test]
+    fn the_defaulted_docker_seat_still_reads_no_relay_document_at_boot() {
+        use crate::home::{SandboxConfig, SandboxMode};
+        use crate::seller_exec::SandboxPolicy;
+
+        let defaulted = SandboxConfig { mode: SandboxMode::Docker, ..Default::default() };
+        let policy =
+            SandboxPolicy::from_config_as(Some(&defaulted), NON_ROOT_UID).expect("docker policy");
+        let delivery = policy
+            .container_delivery()
+            .expect("a docker seat that never named the key delivers from the container");
+        assert_eq!(delivery.token, ContainerDeliveryToken::FreshAfterAgent);
+        assert_eq!(
+            container_delivery_token_gate("wss://relay.example", RELAY_GIT_REMOTE, Some(delivery))
+                .expect("gate"),
+            TokenModeGate::Skip(None),
+            "the new default must not put an HTTP GET on the boot path"
+        );
+    }
+
+    /// The ONE boot line an operator reads the delivery path off. Every state of the switch, in both
+    /// modes, and each line names the path AND the reason — a seat whose path moved on upgrade has
+    /// to be able to say which config state moved it.
+    #[test]
+    fn the_boot_line_names_the_delivery_path_and_the_reason() {
+        use crate::home::{SandboxConfig, SandboxMode};
+
+        let docker = |switch| SandboxConfig {
+            mode: SandboxMode::Docker,
+            container_delivery: switch,
+            ..Default::default()
+        };
+        let launcher = |switch| SandboxConfig {
+            mode: SandboxMode::Launcher,
+            container_delivery: switch,
+            ..Default::default()
+        };
+
+        // docker + absent ⇒ CONTAINER, and the line says the default is what decided it.
+        let line = delivery_path_line(Some(&docker(None)), NON_ROOT_UID);
+        assert!(line.contains("CONTAINER"), "{line}");
+        assert!(line.contains("default"), "the reason is the default: {line}");
+        assert!(line.contains("container_delivery = false"), "names the way back: {line}");
+
+        // docker + true ⇒ CONTAINER, and the line credits the config, not the default.
+        let line = delivery_path_line(Some(&docker(Some(true))), NON_ROOT_UID);
+        assert!(line.contains("CONTAINER"), "{line}");
+        assert!(line.contains("container_delivery = true"), "{line}");
+        assert!(!line.contains("default for"), "an explicit true is not the default: {line}");
+
+        // docker + false ⇒ HOST, named as the opt-out it is.
+        let line = delivery_path_line(Some(&docker(Some(false))), NON_ROOT_UID);
+        assert!(line.contains("HOST"), "{line}");
+        assert!(line.contains("container_delivery = false"), "{line}");
+
+        // launcher, in every state ⇒ HOST, and the reason is the mode rather than the switch.
+        for config in [launcher(None), launcher(Some(false))] {
+            let line = delivery_path_line(Some(&config), NON_ROOT_UID);
+            assert!(line.contains("HOST"), "{line}");
+            assert!(line.contains("launcher"), "the reason is the mode: {line}");
+        }
+
+        // No `[sandbox]` section at all ⇒ HOST.
+        let line = delivery_path_line(None, NON_ROOT_UID);
+        assert!(line.contains("HOST"), "{line}");
+        assert!(line.contains("no [sandbox] section"), "{line}");
+
+        // A ROOT seat (container uid 0) + absent ⇒ HOST, and the line says root decided it and how
+        // to opt in. Root + true ⇒ CONTAINER, credited to the config, with the root warning kept.
+        // RED ON REVERT: the line had no uid and called root + absent the docker default.
+        let line = delivery_path_line(Some(&docker(None)), ROOT_UID);
+        assert!(line.contains("HOST"), "{line}");
+        assert!(line.contains("root"), "the reason is the uid: {line}");
+        assert!(line.contains("container_delivery = true"), "names the opt-in: {line}");
+        assert!(!line.contains('\n'), "one line: {line}");
+        let line = delivery_path_line(Some(&docker(Some(true))), ROOT_UID);
+        assert!(line.contains("CONTAINER"), "{line}");
+        assert!(line.contains("container_delivery = true"), "{line}");
+        assert!(line.contains("root"), "the warning stays: {line}");
+        assert!(!line.contains('\n'), "one line: {line}");
+        // Root changes nothing for the opt-out or for a launcher seat.
+        assert!(delivery_path_line(Some(&docker(Some(false))), ROOT_UID).contains("HOST"));
+        assert!(delivery_path_line(Some(&launcher(None)), ROOT_UID).contains("launcher"));
+
+        // Every line is one operator line: it names the seat and carries no newline.
+        for config in [Some(docker(None)), Some(docker(Some(false))), Some(launcher(None)), None] {
+            let line = delivery_path_line(config.as_ref(), NON_ROOT_UID);
+            assert!(line.starts_with("seller node delivery path: "), "{line}");
+            assert!(!line.contains('\n'), "one line, never two: {line}");
+        }
     }
 
     /// `fresh-after-agent` needs no relay feature, so it must never be blocked — and must never even
@@ -3178,6 +3285,74 @@ async fn probe_one_harness(
 /// operator and a seat that will refuse either way.
 const RELAY_TOKEN_POLICY_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The ONE boot line that names this seat's delivery path and the reason for it.
+///
+/// ⛔ WHY THIS LINE EXISTS. Container delivery is the DEFAULT for a docker seat, so a seat that
+/// upgrades changes where its git runs without anyone changing its config. That must not be silent:
+/// the operator has to be able to read the path off a boot scroll, and has to be told which of the
+/// three states of `[sandbox] container_delivery` decided it. `maxplayer doctor` reports the same
+/// answer in its `relay token policy` row.
+///
+/// Pure, and it reads the CONFIG rather than the resolved policy, so it can name the reason. The
+/// policy keeps only the verdict: `Some(false)` and a launcher seat both resolve to `None`, and the
+/// operator needs to know which one this seat is.
+///
+/// `container_uid` is the uid the container runs as (`job_identity`). Under root the docker default
+/// does not apply — the absent key is the HOST path, and the line says why and how to opt in — and
+/// an explicit opt-in is honoured with a warning on the same line.
+fn delivery_path_line(
+    sandbox: Option<&crate::home::SandboxConfig>,
+    container_uid: u32,
+) -> String {
+    use crate::home::SandboxMode;
+
+    let Some(sandbox) = sandbox else {
+        return "seller node delivery path: HOST — this seat has no [sandbox] section, so there is \
+                no container to run the git steps in"
+            .to_owned();
+    };
+    let root = container_uid == 0;
+    match (sandbox.mode, sandbox.container_delivery) {
+        (SandboxMode::Docker, None) if root => "seller node delivery path: HOST — this seat's \
+                                                daemon runs as root (uid 0), so its container \
+                                                would run the job as root, where the boundary \
+                                                between the job and the delivery orchestrator is \
+                                                weakest. Container delivery is therefore NOT the \
+                                                default for a root seat. Set [sandbox] \
+                                                container_delivery = true to opt in, or run the \
+                                                seller as a non-root user."
+            .to_owned(),
+        (SandboxMode::Docker, Some(true)) if root => "seller node delivery path: CONTAINER — one \
+                                                      container runs the agent and every git step. \
+                                                      This seat sets [sandbox] container_delivery = \
+                                                      true. WARNING: the daemon runs as root (uid \
+                                                      0), so the job is root inside that container \
+                                                      and the boundary between the job and the \
+                                                      delivery orchestrator is weakest; run the \
+                                                      seller as a non-root user."
+            .to_owned(),
+        (SandboxMode::Docker, None) => "seller node delivery path: CONTAINER — one container runs \
+                                        the agent and every git step. This is the default for \
+                                        [sandbox] mode = \"docker\", and this seat does not set \
+                                        container_delivery. Set container_delivery = false for the \
+                                        host path."
+            .to_owned(),
+        (SandboxMode::Docker, Some(true)) => "seller node delivery path: CONTAINER — one container \
+                                              runs the agent and every git step. This seat sets \
+                                              [sandbox] container_delivery = true."
+            .to_owned(),
+        (SandboxMode::Docker, Some(false)) => "seller node delivery path: HOST — the host clones, \
+                                               commits and pushes. This seat sets [sandbox] \
+                                               container_delivery = false, which opts out of the \
+                                               docker default."
+            .to_owned(),
+        (SandboxMode::Launcher, _) => "seller node delivery path: HOST — the host clones, commits \
+                                       and pushes. [sandbox] mode = \"launcher\" creates no \
+                                       container, so container delivery cannot apply to this seat."
+            .to_owned(),
+    }
+}
+
 /// What the boot gate must do about `[sandbox] container_delivery_token`, decided from config alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TokenModeGate {
@@ -3201,7 +3376,7 @@ fn container_delivery_token_gate(
 ) -> Result<TokenModeGate, NodeError> {
     use crate::home::ContainerDeliveryToken;
 
-    // Container delivery off (the shipped default) ⇒ the host delivery path, nothing to ask.
+    // The host delivery path — a launcher seat, or `container_delivery = false` — asks nothing.
     let Some(delivery) = delivery else {
         return Ok(TokenModeGate::Skip(None));
     };
@@ -3309,6 +3484,14 @@ pub async fn probe_configured_harnesses(
     // under a pass-through fallback would prove a harness the awarded job will never run under.
     let sandbox = SandboxPolicy::from_config(home.config.sandbox.as_ref())
         .map_err(|error| NodeError::Sandbox(error.to_string()))?;
+    // Say WHERE this seat's git runs, and why, before the token gate reads anything. Container
+    // delivery is the default for a docker seat, so an upgrade moves the path with no config change;
+    // this line is what stops that being silent. Emitted every boot, not once: the condition is a
+    // standing state of the config, and a seat can be restarted long after the upgrade.
+    opline!(
+        "{}",
+        delivery_path_line(home.config.sandbox.as_ref(), job_identity().0)
+    );
     // Track B, `long-lived` token mode only: prove the relay honours a scoped token's expiration tag
     // BEFORE any harness runs, or refuse to boot. Reads nothing over the network in the default
     // `fresh-after-agent` mode. See `gate_container_delivery_token_mode`.
@@ -6375,23 +6558,26 @@ impl SellerNodeRunner {
         let seller_pubkey = self.seller_pubkey.to_hex();
         let identity = DeliveryAgentIdentity::for_seller(&seller_pubkey);
         let workdir = job_workdir(self.node.home(), job_id);
-        // Track B — container-side delivery, behind `[sandbox] container_delivery`. When it is on, ONE
+        // Track B — container-side delivery, the DEFAULT for a docker seat. When it is on, ONE
         // sandbox container runs the agent AND every git step (clone, gate, commit, push), and this
         // host runs no git and drives no ACP for the job: it launches the container, hands it a
         // branch-scoped push token, and reads back the pushed oid. When it is off, the host path
-        // below runs exactly as before. The raw flag is read here — before any provisioning — because
+        // below runs exactly as before. The config is read here — before any provisioning — because
         // the host path's own `SandboxPolicy::from_config` below must keep its place and its failure
         // ordering; a `container_delivery = true` under `launcher` mode reads as off here and is then
         // refused by that same parse (and by the boot gate) as an invalid `[sandbox]`.
+        //
+        // `container_delivery_enabled` carries the default, the mode and the root posture together.
+        // Reading the field raw would answer "host path" for the commonest docker seat there is: one
+        // that never wrote the key. The uid is the one the container runs as (`docker run --user`):
+        // under root the absent key resolves to the host path.
         let container_delivery = self
             .node
             .home()
             .config
             .sandbox
             .as_ref()
-            .is_some_and(|sandbox| {
-                sandbox.mode == crate::home::SandboxMode::Docker && sandbox.container_delivery
-            });
+            .is_some_and(|sandbox| sandbox.container_delivery_enabled(job_identity().0));
         let (commit, branch, usage, wall_time_ms) = if container_delivery {
             let deadline = offer.deadline_unix.max(0) as u64;
             let memory_section = job_memory_section(
@@ -6556,13 +6742,16 @@ impl SellerNodeRunner {
             let branch = format!("maxplayer/{}", &job_id[..8.min(job_id.len())]);
             // Single source for the delivery ref. The branch-scoped push token (below) is minted for
             // THIS refname, and the push refspec `push_branch_with_header` builds is
-            // `refs/heads/{branch}:refs/heads/{branch}` — both derive from `branch`, so the token scope
-            // and the ref actually pushed cannot drift apart. The relay (PR #929) demands the scope be
-            // fully qualified (`refs/heads/…`); a bare branch name is rejected.
+            // `<gated oid>:refs/heads/{branch}` — the destination derives from `branch`, so the token
+            // scope and the ref actually pushed cannot drift apart. The relay (PR #929) demands the
+            // scope be fully qualified (`refs/heads/…`); a bare branch name is rejected.
             let push_ref = crate::git_transport::delivery_ref(&branch);
             let message = delivery_message(&offer.task);
             let job_hash = job_hash_for_offer(job_id, &offer.task, offer.amount_sats);
-            if let Err(error) = seller_git::snapshot_delivery_at_off_runtime(
+            // The gated commit. The push below sends THIS object and reads the remote back against
+            // it, so the delivered commit is the one the gate produced, whatever the local branch
+            // says at push time (C6).
+            let gated_oid = match seller_git::snapshot_delivery_at_off_runtime(
                 workdir.clone(),
                 identity.clone(),
                 // #616: parent the delivery commit on the base the workdir was provisioned at. A
@@ -6576,31 +6765,35 @@ impl SellerNodeRunner {
             )
             .await
             {
-                // Harness-attributable: the agent returned success having left nothing to deliver. This
-                // is the site that fires on a quota-dead harness — its turn "completes", so the agent-run
-                // arm above sees no error at all — which is why the trigger cannot live at one site.
-                self.drop_harness(
-                    harness,
-                    Some(ExecutionFailure::Harness(Fault::Unproven)),
-                );
-                let (reason_code, feedback) = match error {
-                    seller_git::SellerGitError::NoExecutionObserved(_) => {
-                        opline!(
-                            "seller node execute fail job_id={job_id}: delivery refused no_sentinel — {error}"
-                        );
-                        (ReasonCode::NoSentinel, NO_SENTINEL_FEEDBACK)
-                    }
-                    _ => {
-                        opline!(
-                            "seller node execute fail job_id={job_id}: delivery snapshot failed ({error})"
-                        );
-                        (ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK)
-                    }
-                };
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, reason_code, feedback, None)
-                    .await;
-                return;
-            }
+                Ok(oid) => oid,
+                Err(error) => {
+                    // Harness-attributable: the agent returned success having left nothing to deliver.
+                    // This is the site that fires on a quota-dead harness — its turn "completes", so the
+                    // agent-run arm above sees no error at all — which is why the trigger cannot live at
+                    // one site.
+                    self.drop_harness(
+                        harness,
+                        Some(ExecutionFailure::Harness(Fault::Unproven)),
+                    );
+                    let (reason_code, feedback) = match error {
+                        seller_git::SellerGitError::NoExecutionObserved(_) => {
+                            opline!(
+                                "seller node execute fail job_id={job_id}: delivery refused no_sentinel — {error}"
+                            );
+                            (ReasonCode::NoSentinel, NO_SENTINEL_FEEDBACK)
+                        }
+                        _ => {
+                            opline!(
+                                "seller node execute fail job_id={job_id}: delivery snapshot failed ({error})"
+                            );
+                            (ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK)
+                        }
+                    };
+                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, reason_code, feedback, None)
+                        .await;
+                    return;
+                }
+            };
 
             // Push under the seller's NIP-98 auth. The push authorization is signed THROUGH the signer
             // actor (which owns the seller key), so the push path is NOT a third custody site — the key
@@ -6628,11 +6821,13 @@ impl SellerNodeRunner {
             // per-job branches to the same repo, and concurrent git-receive-pack to one repo is what the
             // relay 409s (surfaced as terminal delivery_failed before this). Serializing removes the race;
             // the push oid is stable (invariant 2), so ordering never duplicates a delivery.
-            // Harden the workdir's `.git/config` (a whole-file replacement) BEFORE pushing, so an
-            // `insteadOf` the agent planted cannot redirect the seller's token to a host it chose
-            // (tests/hostile_local_git_config.rs). Safe here: the job container has already exited, so no
-            // agent process is alive to re-plant the redirect between the rewrite and the push. Both run
-            // in one blocking op inside `neutralize_then_push_off_runtime`.
+            // Gate the workdir layout and REPLACE its `.git/config` BEFORE pushing, so an `insteadOf`
+            // the agent planted cannot redirect the seller's token to a host it chose
+            // (tests/hostile_local_git_config.rs); the transport also binds every leg to
+            // `seller.git_remote`. Safe here: the job container has already exited, so no agent
+            // process is alive to re-plant the redirect between the rewrite and the push. Both run in
+            // one blocking op inside `neutralize_then_push_off_runtime`, which pushes the gated object
+            // and returns the oid the remote attests.
             let commit = match serialized_bounded_push(
                 &self.delivery_push_lock,
                 DELIVERY_PUSH_TIMEOUT,
@@ -6641,6 +6836,7 @@ impl SellerNodeRunner {
                         workdir.clone(),
                         seller.git_remote.clone(),
                         branch.clone(),
+                        gated_oid.clone(),
                         push_header,
                     )
                 },
@@ -6935,9 +7131,18 @@ impl SellerNodeRunner {
             "phase1".to_owned(),
             format!("{}/{}", orch::CONTAINER_EXCHANGE_DIR, orch::PHASE1_INPUTS_FILE),
         ];
+        // The container gate: the orchestrator refuses to run phase1 — and so to reap — unless the
+        // host set this on the `docker run`. It is the LAUNCH's environment, not the agent's: the
+        // orchestrator hands the agent only `agent_env_names` (above) plus its baseline, so the
+        // variable never reaches the job.
+        let mut launch_env = prepared.env.clone();
+        launch_env.push((
+            orch::CONTAINER_DELIVERY_ENV.to_owned(),
+            orch::CONTAINER_DELIVERY_ENV_VALUE.to_owned(),
+        ));
         let job = JobLaunch {
             workdir,
-            env: &prepared.env,
+            env: &launch_env,
             uid: prepared.uid,
             gid: prepared.gid,
             netns: prepared.holder_name.as_deref(),
@@ -6978,6 +7183,17 @@ impl SellerNodeRunner {
                 Ok(None) => {}
                 Err(error) => break Err(Fail::Setup(format!("wait on container: {error}"))),
             }
+            // The deadline is checked BEFORE the marker read, never after it. The marker is a file
+            // the job can write while it lives, so the loop must not depend on that read returning
+            // for the deadline to be seen (the reader is non-blocking and capped; the order stands
+            // on its own). Every `break Err` in this loop lands on the same teardown as a timeout:
+            // the client is killed, the container is captured and removed, the exchange dir is gone.
+            if now_unix().max(0) as u64 > hard_deadline {
+                break Err(Fail::Timeout(format!(
+                    "container still running {}s past the job deadline; killed",
+                    orch::PUSH_MARGIN_SECS + orch::CONTAINER_EXIT_GRACE_SECS
+                )));
+            }
             if marker.is_none() {
                 match orch::read_agent_done_marker(&io_dir, &nonce) {
                     Ok(None) => {}
@@ -7005,15 +7221,10 @@ impl SellerNodeRunner {
                         }
                         marker = Some(seen);
                     }
-                    // A forged or malformed marker: no token, no delivery.
+                    // A forged, planted (FIFO, symlink, over-cap) or malformed marker: no token,
+                    // no delivery. The break lands on the teardown below.
                     Err(error) => break Err(Fail::Delivery(error.to_string())),
                 }
-            }
-            if now_unix().max(0) as u64 > hard_deadline {
-                break Err(Fail::Timeout(format!(
-                    "container still running {}s past the job deadline; killed",
-                    orch::PUSH_MARGIN_SECS + orch::CONTAINER_EXIT_GRACE_SECS
-                )));
             }
             if last_alive_line.elapsed() >= Duration::from_secs(300) {
                 opline!(

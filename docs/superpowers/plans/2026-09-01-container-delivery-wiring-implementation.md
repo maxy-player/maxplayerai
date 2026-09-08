@@ -1,38 +1,44 @@
 # Container-delivery wiring — implementation spec (the go-live work)
 
-> **Status: BUILT, behind a switch that defaults to off.** The wiring is on branch
-> `feat/container-delivery-golive`, behind `[sandbox] container_delivery`. This document is the design
-> reference for the wiring that moves git delivery into the sandbox container. The code follows the
-> sections below. The sections "Live validation record" and "Follow-ups" record the status on
-> 2026-09-03.
+> **Status: BUILT and DEFAULT ON for a docker seat.** The wiring merged in PR #963. `[sandbox]
+> container_delivery` is now `Option<bool>`: absent under `mode = "docker"` means the container path,
+> `false` is the opt-out back to the host path, and a `launcher` seat is unaffected and cannot use the
+> mode. This document is the design reference for the wiring that moves git delivery into the sandbox
+> container. The code follows the sections below. The sections "Live validation record" and
+> "Follow-ups" record the status on 2026-09-03, when the switch still defaulted to off.
 >
-> **Gates:**
-> 1. Relay — **partly met.** Requirement A (#929, ref-scope enforcement) is deployed, and the canary
->    verified it on 2026-09-03. Requirement B (long life for scoped tokens, the brief
->    `2026-08-31-relay-scoped-token-lifetime.md`) is not deployed, and no code in this repo writes it.
->    Therefore the `fresh-after-agent` token mode is the mode in use. The `long-lived` mode waits.
-> 2. Container — **met.** The container path delivered one from-scratch job on 2026-09-03, and the
->    buyer paid for it. The host path (`container_delivery = false`) delivered one job on the same seat
->    with no regression.
-> 3. Security review of C3/C4/C6 and B10 — **open.**
+> **Gates — all met (2026-09-08):**
+> 1. Relay — **met.** Requirement A (#929, ref-scope enforcement) and Requirement B (#968, the
+>    `expiration` tag for a scoped token, cap advertised in NIP-11) are merged AND deployed. The canary
+>    printed `A=enforced B=deployed` on 2026-09-07, and both token modes ran a paid job that day.
+> 2. Container — **met.** From-scratch jobs (2026-09-03, both token modes on 2026-09-07) and a
+>    contribution job (2026-09-07) delivered and were paid through the container path. The host path
+>    (`container_delivery = false`) delivered with no regression.
+> 3. Security review — **met, two rounds (2026-09-07 and 2026-09-08), APPROVE at 968f44c.** C3, C4
+>    and C6 pass. Four HIGH findings were fixed with red-proved adversarial tests: the `.git/commondir`
+>    redirect and the missing destination binding of the token (F1), the unbounded host reads of
+>    job-writable exchange files (F2), the job-removable `/.dockerenv` reap sentinel (F3), and a
+>    zombie thread-group leader that hid a live sibling thread from the reap. Task B10 is replaced
+>    by #980 (uid separation) as the next hardening step.
 
 ## Where this fits
 
 | PR / commit | State | What it did |
 |----|-------|-------------|
-| #937 | merged | interim host fix: `seller_git::neutralize_push_config` + neutralise-then-push on the host. Closes the exploit today. |
+| #937 | merged | interim host fix: `seller_git::neutralize_push_config` + neutralise-then-push on the host. It closed the `.git/config` route only. The `.git/commondir` route (libgit2 reads the config through that pointer) stayed open until the layout gate and the transport destination binding on `sec/push-integrity`. |
 | #930 | merged | Track A: the `["ref", …]` scope tag on the delivery token. |
 | #939 | merged | the orchestrator building blocks (`delivery_orchestrator`, `__deliver` CLI) — INERT; nothing invokes them. |
 | #949 (`51e6587`) | on this branch | Task B8: the `expiration_unix` mint seam for the long-lived token. The `long-lived` token mode uses it. |
 | #950 (`cb26141`) | on this branch | this spec. |
 | `15b6e7b` | on this branch | Task B7: the sandbox image carries the `maxplayer` binary. The image build context is the repo root. |
 | `b090bd3` | on this branch | the relay canary test, `crates/maxplayer-core/tests/relay_canary.rs`. It is `#[ignore]`; a person runs it against a live relay. |
-| `92a4c80` | on this branch | the `[sandbox]` switch: `container_delivery`, `container_delivery_token`, `container_delivery_token_cap_secs`. Default off. |
+| `92a4c80` | on this branch | the `[sandbox]` switch: `container_delivery`, `container_delivery_token`, `container_delivery_token_cap_secs`. Default off at the time; the switch later became `Option<bool>` and defaults ON under `mode = "docker"`. |
 | `e00be26` | on this branch | Task B9: the ACP agent runs inside the delivery container. The host no longer drives ACP. |
 | `008e464` | on this branch | Task B2: the host launches one container, hands off the token in one of two modes, and reads back the OID. C3/C4/C6 land here. |
 | `1258772` | on this branch | docs for the switch: `SELLER-QUICKSTART.md` section 3c and `DOCKER.md`. |
 
-**With the switch off (the default), git is 100% host-side.** Only the agent runs in the container.
+**With the switch off, git is 100% host-side.** That is a `launcher` seat, or a docker seat with
+`container_delivery = false`; it is no longer the default. Only the agent runs in the container.
 Clone (`init_*_workdir`), commit (`snapshot_delivery_at`), and push (`neutralize_then_push_off_runtime`)
 all run on the host in `SellerNodeRunner::execute_job` (`run.rs:6299`). **With the switch on,**
 `execute_job` calls `deliver_via_container` (`run.rs:6473`), and the wiring below runs them in the
@@ -99,7 +105,8 @@ The clone (`init_*_workdir`), the snapshot/gate/sentinel (`snapshot_delivery_at`
 
 **Token freshness / one container.** The host mints the long-lived token up front and injects it in
 the inputs; the orchestrator pushes with it at the end of the (minutes-long) run. Safe because the
-token is branch-scoped (a leak is worthless) and the relay allows the longer life for scoped tokens.
+token is branch-scoped (a leak is bounded: the token can replay a push to that one ref of that one
+repo until it expires, and nothing else) and the relay allows the longer life for scoped tokens.
 *Fallback if the relay freshness change is rejected:* keep tokens 60 s and have the host drop a fresh
 token file into the shared workdir after the agent exits, which the orchestrator then reads and pushes
 (`2026-08-28-…` plan, "Alternative"). One container either way.
@@ -125,12 +132,27 @@ and any container-reported usage is spoofable by the job.
   from that. (Ties to #863.)
 - The container may still emit a usage summary for observability; money decisions use the proxy count.
 
-## Final step — remove the interim host push
+## Final step — remove the interim host push — ⛔ BLOCKED, do NOT do this
 
-Once the container path is the default AND the relay is confirmed enforcing the scope: delete the
-host-side `neutralize_then_push_off_runtime` call in `execute_job` and (if unused elsewhere) the
-`neutralize_then_push_off_runtime` wrapper. `seller_git::neutralize_push_config` stays — the container
-push reuses it via `delivery_orchestrator::push_delivery`.
+> **Decided 2026-09-07: the host push STAYS.** Both original conditions are now met — the container
+> path is the default for a docker seat, and the canary confirms the relay enforces the scope — and
+> the step is still blocked, for a reason this section originally missed.
+
+`SandboxMode::Launcher` is the **default** mode (`home.rs`), not `Docker`. A launcher-mode seat
+creates no container, and `seller_exec.rs` refuses the container-delivery keys under launcher mode.
+So the host push is not a redundant fallback: it is the ONLY delivery path for every seat that has
+not opted into Docker. Deleting it strands all of them.
+
+The same fact bounds the default: `container_delivery` is `Option<bool>` and defaults to on only
+where a container exists. It can never be a plain `true`, because a launcher seat would trip that
+refusal and fail to boot.
+
+This step becomes possible only if launcher mode is retired first, which is a separate decision
+nobody has taken. Until then, treat this section as blocked rather than pending.
+
+For the record, what it WOULD have been: delete the host-side `neutralize_then_push_off_runtime`
+call in `execute_job` and (if unused elsewhere) the wrapper. `seller_git::neutralize_push_config`
+would stay either way — the container push reuses it via `delivery_orchestrator::push_delivery`.
 
 ## Security checks that land WITH this wiring (reviewer C3/C4/C6)
 
@@ -139,9 +161,18 @@ push reuses it via `delivery_orchestrator::push_delivery`.
   mount.
 - **C4** — add a defensive env allowlist at `spawn_agent_child` (the token/`job_hash` must never be in
   the agent's env even by accident).
-- **C6** — carry the gated `expected_oid` into the push and fail closed on mismatch
-  (`OrchestratorError` already has the shape) — a background process surviving the agent could
-  otherwise re-point the branch between gate and push.
+- **C6** — the push sends the gated commit OBJECT: the refspec is `<gated oid>:refs/heads/<branch>`,
+  never a local ref name a surviving process could move under the push. Before the push the local
+  branch must still point at the gated oid (a move is tamper evidence, fail closed). After it the
+  remote's status report must name exactly the delivery ref, and the remote's advertisement is read
+  back over a new connection and must show the ref at the gated oid. The local ref is never
+  re-resolved. Every retry attempt pushes the same object. (`git_transport::push_branch_with_header`,
+  `delivery_orchestrator::push_delivery`.)
+- **F1** — before any push-side repository open, the workdir must have a plain layout
+  (`seller_git::assert_plain_repo_layout`): `.git` a real directory, no `.git/commondir`,
+  `.git/config` a regular file or absent. The config replacement then unlinks and re-creates the
+  file. Independently, `git_transport` binds every leg to the URL the caller named: a remote whose
+  resolved URL differs, or an https leg to any other URL, is refused before a request exists.
 
 ## Validation plan
 

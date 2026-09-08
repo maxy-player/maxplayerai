@@ -540,7 +540,11 @@ fn a_job_launched_through_the_policy_is_contained_and_an_uncontained_one_is_not(
         // for the contained launch to differ from its control.
         file_credentials: Vec::new(),
         codex_chatgpt: None,
-        container_delivery: false,
+        // ABSENT, as an operator's docker config has it — which since the default moved means the
+        // container delivery path. Written as `None` rather than `Some(false)` so this fixture stays
+        // the config a real seat has. It cannot change what this test measures: the delivery path
+        // decides where git runs, and `SandboxPolicy::launch` (the only call below) never reads it.
+        container_delivery: None,
         container_delivery_token: None,
         container_delivery_token_cap_secs: None,
     };

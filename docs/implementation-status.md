@@ -22,14 +22,24 @@ matches the spec.
 |---|---|---|---|
 | §8.1 | An implementation MUST assert a parent count of one in contribution mode, and zero in greenfield mode. | No production path asserts it. The buyer verifies descent and tip-match instead — `delivery_git.rs:254`, `delivery_git.rs:308`, `delivery.rs:93`. The only `parent_count()` assertions are tests — `seller_git.rs:952`, `seller_git.rs:1049`, both inside the `#[cfg(test)]` module that opens at `seller_git.rs:804`. | — |
 
-Container-side delivery exists behind `[sandbox] container_delivery`, default `false` (`home.rs:644`).
-When the switch is on, `execute_job` calls `deliver_via_container` (`seller_node/run.rs:6062`), and one
-container runs the agent and every git step. When it is off, the #937 host path runs unchanged. On
-2026-09-03 one live from-scratch job passed through the container path (`fresh-after-agent` token
-mode) and the buyer paid. The relay canary (`tests/relay_canary.rs`) showed that day that the relay
-enforces the token's ref scope but does not yet honor its `expiration` tag. Open: Task B10 (meter usage
-at the credential proxy), removal of the interim host push, and relay Requirement B (the `expiration`
-tag), on which the `long-lived` token mode waits. The line numbers are from commit `519a4d0`.
+Container-side delivery is the DEFAULT for a docker seat. `[sandbox] container_delivery` is
+`Option<bool>` (`home.rs:680`): absent under `mode = "docker"` means ON, `Some(false)` is the opt-out
+back to the host path, and `Some(true)` under `mode = "launcher"` is refused at boot. A launcher seat
+is unaffected, because `SandboxMode::Launcher` is the default mode and creates no container. The one
+place that reads the default is `SandboxConfig::container_delivery_enabled` (`home.rs:705`). When the
+path is the container, `execute_job` calls `deliver_via_container` (`seller_node/run.rs`), and one
+container runs the agent and every git step. On the host path the #937 host path runs unchanged. The
+seller prints the effective path and its reason at boot (`delivery_path_line`, `seller_node/run.rs`),
+and `maxplayer doctor` prints it in the `relay token policy` row. The default moved to the container
+path after that path was proven live. On 2026-09-03 one live from-scratch job passed through it
+(`fresh-after-agent` token mode) and the buyer paid. The relay canary (`tests/relay_canary.rs`) printed
+`A=enforced B=deployed` on 2026-09-07: the relay enforces the token's ref scope and honors its
+`expiration` tag (#968), so both token modes work; each ran a paid job that day, as did a contribution
+job. The default is ON only for a non-root daemon; a uid-0 seat keeps the host path unless it sets
+`container_delivery = true`. Open: #980 (uid separation, which replaces Task B10). Removal of the
+interim host push is BLOCKED, not pending: `launcher` is the default sandbox mode, has no container,
+and the host push is its only delivery path. The `home.rs` line
+numbers are from the commit that moved the default.
 
 ## Verification checks and rejection
 

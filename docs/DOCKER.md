@@ -444,20 +444,44 @@ The port was never a control.
 default-denying inbound, or a cloud security group that exposes nothing but the ports you chose, both
 satisfy this. Sellers on a home NAT or a private network are already covered by the absence of a route.
 
-#### Container-side delivery (opt-in)
+#### Container-side delivery (the default under `mode = "docker"`)
 
-`container_delivery = true` moves the git steps of a delivery into the job container. One container
-then runs the agent, the clone, the completion gate, the commit, and the push. The host runs no git
-for the job and reads back only the commit id. The switch needs `mode = "docker"` and a sandbox image
-that carries the `maxplayer` binary at `/usr/local/bin/maxplayer`.
+Container-side delivery moves the git steps of a delivery into the job container. One container then
+runs the agent, the clone, the completion gate, the commit, and the push. The host runs no git for the
+job and reads back only the commit id.
+
+**This is the DEFAULT for a docker seat.** A seat with `mode = "docker"` that does not name
+`container_delivery` delivers from the container. It needs a sandbox image that carries the
+`maxplayer` binary at `/usr/local/bin/maxplayer`; the shipped image has it.
 
 ```toml
 [sandbox]
 mode = "docker"
-container_delivery = true
+# container_delivery = false                       # opt back into the host delivery path
 # container_delivery_token = "fresh-after-agent"   # default; or "long-lived"
 # container_delivery_token_cap_secs = 21600        # "long-lived" only
 ```
+
+`container_delivery = false` is the opt-out. The host then clones the base, the container runs the
+agent, and the host commits and pushes, as before.
+
+**Root posture.** A seat whose daemon runs as root (uid 0) runs the job as root inside the
+container, where the boundary between the job and the delivery orchestrator is weakest. Such a seat
+does not get container delivery by default. It must set `container_delivery = true` to opt in, and
+the boot line warns when it does. Run the seller as a non-root user.
+
+A seat with `mode = "launcher"` is not affected, and cannot use this mode: launcher mode creates no
+container to run the git steps in. Such a seat always delivers from the host. It may write
+`container_delivery = false`, which changes nothing, but `container_delivery = true` is REFUSED at
+boot.
+
+The seller prints the effective path at boot, on one line:
+
+```text
+seller node delivery path: CONTAINER — one container runs the agent and every git step. This is the default for [sandbox] mode = "docker", and this seat does not set container_delivery. Set container_delivery = false for the host path.
+```
+
+`maxplayer doctor` reports the same answer in its `relay token policy` row.
 
 The default token mode mints a 60-second branch-scoped push token after the agent has exited, so it
 works with the relay as deployed today. See `SELLER-QUICKSTART.md`, section 3c, "Container-side

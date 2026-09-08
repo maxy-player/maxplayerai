@@ -496,15 +496,21 @@ fn make_temp_repo(
 /// One attempt: the canary records the first answer. Production retries a transient failure; a
 /// retry adds no evidence here. A hook refusal reaches the client in-band as
 /// `ng <ref> pre-receive hook declined` (HTTP 200); the transport reports it as a rejected ref.
-fn run_push(workdir: &Path, remote: &str, branch: &str, header: String) -> (PushOutcome, String) {
+fn run_push(
+    workdir: &Path,
+    remote: &str,
+    branch: &str,
+    gated_oid: &str,
+    header: String,
+) -> (PushOutcome, String) {
     let policy = PushRetryPolicy {
         max_attempts: 1,
         base_delay: Duration::ZERO,
         max_delay: Duration::ZERO,
     };
-    // The canary measures the relay's answer only. The C6 oid guard (`expected_oid`) has its own
-    // unit tests in `delivery_orchestrator`; `None` keeps this probe about the relay.
-    match push_delivery(workdir, remote, branch, Some(header), &policy, None) {
+    // The canary measures the relay's answer only. `gated_oid` is the commit the fixture made; the
+    // production push sends that object and reads the remote back against it (C6).
+    match push_delivery(workdir, remote, branch, Some(header), &policy, gated_oid) {
         Ok(oid) => (PushOutcome::Accepted, format!("accepted oid={oid}")),
         Err(error) => {
             let text = clean(&error.to_string(), 300);
@@ -665,7 +671,7 @@ fn relay_canary() {
 
             // A2: a token scoped to `-scope`, a push to `-other`. Expected: refused.
             let token = mint(&keys, &remote, Some(&scope_ref), None);
-            let (a2, detail) = run_push(&workdir, &remote, &other_branch, token.clone());
+            let (a2, detail) = run_push(&workdir, &remote, &other_branch, &commit, token.clone());
             println!(
                 "CANARY A2 push-other-ref token-scope={scope_ref} pushed-ref={other_ref} expected=refused observed={detail} token={}",
                 redact(&token)
@@ -673,7 +679,7 @@ fn relay_canary() {
 
             // A3: positive control. The same scope, a push to `-scope`. Expected: accepted.
             let token = mint(&keys, &remote, Some(&scope_ref), None);
-            let (a3, detail) = run_push(&workdir, &remote, &scope_branch, token.clone());
+            let (a3, detail) = run_push(&workdir, &remote, &scope_branch, &commit, token.clone());
             println!(
                 "CANARY A3 push-scoped-ref token-scope={scope_ref} pushed-ref={scope_ref} expected=accepted observed={detail} token={}",
                 redact(&token)
