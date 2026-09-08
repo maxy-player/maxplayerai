@@ -3700,9 +3700,13 @@ mod tests {
     /// admitted it (the row is `spending`, bound to that quote) and BEFORE the melt.
     #[derive(Clone, Copy)]
     enum PauseAt {
-        AfterPlan,
-        AfterQuote,
-        AfterAdmit,
+        /// After the plan is journaled (`Fake::plan_gate`).
+        Plan,
+        /// After the payment quote passed the ceiling, before the fence (`Fake::quote_gate`).
+        Quote,
+        /// After the fence admitted the melt and bound the quote, before paying
+        /// (`Fake::admit_gate`).
+        Admit,
     }
 
     /// Two processes against one store: `first` is paused at `gate` (at `pause`), `second` runs
@@ -3719,9 +3723,9 @@ mod tests {
         meanwhile: impl FnOnce(&SellerStore) -> Vec<(RemitOutcome, String)>,
     ) -> PausedRun {
         match pause {
-            PauseAt::AfterPlan => first.plan_gate = Some(Arc::clone(&gate)),
-            PauseAt::AfterQuote => first.quote_gate = Some(Arc::clone(&gate)),
-            PauseAt::AfterAdmit => first.admit_gate = Some(Arc::clone(&gate)),
+            PauseAt::Plan => first.plan_gate = Some(Arc::clone(&gate)),
+            PauseAt::Quote => first.quote_gate = Some(Arc::clone(&gate)),
+            PauseAt::Admit => first.admit_gate = Some(Arc::clone(&gate)),
         }
         first.melt_counter = Some(Arc::clone(&melts));
         first.set_clock(first_now);
@@ -3765,7 +3769,7 @@ mod tests {
             &db,
             a,
             100,
-            PauseAt::AfterPlan,
+            PauseAt::Plan,
             super::test_support::Gate::new(),
             Arc::clone(&melts),
             |store_b| {
@@ -3859,7 +3863,7 @@ mod tests {
             &db,
             a,
             100,
-            PauseAt::AfterAdmit,
+            PauseAt::Admit,
             super::test_support::Gate::new(),
             Arc::clone(&melts),
             |store_b| {
@@ -3973,7 +3977,7 @@ mod tests {
             &db,
             a,
             100,
-            PauseAt::AfterPlan,
+            PauseAt::Plan,
             super::test_support::Gate::new(),
             Arc::clone(&melts),
             |store_b| {
@@ -4096,7 +4100,7 @@ mod tests {
             &db,
             a,
             100,
-            PauseAt::AfterPlan,
+            PauseAt::Plan,
             super::test_support::Gate::new(),
             Arc::clone(&melts),
             |_| {
@@ -4200,7 +4204,7 @@ mod tests {
             &db,
             first_process(&registry),
             100,
-            PauseAt::AfterAdmit,
+            PauseAt::Admit,
             Gate::new(),
             Arc::clone(&melts),
             |store_b| {
@@ -4330,7 +4334,7 @@ mod tests {
             &db,
             a,
             60,
-            PauseAt::AfterAdmit,
+            PauseAt::Admit,
             Gate::new(),
             Arc::clone(&melts),
             |store_b| {
@@ -4485,7 +4489,7 @@ mod tests {
             &db,
             a,
             100,
-            PauseAt::AfterQuote,
+            PauseAt::Quote,
             Gate::new(),
             Arc::clone(&melts),
             |store_b| {
@@ -4826,7 +4830,7 @@ mod tests {
                 &db,
                 first_process(&registry),
                 100,
-                PauseAt::AfterAdmit,
+                PauseAt::Admit,
                 Gate::new(),
                 Arc::clone(&melts),
                 |store_b| {
