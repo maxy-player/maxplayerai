@@ -617,9 +617,7 @@ mod tests {
         // mid-character. Sized so the budget lands off a boundary whatever the marker length is.
         let glyph = "日";
         assert_eq!(glyph.len(), 3);
-        let index: String = std::iter::repeat(glyph)
-            .take(MAX_MEMORY_INDEX_BYTES / 3 + 500)
-            .collect();
+        let index = glyph.repeat(MAX_MEMORY_INDEX_BYTES / 3 + 500);
         assert!(index.len() > MAX_MEMORY_INDEX_BYTES);
         fs::write(dir.join(MEMORY_INDEX_FILE), &index).expect("write index");
         let template = bare_index_template(&root);
