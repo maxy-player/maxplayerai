@@ -2431,7 +2431,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
 
-    use super::test_support::{Fake, Gate, QuoteRegistry, quote_registry};
+    use super::test_support::{Fake, Gate, QuoteRegistry, fake_proofs, quote_registry};
     use super::*;
     use crate::seller_node::STATE_DB_FILE;
     use crate::seller_node::store::{ReceiptFees, RemittanceState};
@@ -3878,10 +3878,12 @@ mod tests {
         Vec<(RemitOutcome, String)>,
     );
 
-    /// Where the paused side stops (addendum 4 §1, addendum 5 §2 tests): after its plan is
-    /// journaled and BEFORE its payment quote; after its payment quote passed the ceiling and BEFORE
-    /// the fence (the row is still `planned`, the quote exists at the mint); or after the fence
-    /// admitted it (the row is `spending`, bound to that quote) and BEFORE the melt.
+    /// Where the paused side stops (addendum 4 §1, addendum 5 §2, addendum 6 §2.1 tests): after
+    /// its plan is journaled and BEFORE its payment quote; after its payment quote passed the
+    /// ceiling and BEFORE the fence (the row is still `planned`, the quote exists at the mint);
+    /// after the fence admitted it (the row is `spending`, bound to that quote) and BEFORE the
+    /// melt; or INSIDE the melt, after the wallet's last local check and BEFORE the request reaches
+    /// the mint.
     #[derive(Clone, Copy)]
     enum PauseAt {
         /// After the plan is journaled (`Fake::plan_gate`).
@@ -3891,6 +3893,9 @@ mod tests {
         /// After the fence admitted the melt and bound the quote, before paying
         /// (`Fake::admit_gate`).
         Admit,
+        /// Inside the payment: after the ceiling, the proof selection and `prepare_melt`'s expiry
+        /// check, before the mint sees the request (`Fake::melt_gate`) — the verdict's B3 pause.
+        Melt,
     }
 
     /// Two processes against one store: `first` is paused at `gate` (at `pause`), `second` runs
@@ -3910,6 +3915,7 @@ mod tests {
             PauseAt::Plan => first.plan_gate = Some(Arc::clone(&gate)),
             PauseAt::Quote => first.quote_gate = Some(Arc::clone(&gate)),
             PauseAt::Admit => first.admit_gate = Some(Arc::clone(&gate)),
+            PauseAt::Melt => first.melt_gate = Some(Arc::clone(&gate)),
         }
         first.melt_counter = Some(Arc::clone(&melts));
         first.set_clock(first_now);
@@ -5236,6 +5242,217 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(&root);
         }
+    }
+
+    // Addendum 6 §2.1 / verdict at 6fc77e1 §4 B3 — the DELAYED CONFIRM, on the full path with a real
+    // store, two owners, two connections, one shared fake mint and one shared fake wallet:
+    //   A plans X at 100, its fence admits X and binds Q (Q expires at 200; X's invoice is still
+    //   valid), A passes its own pre-await margin check (200 > 100 + 60), the wallet's ceiling and
+    //   proof selection (exact denominations 8+4+2+1 out of two disjoint such sets) and
+    //   `prepare_melt`'s expiry check on the wallet's clock — and PAUSES there, its request built
+    //   but not yet at the mint.
+    //   The shared clock moves to 261: Q is past expiry and past the old margin.
+    //   B — another owner, disjoint proofs left in the same wallet — runs `--dry-run` then
+    //   `--confirm`: it asks the mint about Q by id, gets UNPAID (expired), and HOLDS: X stays
+    //   spending, its receipts stay pinned (real SQL), B plans no Y, raises nothing, pays nothing —
+    //   with 15 sats of exact proofs still in the wallet, so B was refused by the STORE, not for
+    //   want of funds.
+    //   A resumes: the mint (as CDK 0.17.2 does) accepts the expired UNPAID Q and pays X.
+    // Exactly ONE debit, never two — and it is one because B was never admitted while X was bound
+    // and spending, NOT because Q expired: at 6fc77e1 the same ordering released X on the expired
+    // Q, B paid Y, and A's late request paid Q — two payments against one accrued balance. The
+    // receipt invariant is asserted through the ordering (pinned to X at both of B's observations,
+    // discharged once by A's debit), not only in the final row count.
+    #[test]
+    fn a_payment_prepared_before_expiry_cannot_be_doubled_by_a_release_after_it() {
+        let (store, root) = store_with_fees("delayed-confirm", &[10, 5]);
+        drop(store);
+        let db = root.join(STATE_DB_FILE);
+        let melts = Arc::new(AtomicUsize::new(0));
+        let registry = quote_registry();
+        // Two disjoint exact sets for a 15-sat payment (13 + reserve 2): whichever A takes, B's
+        // selection cannot collide with it.
+        let proofs = fake_proofs(&[8, 4, 2, 1, 8, 4, 2, 1]);
+        let remaining = |proofs: &super::test_support::FakeProofs| {
+            let mut left = proofs.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            left.sort_unstable();
+            left
+        };
+        let mut a = first_process(&registry);
+        a.quote_expiry_unix = 200;
+        a.proofs = Some(Arc::clone(&proofs));
+        let clock = Arc::clone(&a.clock);
+        let (a_result, b_results) = run_paused(
+            &db,
+            a,
+            100,
+            PauseAt::Melt,
+            Gate::new(),
+            Arc::clone(&melts),
+            |store_b| {
+                // A is inside its payment: X spending, bound to Q; Q UNPAID at the mint, expiring
+                // at 200; A's proofs reserved — one exact set left for anyone else.
+                let x = store_b
+                    .in_flight_remittance()
+                    .expect("query")
+                    .expect("A's row");
+                assert_eq!(x.state, RemittanceState::Spending);
+                assert_eq!(x.spending_since_unix, Some(100));
+                assert_eq!(x.spending_quote_id.as_deref(), Some(X_PAYMENT_QUOTE));
+                {
+                    let quotes = registry.lock().unwrap_or_else(|e| e.into_inner());
+                    assert_eq!(quotes[X_PAYMENT_QUOTE].state, MeltQuoteState::Unpaid);
+                    assert_eq!(quotes[X_PAYMENT_QUOTE].expiry_unix, 200);
+                }
+                assert_eq!(
+                    remaining(&proofs),
+                    vec![1, 2, 4, 8],
+                    "A reserved one exact 15-sat set; the other is still in the wallet"
+                );
+                // The clock both processes read moves past Q's expiry and past the old margin.
+                clock.store(261, Ordering::SeqCst);
+                let mut results = Vec::new();
+                for (trigger, now) in [(RemitTrigger::DryRun, 261), (RemitTrigger::Command, 262)] {
+                    let mut b = second_process(&registry, &melts);
+                    b.clock = Arc::clone(&clock);
+                    b.proofs = Some(Arc::clone(&proofs));
+                    let (outcome, out) = run_remit(store_b, &mut b, trigger, now);
+                    assert_eq!(
+                        outcome,
+                        RemitOutcome::Refused(Refusal::SpendingHeld {
+                            remittance_id: X_ID.to_owned(),
+                            owner: "proc-a".to_owned(),
+                            spending_since_unix: 100,
+                            quote_id: Some(X_PAYMENT_QUOTE.to_owned()),
+                            observed: format!(
+                                "mint https://mint.example reports melt quote {X_PAYMENT_QUOTE} UNPAID (expiry unix 200)"
+                            ),
+                            held_sats: 15,
+                        }),
+                        "at {now}: {out}"
+                    );
+                    assert_eq!(
+                        b.quote_status_calls,
+                        vec![X_PAYMENT_QUOTE.to_owned()],
+                        "B asks about Q by id and nothing else: {out}"
+                    );
+                    assert!(b.status_calls.is_empty(), "{out}");
+                    assert!(
+                        b.invoices.is_empty() && b.quotes.is_empty() && b.melts.is_empty(),
+                        "B was refused admission: no plan, no quote, no payment: {out}"
+                    );
+                    assert!(!out.contains("released 15 sats"), "at {now}: {out}");
+                    assert_eq!(
+                        store_b
+                            .in_flight_remittance()
+                            .expect("query")
+                            .expect("still X")
+                            .state,
+                        RemittanceState::Spending,
+                        "at {now}: held, nothing written"
+                    );
+                    assert_eq!(
+                        ledger(store_b),
+                        (0, 15, 0),
+                        "at {now}: the receipts stay pinned to X while A's prepared Q can still pay"
+                    );
+                    assert_eq!(
+                        remaining(&proofs),
+                        vec![1, 2, 4, 8],
+                        "at {now}: B had exact proofs for a 15-sat payment and did not use them — the store, not the wallet, refused it"
+                    );
+                    results.push((outcome, out));
+                }
+                results
+            },
+        );
+        // A resumes: the mint accepts the expired UNPAID quote (no expiry check on that path) and X
+        // is paid — once.
+        let (a_outcome, a_out) = a_result;
+        assert!(
+            matches!(a_outcome, Ok(RemitOutcome::Paid { .. })),
+            "A's prepared payment lands: {a_outcome:?}\n{a_out}"
+        );
+        assert!(
+            a_out.contains("PAID — remittance hash-13-2-a settled"),
+            "{a_out}"
+        );
+        assert_eq!(b_results.len(), 2);
+        assert_eq!(
+            melts.load(Ordering::SeqCst),
+            1,
+            "exactly one actual debit — A's, on X; never two"
+        );
+        assert_eq!(
+            remaining(&proofs),
+            vec![1, 2, 4, 8],
+            "A spent exactly its reserved 15 sats; B's set is untouched"
+        );
+        {
+            let quotes = registry.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                quotes[X_PAYMENT_QUOTE].state,
+                MeltQuoteState::Paid,
+                "the mint paid the expired quote"
+            );
+            assert!(
+                quotes.keys().all(|id| id.ends_with("-a")),
+                "B raised no quote: {:?}",
+                quotes.keys().collect::<Vec<_>>()
+            );
+            assert_eq!(
+                quotes
+                    .values()
+                    .filter(|quote| quote.state == MeltQuoteState::Paid)
+                    .count(),
+                1,
+                "one quote paid at the mint, ever"
+            );
+        }
+        let store = SellerStore::open(&db).expect("open");
+        let rows = store.remittances().expect("rows");
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.remittance_id.as_str(), row.state))
+                .collect::<Vec<_>>(),
+            vec![(X_ID, RemittanceState::Settled)],
+            "one row, X, settled by its owner's melt; no Y ever existed"
+        );
+        assert_eq!(rows[0].melt_quote_id.as_deref(), Some(X_PAYMENT_QUOTE));
+        assert_eq!(rows[0].settled_by, Some(SettledBy::Melt));
+        assert_eq!(
+            ledger(&store),
+            (15, 0, 0),
+            "the 15 sats accrued were discharged exactly once"
+        );
+        let attempts = store.recent_remit_attempts(10).expect("attempts");
+        assert_eq!(attempts.len(), 2, "{attempts:?}");
+        assert_eq!(
+            (
+                attempts[0].trigger,
+                attempts[0].outcome,
+                attempts[0].remittance_id.as_deref()
+            ),
+            (
+                RemitAttemptTrigger::Collect,
+                RemitAttemptOutcome::Paid,
+                Some(X_ID)
+            )
+        );
+        assert_eq!(
+            (
+                attempts[1].trigger,
+                attempts[1].outcome,
+                attempts[1].remittance_id.as_deref()
+            ),
+            (
+                RemitAttemptTrigger::Command,
+                RemitAttemptOutcome::Refused,
+                Some(X_ID)
+            ),
+            "B's --confirm hold is journaled naming X"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // The attempts journal is bounded and newest-first, and a limit of zero returns nothing.
