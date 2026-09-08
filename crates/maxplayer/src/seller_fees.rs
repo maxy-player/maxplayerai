@@ -1234,45 +1234,23 @@ mod tests {
             let out = String::from_utf8(out).expect("utf8");
             let err = String::from_utf8_lossy(&err);
             assert_eq!(code, REFUSED, "[{label}] stderr={err} stdout={out}");
-            assert!(err.is_empty(), "[{label}] nothing on stderr: {err}");
-            assert!(
-                out.contains("Platform fee remittance — ") && out.contains("Recent attempts:"),
-                "[{label}] {out}"
+            assert_eq!(err, "", "[{label}] nothing on stderr");
+            // The ENTIRE stdout, by equality (addendum 8 §2.1). The only field that varies between
+            // hosts is this home's store path; every other figure is fixed by the fixture (the
+            // planned/admitted clock is 100, the lease is the constant i64::MAX / 2). Both runs print
+            // the same text: the dry run journals nothing, and the `--confirm` run journals its hold
+            // AFTER printing, so "Recent attempts" is empty on both. No plan, no dry-run offer, no
+            // journal line, no payment — by construction of the expected text, not by a denylist.
+            let expected = format!(
+                "Platform fee remittance — {store}\n\
+                 Automatic remittance after each collected payment: ON ([platform_fee] auto_remit = true, the default)\n\
+                 Recent attempts: none journaled yet\n\
+                 Reconciling in-flight remittance hash-held (planned at unix 100 by old-run, lease until unix {lease}: 13 sats to maxplayer@agi.cash, gross 15 sats) — SPENDING since unix 100, bound to melt quote paid-quote-never-raised: asking the mint about that quote by id\n\
+                 \x20 HELD: remittance hash-held is SPENDING (admitted by old-run at unix 100), bound to melt quote paid-quote-never-raised; this wallet holds no such melt quote; 15 sats of receipts stay pinned to it — a spending row is released by nobody and on no clock; it settles only when the mint reports that quote PAID; an operator decision, not a timeout, resolves it. REFUSED — nothing moved by this run; re-run later to reconcile.\n",
+                store = root.join(STATE_DB_FILE).display(),
+                lease = i64::MAX / 2,
             );
-            assert!(
-                out.contains(
-                    "Reconciling in-flight remittance hash-held (planned at unix 100 by old-run, lease until unix"
-                ) && out.contains(
-                    ": 13 sats to maxplayer@agi.cash, gross 15 sats) — SPENDING since unix 100, bound to melt quote paid-quote-never-raised: asking the mint about that quote by id"
-                ),
-                "[{label}] {out}"
-            );
-            let held: Vec<&str> = out
-                .lines()
-                .filter(|line| line.starts_with("  HELD: remittance"))
-                .collect();
-            assert_eq!(held.len(), 1, "[{label}] exactly one HELD line: {out}");
-            assert!(
-                held[0].starts_with(
-                    "  HELD: remittance hash-held is SPENDING (admitted by old-run at unix 100), bound to melt quote paid-quote-never-raised; this wallet holds no such melt quote; 15 sats of receipts stay pinned to it — a spending row is released by nobody and on no clock; it settles only when the mint reports that quote PAID; an operator decision, not a timeout, resolves it. REFUSED — nothing moved by this run; re-run later to reconcile."
-                ),
-                "[{label}] the one HELD line, whole: {}",
-                held[0]
-            );
-            for forbidden in [
-                "Plan:",
-                "DRY RUN",
-                "Journaled",
-                "PAID —",
-                "still settling",
-                "released 15 sats",
-                "paying...",
-            ] {
-                assert!(
-                    !out.contains(forbidden),
-                    "[{label}] a held run must not print {forbidden:?}: {out}"
-                );
-            }
+            assert_eq!(out, expected, "[{label}] the complete stdout, by equality");
         }
         let store = SellerStore::open(root.join(STATE_DB_FILE)).expect("reopen");
         let row = store
