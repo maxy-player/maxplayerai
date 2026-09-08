@@ -164,78 +164,104 @@ $ git diff --stat a6217328..240240c -- crates/maxplayer-core/src/wallet_ops.rs
 ```
 The sole live spending edge is `fee_remit.rs:1764 prepare_melt → :1908 confirm_melt` → `LiveEffects` `:443` / `:463` → `wallet_ops::prepare_melt_payment_blocking` (`wallet_ops.rs:1577`) → `prepared_melt_thread` (`:1637`): `admits` (`:1678`) → `Wallet::prepare_melt` (no proof- or fee-bearing request) → `input_fee_ppk` read (`:1709`) → `admits_confirmable` (`:479`, at `:1733`; round 9) → **`confirm_would_succeed` (`fee_remit.rs:2470`, at `:1785`)** → fence → `PreparedMeltPayment::confirm` (`wallet_ops.rs:629`), reached only after `admit_remittance_spend` changed one row and bound that quote's id, only for that id, and never while a bound spending row exists, because `plan_remittance` refuses first.
 
-## Full suites at `1a5c7c5` (local, macOS arm64; each suite its own command with `--no-fail-fast`, `git rev-parse HEAD` first in each log)
+## Full suites at `240240c` (local, macOS arm64; each suite its own command with `--no-fail-fast`, run serially by `run-gates-exec2.sh` from `d0be4a0`; `git rev-parse HEAD` line 1 and `exec head 240240c; .rs diff to HEAD:` (empty) line 2 of each log in `reports/w-remit-r9/logs/`)
 ```
-$ cargo test -p maxplayer-core --features wallet --no-fail-fast                 (exec2-core-wallet-nff.log)
-lib: test result: FAILED. 1422 passed; 1 failed; 2 ignored; 0 measured; 0 filtered out; finished in 140.27s
-     FAILED: credential_proxy::tests::a_declared_over_cap_body_is_refused_before_the_upstream_sees_it   (loopback "Connection reset by peer"; file not in this PR — the disclosed flake)
-     integration/doc binaries: 8, 1, 1, 1, 1, 2 passed, 0 failed
-$ cargo test -p maxplayer --no-fail-fast                                        (exec2-cli-default.log)
-test result: ok. 143 passed; 0 failed   + cli_e2e 2, mcp_daemon 3, sell 3, wallet 6 — all 0 failed
-$ cargo test -p maxplayer --features acp,wallet --no-fail-fast                  (exec2-cli-acp-wallet.log)
-test result: ok. 180 passed; 0 failed; 1 ignored   + 2, 3, 5, 3, 6 passed, 0 failed
+$ cargo test -p maxplayer-core --features wallet --no-fail-fast                 (exec2-core-wallet-nff.log, exit 0)
+lib: test result: ok. 1427 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 143.21s
+     integration binaries: acp_concurrency 0, collect_integrity 8, free_post_no_wallet 1, git_config_isolation 1, hostile_local_git_config 1, no_system_git 1, relay_git_http_auth 2, sandbox_netns_live 0; doc-tests 0 — all 0 failed
+$ cargo test -p maxplayer --no-fail-fast                                        (exec2-cli-default.log, exit 0)
+test result: ok. 143 passed; 0 failed   + cli_e2e 2, mcp_daemon 3, seller_declared_output 3, seller_memory_read_on_start 6 — all 0 failed
+$ cargo test -p maxplayer --features acp,wallet --no-fail-fast                  (exec2-cli-acp-wallet.log, exit 0)
+test result: ok. 180 passed; 0 failed; 1 ignored   + cli_e2e 2, mcp_daemon 3, sandbox_reap_dry_run 5, seller_declared_output 3, seller_memory_read_on_start 6 — all 0 failed
 ```
-Every remittance, `wallet_ops`, store, seller-node and CLI test passed; the one lib failure is the pre-existing `credential_proxy` loopback flake also seen in round 7's run 3.
+Every remittance, `wallet_ops`, store, seller-node and CLI test passed, and this time the core lib run had no flake (round 8's `credential_proxy` loopback failure did not recur here; it did recur once in the money-path trio below). The lib count is 1427 passed (round 8's run: 1422 passed + 1 failed); the round-9 additions are the six new `--exact` records 39–44 and the renamed record 33 → 43 — the per-test delta beyond those is not itemised here.
 
-## Money-path binary ×3 at `1a5c7c5` (addendum 4 §4) — CI's exact command (`.github/workflows/ci.yml:233`)
+## Money-path binary ×3 at `240240c` (addendum 4 §4) — CI's exact command (`.github/workflows/ci.yml:233`)
 ```
-$ cargo test -p maxplayer-core --release --no-default-features --features gateway,git-delivery,wallet,live-mints --locked       (money-path-ci-{1,2,3}-1a5c7c5.log; `git rev-parse HEAD` = 1a5c7c5… first line of each)
-run 1: test result: ok. 1427 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 142.11s   (exit 0)
-run 2: test result: FAILED. 1424 passed; 3 failed; 2 ignored; 0 measured; 0 filtered out; finished in 152.79s
-run 3: test result: FAILED. 1424 passed; 3 failed; 2 ignored; 0 measured; 0 filtered out; finished in 141.27s
-       FAILED (runs 2 and 3, the same three names): credential_proxy::tests::a_declared_over_cap_body_is_refused_before_the_upstream_sees_it   (loopback "Connection reset by peer")
-               job_lifecycle::tests::a_wait_resolves_on_arrival_rather_than_on_the_safety_recheck    ("mint_unreachable: mint https://mint.minibits.cash/Bitcoin … fee query exceeded 5s")
-               job_lifecycle::tests::get_job_default_skips_kind_zero_fetch                            (same mint_unreachable)
-round 7 (kept, `reports/w-remit-r7/`): at 24ba082 1425/0, 1425/0, 1422/3; at 2d802a3 1423/2, 1422/3, 1423/2 — the same names only
+$ cargo test -p maxplayer-core --release --no-default-features --features gateway,git-delivery,wallet,live-mints --locked       (money-path-ci-{1,2,3}-240240c.log; `git rev-parse HEAD` = d0be4a0… line 1, `exec head 240240c; .rs diff to HEAD:` empty line 2 of each)
+run 1: test result: ok. 1431 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 154.29s   (exit 0)
+run 2: test result: FAILED. 1430 passed; 1 failed; 2 ignored; 0 measured; 0 filtered out; finished in 146.43s   (exit 101)
+       FAILED: credential_proxy::tests::a_declared_over_cap_body_is_refused_before_the_upstream_sees_it   (loopback reqwest error on http://127.0.0.1:57600/v1/messages — the disclosed flake; `git diff --name-only a6217328..240240c | grep credential_proxy` → nothing)
+run 3: test result: ok. 1431 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 153.83s   (exit 0)
+round 8 (kept, `reports/w-remit-r8/`): at 1a5c7c5 1427/0, 1424/3, 1424/3; round 7 (`reports/w-remit-r7/`): at 24ba082 1425/0, 1425/0, 1422/3; at 2d802a3 1423/2, 1422/3, 1423/2 — the same out-of-diff names only
 ```
-- Every remittance, wallet_ops and store test passed in all three release runs (and in round 7's six). The failing files (`credential_proxy.rs`, `job_lifecycle.rs`) are not in this PR's diff; the `job_lifecycle` tests need `mint.minibits.cash` to answer a fee query within 5 s from this host. Reported as FAILED counts, never as green; the three flakes are out of scope by addendum 9 §7.
+- Every remittance, wallet_ops and store test passed in all three release runs (and in rounds 7–8's nine). The one failing file (`credential_proxy.rs`) is not in this PR's diff; the `job_lifecycle` live-mint flake of rounds 7–8 did not fire this time. Reported as FAILED counts, never as green; the flakes are out of scope by addendum 9 §7.
 
-## CI — every head of rounds 7 and 8 (addendum 9 §5: green on the FINAL head, stated at both)
+## CI — every head of rounds 7, 8 and 9 (addendum 9 §5: green on the FINAL head, stated at both; read with `gh run list --commit <sha>` / `--branch feat/seller-fee-remit` at 2026-09-08T18:10Z)
 ```
-24ba082  run 34200030811  pull_request  completed  success   2026-09-08T07:49:03Z   (round 7 executable head; ci-24ba082.txt)
-da0ee92  run 34202015987  pull_request  completed  success   2026-09-08T08:11:42Z   (round 7 final head — read this round; the previous body wrongly called this run "not required")
+24ba082  run 34200030811  pull_request  completed  success   2026-09-08T07:49:03Z   (round 7 executable head)
+da0ee92  run 34202015987  pull_request  completed  success   2026-09-08T08:11:42Z   (round 7 final head)
 1a5c7c5  run 34213151371  pull_request  completed  success   2026-09-08T10:14:27Z   (round 8 executable head)
-036302b  run 34215238371  pull_request  completed  success   2026-09-08T10:36:50Z                                  (reports only)
-4714623  run pending at edit time (pushed minutes before this body; its result is recorded in body-pin-4714623.txt, committed after this head)                                                                (this body's pin — the final head)
+036302b  run 34215238371  pull_request  completed  success   2026-09-08T10:36:50Z   (round 8 reports)
+4714623  run 34217843662  pull_request  completed  success   2026-09-08T11:07:41Z   (round 8 final head — read after the pin, body-pin-4714623.txt)
+ac033f4  run 34219150715  pull_request  completed  success   2026-09-08T11:08:51Z   (round 8 pin commit)
+— round 9 —
+c9cce6c  run 34224625217  pull_request  completed  FAILURE   2026-09-08T12:10:43Z   (commit A, one bound: Money-path tests · acp+wallet combo — four fee_remit tests still carried round-8 expectations against the new gate: records 28, 37, 30, 32 by name in the job log; re-asserted in commits B–E)
+eefdb70  run 34238444853  pull_request  completed  success   2026-09-08T14:28:07Z   (commit B)
+b7e3f34  run 34239118872  pull_request  completed  success   2026-09-08T14:34:22Z   (commit C, store replan)
+c06b490 / 1f03898 / bcbc8b9  runs 34239849561 / 34239949298 / 34240116093  completed  FAILURE   14:41–14:43Z   (commit D in flight: Money-path tests · acp+wallet combo — locally the same tree gave 37 passed / 1 failed, record 37 on its old schedule now re-planning and paying, `logs/fee-remit-tests-D.txt`, commit `c362d24`; the CI job logs for these three runs were not retrievable with `--log-failed` at read time; record 37 moved to its drift schedule in fa2b8af)
+fa2b8af  run 34240554794  pull_request  completed  success   2026-09-08T14:47:37Z
+e6f7b7a  run 34240884382  pull_request  completed  success   2026-09-08T14:50:35Z
+380f097  run 34241088182  pull_request  completed  success   2026-09-08T14:52:28Z
+9ae7c9c  run 34241489343  pull_request  completed  FAILURE   2026-09-08T14:56:10Z   (WIP N2: Money-path tests · acp+wallet combo — records 37 and 29 by name in the job log, the two pre-fence refusal tests whose state/output assertions had not yet moved to the Planned/one-line contract; 71b4971 completes N2)
+71b4971  run 34241586261  pull_request  completed  success   2026-09-08T14:57:06Z
+2521a44  run 34242121884  pull_request  completed  success   2026-09-08T15:01:59Z   (commit F, the intended executable head; lint gate moved the head)
+240240c  no run of its own — pushed together with 4a1bd4a; the tree it built is CI'd as:
+4a1bd4a  run 34243672412  pull_request  completed  success   2026-09-08T15:16:21Z   (reports only on top of 240240c — the executable head's tree)
+d0be4a0 · 49965f4 · cec41be · 2494a0a · c1909a5 · 540c43b   runs 34257261052 · 34258630144 · 34258814655 · 34258836267 · 34259159943 · 34259533876   all completed success   17:28–17:50Z   (reports only)
+fa4228e · 6172b09 · 9b0bc01   runs 34260069114 · 34260445923 · 34260997966   in_progress at read time   (reports only; body drafts)
+final head (this body's pin)   pending — read after the pin, recorded in body-pin-<final>.txt, committed after the final head as in rounds 7–8
 ```
-Read with `gh run list --commit <sha>`. The seven code checks (Money-path tests · Test the full shipped feature combo (acp + wallet) · Build & test (acp) · Build & test (default features) · Build (no default features) · JS test suites · Release workflow gates) are what "success" covers; **Vercel** "Authorization required to deploy" is an authorization status on the fork PR, not a build result.
+Every failing run above is a WIP or intermediate round-9 commit whose failure was fixed in the next code commit; no round-9 head that a gate is reported at (2521a44, 240240c via 4a1bd4a) failed CI. The seven code checks (Money-path tests · Test the full shipped feature combo (acp + wallet) · Build & test (acp) · Build & test (default features) · Build (no default features) · JS test suites · Release workflow gates) are what "success" covers; **Vercel** "Authorization required to deploy" is an authorization status on the fork PR, not a build result.
 
-## fmt / clippy — the WHOLE delivery `a6217328..1a5c7c5`, additions counted, and how each number is counted
-**Denominators (measured at `1a5c7c5`):** 11 files, **+14,918 / −266**; Rust **+14,773 / −251** (10 `.rs` files; 14,298 non-empty added lines). Method: `git diff -U0 a6217328..HEAD` per file → the set of added line ranges (`exec2-added-ranges.diff`, 160 hunks); every clippy `--> file:line` and every rustfmt `Diff in file:line` block is classified INSIDE or OUTSIDE that set, and for each INSIDE fmt block every line rustfmt would rewrite is `git blame`d (`exec2-lint-mapping.md`).
-- **rustfmt:** `cargo fmt --all -- --check` at `1a5c7c5` reports **2,106 blocks** in the tree (`exec2-fmt.log`, exit 1; the repo is unformatted at the base). **Lines this delivery added that rustfmt would rewrite: 0.** Three blocks start inside the added set by context adjacency (`home.rs:1445`, `lib.rs:47`, `lib.rs:55`); the lines they rewrite are `home.rs:1448` and `lib.rs:60–63`, all `git blame` → orveth (pre-existing), or none (`lib.rs:47`, a pure insertion target) — not reformatted, repo-wide lint debt (addendum 9 §7). At `b1c702a` the same gate found nine blocks on round-8 lines; `1a5c7c5` formatted those lines by hand.
-- **clippy (H5 convention — diagnostic blocks carrying a `--> file:line` location):** `cargo clippy --workspace --all-targets --features wallet` at `1a5c7c5`: **125 total / 0 on lines added `a6217328..HEAD`** (17 in touched files on lines this branch did not add, 108 elsewhere; each listed in `exec2-lint-mapping.md`), exit 0 (`exec2-clippy.log`). At `b1c702a`: 125 / **1** (`assertions_on_constants` in the planner regression) — the reason the executable head moved to `1a5c7c5`.
+## fmt / clippy — the WHOLE delivery `a6217328..240240c`, additions counted, and how each number is counted
+**Denominators (measured at `240240c`):** product files 11, **+15,634 / −293** (`.rs` + quickstart; the diffstat below); Rust **+15,884 / −278** over 10 `.rs` files by `git diff -U0 … | grep '^+'` (the per-file numstat sums to +15,884 as well), 176 hunks. Method (round-3 lineage, unchanged since round 8): `git diff -U0 a6217328..HEAD` per file → the set of added line ranges; every clippy `--> file:line` and every rustfmt `Diff in file:line` block is classified INSIDE or OUTSIDE that set, and for each INSIDE fmt block every line rustfmt would rewrite is `git blame`d (`fmt-overlap.py` → `logs/exec2-fmt-overlap.txt`, `clippy-map.py` → `logs/exec2-clippy-map.txt`, adjudicated in `lint-mapping.md`).
+- **rustfmt:** `cargo fmt --all -- --check` at `240240c` reports **2,087 blocks** in the tree (`logs/exec2-fmt.log`, exit 1; the repo is unformatted at the base; round 8 saw 2,106). **Lines this delivery added that rustfmt would rewrite: 0.** The same three blocks as round 8 start inside the added set by context adjacency (`home.rs:1445`, `lib.rs:47`, `lib.rs:55`; `exec2-fmt.log:15559`, `:17463`, `:17476`); the lines they rewrite are `home.rs:1448` (blame `ff3918e4`) and `lib.rs:60–63` (`db63eb96`, `8547fc16`, `b741eaf3`, `7d80595a`), all orveth (pre-existing), or none (`lib.rs:47`, a pure insertion target) — not reformatted, repo-wide lint debt (addendum 9 §7). Round 9's own `.rs` commits added no fmt block: at `2521a44` (the intended executable head) the gate found rustfmt blocks on eight round-9 test hunks in `fee_remit.rs` and three doc lines; `240240c` formatted those by hand (no behaviour change) and every suite, the money-path trio, both lint gates and all 44 `--exact` records were re-run at `240240c`.
+- **clippy (H5 convention — diagnostic blocks carrying a `--> file:line` location):** `cargo clippy --workspace --all-targets --features wallet` at `240240c`: **125 total / 0 on lines added `a6217328..HEAD`** (17 in touched files on lines this branch did not add — the same 17 as round 8, one of them shifted from `wallet_ops.rs:903` to `:1102` by the round-9 insertions above it — and 108 elsewhere; each listed in `lint-mapping.md`), exit 0 (`logs/exec2-clippy.log`).
 
-## Per-file diffstat `a6217328..1a5c7c5`
+## Per-file diffstat `a6217328..240240c` (product files; `git diff --numstat`)
 ```
-7571	0	crates/maxplayer-core/src/fee_remit.rs
+8089	0	crates/maxplayer-core/src/fee_remit.rs
 144	0	crates/maxplayer-core/src/home.rs
 14	3	crates/maxplayer-core/src/lib.rs
 1287	0	crates/maxplayer-core/src/lnurl_pay.rs
 66	20	crates/maxplayer-core/src/platform_fee.rs
 1314	10	crates/maxplayer-core/src/seller_node/run.rs
-2327	122	crates/maxplayer-core/src/seller_node/store.rs
-1291	3	crates/maxplayer-core/src/wallet_ops.rs
+2571	122	crates/maxplayer-core/src/seller_node/store.rs
+1640	30	crates/maxplayer-core/src/wallet_ops.rs
 5	3	crates/maxplayer/src/sell.rs
 754	90	crates/maxplayer/src/seller_fees.rs
 145	15	docs/SELLER-QUICKSTART.md
- 11 files changed, 14918 insertions(+), 266 deletions(-)       (+ 036302b: reports/w-remit-r8/ 72 files, 159,342 lines; + 4714623: reports only)
+ 11 product files: +15,634 / −293 (round 8: +14,918 / −266); the same range also carries reports/w-remit-r8/ (100 files, committed 036302b + 4714623) and the round-9 in-flight logs under reports/w-remit-r9/ (14 files) — `git diff --stat a6217328..240240c | tail -1` = 111 files changed, 213,519 insertions(+), 293 deletions(-)
+$ git diff --stat 240240c..HEAD -- . ':(exclude)reports'   → (empty: no .rs, docs or Cargo change after the executable head; re-checked at every reports commit)
 ```
 
-## Evidence files (`reports/w-remit-r8/`, committed in `036302b`; name · bytes · sha256; the full 71-row table with every `exact-*` log is `evidence-table.txt`; rounds 5–7 stay in `reports/w-remit-r{5,6,7}/` as listed in the previous bodies)
+## Evidence files (`reports/w-remit-r9/`; name · bytes · sha256; the 69-row table over every file in `logs/` is `evidence-table.txt` (committed `9b0bc01`); the logs were committed as they landed — `d0be4a0` (runner), `49965f4` (gates 1–6, lint maps, 44 exact records, money-path runs 1–2), `cec41be` (run 3), `2494a0a` (progress log); rounds 5–8 stay in `reports/w-remit-r{5,6,7,8}/` as listed in the previous bodies)
 ```
-evidence-table.txt · 11731 · cf458d71444c1ea12410dea9ed06ff47c67488ab31713b9a992e51cbaa332e0d
-exact-records.txt · 6736 · 7de6110f16c526aa1d15bf10f447fea4008f318e19fc4685fa647826a190a84d
-exec2-core-wallet-nff.log · 136297 · 797b325d634f729c0a0bf639c184119deee999d78506b8613487b445c9ee9f95
-exec2-cli-default.log · 16846 · ead094aed82503796c94e9bbd863d334942d62b534c52f4f0a4f9c693b25b8aa
-exec2-cli-acp-wallet.log · 18559 · c97b420f22f42c257a9af158d5ca90af41244ba569ce72c6ce22428655068d48
-money-path-ci-1-1a5c7c5.log · 134735 · 0103e44c84e21cc7e2f9e1aa5fb01cbbd1e5585ee490b18382f322188f4b0a6e
-money-path-ci-2-1a5c7c5.log · 130802 · 3d89320d6ac0e88675f8c2d8d06752775836871f18662a97504ff40ab1fd84b4
-money-path-ci-3-1a5c7c5.log · 130805 · 808320f23fe1ed6d17b223c222a272fecd063bb305d461828028484127319600
-exact-28-r8-i-fee-fits-actual-differs-240240c.log · 3639 · fcbd74f421020706882a84717840a2d5c36ace407304d1e035a7d5935af72b0f
-exact-37-r8-ii-post-swap-refused-before-fence-240240c.log · 3623 · d44ab349f9b719d3ccea7551b070702d5880eac634c91dc8a4d8cd696847484c
-exact-38-r8-balance-unknown-no-false-warning-240240c.log · 3571 · 2912dd6dc98a57436032beb28d3043761fa4464ee5eaf20fb67141905ba4babc
-plan.md · 10661 · 7aac574b998991a4a660ee8524401e7575c1761dc275956db3387a5f3c17338b
-(+ exec2-clippy.log, exec2-fmt.log, exec2-added-ranges.diff, exec2-lint-mapping.md, the other 35 exact-NN-*-1a5c7c5.log records, the b1c702a first-attempt logs, step2–8 logs — all in evidence-table.txt; body-plan.md, build-body-r8.py, greps-1a5c7c5.txt, citation-remap-1a5c7c5.txt, body-r8.md and body-pin-4714623.txt are added by 4714623)
+logs/exec2-core-wallet-nff.log · 135917 · 500db2fe1c47c7e6aa180db8995aff54937124868af4689567e6228168c3a129
+logs/exec2-cli-default.log · 16866 · 846d08198dd6c0b3de978cd2744f6b4916e64abe36fec6abf6ba3d1246a32848
+logs/exec2-cli-acp-wallet.log · 18585 · 49246ad6430190218788cc6a5012108a08688dbb39ef8eac9cb0a408dd96807c
+logs/exec2-fmt.log · 1460668 · 1999530c94d13ce11901d7686dadeec365fd76f9c429f4b066ca4d997fd6384a
+logs/exec2-clippy.log · 76982 · 522ecb123be700624f98561f6b67699f70ab0762ffddd2300d7f4dfbcf81d860
+logs/exec2-fmt-overlap.txt · 1438 · 2e43dc7af03219eb17acb3b1ed116b95274fd039d0bf4d98b444d7271fd70509
+logs/exec2-clippy-map.txt · 138 · fdb7ca9511656be51c070d6105f4a68163f3ee4ea5c18aa6fa1321ca57f1d73f
+logs/exec2-progress.txt · 6504 · 96d112e965fc80017abf3dfff39cf1d61e3edb46703f900edc09b5a7da5972ed
+logs/money-path-ci-1-240240c.log · 135191 · 14bfb96984deefcf658880783efc6dd9dc09ce5450d0abd9008d98b6a46a604f
+logs/money-path-ci-2-240240c.log · 130277 · e86b86b6deddb1e55a70c49ced2164bef96c1e2250512c229726303ad03604ba
+logs/money-path-ci-3-240240c.log · 135079 · 506219ab99c0504f17023361d0dea73f7718b702f97225ecfda1576066ed638f
+logs/exact-37-r9-ii-fee-metadata-drift-refused-before-fence-240240c.log · 3661 · 0ddd88dc2075f4d3e25e60768e62f2af8bcc4bf93c558bca079bc59cdc57375c
+logs/exact-39-r9-1.3-gross-19-pays-13-240240c.log · 3629 · 34ad567cf2d66373d358c28de4da329878cb6e9fae14eb9f0e08e49b81e55146
+logs/exact-40-r9-1.4a-shrunk-reserve-replanned-pays-15-240240c.log · 3619 · d5cb12c4dd9a4cb55115058e571ff6a4e9296153d40cfd77a44e1802702db4c8
+logs/exact-41-r9-store-replan-240240c.log · 3625 · f60a1648f13cb1f76b2669e9a067967aac82ca03e9566a39e1731b8b13c37a81
+logs/exact-42-r9-confirm-bound-search-240240c.log · 3595 · 24dd844f33094365fbfda829ce14aef7358bf46c753bb6ea48336eef66afffd8
+logs/exact-43-r9-admits-confirmable-240240c.log · 3587 · b19cfaa8ab49d47b426bfc916f9715eb0f28426063d1bdd1ef1ca18a03ca240e
+logs/exact-44-r9-N3-paid-label-240240c.log · 3579 · 8c0cb59ca0937c7cd888edab1880aaadaeec0b5cf6a8a62066417d4eb12e165d
+exact-records.txt · 8034 · 556979ccc3a7cbffcc41211066ce1fdfd446896d0e23796118c5ec9dcc7bf339
+lint-mapping.md · 6003 · 147394c45ab6750d1ac7c15698b43b9f8c7474ef1b68fd1b3d5419acb9b6f05c
+greps-240240c.txt · 12181 · 728a71e17125e97dc9f3c3102a3c4fe9fdd7b3de662263fdef1c8b01f5eea98f
+plan.md · 18565 · 4cde220014b05d1476ec1a8fa9085bd14995e79a675deddbd486d8d8540e8460
+run-gates-exec2.sh · 2234 · b7c560643c4b49b2eff0ecb2ae500bc127efe30135d7aca0ded3b52cc7ee3a11
+(+ the other 37 exact-NN-*-240240c.log records, the 2521a44 first-attempt logs exec-*.log, the per-commit test logs fee-remit-tests-{D,E1..E4,F}.txt, live-reserve-tests-D.txt and store-replan-b7e3f34.txt — 69 rows, all in evidence-table.txt; fmt-overlap.py, clippy-map.py, body-r9.md, the self-check and remap outputs and the body pin are committed in the reports commits after 240240c)
 ```
 
 ## Disclosures
