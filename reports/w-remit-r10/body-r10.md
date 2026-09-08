@@ -48,10 +48,15 @@ The four sections (verdicts at `6fc77e1`, `6fd13df`, `19f30d3`, `da0ee92`) stand
 
 **Prior-finding ledger (round 9's rows):** B/N1 fitting planner rejection and two-gate bound → closed at `240240c` (records 39, 42, 43; re-plan records 40, 41). B/N2 pre-fence refusal deviated from ordered state/output → closed (records 37, 29, 14 on the Planned/one-line contract). G/N3 aggregate-fee labels → closed (record 44; source `2521a44`). H/N4 eight body/source contradictions → closed in this body and `2521a44`. Owed rows unchanged (recovery path, BudgetGate, force-release, `pay_melt_quote_*` / `TerminalBoundQuote` removal, rebase-or-merge) — "Out of scope" below.
 
-## Gates — command and output, all at the executable head `240240c` (local, macOS arm64; the runner `reports/w-remit-r9/run-gates-exec2.sh` ran every gate serially from the reports-only commit `d0be4a0`, so every log begins with `git rev-parse HEAD` = `d0be4a0930f0dd27615ec751f041af72e6771fc9` and line 2 states `exec head 240240c; .rs diff to HEAD:` empty — `240240c3f26bd35c3a8c5a3d70229f9730a0a221` is the last commit touching any `.rs`; logs in `reports/w-remit-r9/logs/` (`exec2-*`, `exact-NN-*-240240c.log`, `money-path-ci-{1,2,3}-240240c.log`), sizes and sha256 in `reports/w-remit-r9/evidence-table.txt`; grep gates 1–4 re-measured at `240240c` — `greps-240240c.txt`)
+## Gates — command and output, re-run at the executable head `08c476c` (local, macOS arm64)
 
-**Gate 1 — `allow_real_mints` defaults to true; every wallet entry honours `mint_allowed`; the command is `--confirm`-gated.**
+Every line below was re-run in the tree being reported, not carried over from round 9: `git diff --name-only 08c476c..HEAD` has **0** non-`reports/` files, so the `.rs` tree these greps ran against *is* `08c476c`. Transcript verbatim, also committed as `reports/w-remit-r10/gates-greps-08c476c.txt`.
+
 ```
+# Gate greps re-run at executable head 08c476c (2026-09-08T21:23:29Z)
+# tree check: git diff --name-only 08c476c..HEAD | grep -v '^reports/' | wc -l = 0  (0 = the .rs tree IS 08c476c)
+
+### Gate 1
 $ grep -n "fn default_allow_real_mints" -A 2 crates/maxplayer-core/src/home.rs
 1546:fn default_allow_real_mints() -> bool {
 1547-    true
@@ -59,68 +64,95 @@ $ grep -n "fn default_allow_real_mints" -A 2 crates/maxplayer-core/src/home.rs
 $ grep -n "allow_real_mints" crates/maxplayer-core/src/home.rs | grep serde
 1411:    #[serde(default = "default_allow_real_mints")]
 $ grep -n "mint_allowed(" crates/maxplayer-core/src/wallet_ops.rs
-1183:  send_async (fn :1171)         1243:  receive_async (fn :1224)       1318:  melt_within_async (fn :1304, operator composition, out of scope)
-1363:  pay_melt_quote_async (fn :1352, retained; no live caller)
-1590:  prepare_melt_payment_blocking (fn :1577) — THE payment path, before the wallet is opened
-1875:  melt_quote_async (fn :1865, read-only)   1930: melt_status_for_quote_async (fn :1920, read-only)   1969: melt_status_for_invoice_async (fn :1962, read-only)
-$ grep -n '"--confirm" if remit\|let trigger = if confirm' crates/maxplayer/src/seller_fees.rs
+1183:    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+1243:    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+1318:    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+1363:    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+1590:    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+1875:    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+1930:    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+1969:    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+$ grep -n '"--confirm" if remit|let trigger = if confirm' crates/maxplayer/src/seller_fees.rs
 110:            "--confirm" if remit => confirm = true,
 413:    let trigger = if confirm {
 $ grep -n "pub fn pays" -A 2 crates/maxplayer-core/src/fee_remit.rs
-514:    pub fn pays(self) -> bool {
-515-        !matches!(self, Self::DryRun)
-```
+526:    pub fn pays(self) -> bool {
+527-        !matches!(self, Self::DryRun)
+528-    }
 
-**Gate 2a — exactly THREE origin callers; no fourth path, no startup path, no second clock.** Non-test boundaries at `240240c`: `run.rs` first `#[cfg(test)]` at 617 (run-loop `tests` module at 7937); `fee_remit.rs` `test_support` module at 2517, `tests` at 3577 (the file's first `#[cfg(test)]` attribute is `:272`, the `PreparedToken::Fake` variant inside non-test code, so classification uses the module starts); `seller_fees.rs` 444 (`tests` at 500).
-```
-$ grep -n "[^a-z_:]remit(&store\|fee_remit::remit(\|remit_best_effort(\|remit_live_best_effort(" run.rs fee_remit.rs seller_fees.rs   # non-test lines only
-crates/maxplayer/src/seller_fees.rs:418:    let outcome = remit(&store, &mut effects, trigger, now_unix, out)?;                 # (3) the CLI
-crates/maxplayer-core/src/fee_remit.rs:2153:        Ok(mut effects) => remit_best_effort(store, &mut effects, trigger, now_unix),  # remit_live_best_effort (:2146) → remit_best_effort (:2123) → remit
-crates/maxplayer-core/src/seller_node/run.rs:3321:  crate::fee_remit::remit_best_effort(store, effects.as_mut(), trigger, now_unix())  # run_remit_attempt, cfg(test) effects factory branch
-crates/maxplayer-core/src/seller_node/run.rs:3323:  None => crate::fee_remit::remit_live_best_effort(store, home, trigger, now_unix()), # live branch, shared by (1) and (2)
-$ helpers (run.rs): 3666 drain_remit_in_flight · 4041 awaited at shutdown · 4159 boot sleep · 4235 retry arm (if auto_remit) · 4260 pacing notify · 7210–7211 collect hook → 7239 (1) · 7316 start_retry_remit (2)
-$ grep -n "std::thread::Builder\|thread::spawn\|tokio::spawn(\|spawn_local(\|spawn_blocking(" run.rs   # non-test (< 7937)
-303, 1785, 2093, 6051, 7771 pre-date this PR; 7264 (collect-path attempt thread) and 7327 (retry-tick attempt thread) are this PR's — both take the single-flight permit and are what the drain waits for
-$ grep -n "remit" run.rs | grep -i "interval\|sleep(\|timer"   # non-test: the only clock is the loop's own Sleep
-4159:        let remit_retry = tokio::time::sleep(self.remit_pacing_lock().boot_delay());
-$ shutdown order (run_loop): 4033 serve().await → 4041 drain_remit_in_flight().await; 7246 / 7319 both starters check remit_closed
-```
+### Gate 3 — one destination
+$ git grep -n -F 'maxplayer@agi.cash' 08c476c -- 'crates/*.rs' | wc -l
+      46
+$ git grep -n -F 'maxplayer@agi.cash' 08c476c -- 'crates/*.rs' | grep -v tests | head
+08c476c:crates/maxplayer-core/src/fee_remit.rs:3096:            assert_eq!(address.to_string(), "maxplayer@agi.cash");
+08c476c:crates/maxplayer-core/src/fee_remit.rs:3719:            "Destination: maxplayer@agi.cash (LNURL-pay; accepts 1 to 1000000 sats)",
+08c476c:crates/maxplayer-core/src/fee_remit.rs:3722:            "invoice amount (maxplayer@agi.cash receives): 13 sats",
+08c476c:crates/maxplayer-core/src/fee_remit.rs:3726:            "DRY RUN — nothing moved. Re-run with --confirm to pay 13 sats to maxplayer@agi.cash.",
+08c476c:crates/maxplayer-core/src/fee_remit.rs:3780:            "net paid to maxplayer@agi.cash: 13 sats",
+08c476c:crates/maxplayer-core/src/fee_remit.rs:3800:            row.destination, "maxplayer@agi.cash",
+08c476c:crates/maxplayer-core/src/fee_remit.rs:3838:            "paid 13 sats to maxplayer@agi.cash (melt fee 1 sats)"
+08c476c:crates/maxplayer-core/src/fee_remit.rs:3855:            out.contains("unix 100: operator (--confirm) attempt saw 15 sats unremitted — PAID: paid 13 sats to maxplayer@agi.cash (melt fee 1 sats) [remittance hash-13-2]"),
+08c476c:crates/maxplayer-core/src/fee_remit.rs:3905:            out.contains("net paid to maxplayer@agi.cash: 10 sats"),
+08c476c:crates/maxplayer-core/src/fee_remit.rs:4174:            out.contains("Reconciling in-flight remittance hash-9-2 (planned at unix 100 by fake-owner, lease until unix 400: 9 sats to maxplayer@agi.cash, gross 10 sats)"),
+$ git grep -n 'fee_address|platform_fee_address' 08c476c -- crates
+08c476c:crates/maxplayer-core/src/platform_fee.rs:56:///   party that owes the fee. A seller-editable `fee_address` would let any seller point the
 
-**Gates 2a (New-only), 2b–2g, 2f, E, v13, the CLI, the round-7, round-8 and round-9 regressions — ONE `--exact` run per named test at `240240c` (H4). Each block is one log: `git rev-parse HEAD` (line 1), the exec-head line (line 2), the command (line 3), the `test <full name> ... ok` line, `1 passed`. 44 logs: records 01–38 as round 8 (record 37 on its round-9 schedule, renamed `r9-ii-fee-metadata-drift-refused-before-fence`), records 39–44 new this round (§1.3 gross-19-pays-13, §1.4(a) shrunk-reserve-re-planned-pays-15, store `replan_remittance`, `confirm_bound` search table, `admits_confirmable`, N3 PAID-label); **43 × `1 passed`, 0 failed; record 33 is RETIRED** — its test `a_melt_ceiling_bounds_the_total_debit_including_proof_input_and_swap_fees` was renamed in round-9 commit `c9cce6c` to `a_melt_ceiling_admits_a_prepared_melt_by_what_confirm_will_actually_debit` = record 43, so `exact-33-*` filters to `0 passed; 0 failed` and is kept as the proof of retirement (`exact-records.txt` line 33). Core records run `cargo test -p maxplayer-core --features wallet --lib -- --exact <name>`, CLI records `cargo test -p maxplayer --features acp,wallet --bin maxplayer -- --exact <name>`.**
-```
-44 records, one `cargo test … -- --exact <name>` each, logs `logs/exact-NN-<gate>-240240c.log` (line 1 = `git rev-parse HEAD`),
-commands in exact-records.txt, results per record in exact-summary-240240c.txt (moved out of this body):
-  43 passed (1 passed; 0 failed each) · record 33 RETIRED (0 passed, 0 failed: `a_melt_ceiling_admits_total…` was removed
-  with `admits_total` in round 9 — commit A — and is replaced by records 42 and 43)
-  round 9's records: 37 fee-metadata drift refused before the fence · 39 gross 19 / reserve 2 pays 13 (§1.3) · 40 shrunk
-  reserve re-planned, pays 15 (§1.4a) · 41 store `replan_remittance` · 42 `confirm_bound` search · 43 `admits_confirmable` ·
-  44 N3 paid-label; records 01–36, 38 are rounds 2–8's, unchanged in name and result.
-```
-
-**Gate 3 — one destination: the address literal appears in exactly one non-test location.**
-```
-$ git grep -n -F 'maxplayer@agi.cash' 240240c -- 'crates/*.rs' | wc -l
-      42
-NON-TEST crates/maxplayer-core/src/platform_fee.rs:68:pub const PLATFORM_FEE_ADDRESS: &str = "maxplayer@agi.cash";
-test     41 lines, all past their file's test boundary: fee_remit.rs ×18 (≥3072; test_support 2517), lnurl_pay.rs ×5 (≥705; 655), platform_fee.rs ×1 (:220; 126), run.rs ×1 (:14871; 617), store.rs ×6 (≥3987; 2938), seller_fees.rs ×10 (≥688; 444) — 38 at 1a5c7c5 + 4 round-9 test fixtures in fee_remit.rs (the §1.3, §1.4(a), record-37 and N3 tests)
-$ git grep -n 'fee_address\|platform_fee_address' 240240c -- crates
-crates/maxplayer-core/src/platform_fee.rs:56:  (a comment arguing against an override; no config key, no CLI flag, no env var for address or rate)
-```
-
-**Gate 4 / money-hold census — over ALL lines added `a6217328..240240c` (Rust: 15,884 added lines), every spending or hold identifier counted by `git diff -U0 a6217328..240240c -- '*.rs' | grep '^+' | grep -c <name>` (`greps-240240c.txt`); the spend edge grepped in place:**
-```
-send_async 0, prepare_send 0, send_blocking 1, pay_invoice 0, melt_blocking 1, melt_async 3, melt_within_async 8, melt_within_blocking 2, melt_quote_async 15, melt_status_for_quote_async 4, pay_melt_quote_async 8, pay_melt_quote_blocking 5, prepare_melt 61, confirm_melt 14, cancel_melt 7, prepare_melt_payment_blocking 18, prepared_melt_thread 2, PreparedMeltPayment 18, MeltCeiling 37, admits_total 0 (retired in round 9), admits_confirmable 16, confirm_would_succeed 6, plan_confirmable_invoice 9, replan_remittance 10, admit_remittance_spend 19, release_remittance 19, ReleaseOn 56, TerminalBoundQuote 8, SpendingHeld 23, plan_remittance 41, expected_fees_sats 17, expected_melt_fees 2, input_fee_ppk 78, fee_paid 30
-   (send_blocking 1 / melt_blocking 1: the string arguments of the pre-existing `runtime_guard::refuse_nested_block_on(...)` nested-runtime guards, `wallet_ops.rs:2155` / `:2182`, counted because those lines moved in the diff — neither is a call to a spending function.)
-$ grep -n 'effects.prepare_melt(\|effects.confirm_melt(\|effects.cancel_melt(' crates/maxplayer-core/src/fee_remit.rs   # non-test (< 3577)
-1764:    let prepared = match effects.prepare_melt(&quote.quote_id, &ceiling) {
-1788:            if let Err(error) = effects.cancel_melt(prepared) {          # confirmability refused (step 1c): cancel first, before the fence
-1841:            if let Err(error) = effects.cancel_melt(prepared) {          # fence refused: cancel first
-1892:        let cancel_note = match effects.cancel_melt(prepared) {          # pay-time margin refused: cancel first
-1908:    match effects.confirm_melt(prepared) {                              # the one spend
-$ git diff --stat a6217328..240240c -- crates/maxplayer-core/src/wallet_ops.rs
+### Gate 4 — cancel/confirm/prepare call sites in remit_inner
+$ grep -n 'effects.prepare_melt(|effects.confirm_melt(|effects.cancel_melt(' crates/maxplayer-core/src/fee_remit.rs
+1786:    let prepared = match effects.prepare_melt(&quote.quote_id, &ceiling) {
+1811:            if let Err(error) = effects.cancel_melt(prepared) {
+1864:            if let Err(error) = effects.cancel_melt(prepared) {
+1915:        let cancel_note = match effects.cancel_melt(prepared) {
+1931:    match effects.confirm_melt(prepared) {
+$ git diff --stat a6217328..08c476c -- crates/maxplayer-core/src/wallet_ops.rs
+ crates/maxplayer-core/src/wallet_ops.rs | 1670 ++++++++++++++++++++++++++++++-
  1 file changed, 1640 insertions(+), 30 deletions(-)
+
+### Gate 3 (cont.) — the ONE non-test occurrence
+$ git grep -n -F 'maxplayer@agi.cash' 08c476c -- 'crates/*.rs' | wc -l  ->  46 (45 of them inside test modules)
+$ non-test occurrences, by file and test boundary:
+  crates/maxplayer-core/src/platform_fee.rs:68  pub const PLATFORM_FEE_ADDRESS: &str = "maxplayer@agi.cash";
+
+### Gate 2a — origin callers and clocks (non-test)
+$ grep -nE '[^a-z_:]remit\(&store|fee_remit::remit\(|remit_best_effort\(|remit_live_best_effort\(' run.rs fee_remit.rs seller_fees.rs
+crates/maxplayer/src/seller_fees.rs:418:    let outcome = remit(&store, &mut effects, trigger, now_unix, out)?;
+crates/maxplayer-core/src/fee_remit.rs:2147:pub fn remit_best_effort(
+crates/maxplayer-core/src/fee_remit.rs:2170:pub fn remit_live_best_effort(
+crates/maxplayer-core/src/fee_remit.rs:2177:        Ok(mut effects) => remit_best_effort(store, &mut effects, trigger, now_unix),
+crates/maxplayer-core/src/fee_remit.rs:4486:        let error = remit(&store, &mut fake, RemitTrigger::Command, 101, &mut out)
+crates/maxplayer-core/src/fee_remit.rs:4512:        let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 100);
+crates/maxplayer-core/src/fee_remit.rs:4559:        let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 102);
+crates/maxplayer-core/src/fee_remit.rs:4587:        let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 104);
+crates/maxplayer-core/src/fee_remit.rs:7573:            let outcome = remit(&store, &mut a, RemitTrigger::Collect, 100, &mut out);
+crates/maxplayer-core/src/fee_remit.rs:7588:            let outcome = remit(&store, &mut b, RemitTrigger::Command, 401, &mut out);
+crates/maxplayer-core/src/seller_node/run.rs:3321:            crate::fee_remit::remit_best_effort(store, effects.as_mut(), trigger, now_unix())
+crates/maxplayer-core/src/seller_node/run.rs:3323:        None => crate::fee_remit::remit_live_best_effort(store, home, trigger, now_unix()),
+$ grep -nE 'std::thread::Builder|thread::spawn|tokio::spawn\(|spawn_local\(|spawn_blocking\(' crates/maxplayer-core/src/seller_node/run.rs   # non-test
+  (run.rs test boundary: 1582)
+303:    tokio::task::spawn_local(async move {
+$ grep -n remit crates/maxplayer-core/src/seller_node/run.rs | grep -iE 'interval|sleep\(|timer'   # non-test
+
+$ non-test spawn / clock sites in run.rs, test modules excluded by brace-depth (5 `#[cfg(test)]` modules at :1582, :1765, :7437, :7936, :16380 of 16,537 lines):
+  crates/maxplayer-core/src/seller_node/run.rs:303  tokio::task::spawn_local(async move {
+  crates/maxplayer-core/src/seller_node/run.rs:2093  tokio::task::spawn_blocking(move || -> Result<(), DeliveryWorkdirError> {
+  crates/maxplayer-core/src/seller_node/run.rs:6051  tokio::task::spawn_local(async move {
+  crates/maxplayer-core/src/seller_node/run.rs:7264  let spawned = std::thread::Builder::new()
+  crates/maxplayer-core/src/seller_node/run.rs:7327  let spawned = std::thread::Builder::new()
+$ non-test `remit` lines mentioning interval / sleep( / timer:
+  crates/maxplayer-core/src/seller_node/run.rs:4153  // shared backoff re-arms this same timer through `remit_pacing_changed` (addendum 3 §3).
+  crates/maxplayer-core/src/seller_node/run.rs:4159  let remit_retry = tokio::time::sleep(self.remit_pacing_lock().boot_delay());
+  crates/maxplayer-core/src/seller_node/run.rs:7308  /// serving has ended (`remit_closed`), or the thread could not start. The loop re-arms th
 ```
-The sole live spending edge is `fee_remit.rs:1764 prepare_melt → :1908 confirm_melt` → `LiveEffects` `:443` / `:463` → `wallet_ops::prepare_melt_payment_blocking` (`wallet_ops.rs:1577`) → `prepared_melt_thread` (`:1637`): `admits` (`:1678`) → `Wallet::prepare_melt` (no proof- or fee-bearing request) → `input_fee_ppk` read (`:1709`) → `admits_confirmable` (`:479`, at `:1733`; round 9) → **`confirm_would_succeed` (`fee_remit.rs:2470`, at `:1785`)** → fence → `PreparedMeltPayment::confirm` (`wallet_ops.rs:629`), reached only after `admit_remittance_spend` changed one row and bound that quote's id, only for that id, and never while a bound spending row exists, because `plan_remittance` refuses first.
+
+**Gate 1** — `allow_real_mints` defaults to **true** (`home.rs:1546`, `#[serde(default = …)]` at `:1411`), all **8** wallet entry points honour `mint_allowed` (`wallet_ops.rs:1183 · 1243 · 1318 · 1363 · 1590 · 1875 · 1930 · 1969`), and the paying command is `--confirm`-gated (`seller_fees.rs:110`, `:413`; `pays()` `fee_remit.rs:526`).
+
+**Gate 2a** — the origin callers are the three fixed ones: the CLI at `seller_fees.rs:418`, and the seller node's two at `run.rs:3321` / `:3323`; the rest of the hits are the `remit_best_effort` / `remit_live_best_effort` definitions (`fee_remit.rs:2147` / `:2170` / `:2177`) and test call sites. No fourth path and no startup path. Excluding the five `#[cfg(test)]` modules by brace depth (not by a single line threshold), the non-test spawn sites in `run.rs` are `:303`, `:2093`, `:6051`, `:7264`, `:7327` — none of them a remit clock — and the only non-test `remit` lines mentioning a clock are `:4153` / `:4159` (the loop's own boot/backoff `Sleep`, re-armed through `remit_pacing_cha…`) and a doc comment at `:7308`.
+
+**Gates 2b–2g, E, v13, the CLI and the round-7/8/9/10 regressions** — one `--exact` run per named test: all **47** recorded green, listed in the suites section above and in `exact-summary-08c476c.txt`.
+
+**Gate 3 — one destination.** The literal `maxplayer@agi.cash` appears **46** times in `crates/*.rs` at `08c476c`, and exactly **one** of them is outside a test module: `platform_fee.rs:68`, `pub const PLATFORM_FEE_ADDRESS: &str = "maxplayer@agi.cash";`. The only `fee_address` / `platform_fee_address` hit is a comment (`platform_fee.rs:56`) explaining why a seller-editable address is not offered. No second destination exists.
+
+**Gate 4 — the spend edge.** In `fee_remit.rs` the effect call sites are `effects.prepare_melt(` **once** (`:1786`), `effects.cancel_melt(` **three times** (`:1811` post-swap arithmetic refused, `:1864` fence lost, `:1915` pay-time margin) and `effects.confirm_melt(` **once** (`:1931`) — the same three-cancel shape round 8 undercounted as two, now re-counted at this head. `wallet_ops.rs` over the whole delivery: +1,640 / −30.
 
 ## Full suites at `08c476c` (local, macOS arm64; each suite its own command with `--no-fail-fast`, so a failure anywhere cannot hide the rest)
 
