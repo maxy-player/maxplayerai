@@ -381,7 +381,7 @@ pub(crate) fn platform_fee_by_rate(
 /// governs the automatic attempt only, and this command is how an operator pays when it is off.
 #[cfg(feature = "wallet")]
 fn remit_live(home: Option<PathBuf>, confirm: bool, out: &mut dyn Write) -> Result<i32, String> {
-    use maxplayer_core::fee_remit::{LiveEffects, RemitOutcome, RemitTrigger, remit};
+    use maxplayer_core::fee_remit::{LiveEffects, RemitTrigger, remit};
 
     let (store, root, db) = open_store(&home)?;
     let home = maxplayer_core::home::bootstrap(&root)
