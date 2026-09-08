@@ -30,3 +30,51 @@ CI (read 2026-09-08T18:55Z via gh run list --repo MakePrisms/maxplayerai --commi
      Vercel: "Authorization required to deploy" — repo-level, unrelated to this PR (same on every head since round 1)
   Both reports-only commits: no .rs change, so the compile/test jobs exercise the same code as 240240c.
   Follow-up read appended below when the runs complete.
+
+## CI at the pin — read 2026-09-08 19:2xZ (r10 wake; ruling 20260908T1919Z); append-only
+Pre-image: the first 3006 bytes of this file (everything above this section) are byte-identical to commit 68fa0eb; sha256 of that prefix = 5a8e46057d5614b075c7135ea3e0330904f047ff361422248ce39fd4c2afbd99. Verify: head -c 3006 <this file> | shasum -a 256.
+
+Heads: pin source 1ee5cb22aaa88c452b458c46e0e5f933542b4cf0 (body-r9-pin.md); branch head at pin time 68fa0eb549e8adc5a746caa171fcc52c102e4eed (this pin record). Zero code diff between them and 240240c (reports-only).
+
+Run 34265599825 (293e0e6, pin prep): completed, success, 2026-09-08T19:05:53Z. https://github.com/MakePrisms/maxplayerai/actions/runs/34265599825
+
+Run 34265766747 (1ee5cb2): completed, SUCCESS 7/7, 2026-09-08T19:07:28Z. https://github.com/MakePrisms/maxplayerai/actions/runs/34265766747
+  102194608969 Test the full shipped feature combo (acp + wallet) — success
+  102194609074 JS test suites (web/app, web/network) — success
+  102194609183 Build (no default features) — success
+  102194609216 Build & test (default features) — success
+  102194609298 Release workflow gates — success
+  102194609311 Money-path tests — success
+  102194609337 Build & test (acp) — success
+
+Run 34265888505 (68fa0eb): completed, FAILURE 6/7, 2026-09-08T19:09:07Z. https://github.com/MakePrisms/maxplayerai/actions/runs/34265888505
+  102195027134 Test the full shipped feature combo (acp + wallet) — FAILURE
+  102195027388 Money-path tests — success
+  102195027444 Build (no default features) — success
+  102195027476 Build & test (acp) — success
+  102195027478 Build & test (default features) — success
+  102195027493 Release workflow gates — success
+  102195027643 JS test suites (web/app, web/network) — success
+
+Failure detail (job 102195027134, step "Test maxplayer-core (acp + gateway + git-delivery + wallet)", log read via gh run view --log, 2034 lines):
+  test: fee_remit::tests::two_racing_attempts_against_the_same_balance_record_exactly_one_remittance (declared crates/maxplayer-core/src/fee_remit.rs:4582 at 240240c)
+  panic locator: crates/maxplayer-core/src/fee_remit.rs:4640:30
+  panic text (verbatim): unexpected outcome Ok(Refused(SpendingHeld { remittance_id: "hash-13-2-t0", owner: "fake-owner", spending_since_unix: 100, quote_id: Some("paid-quote-lnbc-fake-13-2-t0"), observed: "this wallet holds no such melt quote", held_sats: 15 }))
+  suite line (verbatim): test result: FAILED. 1558 passed; 1 failed; 3 ignored; 0 measured; 0 filtered out; finished in 275.00s
+
+Same test PASSED ("... ok") at 1ee5cb2 (job 102194608969, same code) and in every local log at 240240c that ran it (reports/w-remit-r9/logs/, name | line count):
+  exact-02-2c-race-240240c.log | 89 (the --exact run of this test)
+  exec-core-wallet-nff.log | 1698
+  exec2-core-wallet-nff.log | 1683
+  money-path-ci-1-240240c.log | 1655
+  money-path-ci-2-240240c.log | 1551
+  money-path-ci-3-240240c.log | 1654
+  fee-remit-tests-D.txt | 163
+  fee-remit-tests-E1.txt | 124
+  fee-remit-tests-E2.txt | 125
+  fee-remit-tests-E3.txt | 126
+  fee-remit-tests-E4.txt | 126
+  fee-remit-tests-F.txt | 126
+  live-reserve-tests-D.txt | 194
+
+Nondeterministic; cause not investigated in this turn; the advisor rules.
