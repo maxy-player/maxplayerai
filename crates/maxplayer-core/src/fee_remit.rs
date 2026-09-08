@@ -632,13 +632,13 @@ pub fn reconcile_decision(
             })
         }
         Some(MeltQuoteState::Failed) => terminal_release(format!(
-            "{unpaid_reason}; FAILED, and the row was never admitted to spend under this binary's fence"
+            "{unpaid_reason}; FAILED at the mint, and the row was never admitted to spend under this binary's fence — nothing was spent against it"
         )),
         Some(MeltQuoteState::Unpaid)
             if status.is_some_and(|status| status.expired_at(now_unix)) =>
         {
             terminal_release(format!(
-                "{unpaid_reason}; the quote expired at unix {}, and the row was never admitted to spend under this binary's fence",
+                "{unpaid_reason}; the quote expired at unix {}, and the row was never admitted to spend under this binary's fence — nothing was spent against it",
                 status.map(|status| status.expiry_unix).unwrap_or_default()
             ))
         }
@@ -3005,8 +3005,9 @@ mod tests {
     // PENDING ⇒ refuse this run, keep the row, melt nothing; UNPAID with a LIVE quote ⇒ HOLD too —
     // even our own row, even long after the lease: the melt that errored may have reached the mint
     // (addendum 4 §1.2), so only the mint's verdict resolves a spending row; UNPAID with the quote
-    // EXPIRED (or FAILED) ⇒ terminal: the row fails, the receipts are released and the SAME run
-    // proceeds to a fresh plan (a dry run prints it, a confirm pays it once, on a NEW invoice).
+    // EXPIRED, however long ago, or FAILED, or no quote known ⇒ HOLD too (addendum 6 §1.2: the
+    // mint pays an expired UNPAID or a FAILED quote, so neither is cancellation); the ONE exit is
+    // the mint reporting the bound quote PAID, which settles the row by reconciliation.
     #[test]
     fn an_unpaid_or_pending_interrupted_attempt_is_reconciled_without_paying_twice() {
         let (store, root) = store_with_fees("interrupted-unpaid", &[10]);
@@ -3107,54 +3108,68 @@ mod tests {
         );
         assert_eq!(store.accrued_fees().expect("read").in_flight_fee_sats, 10);
 
-        // UNPAID and the bound quote has EXPIRED at the mint (2000), but the spending margin has not
-        // passed (2001 ≤ 2000 + 60): still HOLD — the owner may be paying it up to the margin.
-        let (outcome, out) = run_remit(&store, &mut fake, RemitTrigger::DryRun, 2001);
+        // UNPAID and the bound quote has EXPIRED at the mint (2000): still HOLD, at 2001, past the
+        // margin at 2061, and ten thousand seconds on (addendum 6 §1.2) — the mint pays an expired
+        // UNPAID quote, so no clock makes the receipts payable again. No fresh plan, no dry run of
+        // a new invoice, the binding kept, the melt count unchanged.
+        for (trigger, now) in [
+            (RemitTrigger::DryRun, 2001),
+            (RemitTrigger::DryRun, 2061),
+            (RemitTrigger::Command, 12_000),
+        ] {
+            let (outcome, out) = run_remit(&store, &mut fake, trigger, now);
+            assert!(
+                matches!(outcome, RemitOutcome::Refused(Refusal::SpendingHeld { .. })),
+                "at {now}: {out}"
+            );
+            assert!(
+                out.contains("HELD: remittance hash-9-2 is SPENDING (admitted by fake-owner at unix 100), bound to melt quote paid-quote-lnbc-fake-9-2; mint https://mint.example reports melt quote paid-quote-lnbc-fake-9-2 UNPAID (expiry unix 2000); 10 sats of receipts stay pinned to it"),
+                "at {now}: {out}"
+            );
+            assert!(!out.contains("DRY RUN"), "no fresh plan on a held row: {out}");
+            let rows = store.remittances().expect("rows");
+            assert_eq!(rows.len(), 1, "at {now}");
+            assert_eq!(rows[0].state, RemittanceState::Spending, "at {now}");
+            assert_eq!(
+                rows[0].spending_quote_id.as_deref(),
+                Some("paid-quote-lnbc-fake-9-2")
+            );
+            assert_eq!(fake.melts.len(), 1, "at {now}");
+            assert_eq!(fake.invoices.len(), invoices_before, "at {now}");
+            assert_eq!(store.accrued_fees().expect("read").in_flight_fee_sats, 10);
+        }
+        // The one exit: the mint reports the bound quote PAID — settled by reconciliation, the
+        // receipts discharged, no second melt. (The paid figures come from the quote; the actual
+        // fee is recorded as not observed.)
+        fake.status = Ok(Some(MeltQuoteStatus {
+            mint_url: "https://mint.example".to_owned(),
+            quote_id: "paid-quote-lnbc-fake-9-2".to_owned(),
+            state: MeltQuoteState::Paid,
+            amount_sats: 9,
+            fee_reserve_sats: 1,
+            expiry_unix: 2000,
+        }));
+        let (outcome, out) = run_remit(&store, &mut fake, RemitTrigger::Command, 12_001);
         assert!(
-            matches!(outcome, RemitOutcome::Refused(Refusal::SpendingHeld { .. })),
+            out.contains("reports melt quote paid-quote-lnbc-fake-9-2 PAID — recorded as settled by reconciliation"),
             "{out}"
         );
-        assert_eq!(
-            store.remittances().expect("rows")[0].state,
-            RemittanceState::Spending
+        assert!(
+            matches!(outcome, RemitOutcome::Refused(Refusal::NothingUnremitted)),
+            "settled, then nothing left to remit: {outcome:?}\n{out}"
         );
-        // Past expiry PLUS the margin (2061 > 2060): terminal — fail, release by the bound-quote
-        // transition, and continue into a fresh DRY RUN on a new invoice.
-        let (outcome, out) = run_remit(&store, &mut fake, RemitTrigger::DryRun, 2061);
-        assert_eq!(outcome, RemitOutcome::DryRun, "{out}");
-        assert!(out.contains("reports melt quote paid-quote-lnbc-fake-9-2 UNPAID — no sats left the wallet; the bound quote expired at unix 2000 and the spending margin (60 s) has passed since — its owner will not pay it and the mint will never pay it: terminal; released 10 sats back to unremitted (release condition: its bound melt quote paid-quote-lnbc-fake-9-2 is terminal at the mint)"), "{out}");
-        assert!(out.contains("10 sats unremitted"), "{out}");
-        assert!(out.contains("DRY RUN — nothing moved."), "{out}");
-        assert_eq!(fake.melts.len(), 1);
+        assert_eq!(fake.melts.len(), 1, "no second melt, ever");
         let rows = store.remittances().expect("rows");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].state, RemittanceState::Failed);
-        assert_eq!(rows[0].receipts, 0);
-        assert_eq!(
-            rows[0].spending_quote_id.as_deref(),
-            Some("paid-quote-lnbc-fake-9-2"),
-            "the binding stays on the failed row as history"
-        );
-        assert_eq!(store.accrued_fees().expect("read").unremitted_fee_sats, 10);
-
-        // Now a confirm pays ONCE on a fresh invoice; the failed row's invoice is never reused.
-        fake.status = Ok(None);
-        fake.melt_results = vec![Ok((9, 1))];
-        let (outcome, out) = run_remit(&store, &mut fake, RemitTrigger::Command, 2062);
-        assert!(is_paid(&outcome), "{out}");
-        assert_eq!(fake.melts.len(), 2);
-        assert_ne!(
-            fake.melts[0], fake.melts[1],
-            "a fresh invoice, not the failed one"
-        );
-        let rows = store.remittances().expect("rows");
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[1].state, RemittanceState::Settled);
+        assert_eq!(rows[0].state, RemittanceState::Settled);
+        assert_eq!(rows[0].settled_by, Some(SettledBy::Reconciliation));
+        assert_eq!(rows[0].melt_fee_sats, None, "not observed, not invented");
         assert_eq!(store.accrued_fees().expect("read").remitted_fee_sats, 10);
 
         // No quote at all for a SPENDING row's invoice (the wallet has no record — the live wallet
         // always holds at least the estimate quote, so this is an anomaly, not a normal failure):
-        // HOLD, fail-closed — "no quote" is not the mint saying terminal. FAILED then releases.
+        // HOLD, fail-closed — "no quote" is not the mint saying terminal. FAILED holds too: the
+        // mint pays a FAILED quote (CDK 0.17.2), so FAILED is not cancellation either.
         let (store2, root2) = store_with_fees("interrupted-noquote", &[10]);
         let mut fake2 = Fake::new(|_| 1);
         fake2.melt_results = vec![Err("mint unreachable".to_owned())];
@@ -3168,6 +3183,10 @@ mod tests {
             matches!(outcome, RemitOutcome::Refused(Refusal::SpendingHeld { .. })),
             "{out}"
         );
+        assert!(
+            out.contains("this wallet holds no such melt quote; 10 sats of receipts stay pinned to it"),
+            "{out}"
+        );
         assert_eq!(
             store2.remittances().expect("rows")[0].state,
             RemittanceState::Spending
@@ -3177,12 +3196,20 @@ mod tests {
             "paid-quote-lnbc-fake-9-2",
         )));
         let (outcome, out) = run_remit(&store2, &mut fake2, RemitTrigger::DryRun, 102);
-        assert_eq!(outcome, RemitOutcome::DryRun, "{out}");
-        assert!(out.contains("FAILED is terminal at the mint whoever owns the row; released 10 sats back to unremitted"), "{out}");
+        assert!(
+            matches!(outcome, RemitOutcome::Refused(Refusal::SpendingHeld { .. })),
+            "{out}"
+        );
+        assert!(
+            out.contains("reports melt quote paid-quote-lnbc-fake-9-2 FAILED (expiry unix"),
+            "{out}"
+        );
+        assert!(!out.contains("released 10 sats"), "{out}");
         assert_eq!(
             store2.remittances().expect("rows")[0].state,
-            RemittanceState::Failed
+            RemittanceState::Spending
         );
+        assert_eq!(store2.accrued_fees().expect("read").in_flight_fee_sats, 10);
         assert_eq!(fake2.melts.len(), 1);
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&root2);
@@ -3620,7 +3647,8 @@ mod tests {
         );
         assert!(matches!(
             reconcile_decision(&theirs, Some(&failed), "proc-a", 200),
-            Reconcile::Release { reason, .. } if reason.contains("FAILED is terminal")
+            Reconcile::Release { reason, .. }
+                if reason.contains("FAILED at the mint, and the row was never admitted to spend")
         ));
         // UNPAID / no quote, another process's live lease: HOLD — "not yet" is not "abandoned".
         assert_eq!(
@@ -3717,15 +3745,15 @@ mod tests {
     }
 
     // The SPENDING row's rule as a pure table (kept as an extra beside the full-path gate 2g (d)
-    // below — addendum 5 §2): the status is the BOUND quote's. PAID settles; FAILED releases;
-    // UNPAID releases only once `now > expiry + SPEND_MARGIN` — its owner refuses to pay the bound
-    // quote inside that margin, so past it nobody will pay it; UNPAID inside the margin, or live,
-    // HOLDS — whoever owns it, and however long ago the lease ran out (lease expiry alone never
-    // touches a spending row); no quote at all HOLDS; PENDING / UNKNOWN hold as for any row. Every
-    // release is the BOUND-QUOTE transition naming `q-bound`; a spending row admitted before quotes
-    // were bound releases by the unbound-spending transition.
+    // below — addendum 5 §2, addendum 6 §1.2): the status is the BOUND quote's. PAID settles.
+    // Everything else HOLDS — FAILED, UNPAID live, UNPAID expired by a second or by ten thousand,
+    // no quote at all — whoever owns the row and however long ago its lease ran out; PENDING /
+    // UNKNOWN hold as for any row. No clock appears in the bound-spending rule: the mint pays an
+    // UNPAID or FAILED quote regardless of its expiry, so no observation proves the bound quote
+    // cannot still debit. Only a spending row admitted before quotes were bound keeps the v12
+    // release (unbound-spending transition), out of this round's scope.
     #[test]
-    fn a_spending_row_is_released_only_on_a_terminal_quote_never_on_time() {
+    fn a_spending_row_is_never_released_by_reconciliation_only_settled() {
         let theirs = spending_row("proc-b", 400, 150);
         let mine = spending_row("proc-a", 400, 150);
         let paid = status(MeltQuoteState::Paid, "q-bound");
@@ -3735,29 +3763,12 @@ mod tests {
         let unpaid_live = status(MeltQuoteState::Unpaid, "q-bound");
         let mut unpaid_expired = status(MeltQuoteState::Unpaid, "q-bound");
         unpaid_expired.expiry_unix = 900;
-        let on_bound = Some(ReleaseOn::TerminalBoundQuote {
-            quote_id: "q-bound".to_owned(),
-        });
 
         assert_eq!(
             reconcile_decision(&theirs, Some(&paid), "proc-a", 10_000),
             Reconcile::Settle
         );
-        let on_failed = reconcile_decision(&theirs, Some(&failed), "proc-a", 10_000);
-        assert!(matches!(
-            &on_failed,
-            Reconcile::Release { reason, .. } if reason.contains("FAILED is terminal")
-        ));
-        assert_eq!(release_on(&on_failed), on_bound);
-        // UNPAID, expired at 900: terminal at 961 (900 + 60 < 961), not at 960.
-        let on_expired = reconcile_decision(&mine, Some(&unpaid_expired), "proc-a", 961);
-        assert!(matches!(
-            &on_expired,
-            Reconcile::Release { reason, .. }
-                if reason.contains("the bound quote expired at unix 900 and the spending margin (60 s) has passed since")
-        ));
-        assert_eq!(release_on(&on_expired), on_bound);
-        // UNPAID, live quote, lease long expired (400 ≪ 10 000): HOLD — theirs AND ours.
+        // HOLD on everything but PAID — theirs AND ours, live or expired, FAILED or absent.
         let held = |row: &FeeRemittance, owner: &str, seen: Option<&MeltQuoteStatus>| {
             Reconcile::Hold(Refusal::SpendingHeld {
                 remittance_id: row.remittance_id.clone(),
@@ -3783,20 +3794,33 @@ mod tests {
             held(&mine, "proc-a", Some(&unpaid_live)),
             "our own spending row: the melt that errored may have reached the mint"
         );
-        assert_eq!(
-            reconcile_decision(&mine, Some(&unpaid_expired), "proc-a", 960),
-            held(&mine, "proc-a", Some(&unpaid_expired)),
-            "expired, but inside the margin its owner may still be paying it: hold"
-        );
-        assert_eq!(
-            reconcile_decision(&mine, Some(&unpaid_expired), "proc-a", 900),
-            held(&mine, "proc-a", Some(&unpaid_expired)),
-            "at the expiry second the quote is still live"
-        );
+        for now in [900, 960, 961, 10_000, i64::MAX] {
+            assert_eq!(
+                reconcile_decision(&mine, Some(&unpaid_expired), "proc-a", now),
+                held(&mine, "proc-a", Some(&unpaid_expired)),
+                "UNPAID past expiry (900) is held at {now}: no clock releases a bound spending row"
+            );
+            assert_eq!(
+                reconcile_decision(&theirs, Some(&failed), "proc-a", now),
+                held(&theirs, "proc-b", Some(&failed)),
+                "FAILED is held at {now}: the mint pays a FAILED quote, so it is not cancellation"
+            );
+        }
         assert_eq!(
             reconcile_decision(&theirs, None, "proc-a", 10_000),
             held(&theirs, "proc-b", None),
             "no quote is not the mint saying terminal"
+        );
+        assert!(
+            release_on(&reconcile_decision(&mine, Some(&failed), "proc-a", 10_000)).is_none()
+                && release_on(&reconcile_decision(
+                    &theirs,
+                    Some(&unpaid_expired),
+                    "proc-a",
+                    i64::MAX
+                ))
+                .is_none(),
+            "no decision on a bound spending row carries a ReleaseOn"
         );
         assert_eq!(
             reconcile_decision(&theirs, Some(&pending), "proc-a", 10_000),
