@@ -3934,47 +3934,55 @@ mod tests {
         (a, b)
     }
 
-    // Gate 2g, the live owner: process A journals its plan (invoice X) and PAUSES before spending.
-    // Process B — another owner, another connection, distinct invoices — runs reconciliation and
-    // then `--confirm`: it finds X planned by a LIVE owner with the mint saying UNPAID, and HOLDS.
-    // It plans nothing, pays nothing. A resumes, passes the pre-spend gate, pays X once. Exactly one
-    // debit (melts counted, not settlement reports); one settled row; B's refusals journaled.
+    // Gate 2g (a), the live owner: process A journals its plan (invoice X) and PAUSES before
+    // spending. Process B — another owner, another connection, distinct invoices, reading the SAME
+    // fake mint through the shared quote registry (addendum 5 §2, addendum 6 §2.2: no scripted
+    // status) — runs reconciliation and then `--confirm`: it asks the mint about X's invoice, finds
+    // the estimate quote A raised UNPAID, sees X planned by a LIVE owner, and HOLDS. It plans
+    // nothing, pays nothing. A resumes, passes the pre-spend gate, pays X once. Exactly one debit
+    // (melts counted, not settlement reports); one settled row; B's refusals journaled.
     #[test]
     fn a_second_process_cannot_release_a_live_owners_planned_row_and_exactly_one_debit_happens() {
         let (store, root) = store_with_fees("live-owner", &[10, 5]);
         drop(store);
         let db = root.join(STATE_DB_FILE);
         let melts = Arc::new(AtomicUsize::new(0));
-        let mut a = Fake::new(|_| 2);
-        a.owner = "proc-a".to_owned();
-        a.invoice_tag = "-a".to_owned();
-        a.melt_results = vec![Ok((13, 1))];
+        let registry = quote_registry();
         let (a_result, b_results) = run_paused(
             &db,
-            a,
+            first_process(&registry),
             100,
             PauseAt::Plan,
             super::test_support::Gate::new(),
             Arc::clone(&melts),
             |store_b| {
+                {
+                    // What the mint holds while A is paused after its plan: A's two estimate
+                    // quotes (probe on the gross, then the net invoice), both UNPAID; no payment
+                    // quote yet.
+                    let quotes = registry.lock().unwrap_or_else(|e| e.into_inner());
+                    assert_eq!(quotes[X_ESTIMATE_QUOTE].state, MeltQuoteState::Unpaid);
+                    assert!(!quotes.contains_key(X_PAYMENT_QUOTE));
+                }
                 let mut results = Vec::new();
                 for (trigger, now) in [(RemitTrigger::DryRun, 110), (RemitTrigger::Command, 111)] {
-                    let mut b = Fake::new(|_| 2);
-                    b.owner = "proc-b".to_owned();
-                    b.invoice_tag = "-b".to_owned();
-                    b.melt_results = vec![Ok((13, 1))];
-                    b.melt_counter = Some(Arc::clone(&melts));
-                    // The mint's honest answer about A's planned invoice while A is paused: UNPAID.
-                    b.status = Ok(Some(status(
-                        MeltQuoteState::Unpaid,
-                        "quote-lnbc-fake-13-2-a",
-                    )));
+                    let mut b = second_process(&registry, &melts);
                     let (outcome, out) = run_remit(store_b, &mut b, trigger, now);
+                    assert_eq!(
+                        b.status_calls,
+                        vec![X_BOLT11.to_owned()],
+                        "B asks the shared mint about X's invoice: {out}"
+                    );
+                    assert!(
+                        b.quote_status_calls.is_empty(),
+                        "a planned row has no bound quote to ask about: {out}"
+                    );
                     assert!(b.melts.is_empty(), "B must not pay: {out}");
                     assert!(
-                        b.invoices.is_empty(),
+                        b.invoices.is_empty() && b.quotes.is_empty(),
                         "B must not even plan on top of a held row: {out}"
                     );
+                    assert_eq!(ledger(store_b), (0, 15, 0), "receipts pinned to X");
                     results.push((outcome, out));
                 }
                 results

@@ -4163,9 +4163,10 @@ impl SellerNodeRunner {
     /// The wait is bounded by [`Self::remit_drain_bound`]: if it elapses, one incident line says
     /// exactly what was abandoned, and the persisted row makes the outcome recoverable at the next
     /// start (reconciliation, made safe by ownership: the next start is a new owner; a row still
-    /// `planned` it may release once the lease has run out or the invoice's quote is terminal, a
-    /// row already `spending` only when the quote bound to it is terminal at the mint — never on
-    /// time, however long the lease has been over).
+    /// `planned` it may release once the lease has run out or the invoice's quote is terminal; a
+    /// row already `spending` it never releases — it settles when the mint reports the bound quote
+    /// PAID and otherwise holds, on no clock, however long the lease has been over — addendum 6
+    /// §1.2).
     async fn drain_remit_in_flight(&self) {
         if !self.remit_flight.in_flight() {
             return;
@@ -14827,10 +14828,10 @@ mod tests {
         );
         assert_eq!(store.job_state(&job).expect("state"), Some(JobState::Paid));
         assert_eq!(store.accrued_fees().expect("read").remitted_fee_sats, 0);
-        // …and once the mint reports the quote FAILED (terminal) the row is released and the same
-        // run pays once, on a FRESH invoice — the same scripted effects continue their invoice
-        // sequence, as a real LNURL host would never hand out the failed invoice twice; the receipt
-        // and the job are still exactly as the collect left them.
+        // …and when the mint reports the quote FAILED it STILL holds (addendum 6 §1.2): the mint
+        // pays a FAILED quote (CDK 0.17.2), so FAILED is not cancellation and releasing on it could
+        // make the same 10 sats payable twice. No melt, nothing released, the job untouched. A
+        // payment is scripted so that a release would be caught as a second debit.
         fake.status = Ok(Some(crate::wallet_ops::MeltQuoteStatus {
             mint_url: "https://mint.example".to_owned(),
             quote_id: "paid-quote-lnbc-fake-9-2".to_owned(),
@@ -14842,11 +14843,56 @@ mod tests {
         fake.melt_results = vec![Ok((9, 1))];
         let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 5004);
         assert!(
-            matches!(report.outcome, Ok(RemitOutcome::Paid { .. })),
+            matches!(
+                report.outcome,
+                Ok(RemitOutcome::Refused(
+                    crate::fee_remit::Refusal::SpendingHeld { .. }
+                ))
+            ),
             "{report:?}"
         );
+        assert_eq!(fake.melts.len(), 1, "no second melt on FAILED");
+        assert_eq!(fake.melt_results.len(), 1, "the scripted payment was never reached");
         assert_eq!(store.job_state(&job).expect("state"), Some(JobState::Paid));
+        let accrued = store.accrued_fees().expect("read");
+        assert_eq!(
+            (accrued.remitted_fee_sats, accrued.in_flight_fee_sats),
+            (0, 10),
+            "held: nothing paid, receipts still pinned"
+        );
+        // The one exit: the mint reports the bound quote PAID — settled by reconciliation, no melt
+        // by this run, the receipt and the job still exactly as the collect left them.
+        fake.status = Ok(Some(crate::wallet_ops::MeltQuoteStatus {
+            mint_url: "https://mint.example".to_owned(),
+            quote_id: "paid-quote-lnbc-fake-9-2".to_owned(),
+            state: crate::wallet_ops::MeltQuoteState::Paid,
+            amount_sats: 9,
+            fee_reserve_sats: 1,
+            expiry_unix: u64::MAX,
+        }));
+        let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 5005);
+        assert!(
+            matches!(
+                report.outcome,
+                Ok(RemitOutcome::Refused(
+                    crate::fee_remit::Refusal::NothingUnremitted
+                ))
+            ),
+            "settled by reconciliation, then nothing left to remit: {report:?}"
+        );
+        assert_eq!(fake.melts.len(), 1, "settled without a second melt");
+        assert_eq!(store.job_state(&job).expect("state"), Some(JobState::Paid));
+        assert!(store.has_receipt(&job).expect("has_receipt"));
         assert_eq!(store.accrued_fees().expect("read").remitted_fee_sats, 10);
+        assert_eq!(
+            store
+                .remittances()
+                .expect("rows")
+                .into_iter()
+                .map(|row| row.state)
+                .collect::<Vec<_>>(),
+            vec![RemittanceState::Settled]
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
