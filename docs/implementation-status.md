@@ -32,10 +32,13 @@ container runs the agent and every git step. On the host path the #937 host path
 seller prints the effective path and its reason at boot (`delivery_path_line`, `seller_node/run.rs`),
 and `maxplayer doctor` prints it in the `relay token policy` row. The default moved to the container
 path after that path was proven live. On 2026-09-03 one live from-scratch job passed through it
-(`fresh-after-agent` token mode) and the buyer paid. The relay canary (`tests/relay_canary.rs`) showed
-that day that the relay enforces the token's ref scope but does not yet honor its `expiration` tag.
-Open: Task B10 (meter usage at the credential proxy), removal of the interim host push, and relay
-Requirement B (the `expiration` tag), on which the `long-lived` token mode waits. The `home.rs` line
+(`fresh-after-agent` token mode) and the buyer paid. The relay canary (`tests/relay_canary.rs`) printed
+`A=enforced B=deployed` on 2026-09-07: the relay enforces the token's ref scope and honors its
+`expiration` tag (#968), so both token modes work; each ran a paid job that day, as did a contribution
+job. The default is ON only for a non-root daemon; a uid-0 seat keeps the host path unless it sets
+`container_delivery = true`. Open: #980 (uid separation, which replaces Task B10). Removal of the
+interim host push is BLOCKED, not pending: `launcher` is the default sandbox mode, has no container,
+and the host push is its only delivery path. The `home.rs` line
 numbers are from the commit that moved the default.
 
 ## Verification checks and rejection

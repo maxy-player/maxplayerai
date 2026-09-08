@@ -7,15 +7,19 @@
 > container. The code follows the sections below. The sections "Live validation record" and
 > "Follow-ups" record the status on 2026-09-03, when the switch still defaulted to off.
 >
-> **Gates:**
-> 1. Relay — **partly met.** Requirement A (#929, ref-scope enforcement) is deployed, and the canary
->    verified it on 2026-09-03. Requirement B (long life for scoped tokens, the brief
->    `2026-08-31-relay-scoped-token-lifetime.md`) is not deployed, and no code in this repo writes it.
->    Therefore the `fresh-after-agent` token mode is the mode in use. The `long-lived` mode waits.
-> 2. Container — **met.** The container path delivered one from-scratch job on 2026-09-03, and the
->    buyer paid for it. The host path (`container_delivery = false`) delivered one job on the same seat
->    with no regression.
-> 3. Security review of C3/C4/C6 and B10 — **open.**
+> **Gates — all met (2026-09-08):**
+> 1. Relay — **met.** Requirement A (#929, ref-scope enforcement) and Requirement B (#968, the
+>    `expiration` tag for a scoped token, cap advertised in NIP-11) are merged AND deployed. The canary
+>    printed `A=enforced B=deployed` on 2026-09-07, and both token modes ran a paid job that day.
+> 2. Container — **met.** From-scratch jobs (2026-09-03, both token modes on 2026-09-07) and a
+>    contribution job (2026-09-07) delivered and were paid through the container path. The host path
+>    (`container_delivery = false`) delivered with no regression.
+> 3. Security review — **met, two rounds (2026-09-07 and 2026-09-08), APPROVE at 968f44c.** C3, C4
+>    and C6 pass. Four HIGH findings were fixed with red-proved adversarial tests: the `.git/commondir`
+>    redirect and the missing destination binding of the token (F1), the unbounded host reads of
+>    job-writable exchange files (F2), the job-removable `/.dockerenv` reap sentinel (F3), and a
+>    zombie thread-group leader that hid a live sibling thread from the reap. Task B10 is replaced
+>    by #980 (uid separation) as the next hardening step.
 
 ## Where this fits
 
