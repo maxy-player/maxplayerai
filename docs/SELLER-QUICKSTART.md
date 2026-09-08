@@ -1242,16 +1242,23 @@ its own:
   10% fee on payments under 10 sats owes under 1 sat, and small balances simply accumulate until they
   clear the minimum. That is the expected steady state for small jobs, not an error.
 - Otherwise it takes a melt quote from your default mint, invoices the balance **minus** the mint's
-  melt fee reserve — **you never pay more than the fee you accrued; the melt fee comes out of that
-  amount, not on top of it** — journals the attempt in `seller.sqlite` (`fee_remittances`: gross,
-  melt fee, net, the address literal, melt quote id, payment hash, state, which process owns the
-  attempt, and when it was admitted to spend), pays the invoice from your ecash through the same gated melt `maxplayer wallet melt`
-  uses (it honours `allow_real_mints`), and marks the receipts it covered as discharged. **The
-  accrued fee is a hard ceiling on the payment, enforced at the moment of spending**: the wallet
-  checks the quote the mint raises for the actual payment — invoice plus that quote's fee reserve —
-  against the gross fee owed, and if the mint's reserve grew between the estimate and the payment
-  so that the two no longer fit, it refuses before any ecash is consumed. The refusal is journaled,
-  the balance stays unremitted, and the next attempt re-quotes.
+  melt fee reserve **and minus the proof fees the wallet expects to pay** (a mint that charges per
+  input proof, or one whose proofs do not fit the amount and need a swap first) — **you never pay
+  more than the fee you accrued; every fee comes out of that amount, not on top of it** — journals
+  the attempt in `seller.sqlite` (`fee_remittances`: gross, melt fee, net, the address literal,
+  melt quote id, payment hash, state, which process owns the attempt, and when it was admitted to
+  spend), pays the invoice from your ecash through the wallet's gated melt (the same
+  `allow_real_mints` gate `maxplayer wallet melt` honours), and marks the receipts it covered as
+  discharged. **The accrued fee is a hard ceiling on everything that leaves the wallet, enforced
+  before anything is posted to the mint**: the wallet prepares the payment locally — reserving
+  proofs, nothing sent yet — and checks the SDK's own figures for that prepared payment, **the
+  invoice plus the mint's fee reserve plus the proof input fee plus any pre-melt swap fee**, against
+  the gross fee owed. If the total does not fit — the mint's reserve grew between the estimate and
+  the payment, or the proof fees came out higher than expected — the prepared payment is cancelled
+  (the proofs go back to unspent) and the attempt is refused before any ecash is consumed or any
+  request reaches the mint; nothing is left pinned, the refusal is journaled, the balance stays
+  unremitted, and the next attempt re-quotes. (The operator's plain `maxplayer wallet melt` keeps
+  its older check — invoice plus reserve only — and is not changed by this.)
 - **It cannot affect the payment it followed.** Your receipt is written and the job is marked paid
   before the attempt starts. If the attempt fails — the mint is down, the payout host is unreachable,
   the wallet is short, no route — the failure is written to the node log and journaled
@@ -1294,10 +1301,14 @@ its own:
   implementation does (pauses after the plan, after the quote, after the gate, inside the payment
   after the wallet's last local check, and between a release decision and its write; the lease and
   the quote expiring while paused; distinct invoices; funds for a second payment present; actual
-  melts counted). Only the delayed-payment case also shares one clock and one wallet's proofs between
-  the two; the others build each process's clock on its own. They do not run a real mint or a real
-  wallet, and no deployed mint's behaviour was measured — the mint behaviour they model is read from
-  the pinned CDK 0.17.2 source.
+  melts counted). What the two processes share is stated per test in the module's documentation,
+  not assumed: all of them share the one store; the fake mint's quote registry is shared in seven
+  (the live-owner, expired-estimate, expired-quote-held, paused-owner, stale-snapshot, full-path and
+  delayed-payment cases); one clock is handed from the first process to the second in four of those
+  (expired-quote-held, paused-owner, stale-snapshot, delayed-payment) while the other three leave
+  each process its own clock; and only the delayed-payment case also shares one wallet's proofs
+  between the two. They do not run a real mint or a real wallet, and no deployed mint's behaviour
+  was measured — the mint behaviour they model is read from the pinned CDK 0.17.2 source.
 - **The log stays readable while it retries.** Every attempt gets at most one line. The first
   failure's line carries its detail — the destination, the balance it saw, the error — and the
   backoff it starts; later attempts in the same streak get one line each (how many have failed,
