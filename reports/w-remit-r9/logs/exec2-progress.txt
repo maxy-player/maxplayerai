@@ -51,3 +51,5 @@
 17:33:40Z STAGE2 exact x44 done
 17:37:50Z done reports/w-remit-r9/logs/money-path-ci-1-240240c.log exit=0
 17:40:17Z done reports/w-remit-r9/logs/money-path-ci-2-240240c.log exit=101
+17:42:58Z done reports/w-remit-r9/logs/money-path-ci-3-240240c.log exit=0
+17:42:58Z STAGE3 money-path x3 done — ALL DONE
