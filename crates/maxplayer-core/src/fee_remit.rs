@@ -2092,6 +2092,104 @@ pub(crate) mod test_support {
         pub(crate) quote_id: String,
         pub(crate) quote: FakeQuote,
         pub(crate) selected: Vec<u64>,
+        pub(crate) input_fee_sats: u64,
+        pub(crate) swap_fee_sats: u64,
+        pub(crate) requires_swap: bool,
+    }
+
+    /// What the fake wallet would use to pay `need` sats and what the SDK would charge for it, in
+    /// the shape of pinned CDK 0.17.2 `MeltSaga::prepare` (`melt/saga/mod.rs:286–460`).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct FakeLayout {
+        /// The proofs taken out of the pool (empty for a Fake without a pool).
+        pub(crate) picked: Vec<u64>,
+        /// `PreparedMelt::input_fee`.
+        pub(crate) input_fee_sats: u64,
+        /// `PreparedMelt::swap_fee`.
+        pub(crate) swap_fee_sats: u64,
+        pub(crate) requires_swap: bool,
+    }
+
+    /// NUT-02 (pinned `cdk/src/wallet/mod.rs:369`): fee = ceil(ppk × count / 1000).
+    pub(crate) fn fee_for(input_fee_ppk: u64, count: usize) -> u64 {
+        (input_fee_ppk * count as u64).div_ceil(1000)
+    }
+
+    /// The SDK's two prepare branches, on a snapshot of the pool (nothing removed):
+    /// - `input_fee_ppk == 0`: the exact-fit branch (`:312–375`) — exact denominations for `need`,
+    ///   no swap, no fees (with a positive ppk `select_proofs(…, include_fees = true)` targets
+    ///   `need` + the selection's own fee, so the exact-fit test `proofs_total == need` at `:321`
+    ///   does not hold and the swap branch is taken — modelled here as "ppk > 0 ⇒ swap branch");
+    /// - otherwise the swap branch (`:377–459`): `estimated_output_count` = the number of proofs
+    ///   in the binary split of `need` (`:383`, = popcount for a power-of-two keyset),
+    ///   `input_fee` = fee on that count (`:384–387`), selection target `need + input_fee`
+    ///   (`:389`), largest-first proofs until they cover the target plus their own input fee
+    ///   (`select_proofs(…, true)`, `:391–397`), `swap_fee` = fee on the proofs picked (`:403`).
+    /// A Fake without a pool has unbounded funds: one notional proof is swapped.
+    pub(crate) fn layout(
+        input_fee_ppk: u64,
+        available: Option<&[u64]>,
+        need: u64,
+    ) -> Result<FakeLayout, String> {
+        if input_fee_ppk == 0 {
+            let picked = match available {
+                None => Vec::new(),
+                Some(available) => {
+                    let mut scratch = available.to_vec();
+                    select_exact(&mut scratch, need).ok_or_else(|| {
+                        format!("no exact proofs for {need} sats among {available:?}")
+                    })?
+                }
+            };
+            return Ok(FakeLayout {
+                picked,
+                input_fee_sats: 0,
+                swap_fee_sats: 0,
+                requires_swap: false,
+            });
+        }
+        let input_fee_sats = fee_for(input_fee_ppk, need.count_ones() as usize);
+        let selection = need + input_fee_sats;
+        let picked = match available {
+            None => Vec::new(),
+            Some(available) => {
+                let mut sorted = available.to_vec();
+                sorted.sort_unstable_by(|a, b| b.cmp(a));
+                let mut picked = Vec::new();
+                let mut sum = 0u64;
+                for denomination in sorted {
+                    picked.push(denomination);
+                    sum += denomination;
+                    if sum >= selection + fee_for(input_fee_ppk, picked.len()) {
+                        break;
+                    }
+                }
+                if sum < selection + fee_for(input_fee_ppk, picked.len()) {
+                    return Err(format!(
+                        "proofs {available:?} do not cover {selection} sats (amount + reserve + {input_fee_sats} sats estimated input fee) plus their own input fee"
+                    ));
+                }
+                picked
+            }
+        };
+        let swap_fee_sats = fee_for(input_fee_ppk, picked.len().max(1));
+        Ok(FakeLayout {
+            picked,
+            input_fee_sats,
+            swap_fee_sats,
+            requires_swap: true,
+        })
+    }
+
+    /// Remove exactly `picked` from `available` (each denomination once).
+    fn take(available: &mut Vec<u64>, picked: &[u64]) {
+        for denomination in picked {
+            let index = available
+                .iter()
+                .position(|candidate| candidate == denomination)
+                .expect("picked from available");
+            available.swap_remove(index);
+        }
     }
 
     pub(crate) fn quote_registry() -> QuoteRegistry {
@@ -2171,6 +2269,10 @@ pub(crate) mod test_support {
         pub(crate) registry: Option<QuoteRegistry>,
         /// The wallet's proofs, shared with the other Fake of a two-owner test; `None` = unbounded.
         pub(crate) proofs: Option<FakeProofs>,
+        /// The mint's keyset `input_fee_ppk` (NUT-02). `0` = a fee-free mint (every test written
+        /// before addendum 8); positive ⇒ every payment takes the SDK's swap branch and pays a
+        /// proof-input fee and a swap fee on top of amount + reserve (see [`layout`]).
+        pub(crate) input_fee_ppk: u64,
         /// The exact proofs each debit spent, in order (empty inner vec when `proofs` is `None`).
         pub(crate) proofs_spent: Vec<Vec<u64>>,
         /// Melts prepared (proofs selected and held) and not yet confirmed or cancelled, by token.
@@ -2235,6 +2337,7 @@ pub(crate) mod test_support {
                 status: Ok(None),
                 registry: None,
                 proofs: None,
+                input_fee_ppk: 0,
                 proofs_spent: Vec::new(),
                 prepared: BTreeMap::new(),
                 next_token: 1,
@@ -2302,6 +2405,31 @@ pub(crate) mod test_support {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(quote_id.to_owned(), quote);
+            }
+        }
+
+        /// The pool's value in sats — the wallet measured, not the melt counter. `None` for a
+        /// Fake with unbounded funds.
+        pub(crate) fn pool_value(&self) -> Option<u64> {
+            self.proofs.as_ref().map(|proofs| {
+                proofs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .sum()
+            })
+        }
+
+        /// The fees the SDK would charge this wallet on top of `need` right now (nothing removed):
+        /// the estimate's `expected_fees_sats`, or `0` and the reason.
+        fn expected_fees(&self, need: u64) -> (u64, Option<String>) {
+            let snapshot: Option<Vec<u64>> = self
+                .proofs
+                .as_ref()
+                .map(|proofs| proofs.lock().unwrap_or_else(|e| e.into_inner()).clone());
+            match layout(self.input_fee_ppk, snapshot.as_deref(), need) {
+                Ok(layout) => (layout.input_fee_sats + layout.swap_fee_sats, None),
+                Err(reason) => (0, Some(reason)),
             }
         }
 
@@ -2454,14 +2582,16 @@ pub(crate) mod test_support {
                     expiry_unix: self.quote_expiry_unix,
                 },
             );
+            let (expected_fees_sats, expected_fees_note) =
+                self.expected_fees(amount_sats.saturating_add(fee_reserve_sats));
             Ok(MeltEstimate {
                 mint_url: "https://mint.example".to_owned(),
                 quote_id,
                 amount_sats,
                 fee_reserve_sats,
                 expiry_unix: self.quote_expiry_unix,
-                expected_fees_sats: 0,
-                expected_fees_note: None,
+                expected_fees_sats,
+                expected_fees_note,
             })
         }
 
@@ -2482,14 +2612,16 @@ pub(crate) mod test_support {
                     expiry_unix: self.quote_expiry_unix,
                 },
             );
+            let (expected_fees_sats, expected_fees_note) =
+                self.expected_fees(amount_sats.saturating_add(fee_reserve_sats));
             Ok(MeltEstimate {
                 mint_url: "https://mint.example".to_owned(),
                 quote_id,
                 amount_sats,
                 fee_reserve_sats,
                 expiry_unix: self.quote_expiry_unix,
-                expected_fees_sats: 0,
-                expected_fees_note: None,
+                expected_fees_sats,
+                expected_fees_note,
             })
         }
 
@@ -2540,23 +2672,39 @@ pub(crate) mod test_support {
                 return Err(MeltFailure::RefusedBeforeSpending(reason));
             }
             let need = quote.amount_sats.saturating_add(quote.fee_reserve_sats);
-            let selected = match &self.proofs {
-                None => Vec::new(),
-                Some(proofs) => {
-                    let mut available = proofs.lock().unwrap_or_else(|e| e.into_inner());
-                    match select_exact(&mut available, need) {
-                        Some(selected) => selected,
-                        None => {
-                            let reason = format!(
-                                "wallet refuses to prepare melt quote {quote_id}: no exact proofs for {need} sats among {:?}",
-                                *available
-                            );
-                            self.pay_refusals.push(reason.clone());
-                            return Err(MeltFailure::Failed(reason));
+            // Selection and reservation, under the pool's lock (a shared pool is read and taken
+            // from atomically, as the wallet's own store is).
+            let layout = {
+                let mut pool = self
+                    .proofs
+                    .as_ref()
+                    .map(|proofs| proofs.lock().unwrap_or_else(|e| e.into_inner()));
+                match layout(
+                    self.input_fee_ppk,
+                    pool.as_deref().map(|available| available.as_slice()),
+                    need,
+                ) {
+                    Ok(layout) => {
+                        if let Some(pool) = pool.as_mut() {
+                            take(pool, &layout.picked);
                         }
+                        layout
+                    }
+                    Err(reason) => {
+                        drop(pool);
+                        let reason =
+                            format!("wallet refuses to prepare melt quote {quote_id}: {reason}");
+                        self.pay_refusals.push(reason.clone());
+                        return Err(MeltFailure::Failed(reason));
                     }
                 }
             };
+            let FakeLayout {
+                picked: selected,
+                input_fee_sats,
+                swap_fee_sats,
+                requires_swap,
+            } = layout;
             let prepare_now = self.now_unix();
             if u64::try_from(prepare_now).is_ok_and(|now| now > quote.expiry_unix) {
                 // CDK wallet `initialize_melt`: `expiry > unix_time()` at prepare — the wallet's
@@ -2569,10 +2717,7 @@ pub(crate) mod test_support {
                 self.pay_refusals.push(reason.clone());
                 return Err(MeltFailure::Failed(reason));
             }
-            // The total bound on the prepared figures (fees are 0 until the fee-bearing fake lands;
-            // the shape is the shipped one).
-            let input_fee_sats = 0;
-            let swap_fee_sats = 0;
+            // The total bound on the prepared figures — the SDK's, as the shipped path takes it.
             let total_debit_sats = MeltCeiling::total_debit(
                 quote.amount_sats,
                 quote.fee_reserve_sats,
@@ -2602,7 +2747,7 @@ pub(crate) mod test_support {
                 fee_reserve_sats: quote.fee_reserve_sats,
                 input_fee_sats,
                 swap_fee_sats,
-                requires_swap: false,
+                requires_swap,
                 total_debit_sats,
                 expiry_unix: quote.expiry_unix,
             };
@@ -2612,6 +2757,9 @@ pub(crate) mod test_support {
                     quote_id: quote_id.to_owned(),
                     quote,
                     selected,
+                    input_fee_sats,
+                    swap_fee_sats,
+                    requires_swap,
                 },
             );
             Ok(PreparedMelt::fake(preparation, token))
@@ -2631,6 +2779,9 @@ pub(crate) mod test_support {
                 quote_id,
                 quote,
                 selected,
+                input_fee_sats,
+                swap_fee_sats,
+                requires_swap,
             } = self
                 .prepared
                 .remove(&token)
@@ -2657,11 +2808,35 @@ pub(crate) mod test_support {
                 return Err(MeltFailure::Failed(reason));
             }
             self.melts.push(quote.bolt11.clone());
-            self.proofs_spent.push(selected);
             if let Some(counter) = &self.melt_counter {
                 counter.fetch_add(1, Ordering::SeqCst);
             }
             let (paid, fee) = self.melt_results.remove(0).map_err(MeltFailure::Failed)?;
+            // Swap branch: the wallet's value drops by exactly amount + fee paid + input fee + swap
+            // fee — the picked proofs are gone (swapped, then melted) and what is left of them comes
+            // back as change, one proof as far as this fake is concerned. Exact-fit branch (a
+            // fee-free mint): the established conservative model stands — the exact set for
+            // amount + reserve is spent whole and the unused reserve is NOT returned (overstating
+            // the loss, never understating it), so the two-process tests' proof-set assertions hold.
+            if requires_swap
+                && let Some(proofs) = &self.proofs
+                && !selected.is_empty()
+            {
+                let change = selected
+                    .iter()
+                    .sum::<u64>()
+                    .saturating_sub(swap_fee_sats)
+                    .saturating_sub(paid)
+                    .saturating_sub(input_fee_sats)
+                    .saturating_sub(fee);
+                if change > 0 {
+                    proofs
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(change);
+                }
+            }
+            self.proofs_spent.push(selected);
             if let Some(registry) = &self.registry
                 && let Some(entry) = registry
                     .lock()
@@ -2677,8 +2852,8 @@ pub(crate) mod test_support {
                 balance_sats: 1_000,
                 quote_id: quote_id.to_owned(),
                 fee_reserve_sats: quote.fee_reserve_sats,
-                input_fee_sats: 0,
-                swap_fee_sats: 0,
+                input_fee_sats,
+                swap_fee_sats,
             })
         }
 
@@ -2735,7 +2910,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
 
-    use super::test_support::{Fake, Gate, QuoteRegistry, fake_proofs, quote_registry};
+    use super::test_support::{
+        Fake, FakeLayout, Gate, QuoteRegistry, fake_proofs, fee_for, layout, quote_registry,
+    };
     use super::*;
     use crate::seller_node::STATE_DB_FILE;
     use crate::seller_node::store::{ReceiptFees, RemittanceState};
@@ -3759,6 +3936,204 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(&root);
         }
+    }
+
+    // ---- addendum 8 §1: the ceiling bounds the ENTIRE wallet debit (verdict B4) ----------------
+
+    // The fake's fee model, checked against the verdict's own arithmetic (§4 B4): a 1000-ppk keyset,
+    // one 32-sat proof, a quote of 13 with a 2-sat reserve against 15 accrued. need = 15 = 8+4+2+1
+    // ⇒ four output proofs ⇒ input fee 4; selection 19 ⇒ the 32 is swapped ⇒ swap fee 1; total
+    // 13 + 2 + 4 + 1 = 20 > 15. The two-figure check admits it; the four-figure one refuses it, and
+    // the refusal leaves the pool untouched.
+    #[test]
+    fn the_fake_wallet_models_the_sdks_proof_input_and_swap_fees_and_the_total_bound_refuses_them() {
+        assert_eq!(fee_for(1000, 4), 4);
+        assert_eq!(fee_for(500, 3), 2, "ceil(1500 / 1000)");
+        assert_eq!(fee_for(0, 7), 0);
+        assert_eq!(
+            layout(1000, Some(&[32]), 15).expect("layout"),
+            FakeLayout {
+                picked: vec![32],
+                input_fee_sats: 4,
+                swap_fee_sats: 1,
+                requires_swap: true,
+            }
+        );
+        assert_eq!(
+            layout(0, Some(&[8, 4, 2, 1]), 15).expect("layout"),
+            FakeLayout {
+                picked: vec![8, 4, 2, 1],
+                input_fee_sats: 0,
+                swap_fee_sats: 0,
+                requires_swap: false,
+            },
+            "a fee-free mint keeps the exact-fit branch every earlier test relies on"
+        );
+        assert!(layout(1000, Some(&[16]), 15).is_err(), "16 < 15 + 4 + 1");
+
+        let mut fake = Fake::new(|_| 2);
+        fake.input_fee_ppk = 1000;
+        fake.proofs = Some(fake_proofs(&[32]));
+        let ceiling = MeltCeiling {
+            max_debit_sats: 15,
+            invoice_sats: 13,
+            planned_quote_id: Some("quote-lnbc-fake-13-1".to_owned()),
+        };
+        assert!(ceiling.admits(13, 2), "the quote's own figures fit exactly");
+        let refused = fake
+            .prepare_melt("paid-quote-lnbc-fake-13-1", &ceiling)
+            .expect_err("the total does not fit");
+        match refused {
+            MeltFailure::RefusedBeforeSpending(reason) => assert!(
+                reason.contains("would debit 20 sats in total (13 sats invoice + 2 sats fee reserve + 4 sats proof input fee + 1 sats swap fee) against a ceiling of 15 sats; the prepared melt was cancelled and its proofs released; nothing was posted to the mint"),
+                "{reason}"
+            ),
+            other => panic!("expected a typed refusal, got {other:?}"),
+        }
+        assert_eq!(fake.pool_value(), Some(32), "the pool is exactly as it was");
+        assert_eq!(fake.ceiling_refusals.len(), 1);
+        assert!(fake.melts.is_empty());
+        assert!(fake.prepared.is_empty(), "nothing is left prepared");
+
+        // The estimate carries the same fees, reserving nothing.
+        let estimate = fake.melt_estimate("lnbc-fake-13-1").expect("estimate");
+        assert_eq!(estimate.expected_fees_sats, 5, "4 input + 1 swap");
+        assert_eq!(estimate.expected_fees_note, None);
+        assert_eq!(fake.pool_value(), Some(32));
+    }
+
+    // Regression (i), addendum 8 §1.5: fee-bearing mint (1000 ppk), surplus funds in a layout that
+    // does not fit (one 32-sat proof), total within the gross ⇒ pays ONCE and the WALLET — measured,
+    // not counted — loses at most the gross. Gross 20 (two 10-sat fees); the estimate's reserve is 3
+    // so the plan invoices 17 under a 20-sat ceiling; the payment quote's reserve is 0 (a reserve
+    // that shrank between estimate and payment, as addendum 3 §1 allows), so need = 17 = 16+1 ⇒ two
+    // output proofs ⇒ input fee 2; selection 19 ⇒ the 32 is swapped ⇒ swap fee 1; total
+    // 17 + 0 + 2 + 1 = 20 ≤ 20: admitted. The mint takes a 0-sat Lightning fee. Wallet before 32,
+    // after 32 − 1 (swap fee) − 17 − 2 − 0 = 12: delta 20 = the gross, to the sat.
+    #[test]
+    fn a_fee_bearing_mint_with_a_swap_required_layout_pays_once_and_the_wallet_loses_at_most_the_gross()
+     {
+        let (store, root) = store_with_fees("fee-bearing-fits", &[10, 10]);
+        let mut fake = Fake::new(|_| 3);
+        fake.live_reserve_for = Some(Box::new(|_| 0));
+        fake.input_fee_ppk = 1000;
+        fake.proofs = Some(fake_proofs(&[32]));
+        fake.registry = Some(quote_registry());
+        fake.melt_results = vec![Ok((17, 0))];
+        let before = fake.pool_value().expect("pool");
+        let (outcome, out) = run_remit(&store, &mut fake, RemitTrigger::Command, 100);
+        assert!(is_paid(&outcome), "{out}");
+        assert_eq!(fake.melts, vec!["lnbc-fake-17-2".to_owned()], "exactly one debit");
+        assert!(
+            out.contains("Prepared melt of quote paid-quote-lnbc-fake-17-2: proof input fee 2 sats, swap fee 1 sats (the wallet's proofs do not fit: a pre-melt swap will be performed); total debit 20 sats (17 invoice + 0 reserve + fees) fits the ceiling of 20 sats; proofs reserved in this wallet only, nothing posted yet"),
+            "{out}"
+        );
+        assert!(
+            out.contains("proof input fee: 2 sats; swap fee: 1 sats"),
+            "{out}"
+        );
+        assert!(!out.contains("WARNING"), "{out}");
+        let after = fake.pool_value().expect("pool");
+        assert_eq!((before, after), (32, 12));
+        let delta = before - after;
+        assert_eq!(delta, 17 + 0 + 2 + 1, "amount + fee paid + input fee + swap fee");
+        assert!(delta <= 20, "the wallet lost {delta} sats against 20 accrued");
+        assert_eq!(fake.proofs_spent, vec![vec![32]]);
+        let rows = store.remittances().expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, RemittanceState::Settled);
+        assert_eq!((rows[0].gross_sats, rows[0].net_sats), (20, 17));
+        assert_eq!(rows[0].melt_fee_sats, Some(0));
+        assert_eq!(rows[0].melt_fee_reserve_sats, Some(0));
+        let accrued = store.accrued_fees().expect("read");
+        assert_eq!(
+            (
+                accrued.remitted_fee_sats,
+                accrued.in_flight_fee_sats,
+                accrued.unremitted_fee_sats
+            ),
+            (20, 0, 0)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Regression (ii), addendum 8 §1.5: the same seller, mint and layout, but the payment quote's
+    // reserve is 1: need = 18 = 16+2 ⇒ input fee 2; selection 20 ⇒ swap fee 1; total
+    // 18 + 2 + 1 = 21 > 20 — one sat over, by the fees. Both two-figure checks admit 18 ≤ 20; the
+    // total bound refuses BEFORE any swap or melt: wallet delta exactly 0, no request posted (the
+    // registry's quote is still UNPAID), the row released (Planned → Failed, receipts back), one
+    // REFUSED line naming the total, its parts and the ceiling.
+    #[test]
+    fn a_fee_bearing_total_that_exceeds_the_gross_by_the_fee_is_refused_before_any_swap_or_melt() {
+        let (store, root) = store_with_fees("fee-bearing-over", &[10, 10]);
+        let mut fake = Fake::new(|_| 3);
+        fake.live_reserve_for = Some(Box::new(|_| 1));
+        fake.input_fee_ppk = 1000;
+        fake.proofs = Some(fake_proofs(&[32]));
+        let registry = quote_registry();
+        fake.registry = Some(Arc::clone(&registry));
+        fake.melt_results = vec![Ok((17, 1))];
+        let (outcome, out) = run_remit(&store, &mut fake, RemitTrigger::Collect, 100);
+        match &outcome {
+            RemitOutcome::MeltRefused {
+                remittance_id,
+                reason,
+            } => {
+                assert_eq!(remittance_id, "hash-17-2");
+                assert!(
+                    reason.contains("would debit 21 sats in total (17 sats invoice + 1 sats fee reserve + 2 sats proof input fee + 1 sats swap fee) against a ceiling of 20 sats; the prepared melt was cancelled and its proofs released; nothing was posted to the mint"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected MeltRefused, got {other:?}\n{out}"),
+        }
+        assert!(fake.melts.is_empty(), "no melt");
+        assert_eq!(fake.ceiling_refusals.len(), 1, "refused by the total bound, once");
+        assert!(fake.cancels.is_empty(), "cancelled inside prepare, not by the fence");
+        assert!(fake.prepared.is_empty());
+        assert_eq!(fake.pool_value(), Some(32), "wallet delta exactly 0: no swap, no melt");
+        assert_eq!(fake.melt_results.len(), 1, "the scripted payment was never consumed");
+        assert!(fake.admitted_seen.is_empty(), "refused before the fence");
+        assert_eq!(
+            out.matches("REFUSED before spending").count(),
+            1,
+            "exactly one refusal line:\n{out}"
+        );
+        assert!(
+            out.contains("REFUSED before spending — melt refused before spending: mint https://mint.example quote paid-quote-lnbc-fake-17-2 would debit 21 sats in total (17 sats invoice + 1 sats fee reserve + 2 sats proof input fee + 1 sats swap fee) against a ceiling of 20 sats"),
+            "{out}"
+        );
+        assert!(
+            out.contains("Nothing left the wallet; released 20 sats back to unremitted."),
+            "{out}"
+        );
+        assert!(!out.contains("Prepared melt of quote"), "{out}");
+        let quote = registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get("paid-quote-lnbc-fake-17-2")
+            .cloned()
+            .expect("the payment quote was raised");
+        assert_eq!(quote.state, MeltQuoteState::Unpaid, "no request reached the mint");
+        let rows = store.remittances().expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, RemittanceState::Failed);
+        assert_eq!(rows[0].receipts, 0, "released");
+        assert_eq!(rows[0].melt_quote_id.as_deref(), Some("quote-lnbc-fake-17-2"));
+        let attempts = store.recent_remit_attempts(10).expect("attempts");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].outcome, RemitAttemptOutcome::Failed);
+        let accrued = store.accrued_fees().expect("read");
+        assert_eq!(
+            (
+                accrued.remitted_fee_sats,
+                accrued.in_flight_fee_sats,
+                accrued.unremitted_fee_sats
+            ),
+            (0, 0, 20),
+            "the accrued balance is exactly what it was"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // ---- addendum 3 §1: the money hold, at the moment of spending (gate 2f) --------------------
