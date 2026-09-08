@@ -2171,8 +2171,22 @@ mod checks {
 fn write_usage(out: &mut dyn Write) {
     let _ = writeln!(
         out,
-        "Usage:\n  maxplayer doctor [--home <dir>]   # seller environment self-check (nix, credential helper, seller key, relay, mint, agent, sandbox, home permissions, harness credential permissions)\n\nExit codes: 0 all checks passed, 1 a blocking check FAILed"
+        "Usage:\n  maxplayer doctor [--home <dir>]   # seller environment self-check (nix, credential helper, seller key, relay, mint, agent, sandbox, home permissions, harness credential permissions)\n\nExit codes: 0 all checks passed, 1 a blocking check FAILed\n{}",
+        crate::skill::docs_pointer_line()
     );
+}
+
+/// The lines `maxplayer doctor` prints before the first check: what this is, which home it read,
+/// and where the documentation lives. Pure, so the pointer is testable without a relay, a mint or
+/// a network — the report itself needs all three. An operator reads doctor output when something
+/// is wrong, which is exactly when the route to the guides matters and, before this, was absent.
+#[cfg(feature = "wallet")]
+fn report_preamble(home_root: &std::path::Path) -> String {
+    format!(
+        "maxplayer doctor — seller environment self-check (home={})\n{}\n",
+        home_root.display(),
+        crate::skill::docs_pointer_line()
+    )
 }
 
 /// Entry from `cli::run` for `maxplayer doctor`.
@@ -2449,7 +2463,7 @@ fn run_doctor(
         }
     };
 
-    let _ = writeln!(out, "maxplayer doctor — seller environment self-check (home={})", home.root.display());
+    let _ = write!(out, "{}", report_preamble(&home.root));
 
     // `doctor` reports; it never boots a seller, so there is nothing here for an unsafe override to
     // waive. The containment check is read at its own severity.
@@ -2536,6 +2550,41 @@ pub fn sell_readiness_gate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The docs pointer on the doctor path. Before this, `maxplayer doctor` — the command an operator
+    // runs when something is wrong — carried no route to https://www.maxplayer.ai/skill.md; only the
+    // MCP handshake did, and a seller never sees that. Asserted against the ONE shared constant, not
+    // a copied URL, and on the pure preamble rather than a full report (which needs a relay, a mint
+    // and a network), so the guard runs everywhere the unit tests do.
+    #[test]
+    fn doctor_usage_and_report_preamble_carry_the_docs_pointer() {
+        let url = crate::skill::SKILL_URL;
+
+        let mut usage = Vec::new();
+        write_usage(&mut usage);
+        let usage = String::from_utf8(usage).expect("utf8");
+        assert!(
+            usage.contains(url),
+            "`doctor --help` must point at the docs:\n{usage}"
+        );
+
+        #[cfg(feature = "wallet")]
+        {
+            let preamble = report_preamble(std::path::Path::new("/tmp/example-home"));
+            assert!(
+                preamble.contains(url),
+                "the doctor report must point at the docs:\n{preamble}"
+            );
+            assert!(
+                preamble.contains("home=/tmp/example-home"),
+                "the preamble still names the home it read:\n{preamble}"
+            );
+            assert!(
+                preamble.ends_with('\n'),
+                "each preamble line is terminated:\n{preamble:?}"
+            );
+        }
+    }
 
     #[test]
     fn registry_runs_every_check_even_after_an_early_fail() {

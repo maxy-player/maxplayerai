@@ -32,6 +32,10 @@ mod sandbox_probe;
 // which needs the docker runner behind that feature â the same gate the boot reaper carries.
 #[cfg(feature = "acp")]
 mod sandbox_reap;
+// `maxplayer skill` and the ONE docs-pointer constant `--help`, `doctor`, seller first-run and the
+// MCP handshake all print from. Every build: a box with nothing but the binary must be able to
+// find the documentation.
+mod skill;
 #[cfg(feature = "stub-pay")]
 mod stub_pay_cli;
 mod wallet_cli;
