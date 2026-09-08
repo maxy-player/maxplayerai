@@ -174,12 +174,20 @@ launcher = ["/home/<user>/.nix-profile/bin/bwrap",
   "--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf", "--ro-bind", "/etc/ssl", "/etc/ssl",
   "--ro-bind", "/home/<user>/.local/share/cursor-agent", "/home/<user>/.local/share/cursor-agent",
   "--ro-bind", "/home/<user>/.config/cursor", "/home/<user>/.config/cursor",
+  "--ro-bind", "/home/<user>/.local/bin/maxplayer", "/home/<user>/.local/bin/maxplayer",
   "--bind", "/home/<user>/.maxplayer/seller-jobs", "/home/<user>/.maxplayer/seller-jobs",
   "--proc", "/proc", "--ro-bind", "/sys", "/sys", "--dev", "/dev", "--tmpfs", "/tmp",
   "--share-net",
   "--setenv", "HOME", "/home/<user>", "--setenv", "PATH", "/usr/bin:/bin",
 ]                                  # footgun 4: $MAXPLAYER_HOME itself is NOT bound
 ```
+
+The `~/.local/bin/maxplayer` bind is not optional: the containment probe that `doctor` runs executes
+the `maxplayer` binary itself inside the launcher (`run_under_launcher` in
+`crates/maxplayer/src/sandbox_probe.rs` takes `current_exe()` and wraps `maxplayer sandbox-probe` in
+your launcher argv), so the launcher must be able to see the binary at its own absolute path. A
+launcher that binds only the agent's paths fails `doctor` with an ENOENT that reads like a missing
+launcher.
 
 **Footgun 2 — `bwrap --ro-bind` flattens a symlink.** `~/.local/bin/cursor-agent` is a symlink into
 `~/.local/share/cursor-agent/versions/<build>/`. Bound read-only into the sandbox it becomes a plain
