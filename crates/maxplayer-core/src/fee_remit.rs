@@ -4950,6 +4950,133 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // Addendum 10 §1.4 (a): the reserve SHRINKS between estimate and payment (3 → 0) and the planned
+    // invoice would no longer confirm — planned on reserve 3: invoice 12 (need 15 ⇒ target 19,
+    // actual 3); at reserve 0: need 12 = 8+4 ⇒ target 14 = [8, 4, 2] ⇒ actual 3 ⇒ needs 15 > 14.
+    // The SAME attempt re-plans ONCE, before anything is prepared: the planner on the live reserve
+    // gives 15 (need 15 ⇒ prepared 4 ⇒ target 19 ⇒ actual 3; 19 ≥ 18; 15 + 0 + 3 + 1 = 19 ≤ 20), a
+    // 15-sat invoice and its live quote are raised, the Planned row is re-pointed at them (same
+    // id, same gross, same two receipts), one "Re-planned:" line prints, and the unchanged sequence
+    // pays it once: swap 32 → 19 (fee 1, change [8, 4]), melt 19, Lightning fee 0, change 19 − 15 −
+    // 0 − 3 = 1 ⇒ `fee_paid` = 19 − 15 − 1 = 3; pool 32 → 12 + 1 = 13, delta 19 ≤ 20. A
+    // next-attempt re-quote could not have done this: it would plan from the probe estimate again.
+    #[test]
+    fn a_reserve_that_shrinks_between_estimate_and_payment_is_re_planned_once_and_pays_invoice_15() {
+        let (store, root) = store_with_fees("fee-bearing-replan", &[10, 10]);
+        let mut fake = Fake::new(|_| 3);
+        fake.live_reserve_for = Some(Box::new(|_| 0));
+        fake.input_fee_ppk = 1000;
+        fake.proofs = Some(fake_proofs(&[32]));
+        let registry = quote_registry();
+        fake.registry = Some(Arc::clone(&registry));
+        fake.melt_results = vec![Ok((15, 0))];
+        let before = fake.pool_value().expect("pool");
+        let (outcome, out) = run_remit(&store, &mut fake, RemitTrigger::Command, 100);
+        match &outcome {
+            RemitOutcome::Paid {
+                remittance_id,
+                net_sats,
+                melt_fee_sats,
+            } => {
+                assert_eq!(remittance_id, "hash-12-2", "the row keeps its id");
+                assert_eq!((*net_sats, *melt_fee_sats), (15, 3));
+            }
+            other => panic!("expected Paid, got {other:?}\n{out}"),
+        }
+        // Planned on the estimate (12), re-planned on the live reserve (15): ONE re-plan line, no
+        // refusal, no warning.
+        assert!(
+            out.contains("invoice amount (maxplayer@agi.cash receives): 12 sats"),
+            "{out}"
+        );
+        assert_eq!(
+            out.lines()
+                .filter(|line| line.starts_with("Re-planned: "))
+                .count(),
+            1,
+            "exactly one re-plan line:\n{out}"
+        );
+        assert!(
+            out.contains("Re-planned: the payment quote's fee reserve is 0 sats (planned on 3 sats); invoice 12 sats would not confirm (the wallet would swap to 14 sats and the SDK's actual proof input fee on those proofs is 3 sats, so the payment would need 15 sats and the SDK would refuse after its swap), invoice 15 sats will (at most 19 sats leaves the wallet, ≤ 20); payment quote paid-quote-lnbc-fake-15-3 raised at mint https://mint.example for 15 sats (fee reserve 0 sats); invoice payment hash: hash-15-3"),
+            "{out}"
+        );
+        assert!(!out.contains("REFUSED"), "{out}");
+        assert!(!out.contains("WARNING"), "{out}");
+        assert!(
+            out.contains("Prepared melt of quote paid-quote-lnbc-fake-15-3: proof input fee 4 sats (estimate; actual on the swapped proofs 3 sats), swap fee 1 sats (the wallet's proofs do not fit: a pre-melt swap will be performed); total debit 19 sats (15 invoice + 0 reserve + fees) fits the ceiling of 20 sats; proofs reserved in this wallet only, nothing posted yet"),
+            "{out}"
+        );
+        for needle in [
+            "bound to melt quote paid-quote-lnbc-fake-15-3",
+            "melt fee taken by the mint: 3 sats (quote paid-quote-lnbc-fake-15-3 reserved 0 sats;",
+            "actual debit: 19 sats = net + melt fee + swap fee",
+            "net paid to maxplayer@agi.cash: 15 sats",
+            "receipts discharged: 2",
+        ] {
+            assert!(out.contains(needle), "missing {needle:?} in:\n{out}");
+        }
+        // Paid ONCE: one swap, one melt — of the RE-PLANNED invoice; the 12-sat quote was never
+        // prepared or paid.
+        assert_eq!(fake.melts, vec!["lnbc-fake-15-3".to_owned()]);
+        assert_eq!(fake.swaps.len(), 1);
+        assert_eq!(fake.swaps[0].sent, vec![32]);
+        assert_eq!(fake.swaps[0].target_sats, 19);
+        assert_eq!(fake.swaps[0].swap_fee_sats, 1);
+        assert_eq!(fake.swaps[0].received, vec![16, 2, 1]);
+        assert_eq!(fake.swaps[0].change, vec![8, 4]);
+        assert!(fake.cancels.is_empty(), "nothing was prepared before the re-plan");
+        assert!(fake.ceiling_refusals.is_empty());
+        assert!(fake.pay_refusals.is_empty());
+        let after = fake.pool_value().expect("pool");
+        assert_eq!((before, after), (32, 13), "change [8, 4] + [1]");
+        assert_eq!(before - after, 15 + 0 + 3 + 1, "delta 19 ≤ 20");
+        let quotes = registry.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            quotes
+                .get("paid-quote-lnbc-fake-15-3")
+                .map(|quote| quote.state),
+            Some(MeltQuoteState::Paid)
+        );
+        assert_eq!(
+            quotes
+                .get("paid-quote-lnbc-fake-12-2")
+                .map(|quote| quote.state),
+            Some(MeltQuoteState::Unpaid),
+            "the first payment quote was raised and never paid"
+        );
+        drop(quotes);
+        // One row, re-pointed then settled: same id and gross, the re-planned invoice's figures,
+        // the second quote bound and settled, both receipts discharged.
+        let rows = store.remittances().expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].remittance_id, "hash-12-2");
+        assert_eq!(rows[0].state, RemittanceState::Settled);
+        assert_eq!((rows[0].gross_sats, rows[0].net_sats), (20, 15));
+        assert_eq!(rows[0].payment_hash, "hash-15-3");
+        assert_eq!(rows[0].bolt11, "lnbc-fake-15-3");
+        assert_eq!(rows[0].melt_fee_sats, Some(3));
+        assert_eq!(rows[0].melt_fee_reserve_sats, Some(0));
+        assert_eq!(
+            rows[0].melt_quote_id.as_deref(),
+            Some("paid-quote-lnbc-fake-15-3")
+        );
+        assert_eq!(
+            rows[0].spending_quote_id.as_deref(),
+            Some("paid-quote-lnbc-fake-15-3")
+        );
+        assert_eq!(rows[0].receipts, 2);
+        let accrued = store.accrued_fees().expect("read");
+        assert_eq!(
+            (
+                accrued.remitted_fee_sats,
+                accrued.in_flight_fee_sats,
+                accrued.unremitted_fee_sats
+            ),
+            (20, 0, 0)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // Regression (ii), addendum 9 §1.4 / addendum 10 §1.1: the prepared figures FIT but the
     // post-swap arithmetic does not. Same seller, mint and layout, reserve 3 at estimate AND at
     // payment (so addendum 10 §1.4's re-plan has nothing to do — its schedule, the reserve
