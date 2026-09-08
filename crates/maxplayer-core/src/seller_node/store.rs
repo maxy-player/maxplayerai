@@ -4827,26 +4827,30 @@ mod tests {
             None
         );
         // Net over the gross: refused before any write.
-        assert!(store
-            .replan_remittance(
-                "h1",
-                "proc-a",
-                &RemittanceReplan {
-                    net_sats: 21,
-                    ..replan.clone()
-                },
-            )
-            .is_err());
-        assert!(store
-            .replan_remittance(
-                "h1",
-                "proc-a",
-                &RemittanceReplan {
-                    payment_hash: "  ".to_owned(),
-                    ..replan.clone()
-                },
-            )
-            .is_err());
+        assert!(
+            store
+                .replan_remittance(
+                    "h1",
+                    "proc-a",
+                    &RemittanceReplan {
+                        net_sats: 21,
+                        ..replan.clone()
+                    },
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .replan_remittance(
+                    "h1",
+                    "proc-a",
+                    &RemittanceReplan {
+                        payment_hash: "  ".to_owned(),
+                        ..replan.clone()
+                    },
+                )
+                .is_err()
+        );
         assert_eq!(
             store.in_flight_remittance().expect("row").expect("planned"),
             planned
@@ -4857,7 +4861,10 @@ mod tests {
             .replan_remittance("h1", "proc-a", &replan)
             .expect("query")
             .expect("re-planned");
-        assert_eq!(replanned.remittance_id, "h1", "the receipts' pin does not move");
+        assert_eq!(
+            replanned.remittance_id, "h1",
+            "the receipts' pin does not move"
+        );
         assert_eq!(replanned.gross_sats, 20, "gross is untouched");
         assert_eq!(replanned.net_sats, 15);
         assert_eq!(replanned.payment_hash, "h1-replan");
@@ -4907,7 +4914,10 @@ mod tests {
                 .expect("query"),
             None
         );
-        let held = store.in_flight_remittance().expect("row").expect("spending");
+        let held = store
+            .in_flight_remittance()
+            .expect("row")
+            .expect("spending");
         assert_eq!(held.state, RemittanceState::Spending);
         assert_eq!(held.net_sats, 15);
         assert_eq!(held.payment_hash, "h1-replan");

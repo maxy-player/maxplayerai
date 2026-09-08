@@ -3620,7 +3620,11 @@ mod tests {
                 && !out.contains("back to unremitted"),
             "nothing of the old stanza follows the one line:\n{out}"
         );
-        assert_eq!(row.state, RemittanceState::Planned, "the row is not written");
+        assert_eq!(
+            row.state,
+            RemittanceState::Planned,
+            "the row is not written"
+        );
         assert_eq!(row.spending_since_unix, None, "never admitted");
         assert_eq!(row.spending_quote_id, None, "no quote bound");
         assert_eq!(row.gross_sats, gross);
@@ -5012,7 +5016,8 @@ mod tests {
     // 0 − 3 = 1 ⇒ `fee_paid` = 19 − 15 − 1 = 3; pool 32 → 12 + 1 = 13, delta 19 ≤ 20. A
     // next-attempt re-quote could not have done this: it would plan from the probe estimate again.
     #[test]
-    fn a_reserve_that_shrinks_between_estimate_and_payment_is_re_planned_once_and_pays_invoice_15() {
+    fn a_reserve_that_shrinks_between_estimate_and_payment_is_re_planned_once_and_pays_invoice_15()
+    {
         let (store, root) = store_with_fees("fee-bearing-replan", &[10, 10]);
         let mut fake = Fake::new(|_| 3);
         fake.live_reserve_for = Some(Box::new(|_| 0));
@@ -5075,12 +5080,19 @@ mod tests {
         assert_eq!(fake.swaps[0].swap_fee_sats, 1);
         assert_eq!(fake.swaps[0].received, vec![16, 2, 1]);
         assert_eq!(fake.swaps[0].change, vec![8, 4]);
-        assert!(fake.cancels.is_empty(), "nothing was prepared before the re-plan");
+        assert!(
+            fake.cancels.is_empty(),
+            "nothing was prepared before the re-plan"
+        );
         assert!(fake.ceiling_refusals.is_empty());
         assert!(fake.pay_refusals.is_empty());
         let after = fake.pool_value().expect("pool");
         assert_eq!((before, after), (32, 13), "change [8, 4] + [1]");
-        assert_eq!(before - after, 15 + 0 + 3 + 1, "delta 19 ≤ 20");
+        assert_eq!(
+            before - after,
+            15 + 3 + 1,
+            "delta 19 ≤ 20: invoice + actual input fee + swap fee, Lightning fee 0"
+        );
         let quotes = registry.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             quotes
@@ -5184,12 +5196,19 @@ mod tests {
             assert!(out.contains(needle), "missing {needle:?} in:\n{out}");
         }
         assert!(!out.contains("REFUSED"), "{out}");
-        assert!(!out.contains("Re-planned"), "reserve unchanged: no re-plan\n{out}");
+        assert!(
+            !out.contains("Re-planned"),
+            "reserve unchanged: no re-plan\n{out}"
+        );
         assert!(
             !out.contains("WARNING"),
             "delta equals the gross exactly; that is not an overspend:\n{out}"
         );
-        assert_eq!(fake.melts, vec!["lnbc-fake-13-2".to_owned()], "exactly one melt");
+        assert_eq!(
+            fake.melts,
+            vec!["lnbc-fake-13-2".to_owned()],
+            "exactly one melt"
+        );
         assert_eq!(fake.swaps.len(), 1, "exactly one swap");
         assert_eq!(fake.swaps[0].sent, vec![32]);
         assert_eq!(fake.swaps[0].target_sats, 19);
@@ -5203,8 +5222,15 @@ mod tests {
         let after = fake.pool_value().expect("pool");
         assert_eq!((before, after), (32, 13), "change [8, 4] + [1]");
         let delta = before - after;
-        assert_eq!(delta, 13 + 2 + 3 + 1, "invoice + Lightning + ACTUAL input + swap");
-        assert!(delta <= 19, "the wallet lost {delta} sats against 19 accrued");
+        assert_eq!(
+            delta,
+            13 + 2 + 3 + 1,
+            "invoice + Lightning + ACTUAL input + swap"
+        );
+        assert!(
+            delta <= 19,
+            "the wallet lost {delta} sats against 19 accrued"
+        );
         assert_eq!(
             registry
                 .lock()
@@ -5217,7 +5243,11 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].state, RemittanceState::Settled);
         assert_eq!((rows[0].gross_sats, rows[0].net_sats), (19, 13));
-        assert_eq!(rows[0].melt_fee_sats, Some(5), "inclusive: Lightning 2 + actual input 3");
+        assert_eq!(
+            rows[0].melt_fee_sats,
+            Some(5),
+            "inclusive: Lightning 2 + actual input 3"
+        );
         assert_eq!(rows[0].melt_fee_reserve_sats, Some(2));
         assert_eq!(
             rows[0].spending_quote_id.as_deref(),
@@ -5661,7 +5691,11 @@ mod tests {
         let rows = store.remittances().expect("rows");
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].remittance_id, "hash-13-2");
-        assert_eq!(rows[0].state, RemittanceState::Failed, "released by reconciliation");
+        assert_eq!(
+            rows[0].state,
+            RemittanceState::Failed,
+            "released by reconciliation"
+        );
         assert_eq!(rows[0].receipts, 0);
         assert_eq!(rows[1].remittance_id, "hash-13-4");
         assert_eq!(rows[1].receipts, 2);
