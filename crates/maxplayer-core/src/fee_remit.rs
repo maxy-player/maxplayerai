@@ -5515,7 +5515,11 @@ mod tests {
                             );
                             assert_eq!(quotes[X_PAYMENT_QUOTE].state, MeltQuoteState::Unpaid);
                         }
-                        assert_eq!(b_plan.invoices, vec![13], "Y's LNURL invoice is the only effect");
+                        assert_eq!(
+                            b_plan.invoices,
+                            vec![13],
+                            "Y's LNURL invoice is the only effect"
+                        );
                         assert!(
                             b_plan.estimates.is_empty()
                                 && b_plan.quotes.is_empty()
