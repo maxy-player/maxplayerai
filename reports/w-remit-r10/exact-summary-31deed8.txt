@@ -1,0 +1,51 @@
+exec head 31deed8 — 47 --exact records (44 carried + 45–48 new; #33 retired r9). Raw logs: /Users/forge/forge/v2/worker/reports/w-remit-r10/logs/exact-<name>-31deed8.log (cmp-identical copies of the runner's /tmp output; uncommitted per the evidence-location ruling). Columns: record · log line 1 (git HEAD at run time, reports-only commit; line 2 of every log states an empty .rs diff 31deed8..HEAD) · bytes · sha256 (first 16) · test result.
+
+01-2b-node-31deed8 · ab9260f · 3621 B · 15147e523f32b96f · test result: ok. 1 passed; 0 failed; in 0.01s
+02-2c-race-31deed8 · ab9260f · 3587 B · 391c69c78b7a2e69 · test result: ok. 1 passed; 0 failed; in 0.11s
+03-2d-backoff-31deed8 · ab9260f · 3591 B · ea660e1e637cadd4 · test result: ok. 1 passed; 0 failed; in 0.00s
+04-2d-bootdelay-31deed8 · ab9260f · 3565 B · 307ccb2d36e8a6e4 · test result: ok. 1 passed; 0 failed; in 0.00s
+05-2d-jitter-31deed8 · ab9260f · 3521 B · 679bbcf7db0debd3 · test result: ok. 1 passed; 0 failed; in 0.00s
+06-2d-singleflight-31deed8 · ab9260f · 3557 B · f0af62429088d115 · test result: ok. 1 passed; 0 failed; in 0.00s
+07-2d-threshold-31deed8 · ab9260f · 3601 B · 287340a75e36412f · test result: ok. 1 passed; 0 failed; in 0.00s
+08-2e-drain-bound-31deed8 · ab9260f · 3605 B · 4f7899f324c31e06 · test result: ok. 1 passed; 0 failed; in 0.70s
+09-2e-rearm-31deed8 · ab9260f · 3543 B · b0ae842f44ce3636 · test result: ok. 1 passed; 0 failed; in 0.00s
+10-2e-retract-31deed8 · ab9260f · 3567 B · 6b635d07cfe3cb83 · test result: ok. 1 passed; 0 failed; in 0.23s
+11-2e-shutdown-drain-31deed8 · ab9260f · 3597 B · e9f1b1846ae9bc92 · test result: ok. 1 passed; 0 failed; in 1.57s
+12-2e-shutdown-retries-31deed8 · ab9260f · 3553 B · 18e0d8796affb17f · test result: ok. 1 passed; 0 failed; in 1.53s
+13-2f-ceiling-31deed8 · ab9260f · 3579 B · 26a0625021513431 · test result: ok. 1 passed; 0 failed; in 0.00s
+14-2f-reserve-31deed8 · ab9260f · 3591 B · 84e5be4d661c47c3 · test result: ok. 1 passed; 0 failed; in 0.01s
+15-2g-B2-stale-snapshot-31deed8 · ab9260f · 3593 B · 4e6d8e892a491627 · test result: ok. 1 passed; 0 failed; in 0.06s
+16-2g-a-31deed8 · ab9260f · 3613 B · 2d5d5345a0c3f26b · test result: ok. 1 passed; 0 failed; in 0.03s
+17-2g-b1-31deed8 · ab9260f · 3587 B · f85f9d93003989af · test result: ok. 1 passed; 0 failed; in 0.01s
+18-2g-b2-expired-held-31deed8 · ab9260f · 3593 B · e853a189beef0a76 · test result: ok. 1 passed; 0 failed; in 0.02s
+19-2g-c-31deed8 · ab9260f · 3615 B · b639302d633a1099 · test result: ok. 1 passed; 0 failed; in 0.01s
+20-2g-d-31deed8 · ab9260f · 3567 B · 36c06d8a7095724e · test result: ok. 1 passed; 0 failed; in 0.07s
+21-2g-delayed-31deed8 · ab9260f · 3583 B · 536819d681d07735 · test result: ok. 1 passed; 0 failed; in 0.02s
+22-E-first-retry-31deed8 · ab9260f · 3631 B · 3b4469c2a7820483 · test result: ok. 1 passed; 0 failed; in 0.00s
+23-E-one-line-31deed8 · ab9260f · 3579 B · 2233fbdbfdc350a1 · test result: ok. 1 passed; 0 failed; in 0.00s
+24-cli-exit-map-31deed8 · ab9260f · 596 B · f799b00e3c87b733 · test result: ok. 1 passed; 0 failed; in 0.00s
+25-cli-invocation-31deed8 · ab9260f · 646 B · 2a4a039aec2c8d70 · test result: ok. 1 passed; 0 failed; in 0.49s
+26-2a-remit-follows-receipt-31deed8 · ab9260f · 3587 B · 50b46d01ffcfbbbe · test result: ok. 1 passed; 0 failed; in 0.00s
+27-v13-migration-31deed8 · ab9260f · 3609 B · 71535b44e3e8bfcb · test result: ok. 1 passed; 0 failed; in 0.01s
+28-r8-i-fee-fits-actual-differs-31deed8 · ab9260f · 3677 B · cd88c776b51a78e9 · test result: ok. 1 passed; 0 failed; in 0.00s
+29-r7-ii-fee-exceeds-31deed8 · ab9260f · 3615 B · 8d35fd959a7ea211 · test result: ok. 1 passed; 0 failed; in 0.00s
+30-r7-iiib-fee-aware-plan-31deed8 · ab9260f · 3615 B · 4f15a2ab7c93ff2f · test result: ok. 1 passed; 0 failed; in 0.00s
+31-r7-never-fits-31deed8 · ab9260f · 3563 B · 3a98bb20356d6301 · test result: ok. 1 passed; 0 failed; in 0.00s
+32-r7-fake-selfcheck-31deed8 · ab9260f · 3619 B · 50aea5416e0b2675 · test result: ok. 1 passed; 0 failed; in 0.00s
+34-r7-total-display-31deed8 · ab9260f · 3571 B · 918286ae854921a7 · test result: ok. 1 passed; 0 failed; in 0.00s
+35-r7-relay-31deed8 · ab9260f · 3547 B · 1c05cad143ca3f2b · test result: ok. 1 passed; 0 failed; in 0.00s
+36-r7-drop-cancels-31deed8 · ab9260f · 3581 B · b2632b133b0d86ec · test result: ok. 1 passed; 0 failed; in 0.00s
+37-r9-ii-fee-metadata-drift-refused-before-fence-31deed8 · ab9260f · 3661 B · d22c0c8b546cca7b · test result: ok. 1 passed; 0 failed; in 0.00s
+38-r8-balance-unknown-no-false-warning-31deed8 · ab9260f · 3609 B · a86bd3ec7fffe829 · test result: ok. 1 passed; 0 failed; in 0.00s
+39-r9-1.3-gross-19-pays-13-31deed8 · ab9260f · 3629 B · 79e23f7482e80d0c · test result: ok. 1 passed; 0 failed; in 0.00s
+40-r9-1.4a-shrunk-reserve-replanned-pays-15-31deed8 · ab9260f · 3619 B · 2ae8d738c8b7bfee · test result: ok. 1 passed; 0 failed; in 0.01s
+41-r9-store-replan-31deed8 · ab9260f · 3625 B · e31da8927b2072dc · test result: ok. 1 passed; 0 failed; in 0.00s
+42-r9-confirm-bound-search-31deed8 · ab9260f · 3595 B · 72669acd811532f8 · test result: ok. 1 passed; 0 failed; in 0.00s
+43-r9-admits-confirmable-31deed8 · ab9260f · 3587 B · 54cff987d3bc0939 · test result: ok. 1 passed; 0 failed; in 0.00s
+44-r9-N3-paid-label-31deed8 · ab9260f · 3579 B · 537ad3a3cffef258 · test result: ok. 1 passed; 0 failed; in 0.00s
+45-r10-1-3-sat-gross-no-reserve-pays-1-31deed8 · ab9260f · 3615 B · 21c66dc8f8fc88ae · test result: ok. 1 passed; 0 failed; in 0.01s
+46-r10-1-8-sat-gross-5-reserve-pays-1-31deed8 · ab9260f · 3607 B · 05369e1ab8996445 · test result: ok. 1 passed; 0 failed; in 0.00s
+47-r10-2c-racer-after-fence-held-31deed8 · ab9260f · 3645 B · 006ada53b7e20689 · test result: ok. 1 passed; 0 failed; in 0.01s
+48-r10-2c-racer-after-settled-nothing-31deed8 · ab9260f · 3611 B · ca8cfcaec4d5aa78 · test result: ok. 1 passed; 0 failed; in 0.01s
+
+totals: 47 passed (1 passed; 0 failed each), 0 not-1-passed
