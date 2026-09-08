@@ -474,6 +474,15 @@ pub enum Refusal {
     /// The mint's melt fee reserve leaves nothing, leaves less than the minimum, or would take more
     /// out of the wallet than was accrued.
     ReserveDoesNotFit { gross: u64, reserve: u64 },
+    /// The mint's melt fee reserve on the net invoice PLUS the proof fees the SDK is expected to
+    /// charge this wallet (proof-input fee, and a pre-melt swap fee when its proofs do not fit)
+    /// would take more out of the wallet than was accrued (addendum 8 §1.3): a plan that can never
+    /// fit is refused here, at planning, not at payment.
+    FeesDoNotFit {
+        gross: u64,
+        reserve: u64,
+        expected_fees: u64,
+    },
     /// An earlier attempt's PLANNED row (or a legacy spending row with no quote bound) has a melt
     /// quote the mint reports PENDING or unknown: a payment may be settling — hold. A bound
     /// spending row in the same state is [`Refusal::SpendingHeld`] instead, so that it renders the
@@ -553,6 +562,14 @@ impl fmt::Display for Refusal {
             Self::ReserveDoesNotFit { gross, reserve } => write!(
                 formatter,
                 "the mint's melt fee reserve ({reserve} sats) does not fit inside the {gross} sats accrued"
+            ),
+            Self::FeesDoNotFit {
+                gross,
+                reserve,
+                expected_fees,
+            } => write!(
+                formatter,
+                "the mint's melt fee reserve ({reserve} sats) plus the expected proof fees ({expected_fees} sats) do not fit inside the {gross} sats accrued"
             ),
             Self::Settling { remittance_id } => write!(
                 formatter,
@@ -1135,30 +1152,55 @@ fn remit_inner(
         ));
     }
     let reserve = probe_estimate.fee_reserve_sats;
-    if reserve >= gross {
+    // Addendum 8 §1.3: the proof fees the SDK is expected to charge THIS wallet (input fee on the
+    // proofs it would send, plus a pre-melt swap fee when its proofs do not fit) come out of the
+    // gross too — the SDK's own figures, estimated on the wallet's current proofs without reserving
+    // any; the hard bound is taken on the prepared melt at payment. Sizing the plan with them means a
+    // payment that can fit is planned, and one that never can is refused here, not at payment.
+    let expected = probe_estimate.expected_fees_sats;
+    let expected_clause = |expected: u64| {
+        if expected > 0 {
+            format!(" plus {expected} sats of expected proof fees")
+        } else {
+            String::new()
+        }
+    };
+    if reserve.saturating_add(expected) >= gross {
         let _ = writeln!(
             out,
-            "REFUSED — mint {} needs a melt fee reserve of {reserve} sats to pay {gross} sats, which leaves nothing for the destination. The balance accumulates. Nothing moved.",
-            probe_estimate.mint_url
+            "REFUSED — mint {} needs a melt fee reserve of {reserve} sats{} to pay {gross} sats, which leaves nothing for the destination. The balance accumulates. Nothing moved.",
+            probe_estimate.mint_url,
+            expected_clause(expected)
         );
-        return Ok(RemitOutcome::Refused(Refusal::ReserveDoesNotFit {
-            gross,
-            reserve,
+        return Ok(RemitOutcome::Refused(if expected > 0 {
+            Refusal::FeesDoNotFit {
+                gross,
+                reserve,
+                expected_fees: expected,
+            }
+        } else {
+            Refusal::ReserveDoesNotFit { gross, reserve }
         }));
     }
-    let net = gross - reserve;
+    let net = gross - reserve - expected;
     if net < min_sats {
         let _ = writeln!(
             out,
-            "REFUSED — after the mint's melt fee reserve ({reserve} sats) the {gross} sats unremitted leaves {net} sats, below the destination's minimum of {min_sats} sats ({} sats short). The balance accumulates. Nothing moved.",
+            "REFUSED — after the mint's melt fee reserve ({reserve} sats){} the {gross} sats unremitted leaves {net} sats, below the destination's minimum of {min_sats} sats ({} sats short). The balance accumulates. Nothing moved.",
+            expected_clause(expected),
             min_sats - net
         );
-        return Ok(RemitOutcome::Refused(Refusal::ReserveDoesNotFit {
-            gross,
-            reserve,
+        return Ok(RemitOutcome::Refused(if expected > 0 {
+            Refusal::FeesDoNotFit {
+                gross,
+                reserve,
+                expected_fees: expected,
+            }
+        } else {
+            Refusal::ReserveDoesNotFit { gross, reserve }
         }));
     }
-    let (invoice, estimate) = if reserve == 0 {
+    let (invoice, estimate) = if reserve == 0 && expected == 0 {
         (probe, probe_estimate)
     } else {
         let invoice = effects.invoice(&pay, net)?;
@@ -1171,11 +1213,11 @@ fn remit_inner(
         }
         (invoice, estimate)
     };
-    let debit_ceiling = net.saturating_add(estimate.fee_reserve_sats);
-    if debit_ceiling > gross {
+    let reserve_ceiling = net.saturating_add(estimate.fee_reserve_sats);
+    if reserve_ceiling > gross {
         let _ = writeln!(
             out,
-            "REFUSED — mint {} quotes a {} sats fee reserve on {net} sats, so up to {debit_ceiling} sats would leave the wallet against {gross} sats accrued. A seller never pays more than it accrued. Nothing moved.",
+            "REFUSED — mint {} quotes a {} sats fee reserve on {net} sats, so up to {reserve_ceiling} sats would leave the wallet against {gross} sats accrued. A seller never pays more than it accrued. Nothing moved.",
             estimate.mint_url, estimate.fee_reserve_sats
         );
         return Ok(RemitOutcome::Refused(Refusal::ReserveDoesNotFit {
@@ -1183,12 +1225,43 @@ fn remit_inner(
             reserve: estimate.fee_reserve_sats,
         }));
     }
+    let debit_ceiling = reserve_ceiling.saturating_add(estimate.expected_fees_sats);
+    if debit_ceiling > gross {
+        let _ = writeln!(
+            out,
+            "REFUSED — mint {} quotes a {} sats fee reserve on {net} sats and this wallet expects {} sats of proof fees on top, so up to {debit_ceiling} sats would leave the wallet against {gross} sats accrued. A seller never pays more than it accrued. Nothing moved.",
+            estimate.mint_url, estimate.fee_reserve_sats, estimate.expected_fees_sats
+        );
+        return Ok(RemitOutcome::Refused(Refusal::FeesDoNotFit {
+            gross,
+            reserve: estimate.fee_reserve_sats,
+            expected_fees: estimate.expected_fees_sats,
+        }));
+    }
 
     // 5. The plan, in the seller's words.
     let _ = writeln!(
         out,
-        "Plan:\n  unremitted platform fee (gross): {gross} sats\n  mint melt fee reserve (ceiling): {} sats — taken out of the gross, never on top\n  invoice amount ({address} receives): {net} sats\n  leaves your wallet: at most {debit_ceiling} sats (≤ {gross}); unused reserve returns as change\n  mint: {} (melt quote {})\n  invoice payment hash: {}",
-        estimate.fee_reserve_sats, estimate.mint_url, estimate.quote_id, invoice.payment_hash
+        "Plan:\n  unremitted platform fee (gross): {gross} sats\n  mint melt fee reserve (ceiling): {} sats — taken out of the gross, never on top\n  invoice amount ({address} receives): {net} sats\n  leaves your wallet: at most {debit_ceiling} sats (≤ {gross}); unused reserve returns as change",
+        estimate.fee_reserve_sats
+    );
+    if estimate.expected_fees_sats > 0 {
+        let _ = writeln!(
+            out,
+            "  expected proof fees (SDK estimate, bounded exactly at payment): {} sats",
+            estimate.expected_fees_sats
+        );
+    }
+    if let Some(note) = &estimate.expected_fees_note {
+        let _ = writeln!(
+            out,
+            "  proof fees not estimable now ({note}); the ceiling still bounds them exactly at payment"
+        );
+    }
+    let _ = writeln!(
+        out,
+        "  mint: {} (melt quote {})\n  invoice payment hash: {}",
+        estimate.mint_url, estimate.quote_id, invoice.payment_hash
     );
     if !trigger.pays() {
         let _ = writeln!(
@@ -4006,11 +4079,12 @@ mod tests {
     // Regression (i), addendum 8 §1.5: fee-bearing mint (1000 ppk), surplus funds in a layout that
     // does not fit (one 32-sat proof), total within the gross ⇒ pays ONCE and the WALLET — measured,
     // not counted — loses at most the gross. Gross 20 (two 10-sat fees); the estimate's reserve is 3
-    // so the plan invoices 17 under a 20-sat ceiling; the payment quote's reserve is 0 (a reserve
-    // that shrank between estimate and payment, as addendum 3 §1 allows), so need = 17 = 16+1 ⇒ two
-    // output proofs ⇒ input fee 2; selection 19 ⇒ the 32 is swapped ⇒ swap fee 1; total
-    // 17 + 0 + 2 + 1 = 20 ≤ 20: admitted. The mint takes a 0-sat Lightning fee. Wallet before 32,
-    // after 32 − 1 (swap fee) − 17 − 2 − 0 = 12: delta 20 = the gross, to the sat.
+    // and the probe on 20 expects popcount(23) = 4 sats of input fee + 1 sat of swap fee, so the plan
+    // invoices 20 − 3 − 5 = 12 under a 20-sat ceiling (re-estimate on 15: 4 + 1 again, 12 + 3 + 5 =
+    // 20 ≤ 20). The payment quote's reserve is 0 (a reserve that shrank between estimate and payment,
+    // as addendum 3 §1 allows), so need = 12 = 8+4 ⇒ two output proofs ⇒ input fee 2; selection 14 ⇒
+    // the 32 is swapped ⇒ swap fee 1; total 12 + 0 + 2 + 1 = 15 ≤ 20: admitted. The mint takes a
+    // 0-sat Lightning fee. Wallet before 32, after 32 − 1 (swap fee) − 12 − 2 − 0 = 17: delta 15 ≤ 20.
     #[test]
     fn a_fee_bearing_mint_with_a_swap_required_layout_pays_once_and_the_wallet_loses_at_most_the_gross()
      {
@@ -4020,17 +4094,21 @@ mod tests {
         fake.input_fee_ppk = 1000;
         fake.proofs = Some(fake_proofs(&[32]));
         fake.registry = Some(quote_registry());
-        fake.melt_results = vec![Ok((17, 0))];
+        fake.melt_results = vec![Ok((12, 0))];
         let before = fake.pool_value().expect("pool");
         let (outcome, out) = run_remit(&store, &mut fake, RemitTrigger::Command, 100);
         assert!(is_paid(&outcome), "{out}");
+        assert!(
+            out.contains("expected proof fees (SDK estimate, bounded exactly at payment): 5 sats"),
+            "{out}"
+        );
         assert_eq!(
             fake.melts,
-            vec!["lnbc-fake-17-2".to_owned()],
+            vec!["lnbc-fake-12-2".to_owned()],
             "exactly one debit"
         );
         assert!(
-            out.contains("Prepared melt of quote paid-quote-lnbc-fake-17-2: proof input fee 2 sats, swap fee 1 sats (the wallet's proofs do not fit: a pre-melt swap will be performed); total debit 20 sats (17 invoice + 0 reserve + fees) fits the ceiling of 20 sats; proofs reserved in this wallet only, nothing posted yet"),
+            out.contains("Prepared melt of quote paid-quote-lnbc-fake-12-2: proof input fee 2 sats, swap fee 1 sats (the wallet's proofs do not fit: a pre-melt swap will be performed); total debit 15 sats (12 invoice + 0 reserve + fees) fits the ceiling of 20 sats; proofs reserved in this wallet only, nothing posted yet"),
             "{out}"
         );
         assert!(
@@ -4039,11 +4117,11 @@ mod tests {
         );
         assert!(!out.contains("WARNING"), "{out}");
         let after = fake.pool_value().expect("pool");
-        assert_eq!((before, after), (32, 12));
+        assert_eq!((before, after), (32, 17));
         let delta = before - after;
         assert_eq!(
             delta,
-            17 + 0 + 2 + 1,
+            12 + 0 + 2 + 1,
             "amount + fee paid + input fee + swap fee"
         );
         assert!(
@@ -4054,7 +4132,7 @@ mod tests {
         let rows = store.remittances().expect("rows");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].state, RemittanceState::Settled);
-        assert_eq!((rows[0].gross_sats, rows[0].net_sats), (20, 17));
+        assert_eq!((rows[0].gross_sats, rows[0].net_sats), (20, 12));
         assert_eq!(rows[0].melt_fee_sats, Some(0));
         assert_eq!(rows[0].melt_fee_reserve_sats, Some(0));
         let accrued = store.accrued_fees().expect("read");
@@ -4069,31 +4147,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // Regression (ii), addendum 8 §1.5: the same seller, mint and layout, but the payment quote's
-    // reserve is 1: need = 18 = 16+2 ⇒ input fee 2; selection 20 ⇒ swap fee 1; total
-    // 18 + 2 + 1 = 21 > 20 — one sat over, by the fees. Both two-figure checks admit 18 ≤ 20; the
-    // total bound refuses BEFORE any swap or melt: wallet delta exactly 0, no request posted (the
-    // registry's quote is still UNPAID), the row released (Planned → Failed, receipts back), one
-    // REFUSED line naming the total, its parts and the ceiling.
+    // Regression (ii), addendum 8 §1.5: the same seller, mint and layout (plan: invoice 12, ceiling
+    // 20), but the payment quote's reserve grew to 7: 12 + 7 = 19 passes the two-figure check
+    // (≤ 20), yet need = 19 = 16+2+1 ⇒ three output proofs ⇒ input fee 3; selection 22 ⇒ swap fee 1;
+    // total 19 + 3 + 1 = 23 > 20 — over, by the fees. The total bound refuses BEFORE any swap or
+    // melt: wallet delta exactly 0, no request posted (the registry's quote is still UNPAID), the row
+    // released (Planned → Failed, receipts back), one REFUSED line naming the total, its parts and
+    // the ceiling.
     #[test]
     fn a_fee_bearing_total_that_exceeds_the_gross_by_the_fee_is_refused_before_any_swap_or_melt() {
         let (store, root) = store_with_fees("fee-bearing-over", &[10, 10]);
         let mut fake = Fake::new(|_| 3);
-        fake.live_reserve_for = Some(Box::new(|_| 1));
+        fake.live_reserve_for = Some(Box::new(|_| 7));
         fake.input_fee_ppk = 1000;
         fake.proofs = Some(fake_proofs(&[32]));
         let registry = quote_registry();
         fake.registry = Some(Arc::clone(&registry));
-        fake.melt_results = vec![Ok((17, 1))];
+        fake.melt_results = vec![Ok((12, 1))];
         let (outcome, out) = run_remit(&store, &mut fake, RemitTrigger::Collect, 100);
         match &outcome {
             RemitOutcome::MeltRefused {
                 remittance_id,
                 reason,
             } => {
-                assert_eq!(remittance_id, "hash-17-2");
+                assert_eq!(remittance_id, "hash-12-2");
                 assert!(
-                    reason.contains("would debit 21 sats in total (17 sats invoice + 1 sats fee reserve + 2 sats proof input fee + 1 sats swap fee) against a ceiling of 20 sats; the prepared melt was cancelled and its proofs released; nothing was posted to the mint"),
+                    reason.contains("would debit 23 sats in total (12 sats invoice + 7 sats fee reserve + 3 sats proof input fee + 1 sats swap fee) against a ceiling of 20 sats; the prepared melt was cancelled and its proofs released; nothing was posted to the mint"),
                     "{reason}"
                 );
             }
@@ -4127,7 +4206,7 @@ mod tests {
             "exactly one refusal line:\n{out}"
         );
         assert!(
-            out.contains("REFUSED before spending — melt refused before spending: mint https://mint.example quote paid-quote-lnbc-fake-17-2 would debit 21 sats in total (17 sats invoice + 1 sats fee reserve + 2 sats proof input fee + 1 sats swap fee) against a ceiling of 20 sats"),
+            out.contains("REFUSED before spending — melt refused before spending: mint https://mint.example quote paid-quote-lnbc-fake-12-2 would debit 23 sats in total (12 sats invoice + 7 sats fee reserve + 3 sats proof input fee + 1 sats swap fee) against a ceiling of 20 sats"),
             "{out}"
         );
         assert!(
@@ -4138,7 +4217,7 @@ mod tests {
         let quote = registry
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get("paid-quote-lnbc-fake-17-2")
+            .get("paid-quote-lnbc-fake-12-2")
             .cloned()
             .expect("the payment quote was raised");
         assert_eq!(
@@ -4152,7 +4231,7 @@ mod tests {
         assert_eq!(rows[0].receipts, 0, "released");
         assert_eq!(
             rows[0].melt_quote_id.as_deref(),
-            Some("quote-lnbc-fake-17-2")
+            Some("quote-lnbc-fake-12-2")
         );
         let attempts = store.recent_remit_attempts(10).expect("attempts");
         assert_eq!(attempts.len(), 1);
@@ -4166,6 +4245,94 @@ mod tests {
             ),
             (0, 0, 20),
             "the accrued balance is exactly what it was"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Addendum 8 §1.3, fee-aware planning: the same fee-bearing mint and layout with NO reserve
+    // slack (estimate reserve 2, payment reserve 2). Without the fees in the plan the invoice would
+    // be 18 and the payment total 18 + 2 + 2 + 1 = 23 > 20 — refused every time, forever. With them:
+    // the probe on 20 expects popcount(20+2 = 22) = 3 output proofs ⇒ input fee 3, the 32 swapped ⇒
+    // swap fee 1 ⇒ expected 4 ⇒ net = 20 − 2 − 4 = 14; the re-estimate on 14 + 2 = 16 = one output
+    // proof ⇒ input fee 1, swap fee 1 ⇒ 14 + 2 + 2 = 18 ≤ 20: planned. Payment: need 16 ⇒ input fee
+    // 1, swap fee 1 ⇒ total 18 ≤ 20 ⇒ pays; the mint takes its full 2-sat reserve; wallet
+    // 32 → 32 − 1 − 14 − 1 − 2 = 14: delta 18 ≤ 20, measured.
+    #[test]
+    fn fee_aware_planning_sizes_the_invoice_so_a_fee_bearing_payment_fits_without_reserve_slack() {
+        let (store, root) = store_with_fees("fee-aware-plan", &[10, 10]);
+        let mut fake = Fake::new(|_| 2);
+        fake.input_fee_ppk = 1000;
+        fake.proofs = Some(fake_proofs(&[32]));
+        fake.registry = Some(quote_registry());
+        fake.melt_results = vec![Ok((14, 2))];
+        let (outcome, out) = run_remit(&store, &mut fake, RemitTrigger::DryRun, 100);
+        assert_eq!(outcome, RemitOutcome::DryRun, "{out}");
+        for needle in [
+            "unremitted platform fee (gross): 20 sats",
+            "mint melt fee reserve (ceiling): 2 sats — taken out of the gross, never on top",
+            "invoice amount (maxplayer@agi.cash receives): 14 sats",
+            "leaves your wallet: at most 18 sats (≤ 20); unused reserve returns as change",
+            "expected proof fees (SDK estimate, bounded exactly at payment): 2 sats",
+            "DRY RUN — nothing moved. Re-run with --confirm to pay 14 sats to maxplayer@agi.cash.",
+        ] {
+            assert!(out.contains(needle), "missing {needle:?} in:\n{out}");
+        }
+        assert_eq!(fake.invoices, vec![20, 14], "probe on the gross, then the net");
+        assert_eq!(fake.pool_value(), Some(32), "estimating reserves nothing");
+
+        let (outcome, out) = run_remit(&store, &mut fake, RemitTrigger::Command, 101);
+        assert!(is_paid(&outcome), "{out}");
+        assert_eq!(fake.melts, vec!["lnbc-fake-14-4".to_owned()]);
+        assert!(
+            out.contains("Prepared melt of quote paid-quote-lnbc-fake-14-4: proof input fee 1 sats, swap fee 1 sats (the wallet's proofs do not fit: a pre-melt swap will be performed); total debit 18 sats (14 invoice + 2 reserve + fees) fits the ceiling of 20 sats"),
+            "{out}"
+        );
+        assert_eq!(fake.pool_value(), Some(14), "32 − 1 swap fee − 14 − 1 input fee − 2 fee paid");
+        assert!(32 - 14 <= 20, "the wallet lost 18 sats against 20 accrued");
+        let rows = store.remittances().expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, RemittanceState::Settled);
+        assert_eq!((rows[0].gross_sats, rows[0].net_sats), (20, 14));
+        assert_eq!(rows[0].melt_fee_sats, Some(2));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The planning refusal for fees that can never fit (addendum 8 §1.3): a 1000-ppk mint against a
+    // 3-sat gross with a 1-sat reserve — the probe on 3 expects popcount(4) = 1 + swap 1 = 2 sats of
+    // fees, 1 + 2 ≥ 3 ⇒ nothing would be left: refused at planning as FeesDoNotFit, no invoice for
+    // the net requested, nothing journaled, the balance intact.
+    #[test]
+    fn fees_that_can_never_fit_are_refused_at_planning_not_at_payment() {
+        let (store, root) = store_with_fees("fee-never-fits", &[3]);
+        let mut fake = Fake::new(|_| 1);
+        fake.input_fee_ppk = 1000;
+        fake.proofs = Some(fake_proofs(&[32]));
+        let (outcome, out) = run_remit(&store, &mut fake, RemitTrigger::Command, 100);
+        assert_eq!(
+            outcome,
+            RemitOutcome::Refused(Refusal::FeesDoNotFit {
+                gross: 3,
+                reserve: 1,
+                expected_fees: 2,
+            }),
+            "{out}"
+        );
+        assert!(
+            out.contains("REFUSED — mint https://mint.example needs a melt fee reserve of 1 sats plus 2 sats of expected proof fees to pay 3 sats, which leaves nothing for the destination. The balance accumulates. Nothing moved."),
+            "{out}"
+        );
+        assert_eq!(fake.invoices, vec![3], "only the probe");
+        assert!(fake.quotes.is_empty() && fake.melts.is_empty());
+        assert_eq!(fake.pool_value(), Some(32));
+        assert!(store.remittances().expect("rows").is_empty());
+        assert_eq!(
+            Refusal::FeesDoNotFit {
+                gross: 3,
+                reserve: 1,
+                expected_fees: 2
+            }
+            .to_string(),
+            "the mint's melt fee reserve (1 sats) plus the expected proof fees (2 sats) do not fit inside the 3 sats accrued"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
