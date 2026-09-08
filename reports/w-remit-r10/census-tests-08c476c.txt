@@ -1,0 +1,10 @@
+method: git diff -U0 a6217328..08c476c -- '*.rs'; added lines whose text (after the +) is exactly '#[test]'; line numbers are new-file
+crates/maxplayer-core/src/fee_remit.rs x44 min:3710 max:8580 boundary:282 all_past:True
+crates/maxplayer-core/src/home.rs x1 min:2713 max:2713 boundary:2293 all_past:True
+crates/maxplayer-core/src/lnurl_pay.rs x14 min:729 max:1279 boundary:655 all_past:True
+crates/maxplayer-core/src/platform_fee.rs x1 min:218 max:218 boundary:126 all_past:True
+crates/maxplayer-core/src/seller_node/run.rs x3 min:13696 max:14819 boundary:617 all_past:True
+crates/maxplayer-core/src/seller_node/store.rs x10 min:4023 max:5035 boundary:2939 all_past:True
+crates/maxplayer-core/src/wallet_ops.rs x6 min:2297 max:2501 boundary:2285 all_past:True
+crates/maxplayer/src/seller_fees.rs x4 min:448 max:1092 boundary:444 all_past:True
+TOTAL 83
