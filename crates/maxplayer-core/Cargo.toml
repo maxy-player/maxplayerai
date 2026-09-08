@@ -129,6 +129,15 @@ required-features = ["git-delivery"]
 name = "push_destination_binding"
 required-features = ["git-delivery"]
 
+# The container reap against a REAL zombie-leader survivor: a thread group whose leader exited while a
+# sibling thread lives. `#[ignore]`d, because it runs the production reaper, which SIGKILLs every
+# process but pid 1 and itself. It must be the only process tree of a fresh container; run it through
+# `scripts/reap-isolated-test.sh`, and see the file header. Linux-only inside the file; gated on
+# `wallet`, which carries the reaper and `libc`.
+[[test]]
+name = "reap_isolated_linux"
+required-features = ["wallet"]
+
 [dev-dependencies]
 async-trait = "0.1.89"
 cdk-sqlite = "=0.17.2"

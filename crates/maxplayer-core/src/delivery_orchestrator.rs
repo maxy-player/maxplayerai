@@ -3046,4 +3046,222 @@ mod tests {
             "the reap must not be gated on a file a job could unlink"
         );
     }
+
+    /// The environment variable that turns a re-executed copy of this test binary into the
+    /// zombie-leader helper. See [`zombie_leader_helper_entry`].
+    #[cfg(all(feature = "wallet", target_os = "linux"))]
+    const ZOMBIE_HELPER_ENV: &str = "MAXPLAYER_TEST_ZOMBIE_HELPER";
+
+    /// The libtest name of [`zombie_leader_helper_entry`] in this binary.
+    #[cfg(all(feature = "wallet", target_os = "linux"))]
+    const ZOMBIE_HELPER_TEST: &str = "delivery_orchestrator::tests::zombie_leader_helper_entry";
+
+    // NOT a test of anything. This is the body of the helper process that
+    // `a_zombie_leader_with_a_live_sibling_thread_is_reported_live` re-executes this binary into.
+    // Without the environment variable it returns at once and passes, so an ordinary run is not
+    // disturbed. With it, it never returns; the parent test kills the process.
+    #[cfg(all(feature = "wallet", target_os = "linux"))]
+    #[test]
+    fn zombie_leader_helper_entry() {
+        if std::env::var(ZOMBIE_HELPER_ENV).as_deref() != Ok("1") {
+            return;
+        }
+        become_zombie_leader_with_live_sibling();
+    }
+
+    /// Make this process a thread group whose LEADER is a zombie while another thread lives: the
+    /// shape a job can leave behind (a detached helper whose initial thread calls `pthread_exit`).
+    ///
+    /// libtest runs every test body on a spawned thread, so the initial thread of the process — the
+    /// group leader — is libtest's, parked on a channel. This thread installs a `SIGUSR1` handler
+    /// that exits only the thread it runs on (`exit`, not `exit_group`), and sends the signal to the
+    /// leader with `tgkill`. The kernel keeps the leader as a zombie because the group is not empty,
+    /// so `/proc/<pid>/status` reads `Z` while this thread and a worker thread sleep. Never returns.
+    #[cfg(all(feature = "wallet", target_os = "linux"))]
+    fn become_zombie_leader_with_live_sibling() -> ! {
+        extern "C" fn exit_this_thread_only(_signal: libc::c_int) {
+            // SAFETY: a raw `exit` syscall ends only the calling thread and touches no memory of
+            // ours. It is async-signal-safe.
+            unsafe {
+                libc::syscall(libc::SYS_exit, 0);
+            }
+        }
+        // A second live thread besides this one, so "a sibling lives" does not rest on libtest.
+        std::thread::spawn(|| std::thread::sleep(Duration::from_secs(120)));
+        // SAFETY: plain libc calls with valid arguments. The handler has the signature `signal`
+        // expects, and `tgkill` targets the leader of this process (tid == tgid).
+        unsafe {
+            let handler: extern "C" fn(libc::c_int) = exit_this_thread_only;
+            let handler = handler as libc::sighandler_t;
+            assert_ne!(libc::signal(libc::SIGUSR1, handler), libc::SIG_ERR);
+            let tgid = libc::getpid();
+            assert_eq!(
+                libc::syscall(libc::SYS_tgkill, tgid, tgid, libc::SIGUSR1),
+                0
+            );
+        }
+        loop {
+            std::thread::sleep(Duration::from_secs(120));
+        }
+    }
+
+    /// The `State:` character of one `/proc/…/status` file, read by the test itself and not by the
+    /// code under test. `None` when the file is gone or has no `State:` line.
+    #[cfg(all(feature = "wallet", target_os = "linux"))]
+    fn observed_state(status_path: &str) -> Option<char> {
+        std::fs::read_to_string(status_path)
+            .ok()?
+            .lines()
+            .find_map(|line| line.strip_prefix("State:"))
+            .and_then(|rest| rest.trim().chars().next())
+    }
+
+    /// `(tid, state)` of every task of `tgid`, read by the test itself.
+    #[cfg(all(feature = "wallet", target_os = "linux"))]
+    fn observed_tasks(tgid: u32) -> Vec<(u32, char)> {
+        let Ok(entries) = std::fs::read_dir(format!("/proc/{tgid}/task")) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+            .filter_map(|tid| {
+                let state = observed_state(&format!("/proc/{tgid}/task/{tid}/status"))?;
+                Some((tid, state))
+            })
+            .collect()
+    }
+
+    /// The helper process of the zombie-leader test: a re-execution of this test binary. Killed and
+    /// reaped on drop, so a failed assertion leaves nothing behind.
+    #[cfg(all(feature = "wallet", target_os = "linux"))]
+    struct ZombieHelper(Option<std::process::Child>);
+
+    #[cfg(all(feature = "wallet", target_os = "linux"))]
+    impl ZombieHelper {
+        fn spawn() -> Self {
+            let exe = std::env::current_exe().expect("this test binary has a path");
+            let child = std::process::Command::new(exe)
+                .args([ZOMBIE_HELPER_TEST, "--exact", "--test-threads=1"])
+                .env(ZOMBIE_HELPER_ENV, "1")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("re-execute this test binary as the helper");
+            Self(Some(child))
+        }
+
+        fn tgid(&self) -> u32 {
+            self.0.as_ref().expect("the helper is live").id()
+        }
+
+        /// Wait until the leader is `Z` and another task is not `Z`/`X`. The test reads both facts
+        /// itself. Returns the observed leader state and task list. Panics with the helper's output
+        /// when the scenario does not appear in time.
+        fn await_zombie_leader_with_live_sibling(
+            &mut self,
+            timeout: Duration,
+        ) -> (char, Vec<(u32, char)>) {
+            let tgid = self.tgid();
+            let started = std::time::Instant::now();
+            loop {
+                let leader = observed_state(&format!("/proc/{tgid}/status"));
+                let tasks = observed_tasks(tgid);
+                let sibling_lives = tasks
+                    .iter()
+                    .any(|(tid, state)| *tid != tgid && !matches!(state, 'Z' | 'X'));
+                if leader == Some('Z') && sibling_lives {
+                    return ('Z', tasks);
+                }
+                if started.elapsed() > timeout {
+                    let output = self.kill_and_reap();
+                    panic!(
+                        "the helper did not become a zombie leader with a live sibling within \
+                         {timeout:?}: leader {leader:?}, tasks {tasks:?}; helper stdout {:?}, \
+                         stderr {:?}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        /// SIGKILL the whole group and reap it.
+        fn kill_and_reap(&mut self) -> std::process::Output {
+            let mut child = self.0.take().expect("the helper is live");
+            let _ = child.kill();
+            child.wait_with_output().expect("reap the helper")
+        }
+    }
+
+    #[cfg(all(feature = "wallet", target_os = "linux"))]
+    impl Drop for ZombieHelper {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    // The attack from the security re-review, reproduced: a thread group whose leader exited while
+    // a sibling thread lives. Linux lists the group in `/proc` under its tgid and reports the
+    // LEADER's state, `Z`, in `/proc/<tgid>/status`. A leader-only reading skips the group, so the
+    // live thread survives the reap and can read the token as the orchestrator's uid. The production
+    // enumerator must report the group live. Read-only: it kills nothing but its own helper.
+    // RED ON REVERT to the leader-only `State:` test: the tgid is absent from the list.
+    #[cfg(all(feature = "wallet", target_os = "linux"))]
+    #[test]
+    fn a_zombie_leader_with_a_live_sibling_thread_is_reported_live() {
+        let mut helper = ZombieHelper::spawn();
+        let tgid = helper.tgid();
+        let (leader, tasks) = helper.await_zombie_leader_with_live_sibling(Duration::from_secs(5));
+        // The scenario is real before anything is asserted about the code under test.
+        assert_eq!(leader, 'Z', "the helper's leader is a zombie");
+        assert!(
+            tasks
+                .iter()
+                .any(|(tid, state)| *tid != tgid && !matches!(state, 'Z' | 'X')),
+            "a sibling thread of the helper lives: {tasks:?}"
+        );
+
+        let live = other_live_pids().expect("the process table of this host is readable");
+        assert!(
+            live.contains(&tgid),
+            "the helper's thread group {tgid} is absent from other_live_pids(): \
+             /proc/{tgid}/status State: {leader}, tasks {tasks:?}; a leader-only reading hides a \
+             live thread"
+        );
+
+        helper.kill_and_reap();
+        assert!(
+            !Path::new(&format!("/proc/{tgid}")).exists(),
+            "SIGKILL to the tgid reached every thread, and the parent reaped the group"
+        );
+    }
+
+    // The edges of the task classifier, on this host: a group that is gone is dead, a status file
+    // that is gone is a task that is gone, a status file with no `State:` line is an error and not
+    // a guess, and this process is live.
+    #[cfg(all(feature = "wallet", target_os = "linux"))]
+    #[test]
+    fn the_task_classifier_fails_closed_on_an_unreadable_state() {
+        // No pid is this large (`pid_max` tops out at 2^22), so the group is gone.
+        assert!(!thread_group_is_live(u32::MAX).expect("a gone group is dead"));
+        assert_eq!(
+            task_state("/proc/4294967295/task/4294967295/status").expect("a gone task"),
+            None
+        );
+        let root = fresh_root("task-state");
+        let path = root.join("status");
+        fs::write(&path, "Name:\tx\nPid:\t1\n").expect("write");
+        let err = task_state(path.to_str().expect("utf-8")).expect_err("no State: line");
+        assert!(matches!(err, OrchestratorError::Io(_)), "{err}");
+        assert!(err.to_string().contains("no State: line"), "{err}");
+        // The calling thread of this process runs, so its group is live.
+        assert!(thread_group_is_live(std::process::id()).expect("readable"));
+        let _ = fs::remove_dir_all(&root);
+    }
 }
