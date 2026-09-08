@@ -3946,7 +3946,8 @@ mod tests {
     // 13 + 2 + 4 + 1 = 20 > 15. The two-figure check admits it; the four-figure one refuses it, and
     // the refusal leaves the pool untouched.
     #[test]
-    fn the_fake_wallet_models_the_sdks_proof_input_and_swap_fees_and_the_total_bound_refuses_them() {
+    fn the_fake_wallet_models_the_sdks_proof_input_and_swap_fees_and_the_total_bound_refuses_them()
+    {
         assert_eq!(fee_for(1000, 4), 4);
         assert_eq!(fee_for(500, 3), 2, "ceil(1500 / 1000)");
         assert_eq!(fee_for(0, 7), 0);
@@ -4023,7 +4024,11 @@ mod tests {
         let before = fake.pool_value().expect("pool");
         let (outcome, out) = run_remit(&store, &mut fake, RemitTrigger::Command, 100);
         assert!(is_paid(&outcome), "{out}");
-        assert_eq!(fake.melts, vec!["lnbc-fake-17-2".to_owned()], "exactly one debit");
+        assert_eq!(
+            fake.melts,
+            vec!["lnbc-fake-17-2".to_owned()],
+            "exactly one debit"
+        );
         assert!(
             out.contains("Prepared melt of quote paid-quote-lnbc-fake-17-2: proof input fee 2 sats, swap fee 1 sats (the wallet's proofs do not fit: a pre-melt swap will be performed); total debit 20 sats (17 invoice + 0 reserve + fees) fits the ceiling of 20 sats; proofs reserved in this wallet only, nothing posted yet"),
             "{out}"
@@ -4036,8 +4041,15 @@ mod tests {
         let after = fake.pool_value().expect("pool");
         assert_eq!((before, after), (32, 12));
         let delta = before - after;
-        assert_eq!(delta, 17 + 0 + 2 + 1, "amount + fee paid + input fee + swap fee");
-        assert!(delta <= 20, "the wallet lost {delta} sats against 20 accrued");
+        assert_eq!(
+            delta,
+            17 + 0 + 2 + 1,
+            "amount + fee paid + input fee + swap fee"
+        );
+        assert!(
+            delta <= 20,
+            "the wallet lost {delta} sats against 20 accrued"
+        );
         assert_eq!(fake.proofs_spent, vec![vec![32]]);
         let rows = store.remittances().expect("rows");
         assert_eq!(rows.len(), 1);
@@ -4088,11 +4100,26 @@ mod tests {
             other => panic!("expected MeltRefused, got {other:?}\n{out}"),
         }
         assert!(fake.melts.is_empty(), "no melt");
-        assert_eq!(fake.ceiling_refusals.len(), 1, "refused by the total bound, once");
-        assert!(fake.cancels.is_empty(), "cancelled inside prepare, not by the fence");
+        assert_eq!(
+            fake.ceiling_refusals.len(),
+            1,
+            "refused by the total bound, once"
+        );
+        assert!(
+            fake.cancels.is_empty(),
+            "cancelled inside prepare, not by the fence"
+        );
         assert!(fake.prepared.is_empty());
-        assert_eq!(fake.pool_value(), Some(32), "wallet delta exactly 0: no swap, no melt");
-        assert_eq!(fake.melt_results.len(), 1, "the scripted payment was never consumed");
+        assert_eq!(
+            fake.pool_value(),
+            Some(32),
+            "wallet delta exactly 0: no swap, no melt"
+        );
+        assert_eq!(
+            fake.melt_results.len(),
+            1,
+            "the scripted payment was never consumed"
+        );
         assert!(fake.admitted_seen.is_empty(), "refused before the fence");
         assert_eq!(
             out.matches("REFUSED before spending").count(),
@@ -4114,12 +4141,19 @@ mod tests {
             .get("paid-quote-lnbc-fake-17-2")
             .cloned()
             .expect("the payment quote was raised");
-        assert_eq!(quote.state, MeltQuoteState::Unpaid, "no request reached the mint");
+        assert_eq!(
+            quote.state,
+            MeltQuoteState::Unpaid,
+            "no request reached the mint"
+        );
         let rows = store.remittances().expect("rows");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].state, RemittanceState::Failed);
         assert_eq!(rows[0].receipts, 0, "released");
-        assert_eq!(rows[0].melt_quote_id.as_deref(), Some("quote-lnbc-fake-17-2"));
+        assert_eq!(
+            rows[0].melt_quote_id.as_deref(),
+            Some("quote-lnbc-fake-17-2")
+        );
         let attempts = store.recent_remit_attempts(10).expect("attempts");
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].outcome, RemitAttemptOutcome::Failed);
