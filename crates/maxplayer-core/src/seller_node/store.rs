@@ -2270,8 +2270,9 @@ impl SellerStore {
 
     /// **Re-plan** a still-PLANNED, still-UNBOUND row of ours onto a new invoice (addendum 10 §1.4):
     /// the live quote's fee reserve differs from the estimate the row was planned on and the
-    /// planned invoice would not confirm, so the SAME attempt raises a smaller invoice BEFORE it
-    /// prepares any spend. ONE conditional update —
+    /// planned invoice would not confirm, so the SAME attempt raises a new (re-planned) invoice —
+    /// smaller or larger, whatever fits at the live reserve — BEFORE it prepares any spend. ONE
+    /// conditional update —
     ///
     /// ```sql
     /// UPDATE fee_remittances SET net_sats, payment_hash, bolt11, melt_fee_reserve_sats, melt_quote_id

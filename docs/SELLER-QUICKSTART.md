@@ -1256,16 +1256,20 @@ its own:
   spend), pays the invoice from your ecash through the wallet's gated melt (the same
   `allow_real_mints` gate `maxplayer wallet melt` honours), and marks the receipts it covered as
   discharged. **The accrued fee is a hard ceiling on everything that leaves the wallet, enforced
-  before any ecash is spent**: the wallet prepares the payment locally — reserving proofs; it may
-  fetch the mint's fee table, but sends no proofs and pays no fee yet — and checks the SDK's own
-  figures for that prepared payment, **the invoice plus the mint's fee reserve plus the proof input
-  fee plus any pre-melt swap fee**, against the gross fee owed; then it re-runs the SDK's post-swap
-  arithmetic on those figures and refuses if the SDK would fail after its swap or the *actual* fee
-  would push the total over the gross. If either check fails — the mint's reserve grew between the
-  estimate and the payment, or the proof fees came out higher than expected — the prepared payment
-  is cancelled (the proofs go back to unspent) and the attempt is refused before any ecash is
-  consumed; nothing is left pinned, the refusal is journaled, the balance stays unremitted, and the
-  next attempt re-quotes. After a payment the report counts the SDK's fee once — `melt fee taken by
+  before any ecash is spent**, in one sequence: first the payment quote's **invoice plus the mint's
+  fee reserve alone** is checked against the gross (a reserve that grew past it is refused here); if
+  the live reserve differs from the estimate and the planned amount would no longer confirm, the
+  attempt re-plans once onto a new invoice; then the wallet prepares the payment locally — reserving
+  proofs; it may fetch the mint's fee table, but sends no proofs and pays no fee yet — and the node
+  re-runs the SDK's post-swap arithmetic on the prepared figures: the bound is the **actual** proof
+  input fee the SDK recomputes on the proofs its swap hands back, so **the invoice plus the reserve
+  plus that actual input fee plus any pre-melt swap fee** must fit the gross, and the payment is
+  refused if the SDK would fail after its swap. The SDK's *prepared* fee display is not the bound: a
+  prepared total over the gross whose actual debit fits is paid. On any of these refusals the
+  prepared payment (if any) is cancelled — the proofs go back to unspent — before any ecash is
+  consumed; the journaled row is left as it was, still planned with its receipts pinned, the refusal
+  is journaled, and the next attempt's reconciliation releases that row (it was this process's own
+  earlier attempt) and re-quotes. After a payment the report counts the SDK's fee once — `melt fee taken by
   the mint` already includes the actual proof input fee — and prints `actual debit: D sats = net +
   melt fee + swap fee`; if the wallet cannot read its balance afterwards it prints `wallet balance
   now: unknown (…)` rather than a guessed number. **Known bound:** the mint can change its fee

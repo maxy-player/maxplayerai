@@ -37,12 +37,19 @@
 //! reserve on the gross and invoice the **net**, so the fee comes OUT of the accrued amount; journal
 //! the plan (which pins the receipts, records this process as the row's owner under a lease, and
 //! refuses a duplicate — the idempotency that makes two concurrent collects pay at most once); raise
-//! the **payment quote** and check it against the hard [`MeltCeiling`] (refused ⇒ the planned row is
-//! released, nothing spent); **prepare** the melt of that quote through
+//! the **payment quote** and check its invoice + reserve alone against the hard [`MeltCeiling`]
+//! (the reserve-only precheck; refused ⇒ the planned row is NOT written: it stays planned, unbound
+//! and ours, receipts pinned, nothing spent, and the next attempt's reconciliation releases it —
+//! addendum 10 §2); if the live reserve differs from the estimate, optionally **re-plan** ONCE onto a
+//! new invoice; **prepare** the melt of that quote through
 //! [`crate::wallet_ops::prepare_melt_payment_blocking`] — the wallet selects and reserves proofs in
-//! its own database and states the SDK's proof-input fee and pre-melt swap fee, and the ceiling is
-//! taken on the TOTAL (invoice + reserve + both fees; over ⇒ the prepared melt is cancelled locally
-//! and the planned row released, nothing posted); pass the **pre-spend gate** — ONE compare-and-set
+//! its own database (it may fetch mint metadata/keysets, a GET; it posts nothing proof-bearing or
+//! fee-bearing) and states the SDK's PREPARED proof-input fee and pre-melt swap fee; run the SDK's
+//! **post-swap arithmetic** on those figures — the bound is the ACTUAL input fee recomputed on the
+//! swapped split, not the prepared display: invoice + reserve + actual input fee + swap fee must fit
+//! the gross (over, or the SDK would refuse after its swap ⇒ the prepared melt is cancelled locally
+//! and the same before-fence refusal: row stays planned, receipts pinned, nothing posted); pass the
+//! **pre-spend gate** — ONE compare-and-set
 //! in the store advances the row `planned → spending` and BINDS that quote to it (only if still
 //! planned, still ours, with more than [`SPEND_MARGIN`] of lease left at the clock read INSIDE the
 //! store call; zero rows changed is a refusal, and the prepared melt is cancelled); then **confirm**
@@ -86,8 +93,10 @@
 //! [`Refusal::FeesDoNotFit`] — and re-checks the quote actually raised; **before the fence**
 //! ([`confirm_would_succeed`]) the same check runs on the prepared figures and the keyset's
 //! `input_fee_ppk` ([`crate::wallet_ops::MeltPreparation::input_fee_ppk`]) and refuses — prepared
-//! melt cancelled, row released, one line — when the SDK would refuse after its swap or the actual
-//! worst case exceeds the gross. After payment the SDK's `FinalizedMelt::fee_paid` (`:139–148`:
+//! melt cancelled, row left planned with its receipts pinned, one line — when the SDK would refuse
+//! after its swap or the actual worst case exceeds the gross. The PREPARED total is not the bound:
+//! a prepared total over the gross whose actual debit fits (19/2/1000/[32] ⇒ invoice 13, prepared
+//! 20 > 19, actual 19 ≤ 19) is admitted. After payment the SDK's `FinalizedMelt::fee_paid` (`:139–148`:
 //! proofs sent − invoice − change) already CONTAINS the actual input fee beside the Lightning fee;
 //! the actual debit is invoice + `fee_paid` + swap fee, counted once — the prepared estimate is
 //! printed, never added. A failed post-payment balance read prints `unknown`, never a computed
@@ -109,7 +118,7 @@
 //! `a_fee_bearing_payment_whose_prepared_input_fee_differs_from_the_actual_pays_once_and_the_wallet_loses_at_most_the_gross`
 //! (one swap, one melt, the wallet measured),
 //! `a_fee_bearing_schedule_whose_prepared_figures_fit_but_post_swap_arithmetic_does_not_is_refused_before_the_fence`
-//! (wallet delta 0, no swap, no melt, row released),
+//! (wallet delta 0, no swap, no melt, row left planned and pinned),
 //! `a_fee_bearing_total_that_exceeds_the_gross_by_the_fee_is_refused_before_any_swap_or_melt`,
 //! `fee_aware_planning_sizes_the_invoice_so_a_fee_bearing_payment_fits_without_reserve_slack`
 //! (invoice 13, not 14), `fees_that_can_never_fit_are_refused_at_planning_not_at_payment` and
@@ -241,11 +250,12 @@ pub const SPEND_MARGIN: Duration = Duration::from_secs(60);
 pub enum MeltFailure {
     /// The payment was refused by the wallet layer with NOTHING posted to the mint: the quote's
     /// stored amount and reserve did not fit the [`MeltCeiling`], or — after `prepare_melt`
-    /// selected and reserved proofs in the wallet's own database — the TOTAL debit (invoice + fee
-    /// reserve + proof-input fee + swap fee, the SDK's own figures) did not fit it and the prepared
-    /// melt was cancelled (addendum 8 §1.1). Raised by [`RemitEffects::prepare_melt`], which the
-    /// remittance calls BEFORE the fence, so the row is still Planned and is released. Nothing left
-    /// the wallet.
+    /// selected and reserved proofs in the wallet's own database — the ACTUAL worst-case debit
+    /// (invoice + fee reserve + the input fee the SDK recomputes on the swapped split + swap fee)
+    /// did not fit it, or the SDK would refuse after its swap, and the prepared melt was cancelled
+    /// (addendum 9 §1.1). Raised by [`RemitEffects::prepare_melt`], which the remittance calls
+    /// BEFORE the fence, so the row is still Planned: it is not written, its receipts stay pinned,
+    /// and the next attempt's reconciliation releases it (addendum 10 §2). Nothing left the wallet.
     RefusedBeforeSpending(String),
     /// The payment failed somewhere the caller cannot see: from `prepare_melt` (unknown or expired
     /// quote, proofs short — still nothing posted, see the caller) or from `confirm_melt` (proofs may
@@ -449,9 +459,11 @@ impl RemitEffects for LiveEffects {
             .map(PreparedMelt::live)
             .map_err(|error| match error {
                 // The two typed refusals: the quote's own figures over the ceiling (before a proof
-                // was selected) or the prepared melt's total over it (prepared melt cancelled).
-                // Both: nothing posted, nothing left the wallet. Every other error from this step
-                // also posted nothing (the wallet layer prepares locally) but is opaque as to why.
+                // was selected) or the actual worst-case debit — invoice + reserve + the input fee
+                // recomputed on the swapped split + swap fee — over it (prepared melt cancelled).
+                // Both: nothing fee-bearing posted, nothing left the wallet. Every other error from
+                // this step also posted nothing fee-bearing (prepare writes the wallet's own
+                // database and at most fetches mint metadata) but is opaque as to why.
                 refused @ (WalletOpsError::MeltExceedsCeiling { .. }
                 | WalletOpsError::MeltTotalExceedsCeiling { .. }) => {
                     MeltFailure::RefusedBeforeSpending(refused.to_string())
@@ -1452,18 +1464,26 @@ fn remit_inner(
     );
     effects.after_plan(&planned);
 
-    // The spend, in the order addendum 5 §1 rule 1 fixes, with addendum 8 §1.2's bound inserted
-    // BEFORE the fence:
+    // The spend, in the order addendum 5 §1 rule 1 fixes, with addendum 9 §1.1's actual-arithmetic
+    // bound inserted BEFORE the fence (one model, addendum 10 §2 / addendum 11):
     //   1. raise the PAYMENT quote Q (spends nothing) and check the ceiling against Q's amount and
-    //      reserve — before any proof is selected; refused ⇒ release our own planned row, journal
-    //      failed, nothing spent;
+    //      reserve ALONE — the reserve-only precheck, before any proof is selected; refused ⇒
+    //      `refuse_before_fence`: the row is NOT written (stays planned, unbound, ours, receipts
+    //      pinned), the attempt is journaled failed, nothing spent; the next attempt's
+    //      reconciliation releases it as our own earlier attempt and re-plans;
+    //   1a. if Q's live reserve differs from the estimate and the planned invoice would not confirm,
+    //      re-plan ONCE onto a new invoice and a live quote for it (one conditional update on the
+    //      still-planned row); a second mismatch is refused as in step 1;
     //   1b. PREPARE the melt of Q: the wallet selects and reserves proofs in its OWN database and
-    //      states the SDK's proof-input fee and pre-melt swap fee; the ceiling is then taken on the
-    //      TOTAL (invoice + reserve + input fee + swap fee). Over ⇒ the prepared melt is cancelled
-    //      (proofs released locally — the mint never heard of it: pinned CDK 0.17.2
-    //      melt/saga/mod.rs:286–460 writes only the local store; the swap :687–697 and the melt
-    //      request :907–911 both live inside `confirm`) and this is refused exactly like step 1:
-    //      own planned row released, nothing spent, no bound Spending row is ever held for a fee;
+    //      states the SDK's PREPARED proof-input fee and pre-melt swap fee. Prepare may fetch mint
+    //      metadata/keysets (a GET); it posts nothing proof-bearing or fee-bearing — pinned CDK
+    //      0.17.2 melt/saga/mod.rs:286–460 writes only the local store; the swap :687–697 and the
+    //      melt request :907–911 both live inside `confirm`. The PREPARED total is not a gate;
+    //   1c. run the SDK's post-swap arithmetic on the prepared figures: the ACTUAL input fee
+    //      recomputed on the swapped split, and invoice + reserve + actual input fee + swap fee
+    //      against the gross. Over, or the SDK would refuse after its swap ⇒ the prepared melt is
+    //      cancelled (proofs back to Unspent, locally) and this is refused exactly like step 1: row
+    //      stays planned and pinned, nothing spent, no bound Spending row is ever held for a fee;
     //   2. the fence — ONE compare-and-set in the store advances the row planned → spending AND
     //      BINDS Q to it, only if it is still planned, still ours, and its lease ends more than
     //      SPEND_MARGIN after the clock as read INSIDE the store call, after its lock (however long
@@ -1570,8 +1590,9 @@ fn remit_inner(
 
     // 1a. Addendum 10 §1.4 — the LIVE reserve differs from the estimate the invoice was planned
     //     on. A reserve that still lets the planned invoice confirm pays with slack; one that does
-    //     not is re-planned ONCE, in this attempt, BEFORE anything is prepared: a smaller invoice
-    //     and a live quote for it, the planned row re-pointed at them by one conditional update
+    //     not is re-planned ONCE, in this attempt, BEFORE anything is prepared: a new (re-planned)
+    //     invoice — smaller or larger, whatever the search finds at the live reserve (record 40:
+    //     12 → 15) — and a live quote for it, the planned row re-pointed at them by one conditional update
     //     (still ours, still planned, still unbound — otherwise nothing is written and this is a
     //     pre-fence refusal). A next-attempt re-quote could not do this: it would plan from the
     //     probe estimate again and meet the same drift (§2.1). Gross, receipts, owner and lease do
@@ -1782,7 +1803,8 @@ fn remit_inner(
     // 1c. Confirmability (addendum 9 §1.1): the SDK's confirm recomputes the input fee on the
     //     proofs its swap yields and refuses AFTER the swap when they do not cover it. Run that
     //     arithmetic now, before the fence: a refusal here cancels the prepared melt (local) and
-    //     takes the pre-fence release path — no fee-bearing request, no bound row.
+    //     takes `refuse_before_fence` — the row is not written, it stays planned with its receipts
+    //     pinned for the next attempt's reconciliation; no fee-bearing request, no bound row.
     let actual_input_fee_sats = match confirm_would_succeed(&preparation, gross) {
         Ok(actual) => actual,
         Err(reason) => {
@@ -1955,10 +1977,11 @@ fn remit_inner(
                 settled.receipts
             );
             if debit > gross {
-                // Belt behind the braces: the prepared melt's total was bounded by the ceiling
-                // before the fence, the confirmability check bounded invoice + reserve + ACTUAL
-                // input fee + swap fee under it too, and the mint's Lightning fee is at most its
-                // reserve, so this line should never print under fixed fee metadata. If it does,
+                // Belt behind the braces: before the fence the confirmability check bounded
+                // invoice + reserve + ACTUAL input fee (recomputed on the swapped split) + swap fee
+                // under the ceiling — the prepared display is not the bound, a prepared total over
+                // the gross with a fitting actual debit is admitted — and the mint's Lightning fee
+                // is at most its reserve, so this line should never print under fixed fee metadata. If it does,
                 // the mint's fee metadata changed between prepare and confirm (§1.5 bound).
                 let _ = writeln!(
                     out,
@@ -5768,8 +5791,9 @@ mod tests {
     // AFTER paying the swap (`melt/saga/mod.rs:704–712`) — and on this path that would land after
     // the fence, leaving a bound Spending row held. The §1.1 bound runs that arithmetic BEFORE the
     // fence: refused, the prepared melt cancelled (local), no swap, no melt, wallet delta exactly 0,
-    // no request posted (the quote is still UNPAID), the row released (Planned → Failed, receipts
-    // back), one REFUSED line naming the target, the actual fee and the estimate. Until round 8 the
+    // no request posted (the quote is still UNPAID), the row NOT written (stays Planned, unbound,
+    // receipts pinned; the next attempt's reconciliation releases it — addendum 10 §2), one REFUSED
+    // line naming the target, the actual fee and the estimate. Until round 8 the
     // fake let the old schedule "succeed" (verdict da0ee92 §4.4).
     #[test]
     fn a_fee_bearing_schedule_whose_prepared_figures_fit_but_post_swap_arithmetic_does_not_is_refused_before_the_fence()
@@ -5867,9 +5891,10 @@ mod tests {
     // Fee-exceeds refusal (addendum 8 §1.5 (ii), kept by addendum 9 §1.4 (iii)): the same seller, mint and layout (plan: invoice 12, ceiling
     // 20), but the payment quote's reserve grew to 7: 12 + 7 = 19 passes the two-figure check
     // (≤ 20), yet need = 19 = 16+2+1 ⇒ three output proofs ⇒ input fee 3; selection 22 ⇒ swap fee 1;
-    // total 19 + 3 + 1 = 23 > 20 — over, by the fees. The total bound refuses BEFORE any swap or
-    // melt: wallet delta exactly 0, no request posted (the registry's quote is still UNPAID), the row
-    // released (Planned → Failed, receipts back), one REFUSED line naming the total, its parts and
+    // total 19 + 3 + 1 = 23 > 20 — over, by the fees. The actual-arithmetic bound refuses BEFORE any
+    // swap or melt: wallet delta exactly 0, no request posted (the registry's quote is still
+    // UNPAID), the row NOT written (stays Planned, unbound, receipts pinned; released by the next
+    // attempt's reconciliation — addendum 10 §2), one REFUSED line naming the total, its parts and
     // the ceiling.
     #[test]
     fn a_fee_bearing_total_that_exceeds_the_gross_by_the_fee_is_refused_before_any_swap_or_melt() {
@@ -6085,7 +6110,8 @@ mod tests {
     // Gate 2f: gross 15, the ESTIMATE quotes a 2-sat reserve (invoice 13, ceiling 15 holds), but the
     // quote the mint raises FOR THE PAYMENT carries a 4-sat reserve: 13 + 4 = 17 > 15. The melt is
     // REFUSED before any proof is spent — zero debits — the attempt is journaled FAILED naming the
-    // row, the row is released, and the accrued balance is exactly what it was. Then the same seller
+    // row, the row stays planned with its receipts pinned (the next attempt's reconciliation
+    // releases it — addendum 10 §2), and nothing left the wallet. Then the same seller
     // with a payment-time reserve that FITS pays exactly once.
     #[test]
     fn a_reserve_that_grows_between_estimate_and_payment_is_refused_before_spending() {
@@ -6112,7 +6138,8 @@ mod tests {
             "ZERO debits: the refusal happens before the proofs are touched"
         );
         // Addendum 5 §1 rule 1: the payment quote was raised and checked BEFORE the fence — the row
-        // was never admitted, so it was released as a planned row of our own.
+        // was never admitted; it is left planned, unbound and pinned (addendum 10 §2), not released
+        // here.
         assert_eq!(fake.quotes, vec!["lnbc-fake-13-2".to_owned()]);
         assert!(fake.admitted_seen.is_empty(), "refused before the fence");
         assert!(
