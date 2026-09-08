@@ -68,9 +68,11 @@
 //! (it may fetch mint metadata/keysets, a GET; the swap `melt/saga/mod.rs:687–697` and the melt
 //! request `:907–911` both live inside `confirm`) — and [`MeltCeiling::admits_confirmable`] is taken on
 //! those four figures; over ⇒ `PreparedMelt::cancel` (`:817–831`, best-effort local compensation:
-//! proofs back to Unspent, quote released) and the ordinary before-fence refusal (planned row
-//! released, one `REFUSED before spending` line naming the total, its parts and the ceiling,
-//! backoff continues) — a fee refusal never leaves a bound Spending row held.
+//! proofs back to Unspent, quote released) and the ordinary before-fence refusal (the planned row
+//! is NOT written: it stays planned, unbound and ours, its receipts pinned; ONE `REFUSED before
+//! spending` line naming the total, its parts and the ceiling; backoff continues and the next
+//! attempt's reconciliation releases the row as our own earlier attempt and re-plans — addendum
+//! 10 §2) — a fee refusal never leaves a bound Spending row held.
 //!
 //! **The fee model is CDK's, not the prepared display's (addendum 9).** The prepared `input_fee` is
 //! an ESTIMATE — the fee on the split of invoice + reserve before that fee is added
@@ -1521,15 +1523,16 @@ fn remit_inner(
                                store: &SellerStore,
                                out: &mut dyn Write|
      -> Result<RemitOutcome, String> {
-        let released = release_own_planned(store, out)?;
+        // Addendum 10 §2: an arithmetic refusal before the fence writes NOTHING to the row. It stays
+        // Planned, unbound (no admission mark, no bound quote), ours, under its lease, its receipts
+        // pinned; the attempt journal records the failure. The next attempt's reconciliation
+        // releases it as our own earlier attempt (`OwnPlanned`) and re-plans on a fresh quote —
+        // backoff continues, one line here. (`release_own_planned` remains for a failed payment
+        // quote and a lost fence, which are not arithmetic refusals.)
+        let _ = store;
         let _ = writeln!(
             out,
-            "REFUSED before spending — {reason}.\n  A seller never pays more than it accrued: the ceiling is {gross} sats, enforced against the quote the mint raised for the payment. Nothing left the wallet{}. The next attempt re-quotes.",
-            if released {
-                format!("; released {gross} sats back to unremitted")
-            } else {
-                String::new()
-            }
+            "REFUSED before spending — {reason}; ceiling {gross} sats; nothing left the wallet; the row stays planned and the next attempt re-quotes."
         );
         Ok(RemitOutcome::MeltRefused {
             remittance_id: planned.remittance_id.clone(),
@@ -2078,7 +2081,7 @@ impl RemitReport {
                 remittance_id,
                 reason,
             }) => format!(
-                "melt REFUSED before spending ({reason}); remittance {remittance_id} released, the balance stays unremitted and the next attempt re-quotes"
+                "melt REFUSED before spending ({reason}); remittance {remittance_id} stays planned and unbound, nothing spent; the next attempt reconciles it and re-quotes"
             ),
             Ok(RemitOutcome::QuoteFailed {
                 remittance_id,
@@ -3582,6 +3585,45 @@ mod tests {
     use crate::wallet_ops::post_swap_figures;
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    /// Addendum 10 §2: a pre-fence arithmetic refusal is ONE line and writes nothing to the row —
+    /// it stays Planned, unbound, with its receipts pinned and its planned quote on it; nothing of
+    /// the old stanza ("A seller never pays…", "released … back to unremitted") follows.
+    fn assert_refused_before_fence_row_stays_planned(
+        out: &str,
+        row: &FeeRemittance,
+        gross: u64,
+        planned_quote_id: &str,
+    ) {
+        let refusals: Vec<&str> = out
+            .lines()
+            .filter(|line| line.starts_with("REFUSED before spending — "))
+            .collect();
+        assert_eq!(refusals.len(), 1, "exactly one refusal line:\n{out}");
+        assert!(
+            refusals[0].ends_with(&format!(
+                "; ceiling {gross} sats; nothing left the wallet; the row stays planned and the next attempt re-quotes."
+            )),
+            "{}",
+            refusals[0]
+        );
+        assert_eq!(
+            out.matches("REFUSED before spending").count(),
+            1,
+            "the refusal is stated once:\n{out}"
+        );
+        assert!(
+            !out.contains("A seller never pays more than it accrued")
+                && !out.contains("back to unremitted"),
+            "nothing of the old stanza follows the one line:\n{out}"
+        );
+        assert_eq!(row.state, RemittanceState::Planned, "the row is not written");
+        assert_eq!(row.spending_since_unix, None, "never admitted");
+        assert_eq!(row.spending_quote_id, None, "no quote bound");
+        assert_eq!(row.gross_sats, gross);
+        assert_eq!(row.receipts, 2, "receipts stay pinned to the planned row");
+        assert_eq!(row.melt_quote_id.as_deref(), Some(planned_quote_id));
+    }
 
     fn temp_home(label: &str) -> PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
@@ -5258,10 +5300,6 @@ mod tests {
             "exactly one refusal line:\n{out}"
         );
         assert!(
-            out.contains("Nothing left the wallet; released 20 sats back to unremitted."),
-            "{out}"
-        );
-        assert!(
             !out.contains("Prepared melt of quote"),
             "refused before the prepared line:\n{out}"
         );
@@ -5279,12 +5317,7 @@ mod tests {
         );
         let rows = store.remittances().expect("rows");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].state, RemittanceState::Failed);
-        assert_eq!(rows[0].receipts, 0, "released");
-        assert_eq!(
-            rows[0].melt_quote_id.as_deref(),
-            Some("quote-lnbc-fake-12-2")
-        );
+        assert_refused_before_fence_row_stays_planned(&out, &rows[0], 20, "quote-lnbc-fake-12-2");
         let attempts = store.recent_remit_attempts(10).expect("attempts");
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].outcome, RemitAttemptOutcome::Failed);
@@ -5363,10 +5396,6 @@ mod tests {
             out.contains("REFUSED before spending — melt refused before spending: mint https://mint.example quote paid-quote-lnbc-fake-12-2 would debit 23 sats in total (12 sats invoice + 7 sats fee reserve + 3 sats proof input fee + 1 sats swap fee) against a ceiling of 20 sats"),
             "{out}"
         );
-        assert!(
-            out.contains("Nothing left the wallet; released 20 sats back to unremitted."),
-            "{out}"
-        );
         assert!(!out.contains("Prepared melt of quote"), "{out}");
         let quote = registry
             .lock()
@@ -5381,12 +5410,7 @@ mod tests {
         );
         let rows = store.remittances().expect("rows");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].state, RemittanceState::Failed);
-        assert_eq!(rows[0].receipts, 0, "released");
-        assert_eq!(
-            rows[0].melt_quote_id.as_deref(),
-            Some("quote-lnbc-fake-12-2")
-        );
+        assert_refused_before_fence_row_stays_planned(&out, &rows[0], 20, "quote-lnbc-fake-12-2");
         let attempts = store.recent_remit_attempts(10).expect("attempts");
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].outcome, RemitAttemptOutcome::Failed);
@@ -5567,11 +5591,8 @@ mod tests {
             out.contains("REFUSED before spending — melt refused before spending"),
             "{out}"
         );
-        assert!(
-            out.contains("A seller never pays more than it accrued: the ceiling is 15 sats, enforced against the quote the mint raised for the payment. Nothing left the wallet; released 15 sats back to unremitted."),
-            "{out}"
-        );
-        // Journaled as a FAILED attempt naming the row; the row is failed and its receipts released.
+        // Journaled as a FAILED attempt naming the row; the row itself is NOT written (addendum 10
+        // §2): it stays planned with its receipts pinned, for the next attempt to reconcile.
         let attempts = store.recent_remit_attempts(10).expect("attempts");
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].outcome, RemitAttemptOutcome::Failed);
@@ -5583,11 +5604,9 @@ mod tests {
             "{}",
             attempts[0].detail
         );
-        assert_eq!(attempts[0].unremitted_sats, 15);
         let rows = store.remittances().expect("rows");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].state, RemittanceState::Failed);
-        assert_eq!(rows[0].receipts, 0, "released");
+        assert_refused_before_fence_row_stays_planned(&out, &rows[0], 15, "quote-lnbc-fake-13-2");
         let accrued = store.accrued_fees().expect("read");
         assert_eq!(
             (
@@ -5595,8 +5614,8 @@ mod tests {
                 accrued.in_flight_fee_sats,
                 accrued.unremitted_fee_sats
             ),
-            (0, 0, 15),
-            "the accrued balance is unchanged: nothing paid, nothing in flight"
+            (0, 15, 0),
+            "nothing paid; the gross is in flight on the planned row until the next attempt reconciles it"
         );
         // It is a failure for the pacing: the backoff escalates.
         let report = RemitReport {
