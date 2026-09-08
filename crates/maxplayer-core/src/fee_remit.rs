@@ -208,7 +208,8 @@ use crate::lnurl_pay::{self, HttpsFetch, LightningAddress, PayRequest, ResolvedI
 use crate::platform_fee::PLATFORM_FEE_ADDRESS;
 use crate::seller_node::store::{
     FeeRemittance, OwnershipLost, PlanRefused, ReleaseOn, RemitAttempt, RemitAttemptOutcome,
-    RemitAttemptTrigger, RemitSettlement, RemittancePlan, RemittanceState, SellerStore, SettledBy,
+    RemitAttemptTrigger, RemitSettlement, RemittancePlan, RemittanceReplan, RemittanceState,
+    SellerStore, SettledBy,
 };
 use crate::wallet_ops::{
     self, MeltCeiling, MeltEstimate, MeltOutcome, MeltPreparation, MeltQuoteState, MeltQuoteStatus,
@@ -1559,6 +1560,168 @@ fn remit_inner(
             out,
         );
     }
+
+    // 1a. Addendum 10 §1.4 — the LIVE reserve differs from the estimate the invoice was planned
+    //     on. A reserve that still lets the planned invoice confirm pays with slack; one that does
+    //     not is re-planned ONCE, in this attempt, BEFORE anything is prepared: a smaller invoice
+    //     and a live quote for it, the planned row re-pointed at them by one conditional update
+    //     (still ours, still planned, still unbound — otherwise nothing is written and this is a
+    //     pre-fence refusal). A next-attempt re-quote could not do this: it would plan from the
+    //     probe estimate again and meet the same drift (§2.1). Gross, receipts, owner and lease do
+    //     not move. The re-planned quote is checked by the same bound; a second mismatch is NOT
+    //     re-planned again.
+    let (invoice, net, quote, ceiling) = if quote.fee_reserve_sats == estimate.fee_reserve_sats {
+        (invoice, net, quote, ceiling)
+    } else {
+        let live_reserve = quote.fee_reserve_sats;
+        let requires_swap = estimate.input_fee_ppk > 0;
+        match confirm_bound(
+            net,
+            live_reserve,
+            None,
+            estimate.expected_swap_fee_sats,
+            estimate.input_fee_ppk,
+            requires_swap,
+            gross,
+        ) {
+            Ok(_) => (invoice, net, quote, ceiling),
+            Err(shortfall) => {
+                let why_not = match &shortfall {
+                    ConfirmShortfall::TargetShort {
+                        bound,
+                        needed_after_swap_sats,
+                    } => format!(
+                        "the wallet would swap to {} sats and the SDK's actual proof input fee on those proofs is {} sats, so the payment would need {needed_after_swap_sats} sats and the SDK would refuse after its swap",
+                        bound.target_sats, bound.actual_input_fee_sats
+                    ),
+                    ConfirmShortfall::OverCeiling { bound, .. } => format!(
+                        "invoice + reserve + actual proof input fee {} sats + swap fee {} sats = {} sats would exceed the {gross} sats accrued",
+                        bound.actual_input_fee_sats, bound.swap_fee_sats, bound.worst_debit_sats
+                    ),
+                    ConfirmShortfall::DifferentInvoice { .. } => {
+                        unreachable!("confirm_bound without a ceiling never compares invoices")
+                    }
+                };
+                let net2 = match plan_confirmable_invoice(
+                    gross,
+                    live_reserve,
+                    estimate.expected_swap_fee_sats,
+                    estimate.input_fee_ppk,
+                ) {
+                    Some(net2) if net2 >= min_sats => net2,
+                    _ => {
+                        return refuse_before_fence(
+                            format!(
+                                "melt refused before spending: mint {} quote {} carries a {live_reserve} sats fee reserve on the {net}-sat invoice (planned on {} sats); {why_not}, and no invoice of at least {min_sats} sats fits {gross} sats at that reserve; nothing left the wallet",
+                                quote.mint_url, quote.quote_id, estimate.fee_reserve_sats
+                            ),
+                            store,
+                            out,
+                        );
+                    }
+                };
+                let invoice2 = match effects.invoice(&pay, net2) {
+                    Ok(invoice2) => invoice2,
+                    Err(error) => {
+                        return refuse_before_fence(
+                            format!(
+                                "melt refused before spending: re-planning from invoice {net} sats to {net2} sats (live fee reserve {live_reserve} sats, planned on {} sats) — the {net2}-sat invoice could not be raised: {error}; nothing left the wallet",
+                                estimate.fee_reserve_sats
+                            ),
+                            store,
+                            out,
+                        );
+                    }
+                };
+                let quote2 = match effects.melt_quote(&invoice2.bolt11) {
+                    Ok(quote2) => quote2,
+                    Err(error) => {
+                        return refuse_before_fence(
+                            format!(
+                                "melt refused before spending: re-planning from invoice {net} sats to {net2} sats (live fee reserve {live_reserve} sats, planned on {} sats) — the payment quote for the {net2}-sat invoice failed: {error}; nothing left the wallet",
+                                estimate.fee_reserve_sats
+                            ),
+                            store,
+                            out,
+                        );
+                    }
+                };
+                if quote2.amount_sats != net2 {
+                    return refuse_before_fence(
+                        format!(
+                            "melt refused before spending: mint {} quoted {} sats for the re-planned {net2}-sat invoice; nothing left the wallet",
+                            quote2.mint_url, quote2.amount_sats
+                        ),
+                        store,
+                        out,
+                    );
+                }
+                // The re-planned quote must itself confirm under the bound — with ITS reserve. A
+                // second mismatch is a refusal, not another re-plan.
+                let bound2 = match confirm_bound(
+                    net2,
+                    quote2.fee_reserve_sats,
+                    None,
+                    estimate.expected_swap_fee_sats,
+                    estimate.input_fee_ppk,
+                    requires_swap,
+                    gross,
+                ) {
+                    Ok(bound2) => bound2,
+                    Err(_) => {
+                        return refuse_before_fence(
+                            format!(
+                                "melt refused before spending: re-planned to invoice {net2} sats on a {live_reserve} sats fee reserve, but mint {} quote {} carries a {} sats fee reserve on it and the payment would not confirm within {gross} sats; not re-planned a second time; nothing left the wallet",
+                                quote2.mint_url, quote2.quote_id, quote2.fee_reserve_sats
+                            ),
+                            store,
+                            out,
+                        );
+                    }
+                };
+                let replanned = store
+                    .replan_remittance(
+                        &planned.remittance_id,
+                        effects.owner(),
+                        &RemittanceReplan {
+                            net_sats: net2,
+                            payment_hash: invoice2.payment_hash.clone(),
+                            bolt11: invoice2.bolt11.clone(),
+                            melt_fee_reserve_sats: quote2.fee_reserve_sats,
+                            melt_quote_id: Some(quote2.quote_id.clone()),
+                        },
+                    )
+                    .map_err(|error| format!("re-plan remittance: {error}"))?;
+                if replanned.is_none() {
+                    return refuse_before_fence(
+                        format!(
+                            "melt refused before spending: the planned row changed under me while re-planning from invoice {net} sats to {net2} sats (live fee reserve {live_reserve} sats) — nothing written; nothing left the wallet"
+                        ),
+                        store,
+                        out,
+                    );
+                }
+                let _ = writeln!(
+                    out,
+                    "Re-planned: the payment quote's fee reserve is {live_reserve} sats (planned on {} sats); invoice {net} sats would not confirm ({why_not}), invoice {net2} sats will (at most {} sats leaves the wallet, ≤ {gross}); payment quote {} raised at mint {} for {net2} sats (fee reserve {} sats); invoice payment hash: {}",
+                    estimate.fee_reserve_sats,
+                    bound2.worst_debit_sats,
+                    quote2.quote_id,
+                    quote2.mint_url,
+                    quote2.fee_reserve_sats,
+                    invoice2.payment_hash
+                );
+                let ceiling2 = MeltCeiling {
+                    max_debit_sats: gross,
+                    invoice_sats: net2,
+                    planned_quote_id: Some(quote2.quote_id.clone()),
+                };
+                (invoice2, net2, quote2, ceiling2)
+            }
+        }
+    };
+    // From here `net`, `quote` and `ceiling` are the (possibly re-planned) figures; `planned` keeps
+    // the row as first journaled — only its unchanged fields (id, gross, receipts) are read below.
     let margin_secs = lease_secs(SPEND_MARGIN);
     let quote_inside_margin = |now_unix: i64| {
         u64::try_from(now_unix.saturating_add(margin_secs))
