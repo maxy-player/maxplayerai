@@ -1211,7 +1211,33 @@ fn remit_inner(
             Refusal::ReserveDoesNotFit { gross, reserve }
         }));
     }
-    let net = gross - reserve - expected;
+    // Addendum 9 §1.2: the invoice is the largest one `confirm` can actually pay within the gross —
+    // the SDK's swap target must cover invoice + reserve + the input fee it RECOMPUTES on the
+    // swapped proofs, and that plus the swap fee must fit the gross. Searched locally on the
+    // probe's reserve, swap fee and keyset ppk; re-checked below on the quote actually raised.
+    let net = match plan_confirmable_invoice(
+        gross,
+        reserve,
+        probe_estimate.expected_swap_fee_sats,
+        probe_estimate.input_fee_ppk,
+    ) {
+        Some(net) => net,
+        None => {
+            let _ = writeln!(
+                out,
+                "REFUSED — no invoice fits: at mint {}'s {} ppk proof fee, no amount up to {} sats ({gross} sats less the {reserve} sats melt fee reserve) can be paid for at most {gross} sats once the SDK recomputes its proof input fee on the swapped proofs{}. The balance accumulates. Nothing moved.",
+                probe_estimate.mint_url,
+                probe_estimate.input_fee_ppk,
+                gross - reserve,
+                expected_clause(expected)
+            );
+            return Ok(RemitOutcome::Refused(Refusal::FeesDoNotFit {
+                gross,
+                reserve,
+                expected_fees: expected,
+            }));
+        }
+    };
     if net < min_sats {
         let _ = writeln!(
             out,
@@ -1268,6 +1294,39 @@ fn remit_inner(
         }));
     }
 
+    // §1.2 re-check on the quote actually raised (its reserve and this wallet's layout for THIS
+    // amount): the SDK's post-swap arithmetic must hold and the worst case must fit the gross.
+    let planned_need = net.saturating_add(estimate.fee_reserve_sats);
+    let planned_estimated_input = estimate
+        .expected_fees_sats
+        .saturating_sub(estimate.expected_swap_fee_sats);
+    let (planned_target, planned_actual_input) = if estimate.input_fee_ppk > 0 {
+        post_swap_figures(
+            planned_need,
+            Some(planned_estimated_input),
+            estimate.input_fee_ppk,
+        )
+    } else {
+        (planned_need, 0)
+    };
+    let worst_debit = planned_need
+        .saturating_add(planned_actual_input)
+        .saturating_add(estimate.expected_swap_fee_sats);
+    if planned_target < planned_need.saturating_add(planned_actual_input) || worst_debit > gross {
+        let _ = writeln!(
+            out,
+            "REFUSED — mint {} quotes a {} sats fee reserve on {net} sats; the wallet would swap to {planned_target} sats and the SDK's actual proof input fee on those proofs is {planned_actual_input} sats (estimate {planned_estimated_input} sats), so the payment would need {} sats and cost up to {worst_debit} sats against {gross} sats accrued. A seller never pays more than it accrued. Nothing moved.",
+            estimate.mint_url,
+            estimate.fee_reserve_sats,
+            planned_need + planned_actual_input
+        );
+        return Ok(RemitOutcome::Refused(Refusal::FeesDoNotFit {
+            gross,
+            reserve: estimate.fee_reserve_sats,
+            expected_fees: estimate.expected_fees_sats,
+        }));
+    }
+
     // 5. The plan, in the seller's words.
     let _ = writeln!(
         out,
@@ -1277,7 +1336,7 @@ fn remit_inner(
     if estimate.expected_fees_sats > 0 {
         let _ = writeln!(
             out,
-            "  expected proof fees (SDK estimate, bounded exactly at payment): {} sats",
+            "  expected proof fees (SDK estimate, bounded exactly at payment): {} sats; actual proof input fee the SDK recomputes on the swapped proofs: {planned_actual_input} sats ⇒ worst case {worst_debit} sats leaves the wallet (≤ {gross})",
             estimate.expected_fees_sats
         );
     }
@@ -2140,6 +2199,47 @@ pub(crate) fn binary_split(amount: u64) -> Vec<u64> {
         .collect()
 }
 
+/// CDK's post-swap figures for a melt of `need` = invoice + reserve on a swap layout: the target the
+/// wallet swaps to (`need` + the PREPARED input fee, `melt/saga/mod.rs:678`) and the ACTUAL input
+/// fee the SDK recomputes on that target's binary split (`:704`). `prepared_input_fee_sats` is what
+/// `prepare_melt` estimated (the fee on the split of `need`, `:383–387`); when `None` it is computed
+/// the same way here (planning, before any quote's figures exist).
+pub(crate) fn post_swap_figures(
+    need_sats: u64,
+    prepared_input_fee_sats: Option<u64>,
+    input_fee_ppk: u64,
+) -> (u64, u64) {
+    let prepared = prepared_input_fee_sats
+        .unwrap_or_else(|| fee_for(input_fee_ppk, binary_split(need_sats).len()));
+    let target_sats = need_sats.saturating_add(prepared);
+    let actual = fee_for(input_fee_ppk, binary_split(target_sats).len());
+    (target_sats, actual)
+}
+
+/// **Fee-aware planning (addendum 9 §1.2): the largest invoice `confirm` can actually pay within
+/// `gross`.** Searches DOWN from `gross − reserve` for the first invoice `n` for which, with
+/// `need = n + reserve`, the post-swap arithmetic holds — target ≥ need + actual input fee — AND
+/// need + actual input fee + `swap_fee_sats` ≤ `gross`. `reserve` and `swap_fee_sats` are the
+/// probe's (the mint's reserve policy and the wallet's swap fee at the gross); the quote raised for
+/// the chosen invoice is checked again with its own figures. `None`: no invoice fits — refuse at
+/// planning. A fee-free mint (`input_fee_ppk == 0`, no swap) yields `gross − reserve`, as before.
+/// Verdict da0ee92 §4.4: gross 20, reserve 2, 1000 ppk, one 32-sat proof ⇒ 13 (need 15, target 19 =
+/// [16, 2, 1], actual 3, worst 19 ≤ 20), not 14 (need 16, target 17 = [16, 1], actual 2, 17 < 18).
+pub(crate) fn plan_confirmable_invoice(
+    gross: u64,
+    reserve: u64,
+    swap_fee_sats: u64,
+    input_fee_ppk: u64,
+) -> Option<u64> {
+    let ceiling = gross.checked_sub(reserve)?;
+    (1..=ceiling).rev().find(|&invoice| {
+        let need = invoice + reserve;
+        let (target, actual) = post_swap_figures(need, None, input_fee_ppk);
+        target >= need.saturating_add(actual)
+            && need.saturating_add(actual).saturating_add(swap_fee_sats) <= gross
+    })
+}
+
 /// **Will `confirm` succeed, under the fee metadata the preparation saw?** Addendum 9 §1.1, from
 /// pinned CDK 0.17.2 `MeltSaga::request_melt_with_options` (`melt/saga/mod.rs:647–760`): on a
 /// swap layout the wallet swaps to a target of invoice + reserve + the PREPARED input fee (`:678`),
@@ -2163,9 +2263,12 @@ pub(crate) fn confirm_would_succeed(preparation: &MeltPreparation, gross: u64) -
         .invoice_sats
         .saturating_add(preparation.fee_reserve_sats);
     let actual_input_fee_sats = if preparation.requires_swap {
-        let target_sats = need.saturating_add(preparation.input_fee_sats);
+        let (target_sats, actual) = post_swap_figures(
+            need,
+            Some(preparation.input_fee_sats),
+            preparation.input_fee_ppk,
+        );
         let split = binary_split(target_sats);
-        let actual = fee_for(preparation.input_fee_ppk, split.len());
         let needed_after_swap = need.saturating_add(actual);
         if target_sats < needed_after_swap {
             return Err(format!(
@@ -2629,14 +2732,18 @@ pub(crate) mod test_support {
 
         /// The fees the SDK would charge this wallet on top of `need` right now (nothing removed):
         /// the estimate's `expected_fees_sats`, or `0` and the reason.
-        fn expected_fees(&self, need: u64) -> (u64, Option<String>) {
+        fn expected_fees(&self, need: u64) -> (u64, u64, Option<String>) {
             let snapshot: Option<Vec<u64>> = self
                 .proofs
                 .as_ref()
                 .map(|proofs| proofs.lock().unwrap_or_else(|e| e.into_inner()).clone());
             match layout(self.input_fee_ppk, snapshot.as_deref(), need) {
-                Ok(layout) => (layout.input_fee_sats + layout.swap_fee_sats, None),
-                Err(reason) => (0, Some(reason)),
+                Ok(layout) => (
+                    layout.input_fee_sats + layout.swap_fee_sats,
+                    layout.swap_fee_sats,
+                    None,
+                ),
+                Err(reason) => (0, 0, Some(reason)),
             }
         }
 
@@ -2789,7 +2896,7 @@ pub(crate) mod test_support {
                     expiry_unix: self.quote_expiry_unix,
                 },
             );
-            let (expected_fees_sats, expected_fees_note) =
+            let (expected_fees_sats, expected_swap_fee_sats, expected_fees_note) =
                 self.expected_fees(amount_sats.saturating_add(fee_reserve_sats));
             Ok(MeltEstimate {
                 mint_url: "https://mint.example".to_owned(),
@@ -2798,6 +2905,8 @@ pub(crate) mod test_support {
                 fee_reserve_sats,
                 expiry_unix: self.quote_expiry_unix,
                 expected_fees_sats,
+                expected_swap_fee_sats,
+                input_fee_ppk: self.input_fee_ppk,
                 expected_fees_note,
             })
         }
@@ -2819,7 +2928,7 @@ pub(crate) mod test_support {
                     expiry_unix: self.quote_expiry_unix,
                 },
             );
-            let (expected_fees_sats, expected_fees_note) =
+            let (expected_fees_sats, expected_swap_fee_sats, expected_fees_note) =
                 self.expected_fees(amount_sats.saturating_add(fee_reserve_sats));
             Ok(MeltEstimate {
                 mint_url: "https://mint.example".to_owned(),
@@ -2828,6 +2937,8 @@ pub(crate) mod test_support {
                 fee_reserve_sats,
                 expiry_unix: self.quote_expiry_unix,
                 expected_fees_sats,
+                expected_swap_fee_sats,
+                input_fee_ppk: self.input_fee_ppk,
                 expected_fees_note,
             })
         }
@@ -4299,6 +4410,18 @@ mod tests {
         assert_eq!(binary_split(14), vec![8, 4, 2]);
         assert_eq!(binary_split(19), vec![16, 2, 1]);
         assert_eq!(binary_split(0), Vec::<u64>::new());
+        // §1.2 planning: the advisor's example and its neighbours.
+        assert_eq!(
+            plan_confirmable_invoice(20, 2, 1, 1000),
+            Some(13),
+            "gross 20, reserve 2: 13 pays at 19; 14 would swap to 17 < 16 + 2"
+        );
+        assert_eq!(plan_confirmable_invoice(20, 3, 1, 1000), Some(12));
+        assert_eq!(plan_confirmable_invoice(3, 1, 1, 1000), None, "never fits");
+        assert_eq!(plan_confirmable_invoice(20, 2, 0, 0), Some(18), "fee-free: gross − reserve");
+        assert_eq!(plan_confirmable_invoice(2, 2, 0, 0), None, "reserve eats the gross");
+        assert_eq!(post_swap_figures(15, Some(4), 1000), (19, 3));
+        assert_eq!(post_swap_figures(16, None, 1000), (17, 2));
         let mut fake = Fake::new(|_| 0);
         fake.input_fee_ppk = 1000;
         fake.proofs = Some(fake_proofs(&[32]));

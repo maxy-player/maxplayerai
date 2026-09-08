@@ -334,6 +334,14 @@ pub struct MeltEstimate {
     /// be made (e.g. the wallet cannot cover amount + reserve at estimate time); the reason is in
     /// [`Self::expected_fees_note`].
     pub expected_fees_sats: u64,
+    /// The part of `expected_fees_sats` that is the pre-melt SWAP's fee (`0` on an exact-fit
+    /// layout); the rest is the SDK's ESTIMATED melt-input fee. Planning needs them apart: the
+    /// input fee is recomputed by `confirm` on the swapped proofs, the swap fee is not.
+    pub expected_swap_fee_sats: u64,
+    /// The active keyset's `input_fee_ppk` (NUT-02), so the planner can run the SDK's post-swap
+    /// input-fee recomputation ahead of time (addendum 9 §1.2). `0` when it could not be read; the
+    /// reason is in [`Self::expected_fees_note`].
+    pub input_fee_ppk: u64,
     /// Why `expected_fees_sats` is `0` by default rather than measured, when it is; `None` when the
     /// estimate was made.
     pub expected_fees_note: Option<String>,
@@ -1227,7 +1235,7 @@ async fn pay_quote_on_wallet(
 /// writing a saga: keysets and unspent proofs are read, `Wallet::select_proofs` is a pure function,
 /// and the fee lookups read the mint's keyset metadata (cached; a GET at most). Returns the
 /// proof-input fee on an exact-fit selection, or estimated input fee + swap fee on a swap layout.
-async fn expected_melt_fees(wallet: &Wallet, inputs_needed: Amount) -> Result<u64, String> {
+async fn expected_melt_fees(wallet: &Wallet, inputs_needed: Amount) -> Result<(u64, u64), String> {
     let active_keyset_ids: Vec<_> = wallet
         .get_mint_keysets(KeysetFilter::Active)
         .await
@@ -1252,12 +1260,15 @@ async fn expected_melt_fees(wallet: &Wallet, inputs_needed: Amount) -> Result<u6
     )
     .map_err(|error| error.to_string())?;
     if exact.total_amount().map_err(|error| error.to_string())? == inputs_needed {
-        return Ok(wallet
-            .get_proofs_fee(&exact)
-            .await
-            .map_err(|error| error.to_string())?
-            .total
-            .to_u64());
+        return Ok((
+            wallet
+                .get_proofs_fee(&exact)
+                .await
+                .map_err(|error| error.to_string())?
+                .total
+                .to_u64(),
+            0,
+        ));
     }
     let active_keyset_id = wallet
         .get_active_keyset()
@@ -1289,7 +1300,7 @@ async fn expected_melt_fees(wallet: &Wallet, inputs_needed: Amount) -> Result<u6
         .await
         .map_err(|error| error.to_string())?
         .total;
-    Ok((input_fee + swap_fee).to_u64())
+    Ok((input_fee.to_u64(), swap_fee.to_u64()))
 }
 
 /// The active keyset's NUT-02 `input_fee_ppk`, read through the SDK's fee function: the fee on
@@ -1586,11 +1597,24 @@ pub async fn melt_quote_async(
         .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
     // Fee-aware estimate (addendum 8 §1.3): the proof fees this wallet would pay on top of
     // amount + reserve, the SDK's way, reserving nothing. Not estimable ⇒ 0 and the reason.
-    let (expected_fees_sats, expected_fees_note) =
+    let (expected_fees_sats, expected_swap_fee_sats, mut expected_fees_note) =
         match expected_melt_fees(&wallet, quote.amount + quote.fee_reserve).await {
-            Ok(fees) => (fees, None),
-            Err(reason) => (0, Some(reason)),
+            Ok((input_fee, swap_fee)) => (input_fee + swap_fee, swap_fee, None),
+            Err(reason) => (0, 0, Some(reason)),
         };
+    // The keyset's ppk for the planner's post-swap recomputation (addendum 9 §1.2); a cached
+    // metadata read. Unreadable ⇒ 0 and the reason, never a guess.
+    let input_fee_ppk = match active_keyset_input_fee_ppk(&wallet).await {
+        Ok(ppk) => ppk,
+        Err(reason) => {
+            let note = format!("keyset input_fee_ppk not readable: {reason}");
+            expected_fees_note = Some(match expected_fees_note {
+                Some(existing) => format!("{existing}; {note}"),
+                None => note,
+            });
+            0
+        }
+    };
     Ok(MeltEstimate {
         mint_url,
         quote_id: quote.id,
@@ -1598,6 +1622,8 @@ pub async fn melt_quote_async(
         fee_reserve_sats: quote.fee_reserve.to_u64(),
         expiry_unix: quote.expiry,
         expected_fees_sats,
+        expected_swap_fee_sats,
+        input_fee_ppk,
         expected_fees_note,
     })
 }
