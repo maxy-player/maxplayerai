@@ -57,26 +57,42 @@
 //! between is a refused, journaled, failed attempt with the balance intact.
 //!
 //! **Ownership (§2), as the tests in this module prove it:** a row is paid only by the process that
-//! planned it, and only through the fence — [`SellerStore::admit_remittance_spend`] — which two
-//! processes cannot both pass. A `planned` row (fence not yet passed: nothing spent against it) is
-//! released by another process only when its quote is terminal at the mint (FAILED, or UNPAID and
-//! expired) or its owner's lease of [`REMIT_LEASE`] has run out — never on a live UNPAID alone,
-//! because UNPAID means "not yet", not "abandoned"; and a planned row whose lease ran down while
-//! its owner paused is refused by the owner's own fence, which reads the clock fresh (the test
-//! `an_owner_whose_lease_ran_down_while_it_paused_is_refused_by_its_own_fence`; the release-then-
-//! refuse interleaving is `an_owner_that_outlives_its_lease_is_released_and_its_fence_then_changes_zero_rows`).
+//! planned it, only through the fence — [`SellerStore::admit_remittance_spend`], which two
+//! processes cannot both pass — and only under the ONE quote the fence bound to it: the payer never
+//! raises a second quote for a row it holds, and a quote it has not raised cannot be spoken for.
+//! Every release is a conditional transition carrying its reason's predicate ([`ReleaseOn`]):
+//! zero rows changed means the row moved under the releasing process, which then holds. A
+//! `planned` row (fence not yet passed: nothing spent against it) is released by another process
+//! only when its invoice's quote is terminal at the mint (FAILED, or UNPAID and expired) or its
+//! owner's lease of [`REMIT_LEASE`] has run out — never on a live UNPAID alone, because UNPAID
+//! means "not yet", not "abandoned"; a planned row whose lease ran down while its owner paused is
+//! refused by the owner's own fence, which reads the clock inside the store's lock
+//! (`an_owner_whose_lease_ran_down_while_it_paused_is_refused_by_its_own_fence`; released-then-
+//! refused: `an_owner_that_outlives_its_lease_is_released_and_its_fence_then_changes_zero_rows`,
+//! `an_owner_paused_after_its_quote_and_past_its_lease_is_released_and_never_pays_that_quote`);
+//! and a release decided on a stale planned snapshot changes zero rows once the owner's fence has
+//! landed (`a_release_decided_on_a_stale_planned_snapshot_cannot_revoke_a_later_admission`).
 //! A `spending` row (fence passed: its owner may be mid-melt) is released by nobody on time — only
-//! a terminal quote releases it and only PAID settles it, however long ago its lease ran out
+//! its BOUND quote, asked by id, releases it (FAILED, or UNPAID past expiry + [`SPEND_MARGIN`], the
+//! margin inside which its owner refuses to pay it) and only PAID settles it, however long ago its
+//! lease ran out and whatever became of the estimate quote raised earlier for the same invoice
 //! (`a_spending_row_is_not_released_when_its_lease_expires_and_its_owner_pays_exactly_once`,
-//! `a_spending_row_is_released_only_on_a_terminal_quote_never_on_time`). Under those tests, two
-//! processes sharing one store debit an accrued balance exactly once. The owner's own reconciliation
-//! of its own `planned` row may release on UNPAID: a process runs at most one attempt at a time
+//! `a_spending_row_is_reconciled_by_its_bound_quote_not_by_an_expired_estimate`,
+//! `a_bound_quote_expired_past_the_margin_is_released_and_its_owner_then_refuses_to_pay_it`,
+//! `a_spending_rows_bound_quote_decides_its_release_on_the_full_path`). **What those tests prove,
+//! and its bound:** two processes on one host clock, sharing one store and one mint, debit an
+//! accrued balance exactly once under every interleaving they schedule — pauses before and after
+//! the quote, before and after the fence, between a release decision and its write; the lease and
+//! the quote expiring while paused. The residual they do not cover is a mint clock ahead of the
+//! host's by more than [`SPEND_MARGIN`]: the owner's refusal to pay inside the margin is measured
+//! on the host clock, the mint's expiry on its own. The owner's own reconciliation of its own
+//! `planned` row may release on UNPAID: a process runs at most one attempt at a time
 //! ([`RemitFlight`] in the node; one shot for the command), so its earlier attempt is over and, the
 //! fence never having been passed, spent nothing. Its own `spending` row gets no such exception.
 //!
 //! Every effect on the world goes through [`RemitEffects`], so the decision logic is tested against
 //! scripted effects without a network or a mint. Exactly one method of that trait spends:
-//! [`RemitEffects::melt`].
+//! [`RemitEffects::pay_melt_quote`].
 
 use std::fmt;
 use std::io::Write;

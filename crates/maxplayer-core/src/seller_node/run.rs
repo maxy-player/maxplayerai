@@ -4161,9 +4161,11 @@ impl SellerNodeRunner {
     /// in flight, if any, to finish — a melt whose proofs may already be with the mint must not be
     /// cancelled mid-flight, which would risk the seller's sats; a slow exit is the lesser harm.
     /// The wait is bounded by [`Self::remit_drain_bound`]: if it elapses, one incident line says
-    /// exactly what was abandoned, and the persisted planned row makes the outcome recoverable at
-    /// the next start (reconciliation, made safe by ownership: the next start is a new owner and
-    /// cannot release this row until its quote is terminal or its lease has run out).
+    /// exactly what was abandoned, and the persisted row makes the outcome recoverable at the next
+    /// start (reconciliation, made safe by ownership: the next start is a new owner; a row still
+    /// `planned` it may release once the lease has run out or the invoice's quote is terminal, a
+    /// row already `spending` only when the quote bound to it is terminal at the mint — never on
+    /// time, however long the lease has been over).
     async fn drain_remit_in_flight(&self) {
         if !self.remit_flight.in_flight() {
             return;

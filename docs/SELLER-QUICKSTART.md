@@ -1273,13 +1273,17 @@ its own:
   expired, or — for an attempt that never reached the point of spending — if the process that owned
   it is provably gone; and otherwise **held**, however long, because a payment that may have reached
   the mint is never paid again on a guess. Two processes sharing one store — the node and a hand-run
-  `maxplayer seller fees remit --confirm`, say — pay an accrued balance exactly once: at most one
+  `maxplayer seller fees remit --confirm`, say — pay an accrued balance once, not twice: at most one
   remittance can be in flight, the receipts it covers are pinned to it, only the process that
-  planned it may pay it, and it passes a single compare-and-set in the store immediately before
-  spending; a second process holds off while the first may still be paying, and a first process
-  that paused too long finds its own gate shut. These are the properties the module's two-process
-  tests exercise (pauses before and after the gate, the clock moved past the lease, distinct
-  invoices, actual melts counted); they are not a claim about every possible failure of a mint.
+  planned it may pay it, it passes a single compare-and-set in the store immediately before
+  spending which also fixes the one mint quote it may pay, and it never pays under any other quote;
+  a second process asks the mint about that exact quote and holds off while it may still be paid,
+  and every release is written as a condition on the row, so a release decided on a stale reading
+  changes nothing. This is what the module's two-process tests prove, and its bound: two processes
+  on one host clock, one store, one mint (pauses before and after the quote, before and after the
+  gate, between a release decision and its write; the lease and the quote expiring while paused;
+  distinct invoices; actual melts counted). What they do not cover is a mint whose clock runs more
+  than 60 seconds ahead of the host's — the margin inside which a payer refuses its own quote.
 - **The log stays readable while it retries.** Every attempt gets at most one line. The first
   failure's line carries its detail — the destination, the balance it saw, the error — and the
   backoff it starts; later attempts in the same streak get one line each (how many have failed,
