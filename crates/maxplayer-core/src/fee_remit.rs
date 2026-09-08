@@ -3127,6 +3127,13 @@ mod tests {
                 "at {now}: {out}"
             );
             assert!(!out.contains("DRY RUN"), "no fresh plan on a held row: {out}");
+            assert_eq!(
+                out.lines()
+                    .filter(|line| line.starts_with("  HELD: remittance"))
+                    .count(),
+                1,
+                "exactly one HELD line per run (addendum 6 §1.3): {out}"
+            );
             let rows = store.remittances().expect("rows");
             assert_eq!(rows.len(), 1, "at {now}");
             assert_eq!(rows[0].state, RemittanceState::Spending, "at {now}");
@@ -5342,6 +5349,13 @@ mod tests {
                         "B was refused admission: no plan, no quote, no payment: {out}"
                     );
                     assert!(!out.contains("released 15 sats"), "at {now}: {out}");
+                    assert_eq!(
+                        out.lines()
+                            .filter(|line| line.starts_with("  HELD: remittance hash-13-2-a"))
+                            .count(),
+                        1,
+                        "at {now}: exactly one HELD line, naming the row: {out}"
+                    );
                     assert_eq!(
                         store_b
                             .in_flight_remittance()

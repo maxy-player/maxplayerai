@@ -411,7 +411,19 @@ fn remit_live(home: Option<PathBuf>, confirm: bool, out: &mut dyn Write) -> Resu
         RemitTrigger::DryRun
     };
     let outcome = remit(&store, &mut effects, trigger, now_unix, out)?;
-    Ok(match outcome {
+    Ok(exit_code_for(&outcome))
+}
+
+/// The exit code for one run's outcome. Nonzero for everything that did not pay or print a clean
+/// plan — including a HELD spending row (addendum 6 §1.3): reconciliation that finds the in-flight
+/// row bound to a quote the mint has not reported PAID refuses the run, prints the one `HELD:` line
+/// naming the row, the quote, the mint's answer and the held receipts, and exits [`REFUSED`] — a
+/// dry run included — so a stuck fee is visible to an operator and to anything scripting this
+/// command. No flag clears it; that is an operator's decision, owed as later work.
+#[cfg(feature = "wallet")]
+fn exit_code_for(outcome: &maxplayer_core::fee_remit::RemitOutcome) -> i32 {
+    use maxplayer_core::fee_remit::RemitOutcome;
+    match outcome {
         RemitOutcome::DryRun | RemitOutcome::Paid { .. } => SUCCESS,
         RemitOutcome::Refused(_) => REFUSED,
         // A melt refused at the ceiling (addendum 3 §1) spent nothing and needs no operator action
@@ -421,7 +433,7 @@ fn remit_live(home: Option<PathBuf>, confirm: bool, out: &mut dyn Write) -> Resu
         // released — a failed effect the operator should see, like a failed payment.
         RemitOutcome::QuoteFailed { .. } => RUNTIME_ERROR,
         RemitOutcome::MeltFailed { .. } => RUNTIME_ERROR,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -1008,6 +1020,57 @@ mod tests {
             assert!(out.contains(needle), "missing {needle:?} in:\n{out}");
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Addendum 6 §1.3: a HELD spending row (bound quote not PAID at the mint) exits the command
+    // nonzero — REFUSED, the same code as every other refusal — on the dry run and on --confirm
+    // alike, so the stuck fee is visible to an operator and to anything scripting `remit`. The
+    // `HELD:` line itself is the core's (`fee_remit::Refusal::SpendingHeld`), asserted there on the
+    // full path; the live CLI entry point needs the packaged wallet to ask the mint, so the mapping
+    // is pinned here on the outcome the core returns for that row. Failed effects stay distinct
+    // (RUNTIME_ERROR): a hold is a refusal that moved nothing, not a broken payment.
+    #[test]
+    fn a_held_spending_row_exits_refused_on_dry_run_and_confirm() {
+        use maxplayer_core::fee_remit::{Refusal, RemitOutcome};
+        let held = RemitOutcome::Refused(Refusal::SpendingHeld {
+            remittance_id: "hash-held".to_owned(),
+            owner: "old-run".to_owned(),
+            spending_since_unix: 100,
+            quote_id: Some("paid-quote-held".to_owned()),
+            observed: "mint https://mint.example reports melt quote paid-quote-held UNPAID (expiry unix 200)".to_owned(),
+            held_sats: 15,
+        });
+        assert_eq!(exit_code_for(&held), REFUSED);
+        assert_ne!(exit_code_for(&held), SUCCESS, "a dry run that finds a held row is not clean");
+        let line = match &held {
+            RemitOutcome::Refused(refusal) => refusal.to_string(),
+            _ => unreachable!(),
+        };
+        assert_eq!(line.lines().count(), 1, "one line, not a paragraph: {line}");
+        for needle in [
+            "HELD: remittance hash-held is SPENDING (admitted by old-run at unix 100)",
+            "bound to melt quote paid-quote-held",
+            "reports melt quote paid-quote-held UNPAID (expiry unix 200)",
+            "15 sats of receipts stay pinned to it",
+            "an operator decision, not a timeout, resolves it",
+        ] {
+            assert!(line.contains(needle), "missing {needle:?} in {line}");
+        }
+        assert_eq!(
+            exit_code_for(&RemitOutcome::Refused(Refusal::Settling {
+                remittance_id: "hash-held".to_owned(),
+            })),
+            REFUSED,
+            "PENDING / UNKNOWN on the bound quote is a hold too"
+        );
+        assert_eq!(
+            exit_code_for(&RemitOutcome::MeltFailed {
+                remittance_id: "hash-held".to_owned(),
+                error: "mint unreachable".to_owned(),
+            }),
+            RUNTIME_ERROR
+        );
+        assert_eq!(exit_code_for(&RemitOutcome::DryRun), SUCCESS);
     }
 
     // §4 gate 1 in code: the live path builds its effects on the packaged wallet through
