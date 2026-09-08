@@ -333,7 +333,8 @@ pub struct MeltEstimate {
     /// at most this, and the difference returns as change.
     pub fee_reserve_sats: u64,
     /// When the quote expires at the mint (unix seconds), as the quote states it. A quote is paid
-    /// by id ([`pay_melt_quote_async`]) only while it is live; the seller fee remittance binds its
+    /// by id ([`prepare_melt_payment_blocking`] → confirm; the retained [`pay_melt_quote_async`]
+    /// likewise) only while it is live; the seller fee remittance binds its
     /// admission to this quote and refuses to pay it inside its spending margin of expiry
     /// (addendum 5 §1, rule 1).
     pub expiry_unix: u64,
@@ -424,8 +425,9 @@ impl std::fmt::Debug for PreparedMeltPayment {
 impl PreparedMeltPayment {
     /// **The payment.** `PreparedMelt::confirm` on the thread that holds it: the pre-melt swap if
     /// one is required, then the melt request; funds leave the wallet here and nowhere else on this
-    /// path. An `Err` is opaque as to how far it got — the SDK runs its saga recovery on a failed
-    /// confirm (pinned `melt/mod.rs:860–868`) and the caller reconciles by quote id.
+    /// path. An `Err` is opaque as to how far it got — on the failure paths it recognises the SDK
+    /// runs its own compensations (best-effort, local; e.g. pinned `melt/saga/mod.rs:709–712` after
+    /// an insufficient post-swap total) and the caller reconciles by quote id.
     pub fn confirm(mut self) -> Result<MeltOutcome, WalletOpsError> {
         self.decide(PreparedCommand::Confirm)?.ok_or_else(|| {
             WalletOpsError::Wallet(
@@ -435,8 +437,13 @@ impl PreparedMeltPayment {
         })
     }
 
-    /// Release the prepared melt: proofs back to Unspent, quote released, saga row deleted — all in
-    /// the wallet's own database; nothing was ever posted, so there is nothing to undo at the mint.
+    /// Release the prepared melt: the SDK's compensations — proofs back to Unspent, quote released,
+    /// saga row deleted — in the wallet's own database. **Best-effort**: pinned CDK `melt/mod.rs:673`
+    /// → `melt/saga/mod.rs:828–830` catches and logs a compensation's own DB error (`:817–824`) and
+    /// still returns `Ok`, so `Ok` means "no fee-bearing request was ever posted, so there is
+    /// nothing to undo at the mint", not "every local reservation is proven released". The
+    /// Drop → Cancel → join below is this wrapper's, not SDK RAII: a bare `PreparedMelt` dropped
+    /// without a decision cancels nothing.
     pub fn cancel(mut self) -> Result<(), WalletOpsError> {
         self.decide(PreparedCommand::Cancel).map(|_| ())
     }
@@ -453,7 +460,7 @@ impl PreparedMeltPayment {
         };
         sender.send(command).map_err(|_| {
             WalletOpsError::Wallet(format!(
-                "the prepared melt's thread is gone before the {what}; the wallet's saga recovery releases its proofs on the next open"
+                "the prepared melt's thread is gone before the {what}; no fee-bearing request was posted by this call; a local proof reservation may remain — opening the wallet does not run CDK recover_incomplete_sagas on this path; a supported recovery path is owed"
             ))
         })?;
         let reply = self.reply.recv().map_err(|_| {
@@ -1120,8 +1127,10 @@ pub async fn melt_within_async(
         .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
     // … then the pay step, on THAT quote by id, under the ceiling. The two steps are one call here
     // (the operator's melt has nothing to fence between them); the seller fee remittance calls them
-    // separately — [`melt_quote_async`] then [`pay_melt_quote_async`] — with its store fence in
-    // between, so that it only ever pays the quote its admission bound (addendum 5 §1, rule 1).
+    // separately — [`melt_quote_async`], then [`prepare_melt_payment_blocking`] →
+    // [`PreparedMeltPayment::confirm`] (since addendum 8; [`pay_melt_quote_async`] is retained but
+    // no longer called on that path, removal owed) — with its store fence in between, so that it
+    // only ever pays the quote its admission bound (addendum 5 §1, rule 1).
     pay_quote_on_wallet(&wallet, mint_url, &quote, ceiling).await
 }
 
@@ -1343,10 +1352,14 @@ async fn active_keyset_input_fee_ppk(wallet: &Wallet) -> Result<u64, String> {
 ///    [`pay_melt_quote_async`] does;
 /// 2. `prepare_melt(quote_id)`: the SDK selects and RESERVES proofs in the wallet's own database and
 ///    computes the proof-input fee and, when the proofs do not fit, the pre-melt swap and its fee
-///    (pinned `melt/saga/mod.rs:286–460`; local writes only — the mint learns nothing);
+///    (pinned `melt/saga/mod.rs:286–460`; writes only the wallet's own database; it may FETCH mint
+///    metadata/keysets — `:303` → keysets → `metadata_cache.load` — a GET, never a proof-bearing or
+///    fee-bearing request);
 /// 3. takes the bound on the SDK's four figures — [`MeltCeiling::admits_total`]. Over the ceiling
-///    ⇒ `PreparedMelt::cancel` (proofs back to Unspent, quote released; `:817–831`) and
-///    [`WalletOpsError::MeltTotalExceedsCeiling`]: nothing was posted, nothing left the wallet;
+///    ⇒ `PreparedMelt::cancel` (best-effort local compensation: proofs back to Unspent, quote
+///    released; `:817–831` logs its own DB errors and still returns Ok) and
+///    [`WalletOpsError::MeltTotalExceedsCeiling`]: no fee-bearing request was posted, nothing left
+///    the wallet;
 /// 4. under it ⇒ returns a [`PreparedMeltPayment`] whose [`PreparedMeltPayment::confirm`] performs
 ///    the swap (if any) and the melt request — the only spend on this path — and whose
 ///    [`PreparedMeltPayment::cancel`] (or drop) releases it.
@@ -1484,10 +1497,13 @@ fn prepared_melt_thread(
         let total_debit_sats =
             MeltCeiling::total_debit(invoice_sats, fee_reserve_sats, input_fee_sats, swap_fee_sats);
         if !ceiling.admits_total(invoice_sats, fee_reserve_sats, input_fee_sats, swap_fee_sats) {
-            // The bound. Cancel FIRST — proofs back to Unspent, quote released, saga deleted, all
-            // local — then refuse, typed. A cancel that itself fails is reported as such: the SDK's
-            // saga recovery releases a stale reservation on the next wallet open, and still nothing
-            // was posted.
+            // The bound. Cancel FIRST — the SDK's compensations: proofs back to Unspent, quote
+            // released, saga deleted, all local — then refuse, typed. Cancel is best-effort (CDK
+            // logs a compensation's own DB error and still returns Ok); an Err here is reported
+            // for what it is: no fee-bearing request was posted, but a local proof reservation may
+            // remain — `open_wallet_async` only constructs the wallet and does not run CDK
+            // `recover_incomplete_sagas` on this path (only `crossmint_hop` calls it); a supported
+            // recovery path is owed, not wired here.
             let refusal = WalletOpsError::MeltTotalExceedsCeiling {
                 mint_url: mint_url.clone(),
                 quote_id: quote.id.clone(),
@@ -1501,7 +1517,7 @@ fn prepared_melt_thread(
             return match prepared.cancel().await {
                 Ok(()) => Err(refusal),
                 Err(error) => Err(WalletOpsError::Wallet(format!(
-                    "{refusal}; AND cancelling the prepared melt failed: {error} (its proofs are released by the wallet's saga recovery on the next open; nothing was posted)"
+                    "{refusal}; AND cancelling the prepared melt failed: {error} (no fee-bearing request was posted; a local proof reservation may remain until a supported recovery path — owed — releases it)"
                 ))),
             };
         }
@@ -1977,8 +1993,11 @@ pub fn melt_status_for_quote_blocking(
     runtime.block_on(melt_status_for_quote_async(home, quote_id, mint_override))
 }
 
-/// [`pay_melt_quote_async`] on a runtime of its own — the seller fee remittance's spending call
-/// (addendum 5 §1, rule 1: pay the bound quote by id, never re-quote).
+/// [`pay_melt_quote_async`] on a runtime of its own. **Retained, and DEAD on the seller fee
+/// remittance path** since addendum 8: that path's spending edge is
+/// [`prepare_melt_payment_blocking`] → [`PreparedMeltPayment::confirm`]; removal of this wrapper is
+/// owed to the owners. Addendum 5 §1, rule 1 still holds for it: pay the bound quote by id, never
+/// re-quote.
 pub fn pay_melt_quote_blocking(
     home: &MaxplayerHome,
     quote_id: &str,

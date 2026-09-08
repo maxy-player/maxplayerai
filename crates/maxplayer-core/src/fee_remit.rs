@@ -1535,8 +1535,9 @@ fn remit_inner(
         quote.expiry_unix
     );
 
-    // 1b. Prepare, and bound the TOTAL. Either refusal here happened in the wallet's own database:
-    //     nothing was posted, nothing left the wallet, the row is still ours and planned.
+    // 1b. Prepare, and bound the TOTAL. Either refusal here happened in the wallet's own database
+    //     (prepare may have fetched mint metadata — a GET): no proof-bearing or fee-bearing request
+    //     was posted, nothing left the wallet, the row is still ours and planned.
     let prepared = match effects.prepare_melt(&quote.quote_id, &ceiling) {
         Ok(prepared) => prepared,
         Err(MeltFailure::RefusedBeforeSpending(reason)) => {
@@ -1610,13 +1611,14 @@ fn remit_inner(
     let admitted = match admitted {
         Ok(admitted) => admitted,
         Err(lost) => {
-            // The prepared melt first: release its proofs in the wallet's database. It posted
-            // nothing, so a failed cancel changes nothing at the mint either — the wallet's saga
-            // recovery releases a stale reservation on its next open; say so.
+            // The prepared melt first: cancel it — the SDK's best-effort local compensation. It
+            // posted no fee-bearing request, so a failed cancel changes nothing at the mint; a
+            // local proof reservation may remain (opening the wallet runs no saga recovery on this
+            // path; a supported recovery path is owed) — say so.
             if let Err(error) = effects.cancel_melt(prepared) {
                 let _ = writeln!(
                     out,
-                    "  (cancelling the prepared melt failed: {error}; nothing was posted; the wallet releases its reserved proofs on its next open)"
+                    "  (cancelling the prepared melt failed: {error}; no fee-bearing request was posted; its local proof reservation may remain until a supported recovery path — owed — releases it)"
                 );
             }
             // Ours, still planned, but too little lease left: nothing was spent, so release our own
@@ -1656,7 +1658,8 @@ fn remit_inner(
     // 3. Confirm the prepared melt of Q. First the local refusal of a quote inside its margin of
     //    expiry, on a fresh clock — to avoid a pointless attempt, not as a safety bound: the row is
     //    spending and stays so, held until the mint reports Q PAID, and this process never
-    //    re-quotes for it. The prepared melt is cancelled (local; nothing was posted).
+    //    re-quotes for it. The prepared melt is cancelled (best-effort local compensation; no
+    //    fee-bearing request was posted).
     let pay_now_unix = effects.now_unix();
     if quote_inside_margin(pay_now_unix) {
         let error = format!(
@@ -1666,7 +1669,7 @@ fn remit_inner(
         let cancel_note = match effects.cancel_melt(prepared) {
             Ok(()) => String::new(),
             Err(cancel_error) => format!(
-                " (cancelling the prepared melt failed: {cancel_error}; nothing was posted; the wallet releases its reserved proofs on its next open)"
+                " (cancelling the prepared melt failed: {cancel_error}; no fee-bearing request was posted; its local proof reservation may remain until a supported recovery path — owed — releases it)"
             ),
         };
         let _ = writeln!(

@@ -24,8 +24,10 @@
 //! A minimum rounds UP to sats (1500 msat means you need 2 whole sats), a maximum rounds DOWN.
 //!
 //! This module moves no money. It produces an invoice; paying it is the caller's act
-//! ([`crate::fee_remit`], through `wallet_ops::pay_melt_quote_blocking` under a ceiling — paying
-//! the one quote its store fence bound, never a fresh one).
+//! ([`crate::fee_remit`], through `wallet_ops::prepare_melt_payment_blocking` →
+//! `PreparedMeltPayment::confirm` under a total ceiling — paying the one quote its store fence
+//! bound, never a fresh one; `wallet_ops::pay_melt_quote_blocking` is retained but no longer called
+//! on that path).
 
 use std::fmt;
 use std::str::FromStr;

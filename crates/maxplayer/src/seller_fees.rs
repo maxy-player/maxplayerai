@@ -17,11 +17,13 @@
 //! **Without `--confirm` that is all it does** (a dry run is the default). With `--confirm` it forces
 //! an attempt now — for an operator whose automatic path has been failing, or who has turned it off
 //! with `[platform_fee] auto_remit = false` — paying the invoice from the seller's ecash through
-//! `wallet_ops::pay_melt_quote_blocking`: the payment quote is raised first and checked against the
-//! accrued gross, the store fence binds it to the row, and then exactly that quote is paid by id
-//! (the same gated melt `maxplayer wallet melt` uses underneath — it honours `allow_real_mints` —
-//! split into its quote step and its pay step), and recording the settlement so the same sats are
-//! never paid twice. Running it again after a payment pays nothing.
+//! `wallet_ops::prepare_melt_payment_blocking` → `PreparedMeltPayment::confirm`: the payment quote
+//! is raised first and checked against the accrued gross, the melt is prepared and its total
+//! (invoice + reserve + the SDK's proof fees) bounded under that gross, the store fence binds the
+//! quote to the row, and then exactly that prepared melt is confirmed (the same gated wallet
+//! `maxplayer wallet melt` uses underneath — it honours `allow_real_mints`; the older
+//! `wallet_ops::pay_melt_quote_blocking` is retained but dead on this path), and recording the
+//! settlement so the same sats are never paid twice. Running it again after a payment pays nothing.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -1083,7 +1085,8 @@ mod tests {
     }
 
     // §4 gate 1 in code: the live path builds its effects on the packaged wallet through
-    // `wallet_ops::pay_melt_quote_blocking` — but `run remit` on a store with NOTHING unremitted returns before
+    // `wallet_ops::melt_quote_blocking` + `prepare_melt_payment_blocking` (the retained
+    // `pay_melt_quote_blocking` is not called) — but `run remit` on a store with NOTHING unremitted returns before
     // any network or wallet call, so this exercises the real CLI entry point offline, including the
     // line that tells the operator whether the automatic remittance is on.
     #[test]
