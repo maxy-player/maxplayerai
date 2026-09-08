@@ -1,13 +1,15 @@
 # Round 10 (addendum 11) — §4 I gates at executable head 08c476c (second exec head)
 
-SKELETON — filled as `/tmp/w-remit-r10/logs-b/progress.txt` reports each gate done; complete when it reads "ALL DONE".
+COMPLETE — `/tmp/w-remit-r10/logs-b/progress.txt` read `STAGE3 money-path x3 done — ALL DONE` at 21:05:40Z and the runner
+exited on its own; every row below is filled from a copied, `cmp`-verified log. §5 is filled and reports a real gap: the PR
+now conflicts with main, so GitHub creates no CI run at this exec head.
 
 ## Why two executable heads this round
 
 | exec head | what it is | gates |
 |---|---|---|
 | `31deed8` | last code commit of steps 1–3 (1df95d8 §1 B/N1, 5647417 fmt, 98272ba §2 D/2c, 31deed8 §7.2 H1 comments/docs) | `gates-summary.md` + `exact-summary-31deed8.txt`: suites 1431/143/180 green, 47/47 exact, fmt 0 lines of ours rewritten, money-path ×3 credential_proxy flake only — **clippy INSIDE = 1**: `fee_remit.rs:5642` `clippy::identity_op` on the literal `1 + 0 + 1 + 1` in record 45's delta assert (step 1 test code) |
-| `08c476c` | one commit after 31deed8: that literal becomes `3`, message "invoice 1 + Lightning 0 + ACTUAL input 1 + swap 1 = 3"; no other change (`git diff --numstat 31deed8..08c476c -- '*.rs'` = 1 file, +2 −3; the same range also carries 5 reports-only files, 285 lines) | this file + `exact-summary-08c476c.txt` |
+| `08c476c` | the only `.rs` commit after 31deed8 (five reports-only commits sit between them: 41ea2e6, ab9260f, c7ebbb2, a476a9b, 3bbd04c): that literal becomes `3`, message "invoice 1 + Lightning 0 + ACTUAL input 1 + swap 1 = 3"; no other change (`git diff --numstat 31deed8..08c476c -- '*.rs'` = 1 file, +2 −3; the same range also carries 5 reports-only files, 285 lines) | this file + `exact-summary-08c476c.txt` |
 
 The fix touches a test assertion literal only — no money code, no expectation change (record 45 still asserts delta = 3 = the
 gross). It moves the executable head because a `.rs` byte changed, so the full §4 I gate set is re-run at 08c476c by a second
@@ -37,7 +39,12 @@ reports-only commit the runner saw is `.rs`-identical to 08c476c.
 |---|---|---|---|---|
 | 1 | `FAILED. 1434 passed; 1 failed; 2 ignored` in 142.25s | **1, and it is the known flake**: `credential_proxy::tests::a_declared_over_cap_body_is_refused_before_the_upstream_sees_it` — `reqwest` `ConnectionReset` (os 54) writing the body to its own loopback stub at `credential_proxy.rs:3520`, no fee/remit code on the path | 44 named `fee_remit` tests ran, all in the 1,434 passed | exit=101 · `money-path-ci-1-08c476c.log` 130,874 B `2c80da572f6daaf3` · line 1 `a44c0be` |
 | 2 | `FAILED. 1434 passed; 1 failed; 2 ignored` in 145.56s | **1, the same known flake as run 1**: `credential_proxy::tests::a_declared_over_cap_body_is_refused_before_the_upstream_sees_it` — same `reqwest` `ConnectionReset` (os 54) at `credential_proxy.rs:3520` writing the body to its own loopback stub (port 62805 this run), no fee/remit code on the path | 44 named `fee_remit` tests ran, all in the 1,434 passed | exit=101 · `money-path-ci-2-08c476c.log` 130,762 B `e6d895882833bee5` · line 1 `a44c0be` |
-| 3 | pending | pending | pending | pending |
+| 3 | `FAILED. 1434 passed; 1 failed; 2 ignored` in 144.52s | **1, the same known flake a third time**: `credential_proxy::tests::a_declared_over_cap_body_is_refused_before_the_upstream_sees_it` — same `reqwest` `ConnectionReset` (os 54) at `credential_proxy.rs:3520` writing the body to its own loopback stub (port 63481 this run), no fee/remit code on the path | 44 named `fee_remit` tests ran, all in the 1,434 passed | exit=101 · `money-path-ci-3-08c476c.log` 130,762 B `5e9edf401f8b166c` · line 1 `ff6e47a` |
+
+All three runs: 1,434 passed / 1 failed / 2 ignored, the failure the *same* `credential_proxy` test with the *same*
+`ConnectionReset` panic at the same line (only the ephemeral loopback port differs: 62173 / 62805 / 63481), and 44 `fee_remit`
+tests green in each. No fee, remit, or money-path test failed in any run. Runner b finished on its own at 21:05:40Z
+(`STAGE3 money-path x3 done — ALL DONE`); pid 53734 was never restarted and no second runner was launched.
 
 ## 3. fmt / clippy mapped onto the added set a6217328..08c476c
 
@@ -70,6 +77,33 @@ delta of 3 sats.
 
 ## 5. CI at the pushed heads
 
-pending — `gh run list --repo MakePrisms/maxplayerai --branch feat/seller-fee-remit`; 31deed8, 08c476c, c94dbd4 and later
-reports heads read at pin time; a failure is named with its job and test (the acp+wallet job flaked at 1df95d8 on orveth's
-`an_accept_naming_another_seats_claim_never_binds_the_loser` and at 68fa0eb on the r9 race test that §2 fixed).
+Read 21:07Z with `gh run list --repo MakePrisms/maxplayerai --branch feat/seller-fee-remit --limit 14 --json
+databaseId,headSha,status,conclusion,createdAt`, plus per-head `…/commits/<sha>/check-suites`.
+
+| head | CI run | result |
+|---|---|---|
+| `1df95d8` (§1 B/N1) | 34273382506 20:11:56Z | **failure** — 6/7 jobs green; *Test the full shipped feature combo (acp + wallet)* (job 102220345699) `FAILED. 1560 passed; 1 failed; 3 ignored`, the one failure `seller_node::run::tests::an_accept_naming_another_seats_claim_never_binds_the_loser` — orveth's seat-claim test, not this branch's code. The same job flaked at `68fa0eb` (run 34265888505) on the r9 race test that §2 of this round fixed. Named, not hidden. |
+| `5647417` (fmt) | 34273464721 20:12:46Z | success |
+| `98272ba` (§2 D/2c) | 34274840748 20:26:46Z | success |
+| `31deed8` (**first exec head**) | 34275523983 20:33:47Z | **success — 7/7 jobs**, including *Money-path tests* and *Test the full shipped feature combo (acp + wallet)*: the acp+wallet flake did not recur |
+| `08c476c` (**second exec head**) | — | **no run exists** |
+| `c94dbd4`, `a44c0be`, `ff6e47a`, `d420245` (reports-only) | — | **no run exists** |
+
+**Why there is no CI at 08c476c — and it is not a skip or a queue.** `.github/workflows/ci.yml` triggers on `pull_request`
+with no path filter, so every push to the PR should build. GitHub creates a `pull_request` run against the *merge* commit
+`refs/pull/979/merge`; when that merge cannot be computed the event produces no run at all. PR #979 went
+`mergeable: CONFLICTING` when main moved to `d55ceaf` at **20:35:58Z** — 2 minutes after 31deed8's run started, and the last
+green head is exactly the last one pushed before that. Every head since (08c476c and the four reports commits) has **zero
+check-suites**; the only check on them is Vercel's `Authorization required to deploy`, which fails on every head of this PR
+and is not CI. Actions itself is healthy — an unrelated branch (`feat/seller-memory-truncate-warn`, e8963eb) started a CI run
+at 20:58:49Z.
+
+One file conflicts: `git merge-tree --write-tree upstream/main d420245` (merge-base `a621732`) auto-merges `home.rs`,
+`lib.rs`, `seller_node/run.rs` and `docs/SELLER-QUICKSTART.md` and reports exactly one
+`CONFLICT (content): crates/maxplayer/src/sell.rs`.
+
+**Consequence, stated plainly:** the second exec head `08c476c` has no CI row and cannot get one until the conflict is
+resolved. Resolving it is a rebase-or-merge, which is not mine to take — it is the same call maxie owes on #969. The local
+§4 I gate set above *is* the evidence at 08c476c: 3 suites green, 47/47 `--exact`, fmt 0 lines of ours, clippy INSIDE 0,
+money-path ×3 with only the credential_proxy flake. The delta 31deed8 → 08c476c is one test-assert literal
+(+2 / −3 in one `.rs` file), and 31deed8 is CI-green 7/7 — so the CI-green head and the gated head differ by no money code.
