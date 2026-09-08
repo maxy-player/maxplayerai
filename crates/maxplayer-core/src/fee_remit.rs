@@ -5311,7 +5311,11 @@ mod tests {
             !out.contains("WARNING"),
             "delta equals the gross exactly; that is not an overspend:\n{out}"
         );
-        assert_eq!(fake.invoices, vec![3, 1], "the gross probe, then the planned net");
+        assert_eq!(
+            fake.invoices,
+            vec![3, 1],
+            "the gross probe, then the planned net"
+        );
         assert_eq!(
             fake.melts,
             vec!["lnbc-fake-1-2".to_owned()],
@@ -5327,9 +5331,17 @@ mod tests {
         assert!(fake.ceiling_refusals.is_empty(), "the bound admitted it");
         assert!(fake.pay_refusals.is_empty());
         let after = fake.pool_value().expect("pool");
-        assert_eq!((before, after), (32, 29), "change [16, 8, 4, 1], no melt change");
+        assert_eq!(
+            (before, after),
+            (32, 29),
+            "change [16, 8, 4, 1], no melt change"
+        );
         let delta = before - after;
-        assert_eq!(delta, 1 + 0 + 1 + 1, "invoice + Lightning + ACTUAL input + swap");
+        assert_eq!(
+            delta,
+            1 + 0 + 1 + 1,
+            "invoice + Lightning + ACTUAL input + swap"
+        );
         assert!(delta <= 3, "the wallet lost {delta} sats against 3 accrued");
         assert_eq!(
             registry
@@ -5405,7 +5417,11 @@ mod tests {
             assert!(out.contains(needle), "missing {needle:?} in:\n{out}");
         }
         assert!(!out.contains("WARNING"), "{out}");
-        assert_eq!(fake.invoices, vec![8, 1], "the gross probe, then the planned net");
+        assert_eq!(
+            fake.invoices,
+            vec![8, 1],
+            "the gross probe, then the planned net"
+        );
         assert_eq!(
             fake.melts,
             vec!["lnbc-fake-1-2".to_owned()],
@@ -5421,9 +5437,17 @@ mod tests {
         assert!(fake.ceiling_refusals.is_empty(), "the bound admitted it");
         assert!(fake.pay_refusals.is_empty());
         let after = fake.pool_value().expect("pool");
-        assert_eq!((before, after), (32, 24), "change [16, 4, 2, 1] + melt change [1]");
+        assert_eq!(
+            (before, after),
+            (32, 24),
+            "change [16, 4, 2, 1] + melt change [1]"
+        );
         let delta = before - after;
-        assert_eq!(delta, 1 + 5 + 1 + 1, "invoice + Lightning + ACTUAL input + swap");
+        assert_eq!(
+            delta,
+            1 + 5 + 1 + 1,
+            "invoice + Lightning + ACTUAL input + swap"
+        );
         assert!(delta <= 8, "the wallet lost {delta} sats against 8 accrued");
         assert_eq!(
             registry
