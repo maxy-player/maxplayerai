@@ -53,7 +53,7 @@ Every gate below ran at `1a5c7c5` with `git rev-parse HEAD` as the first line of
 
 **Prior-finding ledger (this round's rows):** B/F1 fake admits SDK-impossible success → closed at `1a5c7c5` (records 32, 28, 37). G/F2 inclusive `fee_paid` double-counted → closed (record 38 + PAID print). H/F3 false recovery/cancel prose → closed as prose; the recovery path itself is **owed**, not built. H/F4 stale current-caller prose, body §196 / §10 → closed. Rounds 1–7 rows unchanged.
 
-## Gates — command and output, all at `1a5c7c5` (local, macOS arm64; every log begins with `git rev-parse HEAD` = `1a5c7c55665b5c207a98eb2a003b164de9641189`; logs in `reports/w-remit-r8/` (committed `036302b`), sizes and sha256 in `evidence-table.txt`; grep gates 1–4 re-measured at `1a5c7c5` — `greps-1a5c7c5.txt`)
+## Gates — command and output, all at the executable head `240240c` (local, macOS arm64; the runner `reports/w-remit-r9/run-gates-exec2.sh` ran every gate serially from the reports-only commit `d0be4a0`, so every log begins with `git rev-parse HEAD` = `d0be4a0930f0dd27615ec751f041af72e6771fc9` and line 2 states `exec head 240240c; .rs diff to HEAD:` empty — `240240c3f26bd35c3a8c5a3d70229f9730a0a221` is the last commit touching any `.rs`; logs in `reports/w-remit-r9/logs/` (`exec2-*`, `exact-NN-*-240240c.log`, `money-path-ci-{1,2,3}-240240c.log`), sizes and sha256 in `reports/w-remit-r9/evidence-table.txt`; grep gates 1–4 re-measured at `240240c` — `greps-240240c.txt`)
 
 **Gate 1 — `allow_real_mints` defaults to true; every wallet entry honours `mint_allowed`; the command is `--confirm`-gated.**
 ```
@@ -64,23 +64,23 @@ $ grep -n "fn default_allow_real_mints" -A 2 crates/maxplayer-core/src/home.rs
 $ grep -n "allow_real_mints" crates/maxplayer-core/src/home.rs | grep serde
 1411:    #[serde(default = "default_allow_real_mints")]
 $ grep -n "mint_allowed(" crates/maxplayer-core/src/wallet_ops.rs
-984:   send_async (fn :972)          1044:  receive_async (fn :1025)       1119:  melt_within_async (fn :1105, operator composition, out of scope)
-1164:  pay_melt_quote_async (fn :1153, retained; no live caller)
-1390:  prepare_melt_payment_blocking (fn :1377) — THE payment path, before the wallet is opened
-1633:  melt_quote_async (fn :1623, read-only)   1688: melt_status_for_quote_async (fn :1678, read-only)   1727: melt_status_for_invoice_async (fn :1720, read-only)
+1183:  send_async (fn :1171)         1243:  receive_async (fn :1224)       1318:  melt_within_async (fn :1304, operator composition, out of scope)
+1363:  pay_melt_quote_async (fn :1352, retained; no live caller)
+1590:  prepare_melt_payment_blocking (fn :1577) — THE payment path, before the wallet is opened
+1875:  melt_quote_async (fn :1865, read-only)   1930: melt_status_for_quote_async (fn :1920, read-only)   1969: melt_status_for_invoice_async (fn :1962, read-only)
 $ grep -n '"--confirm" if remit\|let trigger = if confirm' crates/maxplayer/src/seller_fees.rs
 110:            "--confirm" if remit => confirm = true,
 413:    let trigger = if confirm {
 $ grep -n "pub fn pays" -A 2 crates/maxplayer-core/src/fee_remit.rs
-511:    pub fn pays(self) -> bool {
-512-        !matches!(self, Self::DryRun)
+514:    pub fn pays(self) -> bool {
+515-        !matches!(self, Self::DryRun)
 ```
 
-**Gate 2a — exactly THREE origin callers; no fourth path, no startup path, no second clock.** Non-test boundaries at `1a5c7c5`: `run.rs` first `#[cfg(test)]` at 617 (run-loop `tests` module at 7937); `fee_remit.rs` `test_support` module at 2352, `tests` at 3364 (the file's first `#[cfg(test)]` attribute is `:269`, the `PreparedToken::Fake` variant inside non-test code, so classification uses the module starts); `seller_fees.rs` 444 (`tests` at 500).
+**Gate 2a — exactly THREE origin callers; no fourth path, no startup path, no second clock.** Non-test boundaries at `240240c`: `run.rs` first `#[cfg(test)]` at 617 (run-loop `tests` module at 7937); `fee_remit.rs` `test_support` module at 2517, `tests` at 3577 (the file's first `#[cfg(test)]` attribute is `:272`, the `PreparedToken::Fake` variant inside non-test code, so classification uses the module starts); `seller_fees.rs` 444 (`tests` at 500).
 ```
 $ grep -n "[^a-z_:]remit(&store\|fee_remit::remit(\|remit_best_effort(\|remit_live_best_effort(" run.rs fee_remit.rs seller_fees.rs   # non-test lines only
 crates/maxplayer/src/seller_fees.rs:418:    let outcome = remit(&store, &mut effects, trigger, now_unix, out)?;                 # (3) the CLI
-crates/maxplayer-core/src/fee_remit.rs:1965:        Ok(mut effects) => remit_best_effort(store, &mut effects, trigger, now_unix),  # remit_live_best_effort (:1958) → remit_best_effort (:1935) → remit
+crates/maxplayer-core/src/fee_remit.rs:2153:        Ok(mut effects) => remit_best_effort(store, &mut effects, trigger, now_unix),  # remit_live_best_effort (:2146) → remit_best_effort (:2123) → remit
 crates/maxplayer-core/src/seller_node/run.rs:3321:  crate::fee_remit::remit_best_effort(store, effects.as_mut(), trigger, now_unix())  # run_remit_attempt, cfg(test) effects factory branch
 crates/maxplayer-core/src/seller_node/run.rs:3323:  None => crate::fee_remit::remit_live_best_effort(store, home, trigger, now_unix()), # live branch, shared by (1) and (2)
 $ helpers (run.rs): 3666 drain_remit_in_flight · 4041 awaited at shutdown · 4159 boot sleep · 4235 retry arm (if auto_remit) · 4260 pacing notify · 7210–7211 collect hook → 7239 (1) · 7316 start_retry_remit (2)
@@ -91,71 +91,78 @@ $ grep -n "remit" run.rs | grep -i "interval\|sleep(\|timer"   # non-test: the o
 $ shutdown order (run_loop): 4033 serve().await → 4041 drain_remit_in_flight().await; 7246 / 7319 both starters check remit_closed
 ```
 
-**Gates 2a (New-only), 2b–2g, 2f, E, v13, the CLI, the round-7 and the round-8 regressions — ONE `--exact` run per named test at `1a5c7c5` (H4). Each block is one log: `git rev-parse HEAD` (line 1), the command (line 2), the `test <full name> ... ok` line, `1 passed`. 38 logs (36 kept + records 28, 37, 38 re-purposed/added for §1.4 and §2.4), 38 × `1 passed`, 0 failed (`exact-records.txt`; core records run `cargo test -p maxplayer-core --features wallet --lib -- --exact <name>`, CLI records `cargo test -p maxplayer --features acp,wallet --bin maxplayer -- --exact <name>`).**
+**Gates 2a (New-only), 2b–2g, 2f, E, v13, the CLI, the round-7, round-8 and round-9 regressions — ONE `--exact` run per named test at `240240c` (H4). Each block is one log: `git rev-parse HEAD` (line 1), the exec-head line (line 2), the command (line 3), the `test <full name> ... ok` line, `1 passed`. 44 logs: records 01–38 as round 8 (record 37 on its round-9 schedule, renamed `r9-ii-fee-metadata-drift-refused-before-fence`), records 39–44 new this round (§1.3 gross-19-pays-13, §1.4(a) shrunk-reserve-re-planned-pays-15, store `replan_remittance`, `confirm_bound` search table, `admits_confirmable`, N3 PAID-label); **43 × `1 passed`, 0 failed; record 33 is RETIRED** — its test `a_melt_ceiling_bounds_the_total_debit_including_proof_input_and_swap_fees` was renamed in round-9 commit `c9cce6c` to `a_melt_ceiling_admits_a_prepared_melt_by_what_confirm_will_actually_debit` = record 43, so `exact-33-*` filters to `0 passed; 0 failed` and is kept as the proof of retirement (`exact-records.txt` line 33). Core records run `cargo test -p maxplayer-core --features wallet --lib -- --exact <name>`, CLI records `cargo test -p maxplayer --features acp,wallet --bin maxplayer -- --exact <name>`.**
 ```
-exact-01-2b-node-1a5c7c5.log · core · seller_node::run::tests::a_failed_remittance_leaves_the_receipt_journaled_the_job_paid_and_the_balance_intact
-exact-02-2c-race-1a5c7c5.log · core · fee_remit::tests::two_racing_attempts_against_the_same_balance_record_exactly_one_remittance
-exact-03-2d-backoff-1a5c7c5.log · core · fee_remit::tests::retry_backoff_doubles_from_base_caps_at_thirty_minutes_and_resets_on_success
-exact-04-2d-bootdelay-1a5c7c5.log · core · fee_remit::tests::the_boot_delay_is_never_less_than_the_base_and_at_most_twice_it
-exact-05-2d-jitter-1a5c7c5.log · core · fee_remit::tests::full_jitter_stays_inside_zero_to_computed
-exact-06-2d-singleflight-1a5c7c5.log · core · fee_remit::tests::single_flight_admits_one_attempt_and_frees_the_slot_on_drop
-exact-07-2d-threshold-1a5c7c5.log · core · fee_remit::tests::a_balance_under_the_threshold_or_at_zero_neither_escalates_nor_resets_the_backoff
-exact-08-2e-drain-bound-1a5c7c5.log · core · seller_node::run::tests::a_shutdown_drain_gives_up_waiting_at_its_bound_but_never_cancels_the_attempt
-exact-09-2e-rearm-1a5c7c5.log · core · seller_node::run::tests::a_shared_outcome_re_arms_the_live_retry_timer
-exact-10-2e-retract-1a5c7c5.log · core · seller_node::run::tests::a_seat_leaving_the_selling_role_retracts_its_announcement
-exact-11-2e-shutdown-drain-1a5c7c5.log · core · seller_node::run::tests::a_requested_shutdown_drains_a_pending_remittance_before_the_loop_returns
-exact-12-2e-shutdown-retries-1a5c7c5.log · core · seller_node::run::tests::a_requested_shutdown_ends_the_platform_fee_retries
-exact-13-2f-ceiling-1a5c7c5.log · core · wallet_ops::tests::a_melt_ceiling_admits_only_the_planned_invoice_within_the_gross_debit
-exact-14-2f-reserve-1a5c7c5.log · core · fee_remit::tests::a_reserve_that_grows_between_estimate_and_payment_is_refused_before_spending
-exact-15-2g-B2-stale-snapshot-1a5c7c5.log · core · fee_remit::tests::a_release_decided_on_a_stale_planned_snapshot_cannot_revoke_a_later_admission
-exact-16-2g-a-1a5c7c5.log · core · fee_remit::tests::a_second_process_cannot_release_a_live_owners_planned_row_and_exactly_one_debit_happens
-exact-17-2g-b1-1a5c7c5.log · core · fee_remit::tests::a_spending_row_is_reconciled_by_its_bound_quote_not_by_an_expired_estimate
-exact-18-2g-b2-expired-held-1a5c7c5.log · core · fee_remit::tests::a_bound_quote_expired_past_the_margin_is_held_and_its_owner_refuses_to_pay_it
-exact-19-2g-c-1a5c7c5.log · core · fee_remit::tests::an_owner_paused_after_its_quote_and_past_its_lease_is_released_and_never_pays_that_quote
-exact-20-2g-d-1a5c7c5.log · core · fee_remit::tests::a_spending_rows_bound_quote_decides_its_release_on_the_full_path
-exact-21-2g-delayed-1a5c7c5.log · core · fee_remit::tests::a_payment_prepared_before_expiry_cannot_be_doubled_by_a_release_after_it
-exact-22-E-first-retry-1a5c7c5.log · core · seller_node::run::tests::the_first_retry_never_fires_before_thirty_seconds_after_boot_even_after_a_collect_success
-exact-23-E-one-line-1a5c7c5.log · core · seller_node::run::tests::a_first_failure_logs_exactly_one_line_with_its_detail_folded_in
-exact-24-cli-exit-map-1a5c7c5.log · CLI · seller_fees::tests::a_held_spending_row_exits_refused_on_dry_run_and_confirm
-exact-25-cli-invocation-1a5c7c5.log · CLI · seller_fees::tests::a_held_spending_row_prints_one_held_line_and_exits_refused_on_dry_run_and_confirm
-exact-26-2a-remit-follows-receipt-1a5c7c5.log · core · seller_node::run::tests::remittance_follows_only_a_new_receipt_never_a_duplicate_or_an_error
-exact-27-v13-migration-1a5c7c5.log · core · seller_node::store::tests::a_v12_store_migrates_to_v13_additively_and_its_spending_row_reads_as_unbound
-exact-28-r8-i-fee-fits-actual-differs-1a5c7c5.log · core · fee_remit::tests::a_fee_bearing_payment_whose_prepared_input_fee_differs_from_the_actual_pays_once_and_the_wallet_loses_at_most_the_gross
-exact-29-r7-ii-fee-exceeds-1a5c7c5.log · core · fee_remit::tests::a_fee_bearing_total_that_exceeds_the_gross_by_the_fee_is_refused_before_any_swap_or_melt
-exact-30-r7-iiib-fee-aware-plan-1a5c7c5.log · core · fee_remit::tests::fee_aware_planning_sizes_the_invoice_so_a_fee_bearing_payment_fits_without_reserve_slack
-exact-31-r7-never-fits-1a5c7c5.log · core · fee_remit::tests::fees_that_can_never_fit_are_refused_at_planning_not_at_payment
-exact-32-r7-fake-selfcheck-1a5c7c5.log · core · fee_remit::tests::the_fake_wallet_models_the_sdks_proof_input_and_swap_fees_and_the_total_bound_refuses_them
-exact-33-r7-admits-total-1a5c7c5.log · core · wallet_ops::tests::a_melt_ceiling_bounds_the_total_debit_including_proof_input_and_swap_fees
-exact-34-r7-total-display-1a5c7c5.log · core · wallet_ops::tests::a_total_ceiling_refusal_names_the_parts_the_total_and_the_ceiling
-exact-35-r7-relay-1a5c7c5.log · core · wallet_ops::tests::a_prepared_payment_relays_confirm_and_cancel_verdicts
-exact-36-r7-drop-cancels-1a5c7c5.log · core · wallet_ops::tests::dropping_an_undecided_prepared_payment_cancels_it_and_joins_its_thread
-exact-37-r8-ii-post-swap-refused-before-fence-1a5c7c5.log · core · fee_remit::tests::a_fee_bearing_schedule_whose_prepared_figures_fit_but_post_swap_arithmetic_does_not_is_refused_before_the_fence
-exact-38-r8-balance-unknown-no-false-warning-1a5c7c5.log · core · fee_remit::tests::a_failed_balance_read_after_a_fee_bearing_payment_prints_unknown_and_no_false_warning
+exact-01-2b-node-240240c.log · core · seller_node::run::tests::a_failed_remittance_leaves_the_receipt_journaled_the_job_paid_and_the_balance_intact
+exact-02-2c-race-240240c.log · core · fee_remit::tests::two_racing_attempts_against_the_same_balance_record_exactly_one_remittance
+exact-03-2d-backoff-240240c.log · core · fee_remit::tests::retry_backoff_doubles_from_base_caps_at_thirty_minutes_and_resets_on_success
+exact-04-2d-bootdelay-240240c.log · core · fee_remit::tests::the_boot_delay_is_never_less_than_the_base_and_at_most_twice_it
+exact-05-2d-jitter-240240c.log · core · fee_remit::tests::full_jitter_stays_inside_zero_to_computed
+exact-06-2d-singleflight-240240c.log · core · fee_remit::tests::single_flight_admits_one_attempt_and_frees_the_slot_on_drop
+exact-07-2d-threshold-240240c.log · core · fee_remit::tests::a_balance_under_the_threshold_or_at_zero_neither_escalates_nor_resets_the_backoff
+exact-08-2e-drain-bound-240240c.log · core · seller_node::run::tests::a_shutdown_drain_gives_up_waiting_at_its_bound_but_never_cancels_the_attempt
+exact-09-2e-rearm-240240c.log · core · seller_node::run::tests::a_shared_outcome_re_arms_the_live_retry_timer
+exact-10-2e-retract-240240c.log · core · seller_node::run::tests::a_seat_leaving_the_selling_role_retracts_its_announcement
+exact-11-2e-shutdown-drain-240240c.log · core · seller_node::run::tests::a_requested_shutdown_drains_a_pending_remittance_before_the_loop_returns
+exact-12-2e-shutdown-retries-240240c.log · core · seller_node::run::tests::a_requested_shutdown_ends_the_platform_fee_retries
+exact-13-2f-ceiling-240240c.log · core · wallet_ops::tests::a_melt_ceiling_admits_only_the_planned_invoice_within_the_gross_debit
+exact-14-2f-reserve-240240c.log · core · fee_remit::tests::a_reserve_that_grows_between_estimate_and_payment_is_refused_before_spending
+exact-15-2g-B2-stale-snapshot-240240c.log · core · fee_remit::tests::a_release_decided_on_a_stale_planned_snapshot_cannot_revoke_a_later_admission
+exact-16-2g-a-240240c.log · core · fee_remit::tests::a_second_process_cannot_release_a_live_owners_planned_row_and_exactly_one_debit_happens
+exact-17-2g-b1-240240c.log · core · fee_remit::tests::a_spending_row_is_reconciled_by_its_bound_quote_not_by_an_expired_estimate
+exact-18-2g-b2-expired-held-240240c.log · core · fee_remit::tests::a_bound_quote_expired_past_the_margin_is_held_and_its_owner_refuses_to_pay_it
+exact-19-2g-c-240240c.log · core · fee_remit::tests::an_owner_paused_after_its_quote_and_past_its_lease_is_released_and_never_pays_that_quote
+exact-20-2g-d-240240c.log · core · fee_remit::tests::a_spending_rows_bound_quote_decides_its_release_on_the_full_path
+exact-21-2g-delayed-240240c.log · core · fee_remit::tests::a_payment_prepared_before_expiry_cannot_be_doubled_by_a_release_after_it
+exact-22-E-first-retry-240240c.log · core · seller_node::run::tests::the_first_retry_never_fires_before_thirty_seconds_after_boot_even_after_a_collect_success
+exact-23-E-one-line-240240c.log · core · seller_node::run::tests::a_first_failure_logs_exactly_one_line_with_its_detail_folded_in
+exact-24-cli-exit-map-240240c.log · CLI · seller_fees::tests::a_held_spending_row_exits_refused_on_dry_run_and_confirm
+exact-25-cli-invocation-240240c.log · CLI · seller_fees::tests::a_held_spending_row_prints_one_held_line_and_exits_refused_on_dry_run_and_confirm
+exact-26-2a-remit-follows-receipt-240240c.log · core · seller_node::run::tests::remittance_follows_only_a_new_receipt_never_a_duplicate_or_an_error
+exact-27-v13-migration-240240c.log · core · seller_node::store::tests::a_v12_store_migrates_to_v13_additively_and_its_spending_row_reads_as_unbound
+exact-28-r8-i-fee-fits-actual-differs-240240c.log · core · fee_remit::tests::a_fee_bearing_payment_whose_prepared_input_fee_differs_from_the_actual_pays_once_and_the_wallet_loses_at_most_the_gross
+exact-29-r7-ii-fee-exceeds-240240c.log · core · fee_remit::tests::a_fee_bearing_total_that_exceeds_the_gross_by_the_fee_is_refused_before_any_swap_or_melt
+exact-30-r7-iiib-fee-aware-plan-240240c.log · core · fee_remit::tests::fee_aware_planning_sizes_the_invoice_so_a_fee_bearing_payment_fits_without_reserve_slack
+exact-31-r7-never-fits-240240c.log · core · fee_remit::tests::fees_that_can_never_fit_are_refused_at_planning_not_at_payment
+exact-32-r7-fake-selfcheck-240240c.log · core · fee_remit::tests::the_fake_wallet_models_the_sdks_proof_input_and_swap_fees_and_the_total_bound_refuses_them
+exact-33-r7-admits-total-240240c.log · core · RETIRED (0 passed, 0 failed) · wallet_ops::tests::a_melt_ceiling_bounds_the_total_debit_including_proof_input_and_swap_fees → renamed, see record 43
+exact-34-r7-total-display-240240c.log · core · wallet_ops::tests::a_total_ceiling_refusal_names_the_parts_the_total_and_the_ceiling
+exact-35-r7-relay-240240c.log · core · wallet_ops::tests::a_prepared_payment_relays_confirm_and_cancel_verdicts
+exact-36-r7-drop-cancels-240240c.log · core · wallet_ops::tests::dropping_an_undecided_prepared_payment_cancels_it_and_joins_its_thread
+exact-37-r9-ii-fee-metadata-drift-refused-before-fence-240240c.log · core · fee_remit::tests::a_fee_bearing_schedule_whose_prepared_figures_fit_but_post_swap_arithmetic_does_not_is_refused_before_the_fence
+exact-38-r8-balance-unknown-no-false-warning-240240c.log · core · fee_remit::tests::a_failed_balance_read_after_a_fee_bearing_payment_prints_unknown_and_no_false_warning
+exact-39-r9-1.3-gross-19-pays-13-240240c.log · core · fee_remit::tests::a_fee_bearing_payment_at_a_19_sat_gross_the_prepared_estimate_would_refuse_pays_invoice_13_once
+exact-40-r9-1.4a-shrunk-reserve-replanned-pays-15-240240c.log · core · fee_remit::tests::a_reserve_that_shrinks_between_estimate_and_payment_is_re_planned_once_and_pays_invoice_15
+exact-41-r9-store-replan-240240c.log · core · seller_node::store::tests::replan_remittance_updates_only_our_own_planned_unbound_row_and_keeps_receipts_pinned
+exact-42-r9-confirm-bound-search-240240c.log · core · wallet_ops::tests::the_confirmability_bound_selects_the_verdicts_invoices_when_searched_downward
+exact-43-r9-admits-confirmable-240240c.log · core · wallet_ops::tests::a_melt_ceiling_admits_a_prepared_melt_by_what_confirm_will_actually_debit
+exact-44-r9-N3-paid-label-240240c.log · core · fee_remit::tests::interrupted_after_the_plan_is_reconciled_as_paid_without_a_second_melt
 ```
 
 **Gate 3 — one destination: the address literal appears in exactly one non-test location.**
 ```
-$ git grep -n -F 'maxplayer@agi.cash' 1a5c7c5 -- 'crates/*.rs' | wc -l
-      38
+$ git grep -n -F 'maxplayer@agi.cash' 240240c -- 'crates/*.rs' | wc -l
+      42
 NON-TEST crates/maxplayer-core/src/platform_fee.rs:68:pub const PLATFORM_FEE_ADDRESS: &str = "maxplayer@agi.cash";
-test     37 lines, all past their file's test boundary: fee_remit.rs ×14 (≥2898; test_support 2352), lnurl_pay.rs ×5 (≥705; 655), platform_fee.rs ×1 (:220; 126), run.rs ×1 (:14871; 617), store.rs ×6 (≥3888; 2839), seller_fees.rs ×10 (≥688; 444) — 36 at 24ba082 + 1 round-8 test fixture (regression (i), `fee_remit.rs:4632`)
-$ git grep -n 'fee_address\|platform_fee_address' -- crates
+test     41 lines, all past their file's test boundary: fee_remit.rs ×18 (≥3072; test_support 2517), lnurl_pay.rs ×5 (≥705; 655), platform_fee.rs ×1 (:220; 126), run.rs ×1 (:14871; 617), store.rs ×6 (≥3987; 2938), seller_fees.rs ×10 (≥688; 444) — 38 at 1a5c7c5 + 4 round-9 test fixtures in fee_remit.rs (the §1.3, §1.4(a), record-37 and N3 tests)
+$ git grep -n 'fee_address\|platform_fee_address' 240240c -- crates
 crates/maxplayer-core/src/platform_fee.rs:56:  (a comment arguing against an override; no config key, no CLI flag, no env var for address or rate)
 ```
 
-**Gate 4 / money-hold census — over ALL lines added `a6217328..1a5c7c5` (Rust: 14,773 added lines), every spending or hold identifier counted by `git diff -U0 a6217328..1a5c7c5 -- '*.rs' | grep '^+' | grep -c <name>` (`greps-1a5c7c5.txt`); the spend edge grepped in place:**
+**Gate 4 / money-hold census — over ALL lines added `a6217328..240240c` (Rust: 15,884 added lines), every spending or hold identifier counted by `git diff -U0 a6217328..240240c -- '*.rs' | grep '^+' | grep -c <name>` (`greps-240240c.txt`); the spend edge grepped in place:**
 ```
-send_async 0, prepare_send 0, send_blocking 0, pay_invoice 0, melt_blocking 0, melt_async 3, melt_within_async 8, melt_within_blocking 2, melt_quote_async 15, melt_status_for_quote_async 4, pay_melt_quote_async 8, pay_melt_quote_blocking 5, prepare_melt 58, confirm_melt 15, cancel_melt 7, prepare_melt_payment_blocking 18, prepared_melt_thread 2, PreparedMeltPayment 18, MeltCeiling 34, admits_total 15, confirm_would_succeed 6, plan_confirmable_invoice 8, admit_remittance_spend 18, release_remittance 19, ReleaseOn 56, TerminalBoundQuote 8, SpendingHeld 23, plan_remittance 29, expected_fees_sats 19, expected_melt_fees 2, input_fee_ppk 62, fee_paid 24
-$ grep -n 'effects.prepare_melt(\|effects.confirm_melt(\|effects.cancel_melt(' crates/maxplayer-core/src/fee_remit.rs   # non-test (< 3364)
-1576:    let prepared = match effects.prepare_melt(&quote.quote_id, &ceiling) {
-1600:            if let Err(error) = effects.cancel_melt(prepared) {          # confirmability refused (round 8, step 1c): cancel first, before the fence
-1653:            if let Err(error) = effects.cancel_melt(prepared) {          # fence refused: cancel first
-1704:        let cancel_note = match effects.cancel_melt(prepared) {          # pay-time margin refused: cancel first
-1720:    match effects.confirm_melt(prepared) {                              # the one spend
-$ git diff --stat a6217328..1a5c7c5 -- crates/maxplayer-core/src/wallet_ops.rs
- 1 file changed, 1291 insertions(+), 3 deletions(-)
+send_async 0, prepare_send 0, send_blocking 1, pay_invoice 0, melt_blocking 1, melt_async 3, melt_within_async 8, melt_within_blocking 2, melt_quote_async 15, melt_status_for_quote_async 4, pay_melt_quote_async 8, pay_melt_quote_blocking 5, prepare_melt 61, confirm_melt 14, cancel_melt 7, prepare_melt_payment_blocking 18, prepared_melt_thread 2, PreparedMeltPayment 18, MeltCeiling 37, admits_total 0 (retired in round 9), admits_confirmable 16, confirm_would_succeed 6, plan_confirmable_invoice 9, replan_remittance 10, admit_remittance_spend 19, release_remittance 19, ReleaseOn 56, TerminalBoundQuote 8, SpendingHeld 23, plan_remittance 41, expected_fees_sats 17, expected_melt_fees 2, input_fee_ppk 78, fee_paid 30
+   (send_blocking 1 / melt_blocking 1: the string arguments of the pre-existing `runtime_guard::refuse_nested_block_on(...)` nested-runtime guards, `wallet_ops.rs:2155` / `:2182`, counted because those lines moved in the diff — neither is a call to a spending function.)
+$ grep -n 'effects.prepare_melt(\|effects.confirm_melt(\|effects.cancel_melt(' crates/maxplayer-core/src/fee_remit.rs   # non-test (< 3577)
+1764:    let prepared = match effects.prepare_melt(&quote.quote_id, &ceiling) {
+1788:            if let Err(error) = effects.cancel_melt(prepared) {          # confirmability refused (step 1c): cancel first, before the fence
+1841:            if let Err(error) = effects.cancel_melt(prepared) {          # fence refused: cancel first
+1892:        let cancel_note = match effects.cancel_melt(prepared) {          # pay-time margin refused: cancel first
+1908:    match effects.confirm_melt(prepared) {                              # the one spend
+$ git diff --stat a6217328..240240c -- crates/maxplayer-core/src/wallet_ops.rs
+ 1 file changed, 1640 insertions(+), 30 deletions(-)
 ```
-The sole live spending edge is `fee_remit.rs:1576 prepare_melt → :1720 confirm_melt` → `LiveEffects` `:445` / `:463` → `wallet_ops::prepare_melt_payment_blocking` (`wallet_ops.rs:1377`) → `prepared_melt_thread` (`:1437`): `admits` (`:1479`) → `Wallet::prepare_melt` (local) → `admits_total` (`:294`) → **`confirm_would_succeed` (`fee_remit.rs:2305`, round 8)** → fence → `PreparedMeltPayment::confirm` (`wallet_ops.rs:1580`), reached only after `admit_remittance_spend` changed one row and bound that quote's id, only for that id, and never while a bound spending row exists, because `plan_remittance` refuses first.
+The sole live spending edge is `fee_remit.rs:1764 prepare_melt → :1908 confirm_melt` → `LiveEffects` `:443` / `:463` → `wallet_ops::prepare_melt_payment_blocking` (`wallet_ops.rs:1577`) → `prepared_melt_thread` (`:1637`): `admits` (`:1678`) → `Wallet::prepare_melt` (no proof- or fee-bearing request) → `input_fee_ppk` read (`:1709`) → `admits_confirmable` (`:479`, at `:1733`; round 9) → **`confirm_would_succeed` (`fee_remit.rs:2470`, at `:1785`)** → fence → `PreparedMeltPayment::confirm` (`wallet_ops.rs:629`), reached only after `admit_remittance_spend` changed one row and bound that quote's id, only for that id, and never while a bound spending row exists, because `plan_remittance` refuses first.
 
 ## Full suites at `1a5c7c5` (local, macOS arm64; each suite its own command with `--no-fail-fast`, `git rev-parse HEAD` first in each log)
 ```
@@ -224,9 +231,9 @@ exec2-cli-acp-wallet.log · 18559 · c97b420f22f42c257a9af158d5ca90af41244ba569c
 money-path-ci-1-1a5c7c5.log · 134735 · 0103e44c84e21cc7e2f9e1aa5fb01cbbd1e5585ee490b18382f322188f4b0a6e
 money-path-ci-2-1a5c7c5.log · 130802 · 3d89320d6ac0e88675f8c2d8d06752775836871f18662a97504ff40ab1fd84b4
 money-path-ci-3-1a5c7c5.log · 130805 · 808320f23fe1ed6d17b223c222a272fecd063bb305d461828028484127319600
-exact-28-r8-i-fee-fits-actual-differs-1a5c7c5.log · 3639 · fcbd74f421020706882a84717840a2d5c36ace407304d1e035a7d5935af72b0f
-exact-37-r8-ii-post-swap-refused-before-fence-1a5c7c5.log · 3623 · d44ab349f9b719d3ccea7551b070702d5880eac634c91dc8a4d8cd696847484c
-exact-38-r8-balance-unknown-no-false-warning-1a5c7c5.log · 3571 · 2912dd6dc98a57436032beb28d3043761fa4464ee5eaf20fb67141905ba4babc
+exact-28-r8-i-fee-fits-actual-differs-240240c.log · 3639 · fcbd74f421020706882a84717840a2d5c36ace407304d1e035a7d5935af72b0f
+exact-37-r8-ii-post-swap-refused-before-fence-240240c.log · 3623 · d44ab349f9b719d3ccea7551b070702d5880eac634c91dc8a4d8cd696847484c
+exact-38-r8-balance-unknown-no-false-warning-240240c.log · 3571 · 2912dd6dc98a57436032beb28d3043761fa4464ee5eaf20fb67141905ba4babc
 plan.md · 10661 · 7aac574b998991a4a660ee8524401e7575c1761dc275956db3387a5f3c17338b
 (+ exec2-clippy.log, exec2-fmt.log, exec2-added-ranges.diff, exec2-lint-mapping.md, the other 35 exact-NN-*-1a5c7c5.log records, the b1c702a first-attempt logs, step2–8 logs — all in evidence-table.txt; body-plan.md, build-body-r8.py, greps-1a5c7c5.txt, citation-remap-1a5c7c5.txt, body-r8.md and body-pin-4714623.txt are added by 4714623)
 ```

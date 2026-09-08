@@ -1,0 +1,139 @@
+grep gates 1-4 re-measured at exec head 240240c3f26bd35c3a8c5a3d70229f9730a0a221 (working tree HEAD 6172b09, .rs diff 240240c..HEAD: 0 files) — 2026-09-08T18:02:25Z
+
+## Gate 1
+1546:fn default_allow_real_mints() -> bool {
+1547-    true
+1548-}
+1411:    #[serde(default = "default_allow_real_mints")]
+1183:    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+1243:    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+1318:    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+1363:    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+1590:    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+1875:    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+1930:    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+1969:    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+110:            "--confirm" if remit => confirm = true,
+413:    let trigger = if confirm {
+514:    pub fn pays(self) -> bool {
+515-        !matches!(self, Self::DryRun)
+516-    }
+
+## Gate 2a
+617:    #[cfg(test)]
+crates/maxplayer/src/seller_fees.rs:500:mod tests {
+crates/maxplayer-core/src/fee_remit.rs:2517:pub(crate) mod test_support {
+crates/maxplayer-core/src/fee_remit.rs:3577:mod tests {
+crates/maxplayer-core/src/seller_node/run.rs:7937:mod tests {
+272:    #[cfg(test)]
+444:#[cfg(test)]
+crates/maxplayer/src/seller_fees.rs:418:    let outcome = remit(&store, &mut effects, trigger, now_unix, out)?;
+crates/maxplayer-core/src/fee_remit.rs:2123:pub fn remit_best_effort(
+crates/maxplayer-core/src/fee_remit.rs:2146:pub fn remit_live_best_effort(
+crates/maxplayer-core/src/fee_remit.rs:2153:        Ok(mut effects) => remit_best_effort(store, &mut effects, trigger, now_unix),
+crates/maxplayer-core/src/fee_remit.rs:4462:        let error = remit(&store, &mut fake, RemitTrigger::Command, 101, &mut out)
+crates/maxplayer-core/src/fee_remit.rs:4488:        let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 100);
+crates/maxplayer-core/src/fee_remit.rs:4535:        let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 102);
+crates/maxplayer-core/src/fee_remit.rs:4563:        let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 104);
+crates/maxplayer-core/src/fee_remit.rs:7049:            let outcome = remit(&store, &mut a, RemitTrigger::Collect, 100, &mut out);
+crates/maxplayer-core/src/fee_remit.rs:7064:            let outcome = remit(&store, &mut b, RemitTrigger::Command, 401, &mut out);
+crates/maxplayer-core/src/seller_node/run.rs:3321:            crate::fee_remit::remit_best_effort(store, effects.as_mut(), trigger, now_unix())
+crates/maxplayer-core/src/seller_node/run.rs:3323:        None => crate::fee_remit::remit_live_best_effort(store, home, trigger, now_unix()),
+crates/maxplayer-core/src/seller_node/run.rs:13752:        let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 5001);
+crates/maxplayer-core/src/seller_node/run.rs:13760:        let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 5002);
+crates/maxplayer-core/src/seller_node/run.rs:13818:        let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 5003);
+crates/maxplayer-core/src/seller_node/run.rs:13843:        let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 5004);
+crates/maxplayer-core/src/seller_node/run.rs:13876:        let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 5005);
+crates/maxplayer-core/src/seller_node/run.rs:14850:        let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 100);
+303 1785 2093 6051 7264 7327 7771 14306 14437 14557 14640 14930 15065 15134 15239 15330 16418 
+4153:        // shared backoff re-arms this same timer through `remit_pacing_changed` (addendum 3 §3).
+4159:        let remit_retry = tokio::time::sleep(self.remit_pacing_lock().boot_delay());
+7308:    /// serving has ended (`remit_closed`), or the thread could not start. The loop re-arms the timer
+
+## Gate 3
+240240c:crates/maxplayer-core/src/fee_remit.rs:3072:            assert_eq!(address.to_string(), "maxplayer@agi.cash");
+240240c:crates/maxplayer-core/src/fee_remit.rs:3695:            "Destination: maxplayer@agi.cash (LNURL-pay; accepts 1 to 1000000 sats)",
+240240c:crates/maxplayer-core/src/fee_remit.rs:3698:            "invoice amount (maxplayer@agi.cash receives): 13 sats",
+240240c:crates/maxplayer-core/src/fee_remit.rs:3702:            "DRY RUN — nothing moved. Re-run with --confirm to pay 13 sats to maxplayer@agi.cash.",
+240240c:crates/maxplayer-core/src/fee_remit.rs:3756:            "net paid to maxplayer@agi.cash: 13 sats",
+240240c:crates/maxplayer-core/src/fee_remit.rs:3776:            row.destination, "maxplayer@agi.cash",
+240240c:crates/maxplayer-core/src/fee_remit.rs:3814:            "paid 13 sats to maxplayer@agi.cash (melt fee 1 sats)"
+240240c:crates/maxplayer-core/src/fee_remit.rs:3831:            out.contains("unix 100: operator (--confirm) attempt saw 15 sats unremitted — PAID: paid 13 sats to maxplayer@agi.cash (melt fee 1 sats) [remittance hash-13-2]"),
+240240c:crates/maxplayer-core/src/fee_remit.rs:3881:            out.contains("net paid to maxplayer@agi.cash: 10 sats"),
+240240c:crates/maxplayer-core/src/fee_remit.rs:4150:            out.contains("Reconciling in-flight remittance hash-9-2 (planned at unix 100 by fake-owner, lease until unix 400: 9 sats to maxplayer@agi.cash, gross 10 sats)"),
+240240c:crates/maxplayer-core/src/fee_remit.rs:4156:            out.contains("reports melt quote paid-quote-lnbc-fake-9-2 PAID — recorded as settled by reconciliation: 9 sats reached maxplayer@agi.cash; Lightning fee at most 1 sats (the quote's reserve); the inclusive melt fee (Lightning + actual proof input fee) is recorded as not observed — the mint reports PAID, not what it kept"),
+240240c:crates/maxplayer-core/src/fee_remit.rs:4889:            out.contains("invoice amount (maxplayer@agi.cash receives): 12 sats"),
+240240c:crates/maxplayer-core/src/fee_remit.rs:5045:            out.contains("invoice amount (maxplayer@agi.cash receives): 12 sats"),
+240240c:crates/maxplayer-core/src/fee_remit.rs:5069:            "net paid to maxplayer@agi.cash: 15 sats",
+240240c:crates/maxplayer-core/src/fee_remit.rs:5178:            out.contains("invoice amount (maxplayer@agi.cash receives): 13 sats"),
+240240c:crates/maxplayer-core/src/fee_remit.rs:5193:            "net paid to maxplayer@agi.cash: 13 sats",
+240240c:crates/maxplayer-core/src/fee_remit.rs:5494:            "invoice amount (maxplayer@agi.cash receives): 13 sats",
+240240c:crates/maxplayer-core/src/fee_remit.rs:5497:            "DRY RUN — nothing moved. Re-run with --confirm to pay 13 sats to maxplayer@agi.cash.",
+240240c:crates/maxplayer-core/src/lnurl_pay.rs:705:        LightningAddress::parse("maxplayer@agi.cash").expect("valid")
+240240c:crates/maxplayer-core/src/lnurl_pay.rs:737:        assert_eq!(address.to_string(), "maxplayer@agi.cash");
+240240c:crates/maxplayer-core/src/lnurl_pay.rs:755:            "maxplayer@agi.cash/",
+240240c:crates/maxplayer-core/src/lnurl_pay.rs:756:            "maxplayer@agi.cash:443",
+240240c:crates/maxplayer-core/src/lnurl_pay.rs:757:            "maxplayer@agi.cash?x=1",
+240240c:crates/maxplayer-core/src/platform_fee.rs:68:pub const PLATFORM_FEE_ADDRESS: &str = "maxplayer@agi.cash";
+240240c:crates/maxplayer-core/src/platform_fee.rs:220:        assert_eq!(PLATFORM_FEE_ADDRESS, "maxplayer@agi.cash");
+240240c:crates/maxplayer-core/src/seller_node/run.rs:14871:            line.contains("destination maxplayer@agi.cash"),
+240240c:crates/maxplayer-core/src/seller_node/store.rs:3987:            destination: "maxplayer@agi.cash".to_owned(),
+240240c:crates/maxplayer-core/src/seller_node/store.rs:4129:        assert_eq!(planned.destination, "maxplayer@agi.cash");
+240240c:crates/maxplayer-core/src/seller_node/store.rs:4507:                 INSERT INTO fee_remittances VALUES ('v10-settled', 10, 1, 9, 'maxplayer@agi.cash', 'q1', 'v10-settled', 'ln1', 'settled', 3, 4);
+240240c:crates/maxplayer-core/src/seller_node/store.rs:4508:                 INSERT INTO fee_remittances VALUES ('v10-planned', 5, NULL, 4, 'maxplayer@agi.cash', 'q2', 'v10-planned', 'ln2', 'planned', 5, NULL);",
+240240c:crates/maxplayer-core/src/seller_node/store.rs:4971:                 INSERT INTO fee_remittances VALUES ('v11-planned', 5, NULL, 4, 'maxplayer@agi.cash', 'q2', 'v11-planned', 'ln2', 'planned', 100, NULL, 'proc-old', 400, 1, NULL);",
+240240c:crates/maxplayer-core/src/seller_node/store.rs:5074:                 INSERT INTO fee_remittances VALUES ('v12-spending', 5, NULL, 4, 'maxplayer@agi.cash', 'q-est', 'v12-spending', 'ln3', 'planned', 100, NULL, 'proc-v12', 400, 1, NULL, 150);",
+240240c:crates/maxplayer/src/seller_fees.rs:688:                destination: "maxplayer@agi.cash".to_owned(),
+240240c:crates/maxplayer/src/seller_fees.rs:708:                destination: "maxplayer@agi.cash".to_owned(),
+240240c:crates/maxplayer/src/seller_fees.rs:730:                destination: "maxplayer@agi.cash".to_owned(),
+240240c:crates/maxplayer/src/seller_fees.rs:752:                destination: "maxplayer@agi.cash".to_owned(),
+240240c:crates/maxplayer/src/seller_fees.rs:773:            "  failed (no sats left; receipts released): 6 sats to maxplayer@agi.cash — gross 7 sats, melt fee not observed, invoice old, 0 receipts, planned at unix 5, resolved at unix 6\n",
+240240c:crates/maxplayer/src/seller_fees.rs:774:            "  settled: 9 sats to maxplayer@agi.cash — gross 10 sats, melt fee 1 sats, invoice abc123, 1 receipt, planned at unix 7, resolved at unix 8\n",
+240240c:crates/maxplayer/src/seller_fees.rs:775:            "  settled: 17 sats to maxplayer@agi.cash — gross 20 sats, melt fee not observed (settled by reconciliation against the mint, which reports the quote paid but not the fee it kept; at most 3 sats, the quote's reserve), invoice rec, 2 receipts, planned at unix 9, resolved at unix 10\n",
+240240c:crates/maxplayer/src/seller_fees.rs:776:            "  SPENDING (melt admitted, bound to melt quote q-mid-pay; resolved only by the mint's verdict on that quote — re-run remit to reconcile): 3 sats to maxplayer@agi.cash — gross 4 sats, melt fee not observed, invoice mid, 1 receipt, planned at unix 11\n",
+240240c:crates/maxplayer/src/seller_fees.rs:1188:                        destination: "maxplayer@agi.cash".to_owned(),
+240240c:crates/maxplayer/src/seller_fees.rs:1251:                 Reconciling in-flight remittance hash-held (planned at unix 100 by old-run, lease until unix {lease}: 13 sats to maxplayer@agi.cash, gross 15 sats) — SPENDING since unix 100, bound to melt quote paid-quote-never-raised: asking the mint about that quote by id\n\
+240240c:crates/maxplayer-core/src/platform_fee.rs:56:///   party that owes the fee. A seller-editable `fee_address` would let any seller point the
+
+## Gate 4 census over added lines a6217328..240240c ('*.rs'): 15884 added lines
+send_async 0
+prepare_send 0
+send_blocking 1
+pay_invoice 0
+melt_blocking 1
+melt_async 3
+melt_within_async 8
+melt_within_blocking 2
+melt_quote_async 15
+melt_status_for_quote_async 4
+pay_melt_quote_async 8
+pay_melt_quote_blocking 5
+prepare_melt 61
+confirm_melt 14
+cancel_melt 7
+prepare_melt_payment_blocking 18
+prepared_melt_thread 2
+PreparedMeltPayment 18
+MeltCeiling 37
+admits_total 0
+admits_confirmable 16
+confirm_would_succeed 6
+plan_confirmable_invoice 9
+replan_remittance 10
+admit_remittance_spend 19
+release_remittance 19
+ReleaseOn 56
+TerminalBoundQuote 8
+SpendingHeld 23
+plan_remittance 41
+expected_fees_sats 17
+expected_melt_fees 2
+input_fee_ppk 78
+fee_paid 30
+1764:    let prepared = match effects.prepare_melt(&quote.quote_id, &ceiling) {
+1788:            if let Err(error) = effects.cancel_melt(prepared) {
+1841:            if let Err(error) = effects.cancel_melt(prepared) {
+1892:        let cancel_note = match effects.cancel_melt(prepared) {
+1908:    match effects.confirm_melt(prepared) {
+ crates/maxplayer-core/src/wallet_ops.rs | 1670 ++++++++++++++++++++++++++++++-
+ 1 file changed, 1640 insertions(+), 30 deletions(-)
