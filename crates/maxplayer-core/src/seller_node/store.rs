@@ -238,6 +238,24 @@ pub struct RemittancePlan {
     pub melt_quote_id: Option<String>,
 }
 
+/// The invoice a still-PLANNED row is re-pointed at when the live quote's fee reserve differs from
+/// the estimate the row was planned on and the planned invoice would not confirm (addendum 10
+/// §1.4). Same gross, same receipts, same row: only the invoice-side figures move, by
+/// [`SellerStore::replan_remittance`], BEFORE any spend is prepared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemittanceReplan {
+    /// The re-planned invoice amount; must still fit under the row's gross.
+    pub net_sats: u64,
+    /// The new invoice's payment hash (hex). The row's `remittance_id` — its receipts' pin — stays
+    /// the ORIGINAL hash; `payment_hash` is what the ledger and the mint are reconciled on.
+    pub payment_hash: String,
+    pub bolt11: String,
+    /// The live quote's fee reserve, the figure the re-plan was bounded by.
+    pub melt_fee_reserve_sats: u64,
+    /// The melt quote raised on the new invoice — the one the fence will bind.
+    pub melt_quote_id: Option<String>,
+}
+
 /// How a `settled` remittance row came to be settled — the row says so itself, because the two
 /// paths can observe different things (addendum 3 §2.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2246,6 +2264,85 @@ impl SellerStore {
             now_unix,
             margin_secs,
         }))
+    }
+
+    /// **Re-plan** a still-PLANNED, still-UNBOUND row of ours onto a new invoice (addendum 10 §1.4):
+    /// the live quote's fee reserve differs from the estimate the row was planned on and the
+    /// planned invoice would not confirm, so the SAME attempt raises a smaller invoice BEFORE it
+    /// prepares any spend. ONE conditional update —
+    ///
+    /// ```sql
+    /// UPDATE fee_remittances SET net_sats, payment_hash, bolt11, melt_fee_reserve_sats, melt_quote_id
+    ///  WHERE remittance_id = :id AND state = 'planned' AND spending_since_unix IS NULL AND owner = :owner
+    /// ```
+    ///
+    /// — so a row that was admitted (spending, quote bound), resolved by another process, or never
+    /// ours changes ZERO rows ⇒ `Ok(None)`: the caller refuses before the fence and prints that the
+    /// row changed under it. `gross_sats` is untouched, the receipts stay pinned to the row's
+    /// `remittance_id` (the ORIGINAL payment hash), the owner and lease stand; one row per attempt.
+    /// The new `payment_hash` must be unused by any earlier row (the column is UNIQUE) and `net`
+    /// must fit under the gross.
+    pub fn replan_remittance(
+        &self,
+        remittance_id: &str,
+        owner: &str,
+        replan: &RemittanceReplan,
+    ) -> Result<Option<FeeRemittance>, StoreError> {
+        if replan.payment_hash.trim().is_empty() || replan.bolt11.trim().is_empty() {
+            return Err(StoreError(
+                "a re-plan names the new invoice: payment hash and bolt11".to_owned(),
+            ));
+        }
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let gross: Option<i64> = tx
+            .query_row(
+                "SELECT gross_sats FROM fee_remittances WHERE remittance_id = ?1",
+                params![remittance_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(gross) = gross else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        if replan.net_sats as i64 > gross {
+            return Err(StoreError(format!(
+                "re-planned net {} exceeds gross {gross}: the melt fee must come out of the gross, never on top",
+                replan.net_sats
+            )));
+        }
+        let changed = tx.execute(
+            "UPDATE fee_remittances
+             SET net_sats = ?3, payment_hash = ?4, bolt11 = ?5,
+                 melt_fee_reserve_sats = ?6, melt_quote_id = ?7
+             WHERE remittance_id = ?1 AND state = ?8 AND spending_since_unix IS NULL AND owner = ?2",
+            params![
+                remittance_id,
+                owner,
+                replan.net_sats as i64,
+                replan.payment_hash,
+                replan.bolt11,
+                replan.melt_fee_reserve_sats as i64,
+                replan.melt_quote_id,
+                RemittanceState::Planned.column_value(),
+            ],
+        )?;
+        if changed == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let row = tx.query_row(
+            &format!(
+                "SELECT {} FROM fee_remittances f WHERE f.remittance_id = ?1",
+                Self::REMITTANCE_COLUMNS
+            ),
+            params![remittance_id],
+            Self::read_remittance,
+        )?;
+        tx.commit()?;
+        debug_assert_eq!(row.state, RemittanceState::Planned);
+        Ok(Some(row))
     }
 
     /// Mark a `planned` remittance settled: the melt confirmed (or the mint reports the quote PAID
@@ -4678,6 +4775,141 @@ mod tests {
         assert!(!planned.lease_holds("proc-b", 3, 60));
         assert!(!planned.lease_expired(499));
         assert!(planned.lease_expired(500));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Addendum 10 §1.4 (ledger): a re-plan moves ONLY the invoice-side figures of OUR still-planned,
+    // still-unbound row — net, payment hash, bolt11, reserve, quote — and nothing else: gross,
+    // remittance_id (the receipts' pin), owner, lease and state are as planned. Another owner, and a
+    // row already admitted by the fence, change zero rows (`Ok(None)`) and are left exactly as they
+    // were; a net over the gross is refused before any write.
+    #[test]
+    fn replan_remittance_updates_only_our_own_planned_unbound_row_and_keeps_receipts_pinned() {
+        let (store, path) = fresh_store("remit-replan");
+        store
+            .collect_receipt("r1", "job-1", 100, fees(1, 1000, 10), 1)
+            .expect("collect");
+        store
+            .collect_receipt("r2", "job-2", 100, fees(1, 1000, 10), 1)
+            .expect("collect");
+        let planned = store
+            .plan_remittance(&plan("h1", 20, 17), "proc-a", 500, 2)
+            .expect("plan");
+        assert_eq!(planned.net_sats, 17);
+        assert_eq!(planned.melt_fee_reserve_sats, Some(3));
+        let replan = RemittanceReplan {
+            net_sats: 15,
+            payment_hash: "h1-replan".to_owned(),
+            bolt11: "lnbc-test-h1-replan".to_owned(),
+            melt_fee_reserve_sats: 0,
+            melt_quote_id: Some("quote-h1-replan".to_owned()),
+        };
+
+        // Another owner: zero rows, and the row is untouched.
+        assert_eq!(
+            store
+                .replan_remittance("h1", "proc-b", &replan)
+                .expect("query"),
+            None
+        );
+        assert_eq!(
+            store.in_flight_remittance().expect("row").expect("planned"),
+            planned,
+            "a refused re-plan writes nothing"
+        );
+        // A row that does not exist: zero rows.
+        assert_eq!(
+            store
+                .replan_remittance("h-none", "proc-a", &replan)
+                .expect("query"),
+            None
+        );
+        // Net over the gross: refused before any write.
+        assert!(store
+            .replan_remittance(
+                "h1",
+                "proc-a",
+                &RemittanceReplan {
+                    net_sats: 21,
+                    ..replan.clone()
+                },
+            )
+            .is_err());
+        assert!(store
+            .replan_remittance(
+                "h1",
+                "proc-a",
+                &RemittanceReplan {
+                    payment_hash: "  ".to_owned(),
+                    ..replan.clone()
+                },
+            )
+            .is_err());
+        assert_eq!(
+            store.in_flight_remittance().expect("row").expect("planned"),
+            planned
+        );
+
+        // The owner, on its planned unbound row: ONE row changed; only the invoice-side figures moved.
+        let replanned = store
+            .replan_remittance("h1", "proc-a", &replan)
+            .expect("query")
+            .expect("re-planned");
+        assert_eq!(replanned.remittance_id, "h1", "the receipts' pin does not move");
+        assert_eq!(replanned.gross_sats, 20, "gross is untouched");
+        assert_eq!(replanned.net_sats, 15);
+        assert_eq!(replanned.payment_hash, "h1-replan");
+        assert_eq!(replanned.bolt11, "lnbc-test-h1-replan");
+        assert_eq!(replanned.melt_fee_reserve_sats, Some(0));
+        assert_eq!(replanned.melt_quote_id.as_deref(), Some("quote-h1-replan"));
+        assert_eq!(replanned.state, RemittanceState::Planned);
+        assert_eq!(replanned.owner.as_deref(), Some("proc-a"));
+        assert_eq!(replanned.lease_until_unix, Some(500));
+        assert_eq!(replanned.spending_since_unix, None);
+        assert_eq!(replanned.spending_quote_id, None);
+        assert_eq!(replanned.melt_fee_sats, None);
+        assert_eq!(replanned.settled_at_unix, None);
+        assert_eq!(replanned.created_at_unix, planned.created_at_unix);
+        let accrued = store.accrued_fees().expect("read-out");
+        assert_eq!(
+            (accrued.in_flight_fee_sats, accrued.unremitted_fee_sats),
+            (20, 0),
+            "both receipts stay pinned to the re-planned row"
+        );
+        // A second plan is still refused: the re-planned row is the one in flight.
+        assert!(matches!(
+            store.plan_remittance(&plan("h2", 20, 17), "proc-a", 500, 3),
+            Err(PlanRefused::InFlight(_))
+        ));
+        // The original hash is the row id, so the NEW hash cannot be reused by a later plan.
+        // (Exercised once the row is terminal; here the fence binds the re-planned quote.)
+        let admitted = store
+            .admit_remittance_spend("h1", "proc-a", "quote-h1-replan", 60, &mut || 3)
+            .expect("query")
+            .expect("admitted");
+        assert_eq!(admitted.state, RemittanceState::Spending);
+        assert_eq!(admitted.net_sats, 15);
+        // Once admitted (spending, quote bound): zero rows — a re-plan never moves a spend in
+        // progress.
+        assert_eq!(
+            store
+                .replan_remittance(
+                    "h1",
+                    "proc-a",
+                    &RemittanceReplan {
+                        net_sats: 14,
+                        payment_hash: "h1-again".to_owned(),
+                        ..replan.clone()
+                    },
+                )
+                .expect("query"),
+            None
+        );
+        let held = store.in_flight_remittance().expect("row").expect("spending");
+        assert_eq!(held.state, RemittanceState::Spending);
+        assert_eq!(held.net_sats, 15);
+        assert_eq!(held.payment_hash, "h1-replan");
+        assert_eq!(held.spending_quote_id.as_deref(), Some("quote-h1-replan"));
         let _ = std::fs::remove_file(&path);
     }
 
