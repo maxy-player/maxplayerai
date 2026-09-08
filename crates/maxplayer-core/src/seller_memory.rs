@@ -183,10 +183,13 @@ pub fn truncation_marker(shown_bytes: usize, total_bytes: usize) -> String {
 
 /// Fit an index into [`MAX_MEMORY_INDEX_BYTES`]. An index at or under the budget comes back
 /// trailing-trimmed and untouched. An index over it is cut at the LAST COMPLETE LINE at or before
-/// the budget — never mid-line and never mid-UTF-8-character; a single line longer than the budget
-/// is cut at the nearest lower char boundary — and [`truncation_marker`] is appended as the final
-/// line. The marker's bytes are reserved BEFORE the cut, so the returned text is always
-/// `<= MAX_MEMORY_INDEX_BYTES` including the marker.
+/// the budget that leaves a NON-EMPTY head, and [`truncation_marker`] is appended as the final
+/// line. When no such line exists — a single line longer than the budget, or a file whose only
+/// newline at or before the budget sits at offset 0 (the head would be empty and the seat would
+/// inject zero specialization) — the long-line fallback applies: the cut lands on the nearest lower
+/// char boundary, never mid-UTF-8-character. The marker's bytes are reserved BEFORE the cut, so the
+/// returned text is always `<= MAX_MEMORY_INDEX_BYTES` including the marker; the bound covers the
+/// index text plus the marker, not the surrounding prompt template.
 pub fn fit_index_to_budget(index: &str) -> (String, Option<IndexTruncation>) {
     let total_bytes = index.len();
     if total_bytes <= MAX_MEMORY_INDEX_BYTES {
@@ -210,13 +213,17 @@ pub fn fit_index_to_budget(index: &str) -> (String, Option<IndexTruncation>) {
 }
 
 /// The byte offset to cut `text` at so the result is at most `budget` bytes: just after the last
-/// newline at or before the budget when one exists (so the cut lands on a complete line), else the
-/// nearest char boundary at or below the budget (a single line longer than the whole budget).
+/// newline at or before the budget that leaves a NON-EMPTY head (so the cut lands on a complete
+/// line), else the nearest char boundary at or below the budget — the long-line fallback, which
+/// covers both a single line longer than the whole budget and a file whose only newline at or
+/// before the budget sits at offset 0.
 fn line_boundary_cut(text: &str, budget: usize) -> usize {
     let budget = budget.min(text.len());
     let window = &text.as_bytes()[..budget];
     if let Some(newline) = window.iter().rposition(|&byte| byte == b'\n') {
-        // A newline at offset 0 would keep nothing; fall through to the char-boundary cut instead.
+        // The only newline at or before the budget sits at offset 0: cutting there would leave an
+        // EMPTY head and inject zero specialization. Contract (PR #983 addendum 1): apply the
+        // long-line fallback instead.
         if newline > 0 {
             return newline + 1;
         }
@@ -638,6 +645,48 @@ mod tests {
         // Also directly: the pure fitter produces a String that round-trips as valid UTF-8 bytes.
         let (fitted, _) = fit_index_to_budget(&index);
         assert!(std::str::from_utf8(fitted.as_bytes()).is_ok());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An index whose ONLY newline at or before the budget sits at offset 0 (one LF, then one
+    /// 65,536-byte line): the last-complete-line rule would leave an EMPTY head, so the long-line
+    /// fallback applies — the head is non-empty, cut on a char boundary inside the second line, the
+    /// marker is the final line and the whole result fits the budget as valid UTF-8.
+    #[test]
+    fn read_on_start_leading_blank_line_then_overlong_line_keeps_a_non_empty_head() {
+        let root = temp_dir("ros-leading-lf");
+        let dir = memory_dir(&root);
+        fs::create_dir_all(&dir).expect("mkdir");
+        let mut index = String::from("\n");
+        index.push_str(&"x".repeat(MAX_MEMORY_INDEX_BYTES));
+        assert_eq!(index.len(), MAX_MEMORY_INDEX_BYTES + 1);
+        assert_eq!(index.find('\n'), Some(0), "the only newline is at offset 0");
+        fs::write(dir.join(MEMORY_INDEX_FILE), &index).expect("write index");
+        let template = bare_index_template(&root);
+
+        let read = read_on_start(&dir, Some(&template))
+            .expect("a leading blank line is not an error")
+            .expect("and the index still injects");
+        let truncation = read.truncation.expect("truncated");
+        assert_eq!(truncation.total_bytes, index.len());
+        assert!(
+            read.section.len() <= MAX_MEMORY_INDEX_BYTES,
+            "result incl. marker is {} bytes, over the budget",
+            read.section.len()
+        );
+        assert!(std::str::from_utf8(read.section.as_bytes()).is_ok(), "valid UTF-8");
+        let (head, marker) = split_head_and_marker(&read.section);
+        assert_eq!(marker, truncation_marker(truncation.shown_bytes, truncation.total_bytes));
+        assert!(marker.starts_with("[maxplayer: MEMORY.md truncated"), "marker is the final line");
+        // Non-empty head, cut inside the second line: the head keeps the file's leading LF and then
+        // a run of `x` from the second line — NOT the empty string an offset-0 cut would have given.
+        assert!(!head.trim().is_empty(), "the head carries specialization, not an empty line");
+        assert!(head.starts_with('\n'), "the head is a prefix of the file, incl. its leading LF");
+        let second_line = &head[1..];
+        assert!(!second_line.is_empty(), "the cut landed inside the second line");
+        assert!(second_line.chars().all(|c| c == 'x'), "and kept only that line's own bytes");
+        assert!(index.is_char_boundary(head.len()), "the cut is on a char boundary");
+        assert_eq!(head.len(), truncation.shown_bytes);
         let _ = fs::remove_dir_all(&root);
     }
 

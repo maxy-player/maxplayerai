@@ -1009,15 +1009,19 @@ open them, so anything the agent must see goes in `MEMORY.md` itself, not in a f
 `operator-notes.md`) are the ones a future retro is bound to leave untouched; write yours that way.
 
 **The injection budget — 64 KiB.** The index is capped at `MAX_MEMORY_INDEX_BYTES` = 65,536 bytes per
-job. An index **over** the budget is **truncated, never dropped**: the job gets the last complete line at
-or before the budget, then one marker line —
+job. An index **over** the budget is **truncated, never dropped**: the job gets everything up to the last
+complete line at or before the budget that leaves a non-empty head, then one marker line —
 
 ```
 [maxplayer: MEMORY.md truncated to the 65536-byte injection budget — <shown> of <total> bytes shown, tail dropped]
 ```
 
-— so the agent reads a fragment as a fragment and the seat keeps its specialization *head*. The cut is
-never mid-line or mid-character, and the injected block including the marker stays ≤ 64 KiB. You are told
+— so the agent reads a fragment as a fragment and the seat keeps its specialization *head*. Two shapes get
+no complete line to cut on: a single line longer than the budget, or a file whose first in-budget newline
+is at offset 0 (a leading blank line, then one huge line). Those are cut at a character boundary inside
+the long line — never mid-character, so the text stays valid — because an empty head would inject
+nothing. The marker's bytes are reserved before the cut, so the index text plus the marker stays ≤ 64 KiB;
+that bound is the index and marker only, not the surrounding prompt template. You are told
 three times: once at **boot** (`seller node WARNING: memory index … is N bytes, over the 65536-byte
 injection budget — every job prompt will get a TRUNCATED copy …`), once **per job** in the daemon log, and
 by `maxplayer doctor` on demand. Fix it by shortening `MEMORY.md` itself; moving text into a linked topic
