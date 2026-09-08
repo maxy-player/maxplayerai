@@ -241,8 +241,13 @@ pub struct MeltOutcome {
     pub swap_fee_sats: u64,
 }
 
-/// A hard bound a caller places on a melt, checked against the quote the mint raises AT PAYMENT
-/// TIME and BEFORE any proof is selected, prepared or spent ([`melt_within_async`]). The seller fee
+/// A hard bound a caller places on a melt. Two checks share it: [`Self::admits`] bounds the two
+/// figures a QUOTE carries (invoice + fee reserve) and is taken before any proof is selected — the
+/// operator's [`melt_within_async`] takes only this one (its reserve-only ceiling is kept as is,
+/// addendum 8 §6); [`Self::admits_total`] bounds the four figures a PREPARED melt carries (invoice +
+/// fee reserve + the SDK's proof-input fee + its pre-melt swap fee) and is taken between
+/// `prepare_melt` and `confirm` by [`prepare_melt_payment_blocking`] — the seller fee remittance's
+/// path, whose ceiling therefore bounds the ENTIRE wallet debit (addendum 8 §1, verdict B4). The
 /// remittance's money hold (stage 2a, addendum 3 §1): the plan's estimate is not the quote the spend
 /// runs under — the mint quotes again when the payment is made, and its fee reserve can differ — so
 /// the ceiling is enforced at the moment of spending, not estimated beforehand or regretted
@@ -1058,10 +1063,13 @@ pub async fn melt_async(
 /// here — at payment time — and BEFORE `prepare_melt` selects a single proof: quote, then the same
 /// pay step [`pay_melt_quote_async`] uses. The operator's `maxplayer wallet melt` composes it. The
 /// seller fee remittance does NOT pay through this (it did in stage 2a rounds 2–3): since
-/// addendum 5 it raises its payment quote with [`melt_quote_async`], binds the id in the store, and
-/// pays exactly that quote with [`pay_melt_quote_async`]. A fee reserve that does not fit the
-/// ceiling is refused as [`WalletOpsError::MeltExceedsCeiling`] and nothing leaves the wallet. Same
-/// mint resolution, same `allow_real_mints` gate, same effect boundary as the unbounded form.
+/// addendum 5 it raises its payment quote with [`melt_quote_async`] and binds the id in the store,
+/// and since addendum 8 it prepares and confirms that quote with [`prepare_melt_payment_blocking`].
+/// A fee reserve that does not fit the ceiling is refused as [`WalletOpsError::MeltExceedsCeiling`]
+/// and nothing leaves the wallet. **This operator path keeps its RESERVE-ONLY ceiling** (addendum 8
+/// §6, out of scope): it does not take the total bound on the prepared melt's proof-input and swap
+/// fees — those are reported in the [`MeltOutcome`], not bounded. Same mint resolution, same
+/// `allow_real_mints` gate, same effect boundary as the unbounded form.
 pub async fn melt_within_async(
     home: &MaxplayerHome,
     bolt11: &str,
@@ -1093,7 +1101,10 @@ pub async fn melt_within_async(
 }
 
 /// **Pay a melt quote the wallet already holds, by id, and never raise another.** The seller fee
-/// remittance's spending call (addendum 5 §1, rule 1): the quote was raised by [`melt_quote_async`]
+/// remittance's spending call in stage 2a rounds 4–6 (addendum 5 §1, rule 1); since addendum 8 the
+/// remittance uses the two-phase [`prepare_melt_payment_blocking`] instead, so that the ceiling is
+/// taken on the prepared melt's TOTAL before the fence — this one-shot form bounds invoice + fee
+/// reserve only and is kept for [`melt_within_async`]. The quote was raised by [`melt_quote_async`]
 /// AFTER the plan was journaled (the estimate quote predates the plan; this payment quote does
 /// not), its id was bound to the row by the store fence, and this pays exactly that quote —
 /// `prepare_melt(quote_id)` / `confirm` — after re-checking the ceiling against the quote's STORED

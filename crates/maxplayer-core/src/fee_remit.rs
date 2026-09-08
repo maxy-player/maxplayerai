@@ -38,23 +38,47 @@
 //! the plan (which pins the receipts, records this process as the row's owner under a lease, and
 //! refuses a duplicate — the idempotency that makes two concurrent collects pay at most once); raise
 //! the **payment quote** and check it against the hard [`MeltCeiling`] (refused ⇒ the planned row is
-//! released, nothing spent); pass the **pre-spend gate** — ONE compare-and-set in the store advances
-//! the row `planned → spending` and BINDS that quote to it (only if still planned, still ours, with
-//! more than [`SPEND_MARGIN`] of lease left at the clock read INSIDE the store call; zero rows
-//! changed is a refusal); then pay exactly that quote, by id, through
-//! [`crate::wallet_ops::pay_melt_quote_blocking`] — the same gated melt `maxplayer wallet melt`
-//! uses (it honours `allow_real_mints`), split into its quote step and its pay step, which re-checks
-//! the ceiling BEFORE any proof is spent and never raises a second quote; settle. Every attempt that
-//! meant to pay is journaled with its outcome (`fee_remit_attempts`), so a payout that keeps failing
-//! is visible in the read-out rather than silent.
+//! released, nothing spent); **prepare** the melt of that quote through
+//! [`crate::wallet_ops::prepare_melt_payment_blocking`] — the wallet selects and reserves proofs in
+//! its own database and states the SDK's proof-input fee and pre-melt swap fee, and the ceiling is
+//! taken on the TOTAL (invoice + reserve + both fees; over ⇒ the prepared melt is cancelled locally
+//! and the planned row released, nothing posted); pass the **pre-spend gate** — ONE compare-and-set
+//! in the store advances the row `planned → spending` and BINDS that quote to it (only if still
+//! planned, still ours, with more than [`SPEND_MARGIN`] of lease left at the clock read INSIDE the
+//! store call; zero rows changed is a refusal, and the prepared melt is cancelled); then **confirm**
+//! the prepared melt — the swap if one is required, then the melt request for exactly that quote, by
+//! id — the same gated wallet `maxplayer wallet melt` uses (it honours `allow_real_mints`); it never
+//! raises a second quote; settle. Every attempt that meant to pay is journaled with its outcome
+//! (`fee_remit_attempts`), so a payout that keeps failing is visible in the read-out rather than
+//! silent.
 //!
-//! ## The two invariants (stage 2a, addendum 3; the fence of addendum 4; the hold of addendum 6)
+//! ## The two invariants (stage 2a, addendum 3; the fence of addendum 4; the hold of addendum 6; the total bound of addendum 8)
 //!
 //! **Money hold (§1):** the seller never pays more than the fee it accrued — gross is the ceiling,
-//! the melt fee comes out of it, and the ceiling is enforced at the moment of spending, not
-//! estimated beforehand or regretted afterwards. The estimate at plan time is a plan; the quote the
-//! wallet actually pays under is checked against `gross` inside the melt, and a reserve that grew in
-//! between is a refused, journaled, failed attempt with the balance intact.
+//! every cost of the payment comes out of it, and the ceiling is enforced at the moment of spending,
+//! not estimated beforehand or regretted afterwards. The estimate at plan time is a plan; the quote
+//! the wallet actually pays under is checked against `gross`, and a reserve that grew in between is
+//! a refused, journaled, failed attempt with the balance intact. Since addendum 8 the bound is on the
+//! **entire wallet debit**: the pinned CDK 0.17.2 wallet charges, on top of invoice + fee reserve, a
+//! proof-input fee on the proofs it sends (`input_fee_ppk`, NUT-02) and — when its proofs do not fit
+//! — the fee of a pre-melt swap it performs inside `confirm`; the delivered ceiling of rounds 1–6
+//! saw neither (verdict B4 at 19f30d3). Now the melt is PREPARED before the fence — `prepare_melt`
+//! selects and reserves proofs in the wallet's own store and exposes `input_fee`, `swap_fee` and
+//! `requires_swap` (`melt/mod.rs:428–450`) while posting nothing to the mint (the swap
+//! `melt/saga/mod.rs:687–697` and the melt request `:907–911` both live inside `confirm`) — and
+//! [`MeltCeiling::admits_total`] is taken on those four figures; over ⇒ `PreparedMelt::cancel`
+//! (`:817–831`, local: proofs back to Unspent, quote released) and the ordinary before-fence refusal
+//! (planned row released, one `REFUSED before spending` line naming the total, its parts and the
+//! ceiling, backoff continues) — a fee refusal never leaves a bound Spending row held. Planning is
+//! fee-aware too ([`crate::wallet_ops::MeltEstimate::expected_fees_sats`]): the expected proof fees
+//! come out of the gross beside the reserve, so a payment that can fit is planned and one that never
+//! can is refused at planning ([`Refusal::FeesDoNotFit`]). The fee-bearing fake wallet and the
+//! regressions `a_fee_bearing_mint_with_a_swap_required_layout_pays_once_and_the_wallet_loses_at_most_the_gross`
+//! (the wallet measured, not the melt counter),
+//! `a_fee_bearing_total_that_exceeds_the_gross_by_the_fee_is_refused_before_any_swap_or_melt`,
+//! `fee_aware_planning_sizes_the_invoice_so_a_fee_bearing_payment_fits_without_reserve_slack` and
+//! `fees_that_can_never_fit_are_refused_at_planning_not_at_payment` hold it; the reserve-grew case
+//! `a_reserve_that_grows_between_estimate_and_payment_is_refused_before_spending` stands.
 //!
 //! **Ownership (§2), as the tests in this module prove it:** a row is paid only by the process that
 //! planned it, only through the fence — [`SellerStore::admit_remittance_spend`], which two
@@ -99,8 +123,11 @@
 //! `a_spending_row_is_never_released_by_reconciliation_only_settled`). What "at most one debit"
 //! rests on is the exclusion: a second attempt is never admitted while a bound spending row
 //! exists — at two boundaries. The ordinary one is RECONCILIATION: every `remit` run first finds the
-//! in-flight row and, on anything but PAID, returns [`Refusal::SpendingHeld`] before it plans
-//! anything (the two-process tests' B runs all stop here). Behind it is the STORE:
+//! in-flight row and, when it is SPENDING with a quote bound and the mint's answer about that quote
+//! is anything but PAID, returns [`Refusal::SpendingHeld`] before it plans anything (this is where
+//! B stops in (b1), (b2), (d) and the delayed-confirm test; a PLANNED row in flight is a different
+//! case — (a)'s B returns [`Refusal::HeldByOwner`], (c)'s B releases the expired-lease row and pays
+//! its own quote, (B2)'s B returns [`Refusal::RowChangedUnderMe`]). Behind it is the STORE:
 //! [`SellerStore::plan_remittance`] refuses a second plan with `PlanRefused::InFlight` inside its own
 //! `IMMEDIATE` transaction while any planned-or-spending row exists — the race-closing layer, reached
 //! when two runs both saw no row (`two_racing_attempts_against_the_same_balance_record_exactly_one_remittance`)
@@ -120,12 +147,13 @@
 //! last local check, and between a release decision and its write; the lease and the quote expiring
 //! while paused; distinct invoices; actual melts counted; the fake mint accepting UNPAID or FAILED
 //! quotes regardless of expiry, as the inspected CDK 0.17.2 implementation does. What each shares
-//! is stated per test, not assumed: (a), (b1), (b2), (c), (B2) and (d) share one fake mint (the quote
-//! registry) and build their two processes' clocks independently unless the test reassigns them
-//! ((b2) and the delayed-confirm test hand B the clock A reads); only the delayed-confirm test
-//! also shares one fake wallet — one proof pool both processes select from; the older (b)/(c) cases
-//! and the node's 2b test script the mint's answer on one process instead of reading a shared
-//! registry. They do not run a real mint or a real wallet, and
+//! is stated per test, not assumed. One fake mint (the quote registry): (a), (b1), (b2), (c), (B2),
+//! (d) and the delayed-confirm test. One effects clock handed from A to B: (b2), (c), (B2) and the
+//! delayed-confirm test — (a), (b1) and (d) leave each process its own clock. One fake wallet (one
+//! proof pool both processes select from): the delayed-confirm test only; the single-process
+//! fee-bearing tests of addendum 8 each own a pool of their own. The older (b)/(c) cases and the
+//! node's 2b test script the mint's answer on one process instead of reading a shared registry.
+//! They do not run a real mint or a real wallet, and
 //! `a_release_decided_on_a_stale_planned_snapshot…` moves its command clock (401) independently of
 //! its effects clock (100) to force the SQL ordering — a synthetic time model, not a claim about
 //! how a mint's clock behaves.
