@@ -4277,7 +4277,11 @@ mod tests {
         ] {
             assert!(out.contains(needle), "missing {needle:?} in:\n{out}");
         }
-        assert_eq!(fake.invoices, vec![20, 14], "probe on the gross, then the net");
+        assert_eq!(
+            fake.invoices,
+            vec![20, 14],
+            "probe on the gross, then the net"
+        );
         assert_eq!(fake.pool_value(), Some(32), "estimating reserves nothing");
 
         let (outcome, out) = run_remit(&store, &mut fake, RemitTrigger::Command, 101);
@@ -4287,7 +4291,11 @@ mod tests {
             out.contains("Prepared melt of quote paid-quote-lnbc-fake-14-4: proof input fee 1 sats, swap fee 1 sats (the wallet's proofs do not fit: a pre-melt swap will be performed); total debit 18 sats (14 invoice + 2 reserve + fees) fits the ceiling of 20 sats"),
             "{out}"
         );
-        assert_eq!(fake.pool_value(), Some(14), "32 − 1 swap fee − 14 − 1 input fee − 2 fee paid");
+        assert_eq!(
+            fake.pool_value(),
+            Some(14),
+            "32 − 1 swap fee − 14 − 1 input fee − 2 fee paid"
+        );
         assert!(32 - 14 <= 20, "the wallet lost 18 sats against 20 accrued");
         let rows = store.remittances().expect("rows");
         assert_eq!(rows.len(), 1);
