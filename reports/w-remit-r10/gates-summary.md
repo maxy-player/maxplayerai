@@ -34,7 +34,7 @@ runner ran); line 2 of every log states `.rs diff 31deed8..HEAD` = empty, so the
 | run | result line | failures (names) | fee_remit tests | exit |
 |---|---|---|---|---|
 | 1 | `FAILED. 1434 passed; 1 failed; 2 ignored` (152.97 s) | `credential_proxy::tests::a_declared_over_cap_body_is_refused_before_the_upstream_sees_it` (known loopback flake, rounds 5–9; not a remitter test) | 44/44 `fee_remit::tests` ok | 101 — `money-path-ci-1-31deed8.log` 130,874 B `aaff9a64723ced37…` (line 1 `ab9260f`) |
-| 2 | pending | pending | pending | pending |
+| 2 | `FAILED. 1434 passed; 1 failed; 2 ignored` (145.52 s) | `credential_proxy::tests::a_declared_over_cap_body_is_refused_before_the_upstream_sees_it` (same known flake) | 44/44 `fee_remit::tests` ok | 101 — `money-path-ci-2-31deed8.log` 130,762 B `39dbbb144783360f…` (line 1 `c7ebbb2`) |
 | 3 | pending | pending | pending | pending |
 
 Known pre-existing flakes from rounds 5–9: `credential_proxy` loopback, `job_lifecycle` live-mint (minibits) — each run's
