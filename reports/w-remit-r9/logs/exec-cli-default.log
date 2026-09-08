@@ -1,0 +1,262 @@
+775f17356e89a2a32353bf72373fb42e92d20318
+exec head 2521a44; .rs diff to HEAD: 
+$ cargo test -p maxplayer --no-fail-fast
+   Compiling maxplayer v0.5.7 (/Users/forge/forge/v2/wt/w-seller-fee-stage2a-remit/crates/maxplayer)
+warning: struct `AgentMessageCapture` is never constructed
+   --> crates/maxplayer-core/src/engine.rs:246:19
+    |
+246 | pub(crate) struct AgentMessageCapture {
+    |                   ^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: methods `observe` and `into_last_message` are never used
+   --> crates/maxplayer-core/src/engine.rs:255:19
+    |
+250 | impl AgentMessageCapture {
+    | ------------------------ methods in this implementation
+...
+255 |     pub(crate) fn observe(&mut self, event: RunEvent<'_>) {
+    |                   ^^^^^^^
+...
+268 |     pub(crate) fn into_last_message(self) -> Option<String> {
+    |                   ^^^^^^^^^^^^^^^^^
+
+warning: associated function `adopt` is never used
+  --> crates/maxplayer-core/src/sandbox_netns.rs:75:8
+   |
+72 | impl NetnsHolder {
+   | ---------------- associated function in this implementation
+...
+75 |     fn adopt(name: String) -> Self {
+   |        ^^^^^
+
+warning: function `job_diagnostics_dir` is never used
+    --> crates/maxplayer-core/src/seller_exec.rs:1337:4
+     |
+1337 | fn job_diagnostics_dir(workdir: &Path) -> Option<PathBuf> {
+     |    ^^^^^^^^^^^^^^^^^^^
+
+warning: fields `base_url_env`, `default_upstream`, `placeholder_prefix`, and `placeholder_random_len` are never read
+    --> crates/maxplayer-core/src/seller_exec.rs:2518:5
+     |
+2514 | struct ContainedCred {
+     |        ------------- fields in this struct
+...
+2518 |     base_url_env: &'static str,
+     |     ^^^^^^^^^^^^
+2519 |     /// The vendor default upstream, used when the operator set no `base_url_env`.
+2520 |     default_upstream: &'static str,
+     |     ^^^^^^^^^^^^^^^^
+2521 |     /// The placeholder's vendor prefix (so a client that shape-validates locally does not refuse).
+2522 |     placeholder_prefix: &'static str,
+     |     ^^^^^^^^^^^^^^^^^^
+2523 |     /// Random characters after the prefix, chosen to match the vendor credential's length.
+2524 |     placeholder_random_len: usize,
+     |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `maxplayer-core` (lib) generated 5 warnings
+warning: variant `AllowList` is never constructed
+   --> crates/maxplayer/src/sandbox_probe.rs:109:5
+    |
+106 | pub enum ContainmentModel {
+    |          ---------------- variant in this enum
+...
+109 |     AllowList,
+    |     ^^^^^^^^^
+    |
+    = note: `ContainmentModel` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `maxplayer` (bin "maxplayer") generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.17s
+     Running unittests src/main.rs (target/debug/deps/maxplayer-6bcfc7c6e99dafe7)
+
+running 143 tests
+test cli::tests::is_help_request_matches_sole_help_at_any_depth_only ... ok
+test cli::tests::buyer_status_with_home_equals_form_refuses_the_same_way ... ok
+test cli::tests::buyer_serve_with_stray_argument_refuses_instead_of_swallowing_it ... ok
+test cli::tests::buyer_serve_with_home_equals_form_refuses_the_same_way ... ok
+test cli::tests::doctor_help_line_uses_seller_wording ... ok
+test cli::tests::buyer_bare_with_home_flag_refuses_with_the_clear_message ... ok
+test cli::tests::buyer_status_help_never_contacts_the_daemon ... ok
+test cli::tests::buyer_serve_with_home_flag_refuses_instead_of_silently_ignoring_it ... ok
+test cli::tests::buyer_status_with_home_flag_refuses_instead_of_silently_ignoring_it ... ok
+test cli::tests::help_and_version_flags_succeed_on_stdout ... ok
+test cli::tests::help_on_every_subcommand_prints_usage_to_stdout_and_exits_zero ... ok
+test cli::tests::retired_sell_subcommand_is_rejected_no_alias ... ok
+test cli::tests::sell_is_absent_from_the_buyer_surface ... ok
+test cli::tests::usage_and_version ... ok
+test cli::tests::version_carries_a_build_stamp_in_both_forms ... ok
+test doctor::tests::an_unusable_allowlist_entry_fences_nothing ... ok
+test doctor::tests::an_open_flag_blocks_at_the_engine_floor_even_with_an_allowlist ... ok
+test doctor::tests::any_unrecoverable_failure_defeats_transient_retry ... ok
+test doctor::tests::a_cursor_seat_with_no_credential_directory_anywhere_is_a_finding ... ok
+test doctor::tests::containment_model_guarantee_clauses_are_the_specified_wording ... ok
+test cli::tests::replay_renders_log_envelopes_in_order ... ok
+test cli::tests::replay_surfaces_corrupt_tail_after_valid_envelopes ... ok
+test doctor::tests::docker_operator_forwarded_var_warns_that_it_is_uncontained ... ok
+test doctor::tests::docker_mode_is_refused_when_the_seller_is_itself_containerized ... ok
+test doctor::tests::a_cursor_seat_that_linked_at_the_measured_location_passes_and_names_it ... ok
+test doctor::tests::doctor_agent_check_fails_when_boot_registry_refuses ... ok
+test doctor::tests::doctor_agent_check_matches_boot_verdict_on_verbatim_command ... ok
+test doctor::tests::doctor_agent_pass_is_labelled_resolution_only_not_probe_verified ... ok
+test doctor::tests::doctor_engine_floor_below_the_floor_names_the_exposure_and_the_fix ... ok
+test doctor::tests::doctor_engine_floor_is_moot_under_runsc ... ok
+test doctor::tests::doctor_engine_floor_passes_at_and_above_the_floor ... ok
+test doctor::tests::doctor_engine_floor_reports_an_unreadable_version_instead_of_passing_silently ... ok
+test cli::tests::permission_request_routes_deny_outcome ... ok
+test cli::tests::whoami_prints_pubkey_npub_and_resolved_home ... ok
+test doctor::tests::doctor_engine_version_parse_keeps_unknown_distinct_from_zero ... ok
+test cli::tests::whoami_output_never_contains_secret_key ... ok
+test doctor::tests::doctor_parses_home_and_refuses_unknown_flags ... ok
+test cli::tests::failed_turn_maps_to_failed_execution_status ... ok
+test doctor::tests::doctor_sandbox_image_flags_absence_with_pull_command ... ok
+test cli::tests::mock_run_happy_path_prints_updates_and_writes_replayable_log ... ok
+test doctor::tests::doctor_sandbox_image_is_a_noop_without_docker_mode ... ok
+test doctor::tests::doctor_sandbox_egress_warns_until_the_rules_are_actually_installed ... ok
+test doctor::tests::doctor_sandbox_image_timeout_is_not_reported_as_absent ... ok
+test doctor::tests::either_open_flag_serves_strangers_even_with_a_populated_allowlist ... ok
+test doctor::tests::either_open_surface_alone_counts_as_serving_strangers ... ok
+test doctor::tests::environment_failure_refusal_does_not_advertise_skip_doctor ... ok
+test doctor::tests::exit_code_zero_when_only_pass_and_warn ... ok
+test doctor::tests::exhausted_transient_retries_still_refuse_fail_closed ... ok
+test doctor::tests::harness_credential_check_carries_absence_rather_than_inventing_a_path ... ok
+test doctor::tests::harness_credential_check_unknown_label_does_not_fall_back_to_a_builtin ... ok
+test doctor::tests::harness_credential_check_unresolvable_hatch_says_so_and_does_not_guess ... ok
+test doctor::tests::harness_credential_check_absent_directory_is_warn_not_silent_skip ... ok
+test doctor::tests::mint_reachability_blocks_only_when_every_mint_is_down ... ok
+test doctor::tests::mixed_refusal_offers_skip_doctor_only_for_the_readiness_failures ... ok
+test doctor::tests::harness_credential_check_flags_group_write_not_group_read ... ok
+test doctor::tests::nix_check_failure_carries_installer_one_liner_and_names_path_skew ... ok
+test doctor::tests::home_permissions_warns_targeted_and_fails_open_pool_on_a_loose_home ... ok
+test doctor::tests::nix_check_passes_when_nix_runs_from_path ... ok
+test doctor::tests::nix_check_reports_an_installed_off_path_nix_as_path_skew_not_uninstalled ... ok
+test doctor::tests::readiness_refuses_on_fail_and_boots_on_warn ... ok
+test doctor::tests::doctor_honors_home_override_and_inspects_that_home ... ok
+test doctor::tests::registry_runs_every_check_even_after_an_early_fail ... ok
+test doctor::tests::render_shows_fix_hint_only_when_not_pass ... ok
+test doctor::tests::sandbox_launcher_check_fails_only_on_an_unresolvable_launcher ... ok
+test doctor::tests::seat_reachability_counts_only_the_usable_allowlist_entries ... ok
+test doctor::tests::seat_reachability_passes_on_each_route_in ... ok
+test doctor::tests::seat_reachability_refuses_an_allowlist_that_can_never_match ... ok
+test doctor::tests::seat_reachability_reports_a_list_and_an_open_route_as_both_in_effect ... ok
+test doctor::tests::seat_reachability_warns_a_seat_nothing_can_reach ... ok
+test doctor::tests::seller_key_check_blocks_when_absent ... ok
+test doctor::tests::seller_key_check_names_the_resolved_home_not_hardcoded_default ... ok
+test doctor::tests::containment_warn_on_a_closed_seat_does_not_claim_it_named_buyers ... ok
+test doctor::tests::containment_warn_on_a_named_seat_credits_the_closed_routes_not_the_list ... ok
+test doctor::tests::containment_pass_names_the_assumed_platform_model ... ok
+test doctor::tests::stranger_exposure_escalates_severity_on_either_surface ... ok
+test doctor::tests::the_unreachable_finding_names_all_three_routes_in ... ok
+test doctor::tests::transient_retry_worthwhile_requires_all_blocking_fails_transient ... ok
+test doctor::tests::transient_failure_then_success_boots ... ok
+test doctor::tests::unrecoverable_failure_refuses_immediately_without_retry ... ok
+test mcp::tests::initialize_instructions_add_exact_nix_hint_only_when_probe_fails ... ok
+test mcp::tests::initialize_instructions_are_exact_when_nix_is_available ... ok
+test mcp::tests::moved_tools_point_at_their_cli_command ... ok
+test mcp::tests::get_job_timeout_schema_maximum_tracks_lifecycle_cap ... ok
+test mcp::tests::prereq_hint_names_wallet_setup_on_funds_failure ... ok
+test mcp::tests::read_accepts_newline_and_content_length ... ok
+test mcp::tests::post_job_award_filter_descriptions_match_enforcement ... ok
+test mcp::tests::response_uses_newline_delimited_json_rpc ... ok
+test mcp::tests::tools_list_is_slimmed_to_the_trade_loop ... ok
+test doctor::tests::an_open_flag_blocks_containment_even_with_an_allowlist ... ok
+test doctor::tests::harness_credential_check_is_wired_into_the_boot_gate ... ok
+test profile_cli::tests::profile_set_dry_run_refuses_nonexistent_home_without_creating_it ... ok
+test doctor::tests::skip_doctor_registry_is_exactly_the_environment_checks ... ok
+test profile_cli::tests::profile_set_refuses_nonexistent_home_without_creating_it ... ok
+test profile_cli::tests::refusal_recommends_only_commands_that_exist ... ok
+test sandbox_probe::tests::a_launcher_that_never_ran_the_payload_is_not_containment ... ok
+test profile_cli::tests::profile_set_refuses_empty_home_without_creating_key ... ok
+test mcp::tests::initialize_returns_startup_composed_instructions ... ok
+test sandbox_probe::tests::a_readable_canary_is_not_containment ... ok
+test sandbox_probe::tests::a_targeted_only_seat_is_advisory ... ok
+test sandbox_probe::tests::a_sandbox_too_tight_to_write_is_refused_on_its_own_terms ... ok
+test sandbox_probe::tests::an_open_pool_seat_needs_containment ... ok
+test sandbox_probe::tests::both_legs_as_required_is_containment ... ok
+test sandbox_probe::tests::docker_probe_reports_containment_against_a_real_container ... ok
+test mcp::tests::tools_call_error_path_never_echoes_secret ... ok
+test sandbox_probe::tests::a_passthrough_policy_is_reported_as_uncontained_without_spawning_anything ... ok
+test sandbox_probe::tests::every_failing_verdict_refuses_an_open_pool_seat ... ok
+test doctor::tests::nix_check_is_wired_into_the_shared_registry ... ok
+test sandbox_probe::tests::half_an_answer_is_no_answer ... ok
+test sandbox_probe::tests::payload_refuses_missing_arguments ... ok
+test sandbox_probe::tests::the_override_is_the_only_way_past_a_failed_probe ... ok
+test sandbox_probe::tests::payload_reports_both_legs_and_exits_zero_even_when_denied ... ok
+test profile_cli::tests::initialized_home_passes_check_without_minting_another_key ... ok
+test profile_cli::tests::profile_set_dry_run_prints_home_and_pubkey_without_publishing ... ok
+test sandbox_probe::tests::payload_reads_a_readable_canary ... ok
+test wallet_cli::tests::mint_complete_without_quote_id_is_usage_error ... ok
+test doctor::tests::sandbox_launcher_check_is_wired_into_the_boot_gate ... ok
+test sandbox_probe::tests::the_container_payload_speaks_the_shared_verdict_contract ... ok
+test wallet_cli::tests::missing_token_completion_refuses_without_the_spent_alarm ... ok
+test wallet_cli::tests::parse_common_accepts_amount_flag_alongside_positional ... ok
+test wallet_cli::tests::parse_common_amount_flag_rejects_non_numeric ... ok
+test wallet_cli::tests::parse_common_amount_flag_requires_value ... ok
+test wallet_cli::tests::parse_complete_locked_collects_repeated_accepted_mints ... ok
+test wallet_cli::tests::parse_complete_locked_requires_the_identity_flags ... ok
+test doctor::tests::doctor_bounds_a_probe_that_never_returns ... ok
+test wallet_cli::tests::setup_money_gate_refuses_only_silent_play ... ok
+test doctor::tests::containment_blocks_on_a_junk_allowlist_with_both_routes_open ... ok
+test wallet_cli::tests::setup_summaries_mark_play_money_only ... ok
+test wallet_cli::tests::spent_completion_emits_alarm_and_distinct_exit_code ... ok
+test wallet_cli::tests::wallet_rows_mark_play_money_only ... ok
+test wallet_cli::tests::wallet_usage_names_the_shipped_default_mint_and_never_calls_it_testnut ... ok
+test wallet_cli::tests::invoice_refuses_silent_play_money_without_explicit_mint ... ok
+test wallet_cli::tests::mint_refuses_silent_play_money_without_explicit_mint ... ok
+test wallet_cli::tests::mints_list_command_marks_play_money_per_row ... ok
+test wallet_cli::tests::setup_refuses_silent_play_money_without_explicit_mint ... ok
+test doctor::tests::doctor_bounded_probe_still_reports_success_and_failure ... ok
+test wallet_cli::tests::balance_configured_only_output_keeps_the_existing_grammar ... ok
+test wallet_cli::tests::balance_mint_filter_distinguishes_discovered_from_never_seen ... ok
+test wallet_cli::tests::balance_reports_unconfigured_db_proofs_and_both_totals ... ok
+test wallet_cli::tests::balance_mint_filter_totals_count_only_the_matched_rows ... ok
+test doctor::tests::sandbox_image_check_is_wired_into_the_boot_gate ... ok
+test wallet_cli::tests::setup_mint_flag_auto_adds_unconfigured_mint ... ok
+test doctor::tests::containment_messages_name_each_model_on_every_contained_branch ... ok
+test doctor::tests::sandbox_engine_floor_check_is_wired_into_the_boot_gate ... ok
+
+test result: ok. 143 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.77s
+
+     Running tests/cli_e2e.rs (target/debug/deps/cli_e2e-6ddf17df70741131)
+
+running 2 tests
+test mock_run_then_log_replay_round_trips_envelope_payloads ... ok
+test help_and_version_flags_exit_zero_on_the_real_binary ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.15s
+
+     Running tests/mcp_daemon.rs (target/debug/deps/mcp_daemon-1b37a728a3e605c4)
+
+running 3 tests
+test money_op_is_served_by_the_daemon_never_in_process ... ok
+maxplayer buyer online (home=/var/folders/mc/_gm6z2qx19qfdb0wl005gvnr0000gp/T/maxplayer-mcp-daemon-spawn-58827-0, socket=/var/folders/mc/_gm6z2qx19qfdb0wl005gvnr0000gp/T/maxplayer-mcp-daemon-spawn-58827-0/buyer.sock)
+maxplayer buyer: another maxplayer buyer already owns this home (lock held: /var/folders/mc/_gm6z2qx19qfdb0wl005gvnr0000gp/T/maxplayer-mcp-daemon-spawn-58827-0/buyer.lock); refusing to start a second owner
+test connect_or_spawn_starts_then_reuses_one_daemon ... ok
+test spawning_a_daemon_announces_pid_and_home_but_reuse_does_not ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 40.36s
+
+     Running tests/seller_declared_output.rs (target/debug/deps/seller_declared_output-3c5b12194e514502)
+
+running 3 tests
+test the_prompt_carries_this_offers_own_output_type_and_not_another_offers ... ok
+test an_offer_with_no_declared_output_type_states_none_and_nothing_is_enforced ... ok
+test the_declared_output_type_is_persisted_and_reaches_the_agents_prompt ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/seller_memory_read_on_start.rs (target/debug/deps/seller_memory_read_on_start-248a0707393471de)
+
+running 6 tests
+test the_read_wire_never_creates_the_memory_directory ... ok
+test an_index_of_exactly_65536_bytes_is_accepted_and_reaches_the_agent ... ok
+test the_operator_authored_memory_index_reaches_the_agents_prompt ... ok
+test a_disabled_config_injects_nothing ... ok
+test an_over_budget_index_degrades_instead_of_blocking_the_job ... ok
+test the_golden_invariant_holds_no_memory_is_byte_identical ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+exit=0
