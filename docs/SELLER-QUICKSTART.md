@@ -1010,17 +1010,22 @@ open them, so anything the agent must see goes in `MEMORY.md` itself, not in a f
 
 **The injection budget — 64 KiB.** The index is capped at `MAX_MEMORY_INDEX_BYTES` = 65,536 bytes per
 job. An index **over** the budget is **truncated, never dropped**: the job gets everything up to the last
-complete line at or before the budget that leaves a non-empty head, then one marker line —
+complete line at or before the budget whose head still has content once trailing whitespace is trimmed,
+then one marker line —
 
 ```
 [maxplayer: MEMORY.md truncated to the 65536-byte injection budget — <shown> of <total> bytes shown, tail dropped]
 ```
 
 — so the agent reads a fragment as a fragment and the seat keeps its specialization *head*. Two shapes get
-no complete line to cut on: a single line longer than the budget, or a file whose first in-budget newline
-is at offset 0 (a leading blank line, then one huge line). Those are cut at a character boundary inside
-the long line — never mid-character, so the text stays valid — because an empty head would inject
-nothing. The marker's bytes are reserved before the cut, so the index text plus the marker stays ≤ 64 KiB;
+no usable complete line to cut on: a single line longer than the budget, or a file that opens with nothing
+but whitespace before one huge line — one blank line, several, a `\r\n` blank line or an indented one, all
+alike — because every newline in the window would leave a head that trims away to nothing. Those are cut
+at a character boundary inside the long line — never mid-character, so the text stays valid — and the
+file's own opening bytes are kept, not skipped, because an empty head would inject nothing. What the rule
+cannot do is reach text that only starts *after* the budget: an index whose whole first 64 KiB is
+whitespace has no head to keep and gets none. The marker's bytes are reserved before the cut, so the
+index text plus the marker stays ≤ 64 KiB;
 that bound is the index and marker only, not the surrounding prompt template. You are told
 three times: once at **boot** (`seller node WARNING: memory index … is N bytes, over the 65536-byte
 injection budget — every job prompt will get a TRUNCATED copy …`), once **per job** in the daemon log, and
