@@ -1102,7 +1102,7 @@ fn remit_inner(
                     .map_err(|error| format!("record settled remittance: {error}"))?;
                 let _ = writeln!(
                     out,
-                    "  mint {} reports melt quote {} PAID — recorded as settled by reconciliation: {} sats reached {}; melt fee at most {} sats (the quote's reserve — the mint reports a quote paid by another run as PAID, not what it kept, so the actual fee is recorded as not observed)",
+                    "  mint {} reports melt quote {} PAID — recorded as settled by reconciliation: {} sats reached {}; Lightning fee at most {} sats (the quote's reserve); the inclusive melt fee (Lightning + actual proof input fee) is recorded as not observed — the mint reports PAID, not what it kept",
                     status.mint_url,
                     status.quote_id,
                     status.amount_sats,
@@ -1383,14 +1383,17 @@ fn remit_inner(
     // 5. The plan, in the seller's words.
     let _ = writeln!(
         out,
-        "Plan:\n  unremitted platform fee (gross): {gross} sats\n  mint melt fee reserve (ceiling): {} sats — taken out of the gross, never on top\n  invoice amount ({address} receives): {net} sats\n  leaves your wallet: at most {worst_debit} sats (≤ {gross}); unused reserve returns as change",
+        "Plan:\n  unremitted platform fee (gross): {gross} sats\n  mint melt fee reserve (bounds the Lightning fee): {} sats — taken out of the gross, never on top\n  invoice amount ({address} receives): {net} sats\n  leaves your wallet: at most {worst_debit} sats (≤ {gross}); unused reserve returns as change",
         estimate.fee_reserve_sats
     );
     if estimate.expected_fees_sats > 0 {
         let _ = writeln!(
             out,
-            "  expected proof fees (SDK estimate, bounded exactly at payment): {} sats; actual proof input fee the SDK recomputes on the swapped proofs: {planned_actual_input} sats ⇒ worst case {worst_debit} sats leaves the wallet (≤ {gross})",
-            estimate.expected_fees_sats
+            "  expected proof fees (SDK estimate, bounded exactly at payment): {} sats = estimated proof input fee {planned_estimated_input} sats + swap fee {} sats; actual proof input fee the SDK recomputes on the swapped proofs: {planned_actual_input} sats ⇒ worst case {worst_debit} sats leaves the wallet (≤ {gross}) = invoice {net} + reserve {} (bounds the Lightning fee) + actual proof input fee {planned_actual_input} + swap fee {}; the inclusive melt fee (Lightning + actual proof input fee) is known only at payment",
+            estimate.expected_fees_sats,
+            estimate.expected_swap_fee_sats,
+            estimate.fee_reserve_sats,
+            estimate.expected_swap_fee_sats
         );
     }
     if let Some(note) = &estimate.expected_fees_note {
@@ -3687,7 +3690,7 @@ mod tests {
             "Accrued platform fee: 15 sats all-time — 0 sats remitted, 15 sats unremitted",
             "Destination: maxplayer@agi.cash (LNURL-pay; accepts 1 to 1000000 sats)",
             "unremitted platform fee (gross): 15 sats",
-            "mint melt fee reserve (ceiling): 2 sats — taken out of the gross, never on top",
+            "mint melt fee reserve (bounds the Lightning fee): 2 sats — taken out of the gross, never on top",
             "invoice amount (maxplayer@agi.cash receives): 13 sats",
             "leaves your wallet: at most 15 sats (≤ 15)",
             "mint: https://mint.example (melt quote quote-lnbc-fake-13-2)",
@@ -4143,9 +4146,15 @@ mod tests {
             out.contains("Reconciling in-flight remittance hash-9-2 (planned at unix 100 by fake-owner, lease until unix 400: 9 sats to maxplayer@agi.cash, gross 10 sats)"),
             "{out}"
         );
+        // Addendum 10 §3: the reserve bounds the LIGHTNING fee, not the inclusive melt fee (which
+        // includes the actual proof input fee and was not observed on a quote paid by another run).
         assert!(
-            out.contains("reports melt quote paid-quote-lnbc-fake-9-2 PAID — recorded as settled by reconciliation: 9 sats reached maxplayer@agi.cash; melt fee at most 1 sats (the quote's reserve"),
+            out.contains("reports melt quote paid-quote-lnbc-fake-9-2 PAID — recorded as settled by reconciliation: 9 sats reached maxplayer@agi.cash; Lightning fee at most 1 sats (the quote's reserve); the inclusive melt fee (Lightning + actual proof input fee) is recorded as not observed — the mint reports PAID, not what it kept"),
             "{out}"
+        );
+        assert!(
+            !out.contains("melt fee at most"),
+            "the reserve is not presented as a bound on the inclusive melt fee:\n{out}"
         );
         assert!(out.contains("Nothing to remit."), "{out}");
         // A spending row is reconciled by its BOUND quote, by id — never by the invoice.
@@ -4877,7 +4886,7 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains("expected proof fees (SDK estimate, bounded exactly at payment): 5 sats; actual proof input fee the SDK recomputes on the swapped proofs: 3 sats ⇒ worst case 19 sats leaves the wallet (≤ 20)"),
+            out.contains("expected proof fees (SDK estimate, bounded exactly at payment): 5 sats = estimated proof input fee 4 sats + swap fee 1 sats; actual proof input fee the SDK recomputes on the swapped proofs: 3 sats ⇒ worst case 19 sats leaves the wallet (≤ 20) = invoice 12 + reserve 3 (bounds the Lightning fee) + actual proof input fee 3 + swap fee 1; the inclusive melt fee (Lightning + actual proof input fee) is known only at payment"),
             "{out}"
         );
         assert_eq!(
@@ -5158,7 +5167,7 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains("expected proof fees (SDK estimate, bounded exactly at payment): 5 sats; actual proof input fee the SDK recomputes on the swapped proofs: 3 sats ⇒ worst case 19 sats leaves the wallet (≤ 19)"),
+            out.contains("expected proof fees (SDK estimate, bounded exactly at payment): 5 sats = estimated proof input fee 4 sats + swap fee 1 sats; actual proof input fee the SDK recomputes on the swapped proofs: 3 sats ⇒ worst case 19 sats leaves the wallet (≤ 19) = invoice 13 + reserve 2 (bounds the Lightning fee) + actual proof input fee 3 + swap fee 1; the inclusive melt fee (Lightning + actual proof input fee) is known only at payment"),
             "{out}"
         );
         assert!(
@@ -5451,10 +5460,10 @@ mod tests {
         assert_eq!(outcome, RemitOutcome::DryRun, "{out}");
         for needle in [
             "unremitted platform fee (gross): 20 sats",
-            "mint melt fee reserve (ceiling): 2 sats — taken out of the gross, never on top",
+            "mint melt fee reserve (bounds the Lightning fee): 2 sats — taken out of the gross, never on top",
             "invoice amount (maxplayer@agi.cash receives): 13 sats",
             "leaves your wallet: at most 19 sats (≤ 20); unused reserve returns as change",
-            "expected proof fees (SDK estimate, bounded exactly at payment): 5 sats; actual proof input fee the SDK recomputes on the swapped proofs: 3 sats ⇒ worst case 19 sats leaves the wallet (≤ 20)",
+            "expected proof fees (SDK estimate, bounded exactly at payment): 5 sats = estimated proof input fee 4 sats + swap fee 1 sats; actual proof input fee the SDK recomputes on the swapped proofs: 3 sats ⇒ worst case 19 sats leaves the wallet (≤ 20) = invoice 13 + reserve 2 (bounds the Lightning fee) + actual proof input fee 3 + swap fee 1; the inclusive melt fee (Lightning + actual proof input fee) is known only at payment",
             "DRY RUN — nothing moved. Re-run with --confirm to pay 13 sats to maxplayer@agi.cash.",
         ] {
             assert!(out.contains(needle), "missing {needle:?} in:\n{out}");

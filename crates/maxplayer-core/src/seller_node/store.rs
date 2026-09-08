@@ -2196,8 +2196,10 @@ impl SellerStore {
     /// someone else, or ours with `margin_secs` or less of lease left — another process is entitled
     /// to release a PLANNED row once its lease ends, and an admission that close would race the
     /// release. `Ok(row)` is the admitted row, now [`RemittanceState::Spending`] with the quote
-    /// bound: from here on it is released only when the mint reports that quote terminal, never on
-    /// time (§1.2).
+    /// bound. Once admitted the row is HELD until the mint reports the bound quote PAID
+    /// (`fee_remit.rs`, the PAID branch of reconciliation settles it): no terminal-state release,
+    /// no clock release (§1.2; addendum 10 §6 item 8) — an UNPAID or FAILED verdict on a bound
+    /// quote holds the row too, since the mint can still pay a quote it once reported unpaid.
     ///
     /// One `IMMEDIATE` transaction, so two processes cannot both pass: the second sees the first's
     /// mark and changes zero rows.

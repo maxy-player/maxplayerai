@@ -289,8 +289,10 @@ pub struct MeltOutcome {
     /// The mint's melt quote id the payment settled under — journaled by the seller fee remittance
     /// so a settled row names the quote the mint can be asked about.
     pub quote_id: String,
-    /// The fee RESERVE the paying quote carried — the ceiling on `fee_sats`, checked against the
-    /// caller's [`MeltCeiling`] before anything was spent. Journaled beside the actual fee.
+    /// The mint's fee RESERVE on the paying quote: the ceiling on the LIGHTNING fee the mint may
+    /// keep (NUT-05), checked against the caller's [`MeltCeiling`] before anything was spent.
+    /// `fee_sats` (Lightning + actual proof input fee, CDK's inclusive `fee_paid`) can exceed it by
+    /// that input fee; the reserve bounds the Lightning component only. Journaled beside the fee.
     pub fee_reserve_sats: u64,
     /// The proof-input fee the SDK's prepared melt carried (CDK `PreparedMelt::input_fee`): an
     /// ESTIMATE on the split of invoice + reserve (`melt/saga/mod.rs:383–387`), bounded under the
@@ -523,8 +525,10 @@ pub struct MeltEstimate {
     pub quote_id: String,
     /// The invoice amount the mint quoted, in sats.
     pub amount_sats: u64,
-    /// The mint's fee RESERVE for this melt — the ceiling on the fee it will take; the actual fee is
-    /// at most this, and the difference returns as change.
+    /// The mint's fee RESERVE for this melt: the ceiling on the LIGHTNING fee it may keep (NUT-05);
+    /// the unused part returns as change. It does not bound the proof input fee: the inclusive
+    /// melt fee (Lightning + actual proof input fee, CDK's `fee_paid`) can exceed the reserve by
+    /// that input fee, which [`confirm_bound`] accounts for separately.
     pub fee_reserve_sats: u64,
     /// When the quote expires at the mint (unix seconds), as the quote states it. A quote is paid
     /// by id ([`prepare_melt_payment_blocking`] → confirm; the retained [`pay_melt_quote_async`]
