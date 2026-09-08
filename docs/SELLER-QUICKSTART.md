@@ -1241,24 +1241,41 @@ its own:
   destination's minimum, and **if the unremitted balance is below that minimum it does nothing**: a
   10% fee on payments under 10 sats owes under 1 sat, and small balances simply accumulate until they
   clear the minimum. That is the expected steady state for small jobs, not an error.
-- Otherwise it takes a melt quote from your default mint, invoices the balance **minus** the mint's
-  melt fee reserve **and minus the proof fees the wallet expects to pay** (a mint that charges per
-  input proof, or one whose proofs do not fit the amount and need a swap first) — **you never pay
-  more than the fee you accrued; every fee comes out of that amount, not on top of it** — journals
+- Otherwise it takes a melt quote from your default mint and invoices **the largest amount the
+  wallet can actually pay for at most the accrued fee**: the mint's melt fee reserve and the proof
+  fees come out of it (a mint that charges per input proof, or one whose proofs do not fit the
+  amount and need a swap first). The wallet SDK (CDK) *estimates* the proof fee before paying and
+  *recomputes* it on the proofs its swap hands back, refusing after the swap if they fall short — so
+  the planner runs that recomputation itself and picks an amount that survives it (the plan prints
+  both figures: `expected proof fees (SDK estimate, bounded exactly at payment): N sats; actual
+  proof input fee the SDK recomputes on the swapped proofs: M sats ⇒ worst case W sats leaves the
+  wallet (≤ G)`). **You never pay more than the fee you accrued; every fee comes out of that amount,
+  not on top of it.** It then journals
   the attempt in `seller.sqlite` (`fee_remittances`: gross, melt fee, net, the address literal,
   melt quote id, payment hash, state, which process owns the attempt, and when it was admitted to
   spend), pays the invoice from your ecash through the wallet's gated melt (the same
   `allow_real_mints` gate `maxplayer wallet melt` honours), and marks the receipts it covered as
   discharged. **The accrued fee is a hard ceiling on everything that leaves the wallet, enforced
-  before anything is posted to the mint**: the wallet prepares the payment locally — reserving
-  proofs, nothing sent yet — and checks the SDK's own figures for that prepared payment, **the
-  invoice plus the mint's fee reserve plus the proof input fee plus any pre-melt swap fee**, against
-  the gross fee owed. If the total does not fit — the mint's reserve grew between the estimate and
-  the payment, or the proof fees came out higher than expected — the prepared payment is cancelled
-  (the proofs go back to unspent) and the attempt is refused before any ecash is consumed or any
-  request reaches the mint; nothing is left pinned, the refusal is journaled, the balance stays
-  unremitted, and the next attempt re-quotes. (The operator's plain `maxplayer wallet melt` keeps
-  its older check — invoice plus reserve only — and is not changed by this.)
+  before any ecash is spent**: the wallet prepares the payment locally — reserving proofs; it may
+  fetch the mint's fee table, but sends no proofs and pays no fee yet — and checks the SDK's own
+  figures for that prepared payment, **the invoice plus the mint's fee reserve plus the proof input
+  fee plus any pre-melt swap fee**, against the gross fee owed; then it re-runs the SDK's post-swap
+  arithmetic on those figures and refuses if the SDK would fail after its swap or the *actual* fee
+  would push the total over the gross. If either check fails — the mint's reserve grew between the
+  estimate and the payment, or the proof fees came out higher than expected — the prepared payment
+  is cancelled (the proofs go back to unspent) and the attempt is refused before any ecash is
+  consumed; nothing is left pinned, the refusal is journaled, the balance stays unremitted, and the
+  next attempt re-quotes. After a payment the report counts the SDK's fee once — `melt fee taken by
+  the mint` already includes the actual proof input fee — and prints `actual debit: D sats = net +
+  melt fee + swap fee`; if the wallet cannot read its balance afterwards it prints `wallet balance
+  now: unknown (…)` rather than a guessed number. **Known bound:** the mint can change its fee
+  table between the preparation and the payment and the SDK accepts no caller maximum; if that
+  happens the payment can fail after its swap (the swap fee is lost and the row stays held until
+  the mint says PAID or an operator decides) or cost more than predicted (a `WARNING` line). Not
+  observed on any mint; disclosed, not solved. Also owed: if cancelling a prepared payment itself
+  fails, a local proof reservation can remain — reopening the wallet does not clear it — until a
+  supported recovery path exists. (The operator's plain `maxplayer wallet melt` keeps its older
+  check — invoice plus reserve only — and is not changed by this.)
 - **It cannot affect the payment it followed.** Your receipt is written and the job is marked paid
   before the attempt starts. If the attempt fails — the mint is down, the payout host is unreachable,
   the wallet is short, no route — the failure is written to the node log and journaled

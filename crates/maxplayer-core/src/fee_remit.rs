@@ -64,21 +64,56 @@
 //! — the fee of a pre-melt swap it performs inside `confirm`; the delivered ceiling of rounds 1–6
 //! saw neither (verdict B4 at 19f30d3). Now the melt is PREPARED before the fence — `prepare_melt`
 //! selects and reserves proofs in the wallet's own store and exposes `input_fee`, `swap_fee` and
-//! `requires_swap` (`melt/mod.rs:428–450`) while posting nothing to the mint (the swap
-//! `melt/saga/mod.rs:687–697` and the melt request `:907–911` both live inside `confirm`) — and
-//! [`MeltCeiling::admits_total`] is taken on those four figures; over ⇒ `PreparedMelt::cancel`
-//! (`:817–831`, local: proofs back to Unspent, quote released) and the ordinary before-fence refusal
-//! (planned row released, one `REFUSED before spending` line naming the total, its parts and the
-//! ceiling, backoff continues) — a fee refusal never leaves a bound Spending row held. Planning is
-//! fee-aware too ([`crate::wallet_ops::MeltEstimate::expected_fees_sats`]): the expected proof fees
-//! come out of the gross beside the reserve, so a payment that can fit is planned and one that never
-//! can is refused at planning ([`Refusal::FeesDoNotFit`]). The fee-bearing fake wallet and the
-//! regressions `a_fee_bearing_mint_with_a_swap_required_layout_pays_once_and_the_wallet_loses_at_most_the_gross`
-//! (the wallet measured, not the melt counter),
+//! `requires_swap` (`melt/mod.rs:428–450`) while posting no proof-bearing or fee-bearing request
+//! (it may fetch mint metadata/keysets, a GET; the swap `melt/saga/mod.rs:687–697` and the melt
+//! request `:907–911` both live inside `confirm`) — and [`MeltCeiling::admits_total`] is taken on
+//! those four figures; over ⇒ `PreparedMelt::cancel` (`:817–831`, best-effort local compensation:
+//! proofs back to Unspent, quote released) and the ordinary before-fence refusal (planned row
+//! released, one `REFUSED before spending` line naming the total, its parts and the ceiling,
+//! backoff continues) — a fee refusal never leaves a bound Spending row held.
+//!
+//! **The fee model is CDK's, not the prepared display's (addendum 9).** The prepared `input_fee` is
+//! an ESTIMATE — the fee on the split of invoice + reserve before that fee is added
+//! (`melt/saga/mod.rs:383–387`). `confirm` swaps to a target of invoice + reserve + that estimate
+//! (`:678`), receives exactly the target's denomination split, RECOMPUTES the input fee on that
+//! split (`:704`) and refuses — after the swap has been paid — when the target does not cover
+//! invoice + reserve + the actual fee (`:706–712`). So this module runs that arithmetic itself,
+//! twice, before any fee-bearing effect: **planning** ([`plan_confirmable_invoice`]) searches down
+//! from gross − reserve for the largest invoice whose post-swap arithmetic holds and whose worst
+//! case (invoice + reserve + actual input fee + swap fee) fits the gross — none ⇒
+//! [`Refusal::FeesDoNotFit`] — and re-checks the quote actually raised; **before the fence**
+//! ([`confirm_would_succeed`]) the same check runs on the prepared figures and the keyset's
+//! `input_fee_ppk` ([`crate::wallet_ops::MeltPreparation::input_fee_ppk`]) and refuses — prepared
+//! melt cancelled, row released, one line — when the SDK would refuse after its swap or the actual
+//! worst case exceeds the gross. After payment the SDK's `FinalizedMelt::fee_paid` (`:139–148`:
+//! proofs sent − invoice − change) already CONTAINS the actual input fee beside the Lightning fee;
+//! the actual debit is invoice + `fee_paid` + swap fee, counted once — the prepared estimate is
+//! printed, never added. A failed post-payment balance read prints `unknown`, never a computed
+//! figure.
+//!
+//! **Bound, disclosed not solved (addendum 9 §1.5):** the mint's fee metadata can change between
+//! prepare and confirm, and the SDK takes no caller maximum into `confirm`. A change there can make
+//! `confirm` fail after the swap (the swap fee is gone, the row is bound Spending and HELD by the
+//! PAID-only rule below) or cost more than the arithmetic predicted (the `WARNING` line after
+//! payment). No exploit is claimed or reproduced; no changing-fee mint was measured. Likewise
+//! **owed**: a cancelled preparation whose SDK compensation itself failed can leave a local proof
+//! reservation — `open_wallet_async` only constructs the wallet and CDK `recover_incomplete_sagas`
+//! is not run on this path (a blanket recovery could replay a still-live payer's saga); a supported
+//! recovery path is owed, not wired.
+//!
+//! The fee-bearing fake wallet — whose `confirm` models the swap output split, the swap fee charged
+//! even when the melt then fails, the recomputed input fee, the post-swap refusal and the inclusive
+//! `fee_paid` — and the regressions
+//! `a_fee_bearing_payment_whose_prepared_input_fee_differs_from_the_actual_pays_once_and_the_wallet_loses_at_most_the_gross`
+//! (one swap, one melt, the wallet measured),
+//! `a_fee_bearing_schedule_whose_prepared_figures_fit_but_post_swap_arithmetic_does_not_is_refused_before_the_fence`
+//! (wallet delta 0, no swap, no melt, row released),
 //! `a_fee_bearing_total_that_exceeds_the_gross_by_the_fee_is_refused_before_any_swap_or_melt`,
-//! `fee_aware_planning_sizes_the_invoice_so_a_fee_bearing_payment_fits_without_reserve_slack` and
-//! `fees_that_can_never_fit_are_refused_at_planning_not_at_payment` hold it; the reserve-grew case
-//! `a_reserve_that_grows_between_estimate_and_payment_is_refused_before_spending` stands.
+//! `fee_aware_planning_sizes_the_invoice_so_a_fee_bearing_payment_fits_without_reserve_slack`
+//! (invoice 13, not 14), `fees_that_can_never_fit_are_refused_at_planning_not_at_payment` and
+//! `a_failed_balance_read_after_a_fee_bearing_payment_prints_unknown_and_no_false_warning` hold
+//! it; the reserve-grew case `a_reserve_that_grows_between_estimate_and_payment_is_refused_before_spending`
+//! stands.
 //!
 //! **Ownership (§2), as the tests in this module prove it:** a row is paid only by the process that
 //! planned it, only through the fence — [`SellerStore::admit_remittance_spend`], which two

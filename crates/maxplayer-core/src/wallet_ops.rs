@@ -1364,6 +1364,14 @@ async fn active_keyset_input_fee_ppk(wallet: &Wallet) -> Result<u64, String> {
 ///    the swap (if any) and the melt request — the only spend on this path — and whose
 ///    [`PreparedMeltPayment::cancel`] (or drop) releases it.
 ///
+/// The four figures are the SDK's PREPARED ones. `input_fee` is an estimate: `confirm` swaps to
+/// invoice + reserve + that estimate, recomputes the input fee on the proofs it receives and refuses
+/// after the swap when they do not cover it (pinned `melt/saga/mod.rs:678`, `:704–712`). The
+/// preparation therefore also carries the keyset's [`MeltPreparation::input_fee_ppk`], and the
+/// caller runs `fee_remit::confirm_would_succeed` on it before its fence (addendum 9 §1.1) — this
+/// function does not. Bound (§1.5): fee metadata can change between prepare and confirm and the
+/// SDK takes no caller maximum; the seller fee remittance's bound-Spending hold covers that failure.
+///
 /// Same mint resolution and `allow_real_mints` gate as every melt here. The operator's
 /// `melt_within_*` path does NOT use this: it keeps its reserve-only ceiling (addendum 8 §6).
 pub fn prepare_melt_payment_blocking(
