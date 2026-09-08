@@ -2609,7 +2609,8 @@ pub(crate) mod test_support {
         pub(crate) requires_swap: bool,
     }
 
-    pub(crate) use super::{binary_split, fee_for};
+    pub(crate) use super::binary_split;
+    pub(crate) use crate::wallet_ops::fee_for;
 
     /// One pre-melt swap the fake wallet performed inside `confirm` (CDK `melt/saga/mod.rs:
     /// 678–697` → `swap_no_reserve`): what it sent, what the mint kept as swap fee, what came back
