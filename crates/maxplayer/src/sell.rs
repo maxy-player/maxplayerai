@@ -545,6 +545,12 @@ fn ensure_seller_config(
         "wrote [seller] to {}",
         home.root.join("config.toml").display()
     );
+    // A NEW seat: the first moment a seller-only operator has any route to the docs. A seller never
+    // registers `maxplayer mcp`, so the handshake pointer in `mcp.rs` never reaches them. Steady-
+    // state relaunches stay quiet — the pointer is for the operator configuring a seat.
+    if existing.is_none() {
+        let _ = writeln!(err, "{}", crate::skill::docs_pointer_line());
+    }
     Ok(())
 }
 
@@ -786,7 +792,8 @@ impl SellOptions {
 fn sell_usage(w: &mut dyn Write) {
     let _ = writeln!(
         w,
-        "Usage:\n  maxplayer seller --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--accept-open-targeted] [--name <display>] [--home <dir>] [--skip-doctor]\n  maxplayer seller   # zero-prompt relaunch from config.toml\n  maxplayer seller --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch\n  maxplayer seller fees [--home <dir>]   # per-job ledger: what the buyer paid / mint fee / platform fee (10%) / you keep — recorded only, nothing is paid out\n\nNotes:\n  - required user choices: --agent (or --agent-argv) + --rate-sats (first run)\n  - defaults: relay=wss://relay.maxplayer.ai mint=mint.minibits.cash git-remote=relay-git key=0600 auto\n  - no --key (packaged key file only)\n  - startup runs the doctor readiness gate and REFUSES to boot on a blocking failure (no working nix, agent unresolvable, no mint reachable, seller key missing, relay unreachable), each with a fix hint\n  - --skip-doctor: bypass the startup readiness checks (default: checks-on; not recommended). The nix check still runs — it is an environment requirement (#745) with no bypass\n  - --unsafe-no-sandbox: serve a STRANGER-FACING surface with no working sandbox (either open surface) — this box then runs code written by strangers with no containment (waives only that one check)\n  - BOTH open surfaces are OFF by default, and they are separate: --claim-open-pool opts in to untargeted pool offers, --accept-open-targeted opts in to targeted offers from buyers you have not named\n  - with neither set and no [seller] accept_offers_only_from, this seat claims NOTHING and says so at boot\n  - --offer-backfill-secs <n>: see OPEN-POOL offers posted up to n seconds before startup (default 1200; 0 = live-only; targeted offers always backfill)"
+        "Usage:\n  maxplayer seller --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--accept-open-targeted] [--name <display>] [--home <dir>] [--skip-doctor]\n  maxplayer seller   # zero-prompt relaunch from config.toml\n  maxplayer seller --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch\n  maxplayer seller fees [--home <dir>]   # per-job ledger: what the buyer paid / mint fee / platform fee (10%) / you keep — recorded only, nothing is paid out\n\nNotes:\n  - required user choices: --agent (or --agent-argv) + --rate-sats (first run)\n  - defaults: relay=wss://relay.maxplayer.ai mint=mint.minibits.cash git-remote=relay-git key=0600 auto\n  - no --key (packaged key file only)\n  - startup runs the doctor readiness gate and REFUSES to boot on a blocking failure (no working nix, agent unresolvable, no mint reachable, seller key missing, relay unreachable), each with a fix hint\n  - --skip-doctor: bypass the startup readiness checks (default: checks-on; not recommended). The nix check still runs — it is an environment requirement (#745) with no bypass\n  - --unsafe-no-sandbox: serve a STRANGER-FACING surface with no working sandbox (either open surface) — this box then runs code written by strangers with no containment (waives only that one check)\n  - BOTH open surfaces are OFF by default, and they are separate: --claim-open-pool opts in to untargeted pool offers, --accept-open-targeted opts in to targeted offers from buyers you have not named\n  - with neither set and no [seller] accept_offers_only_from, this seat claims NOTHING and says so at boot\n  - --offer-backfill-secs <n>: see OPEN-POOL offers posted up to n seconds before startup (default 1200; 0 = live-only; targeted offers always backfill)\n{}",
+        crate::skill::docs_pointer_line()
     );
 }
 
@@ -799,6 +806,66 @@ mod tests {
     // information; testnut never appears in normal use). This also binds the string to a test: the
     // #447/#595 root bug was a money string nothing checked, which let the copy drift from the mint
     // the code ships (this help had already drifted from its SELLER-QUICKSTART.md mirror).
+    // The docs pointer on the seller first-run path. A seller never registers `maxplayer mcp`, so the
+    // handshake text — until now the binary's only route to https://www.maxplayer.ai/skill.md — never
+    // reaches the operator configuring a new seat. Asserted against the ONE shared constant, never a
+    // copied URL. Uses the raw-argv hatch so no adapter has to be on PATH; the pointer is about the
+    // seat being NEW, not about which harness it runs.
+    #[test]
+    fn first_run_writes_seller_and_points_at_the_docs_once() {
+        let url = crate::skill::SKILL_URL;
+        let root = std::env::temp_dir().join(format!(
+            "maxplayer-first-run-docs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = home::bootstrap(&root).expect("bootstrap temp home");
+        assert!(home.config.seller.is_none(), "a fresh home has no [seller] yet");
+
+        let options = SellOptions {
+            non_interactive: true,
+            agent_argv: vec!["/bin/sh".to_owned(), "-c".to_owned(), "true".to_owned()],
+            rate_sats: Some(100),
+            ..SellOptions::default()
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        ensure_seller_config(&mut home, &options, &mut out, &mut err).unwrap_or_else(|code| {
+            panic!(
+                "ensure_seller_config failed code={code} err={}",
+                String::from_utf8_lossy(&err)
+            )
+        });
+        let first = String::from_utf8_lossy(&err).into_owned();
+        assert!(first.contains("wrote [seller]"), "first run writes the seat:\n{first}");
+        assert!(first.contains(url), "first run must point at the docs:\n{first}");
+
+        // A steady-state relaunch of the same seat is not a new seat: the pointer is not repeated.
+        let mut home = home::bootstrap(&root).expect("reload persisted config");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        ensure_seller_config(&mut home, &SellOptions::default(), &mut out, &mut err)
+            .unwrap_or_else(|code| {
+                panic!(
+                    "relaunch ensure_seller_config failed code={code} err={}",
+                    String::from_utf8_lossy(&err)
+                )
+            });
+        let relaunch = String::from_utf8_lossy(&err);
+        assert!(!relaunch.contains(url), "a relaunch does not repeat the pointer:\n{relaunch}");
+
+        // And the seller's own `--help` carries it for the operator who has not run anything yet.
+        let mut usage = Vec::new();
+        sell_usage(&mut usage);
+        let usage = String::from_utf8_lossy(&usage);
+        assert!(usage.contains(url), "`seller --help` must point at the docs:\n{usage}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // RED-ON-REVERT: re-adding "(a REAL mint — jobs settle in real sats)" reds this.
     #[test]
     fn sell_usage_does_not_fork_mint_classes_or_say_real() {

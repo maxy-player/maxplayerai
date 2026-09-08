@@ -68,6 +68,9 @@ where
         Some("wallet") => crate::wallet_cli::run(&args[2..], out, err),
         Some("profile") => crate::profile_cli::run(&args[2..], out, err),
         Some("whoami") => crate::whoami::run(&args[2..], out, err),
+        // Where the agent documentation lives. Pure print — no home, key, wallet or network — so
+        // it works on a box that has installed nothing but the binary.
+        Some("skill") => crate::skill::run(&args[2..], out, err),
         #[cfg(feature = "stub-pay")]
         Some("stub-pay") => crate::stub_pay_cli::run(&args[2..], out, err),
         Some("log") => run_log(&args[2..], out, err),
@@ -324,7 +327,7 @@ fn usage(err: &mut dyn Write) -> i32 {
 fn write_usage(out: &mut dyn Write) {
     let _ = write!(
         out,
-        "Usage:\n  maxplayer [--help | --version]\n  maxplayer version\n  maxplayer mcp\n  maxplayer buyer     # persistent per-home daemon (exclusive lock, unix-socket RPC); `maxplayer buyer status` = thin client\n  maxplayer doctor   # seller environment self-check (git, credential helper, relay, mint, agent)\n  maxplayer wallet <setup|balance|mint|mint-complete|send|receive|melt|invoice|mints|reconcile> ...\n  maxplayer profile set [--name <name>] [--about <about>]   # publish kind-0 identity\n  maxplayer whoami [--home <dir>]   # print this seat's public identity (hex pubkey, npub, resolved home)\n"
+        "Usage:\n  maxplayer [--help | --version]\n  maxplayer version\n  maxplayer skill    # print where the agent documentation lives (orientation URL + skill index); no wallet, key or network\n  maxplayer mcp\n  maxplayer buyer     # persistent per-home daemon (exclusive lock, unix-socket RPC); `maxplayer buyer status` = thin client\n  maxplayer doctor   # seller environment self-check (git, credential helper, relay, mint, agent)\n  maxplayer wallet <setup|balance|mint|mint-complete|send|receive|melt|invoice|mints|reconcile> ...\n  maxplayer profile set [--name <name>] [--about <about>]   # publish kind-0 identity\n  maxplayer whoami [--home <dir>]   # print this seat's public identity (hex pubkey, npub, resolved home)\n"
     );
     #[cfg(feature = "stub-pay")]
     let _ = write!(
@@ -341,7 +344,8 @@ fn write_usage(out: &mut dyn Write) {
     );
     let _ = writeln!(
         out,
-        "  maxplayer accept <job_id> <claim_id> [--result-id <id>]   # buyer: bind a delivered result (collect folds this in)\n  maxplayer collect <job_id> [--out <folder>]   # buyer: accept-if-needed + verify + pay + materialize\n  maxplayer log replay <path>\n  maxplayer mock run --script <path> --log <path> [--job-id <id>] [--permission-policy allow|deny]\n  maxplayer run --agent-command <cmd> --task <text> --log <path> [--cwd <dir>] [--job-id <id>] [--permission-policy allow|allow-always|deny] [--idle-timeout <secs>]\n\nExit codes: 0 success, 1 usage error, 2 runtime error"
+        "  maxplayer accept <job_id> <claim_id> [--result-id <id>]   # buyer: bind a delivered result (collect folds this in)\n  maxplayer collect <job_id> [--out <folder>]   # buyer: accept-if-needed + verify + pay + materialize\n  maxplayer log replay <path>\n  maxplayer mock run --script <path> --log <path> [--job-id <id>] [--permission-policy allow|deny]\n  maxplayer run --agent-command <cmd> --task <text> --log <path> [--cwd <dir>] [--job-id <id>] [--permission-policy allow|allow-always|deny] [--idle-timeout <secs>]\n\nExit codes: 0 success, 1 usage error, 2 runtime error\n{}",
+        crate::skill::docs_pointer_line()
     );
 }
 
@@ -666,6 +670,41 @@ mod tests {
         assert!(!is_help_request(&s(&["status"])));
     }
 
+    // The docs pointer on the paths that had none. Measured on the base commit: the whole binary
+    // carried exactly one route to https://www.maxplayer.ai/skill.md, the MCP handshake text — so
+    // a seller-only operator, or an agent driving the CLI directly, was never told where the
+    // guides are. Every assertion is against the ONE shared constant, never a hand-copied URL: a
+    // copy in the test would let the constant change while the test keeps passing against the old
+    // text. `maxplayer skill` is the route with no prerequisites (no home, no key, no network), and
+    // the top-level help is where an agent looks first.
+    #[test]
+    fn help_and_skill_carry_the_docs_pointer() {
+        let url = crate::skill::SKILL_URL;
+
+        let (code, out, _) = run_captured(["maxplayer", "--help"]);
+        assert_eq!(code, 0);
+        assert!(out.contains(url), "`maxplayer --help` must point at the docs:\n{out}");
+        assert!(
+            out.contains("maxplayer skill"),
+            "`maxplayer --help` must list the skill subcommand:\n{out}"
+        );
+
+        // A wrong invocation prints the same usage to stderr — a stranger who typed the wrong thing
+        // is exactly the reader who needs the pointer.
+        let (code, _, err) = run_captured(["maxplayer", "unknown"]);
+        assert_eq!(code, 1);
+        assert!(err.contains(url), "usage on stderr must carry the pointer too:\n{err}");
+
+        let (code, out, err) = run_captured(["maxplayer", "skill"]);
+        assert_eq!(code, 0, "stderr={err}");
+        assert!(out.contains(url), "`maxplayer skill` must print the orientation URL:\n{out}");
+        assert!(
+            out.contains(crate::skill::SKILL_INDEX_URL),
+            "`maxplayer skill` must print the skill index URL:\n{out}"
+        );
+        assert!(err.is_empty(), "`maxplayer skill` needs nothing and touches nothing:\n{err}");
+    }
+
     // The shape #570 is about: a sole `--help` on ANY registered subcommand — at every nesting depth
     // (`buyer status`, `wallet mints add`) — prints that command's usage to STDOUT and exits 0 with
     // nothing on stderr (no parse, no home bootstrap, no daemon socket). #549 fixed only `seller`;
@@ -698,6 +737,7 @@ mod tests {
             ("profile --help", "maxplayer profile"),
             ("profile set --help", "maxplayer profile"),
             ("whoami --help", "maxplayer whoami"),
+            ("skill --help", "maxplayer skill"),
             ("accept --help", "maxplayer accept"),
             ("collect --help", "maxplayer collect"),
             ("mcp --help", "maxplayer mcp"),

@@ -28,7 +28,6 @@ const TOOL_DEADLINE_SECS: u64 = 15;
 
 const INSTRUCTION_MARKETPLACE: &str = "maxplayer is an agent marketplace — post jobs for other agents to do, or claim and deliver jobs for bitcoin ecash.";
 const INSTRUCTION_REAL_MONEY: &str = "Posting a job commits payment automatically at award. Treat post_job as spending real money: confirm amount and job text with your user before calling it. The daemon commits up to `max_sats` (which defaults to `amount_sats`). The one exception is `payment=\"none\"`, which posts a FREE job at `amount_sats=0`: it commits nothing and spends nothing.";
-const INSTRUCTION_GUIDES: &str = "Setup, operation, and debugging guides: https://www.maxplayer.ai/skill.md — start there before first use.";
 const INSTRUCTION_WALLET: &str = "Buyer wallet funding is CLI-only: run `maxplayer wallet setup` (and mint-complete) before post_job; MCP has no wallet tools. A `payment=\"none\"` job needs no wallet, no mint and no balance — post and collect it with an empty wallet.";
 const INSTRUCTION_NIX_MISSING: &str = "nix is not installed on this machine — selling and delivery verification are unavailable. To enable: `curl -fsSL https://install.determinate.systems/nix | sh -s -- install` (asks for sudo once).";
 
@@ -128,11 +127,23 @@ fn nix_probe_succeeds() -> bool {
         .is_ok_and(|status| status.success())
 }
 
+/// The docs pointer in the handshake, built from the ONE shared URL constant (`crate::skill`) so
+/// this route and the CLI routes (`--help`, `doctor`, seller first-run, `maxplayer skill`) cannot
+/// drift apart. Until those existed this line was the binary's only pointer to the docs — and a
+/// client may discard `instructions`, so it was advisory even for the buyers it reached.
+fn instruction_guides() -> String {
+    format!(
+        "Setup, operation, and debugging guides: {} — start there before first use.",
+        crate::skill::SKILL_URL
+    )
+}
+
 fn compose_instructions(nix_available: bool) -> String {
+    let guides = instruction_guides();
     let mut lines = vec![
         INSTRUCTION_MARKETPLACE,
         INSTRUCTION_REAL_MONEY,
-        INSTRUCTION_GUIDES,
+        guides.as_str(),
         INSTRUCTION_WALLET,
     ];
     if !nix_available {
