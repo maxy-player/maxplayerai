@@ -1,0 +1,194 @@
+1f03898c9cbabd3b775c340e1ac06c4544e24738
+   Compiling maxplayer-core v0.5.7 (/Users/forge/forge/v2/wt/w-seller-fee-stage2a-remit/crates/maxplayer-core)
+warning: unused import: `PaymentState`
+    --> crates/maxplayer-core/src/payment_wallet.rs:2334:9
+     |
+2334 |         PaymentState, ReceiptAuthority, ResultId,
+     |         ^^^^^^^^^^^^
+     |
+     = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `EMFILE_LEG_ENV` is never used
+   --> crates/maxplayer-core/src/delivery_git.rs:667:11
+    |
+667 |     const EMFILE_LEG_ENV: &str = "MAXPLAYER_EMFILE_LEG";
+    |           ^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `EMFILE_FD_CEILING` is never used
+   --> crates/maxplayer-core/src/delivery_git.rs:671:11
+    |
+671 |     const EMFILE_FD_CEILING: usize = 64;
+    |           ^^^^^^^^^^^^^^^^^
+
+warning: constant `EMFILE_DELIVERIES` is never used
+   --> crates/maxplayer-core/src/delivery_git.rs:676:11
+    |
+676 |     const EMFILE_DELIVERIES: usize = 80;
+    |           ^^^^^^^^^^^^^^^^^
+
+warning: constant `RAISE_CHILD_ENV` is never used
+    --> crates/maxplayer-core/src/buyer/mod.rs:3171:11
+     |
+3171 |     const RAISE_CHILD_ENV: &str = "MAXPLAYER_RAISE_NOFILE_CHILD";
+     |           ^^^^^^^^^^^^^^^
+
+warning: struct `AcceptDelivery` is never constructed
+    --> crates/maxplayer-core/src/payment_wallet.rs:2340:12
+     |
+2340 |     struct AcceptDelivery;
+     |            ^^^^^^^^^^^^^^
+
+warning: function `git_delivery_for_key` is never used
+    --> crates/maxplayer-core/src/payment_wallet.rs:4390:8
+     |
+4390 |     fn git_delivery_for_key(key: &PaymentKey) -> GitDelivery {
+     |        ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `odd_secret_key` is never used
+    --> crates/maxplayer-core/src/payment_wallet.rs:4495:8
+     |
+4495 |     fn odd_secret_key() -> SecretKey {
+     |        ^^^^^^^^^^^^^^
+
+warning: struct `NostrRecipientSend` is never constructed
+    --> crates/maxplayer-core/src/payment_wallet.rs:4527:12
+     |
+4527 |     struct NostrRecipientSend;
+     |            ^^^^^^^^^^^^^^^^^^
+
+warning: fields `base_url_env`, `default_upstream`, `placeholder_prefix`, and `placeholder_random_len` are never read
+    --> crates/maxplayer-core/src/seller_exec.rs:2518:5
+     |
+2514 | struct ContainedCred {
+     |        ------------- fields in this struct
+...
+2518 |     base_url_env: &'static str,
+     |     ^^^^^^^^^^^^
+2519 |     /// The vendor default upstream, used when the operator set no `base_url_env`.
+2520 |     default_upstream: &'static str,
+     |     ^^^^^^^^^^^^^^^^
+2521 |     /// The placeholder's vendor prefix (so a client that shape-validates locally does not refuse).
+2522 |     placeholder_prefix: &'static str,
+     |     ^^^^^^^^^^^^^^^^^^
+2523 |     /// Random characters after the prefix, chosen to match the vendor credential's length.
+2524 |     placeholder_random_len: usize,
+     |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `maxplayer-core` (lib test) generated 10 warnings (run `cargo fix --lib -p maxplayer-core --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.00s
+     Running unittests src/lib.rs (target/debug/deps/maxplayer_core-5299820283977d28)
+
+running 38 tests
+test fee_remit::tests::a_balance_under_the_threshold_or_at_zero_neither_escalates_nor_resets_the_backoff ... ok
+test fee_remit::tests::a_spending_row_is_never_released_by_reconciliation_only_settled ... ok
+test fee_remit::tests::a_fee_bearing_total_that_exceeds_the_gross_by_the_fee_is_refused_before_any_swap_or_melt ... FAILED
+test fee_remit::tests::a_fee_bearing_schedule_whose_prepared_figures_fit_but_post_swap_arithmetic_does_not_is_refused_before_the_fence ... FAILED
+test fee_remit::tests::a_failed_balance_read_after_a_fee_bearing_payment_prints_unknown_and_no_false_warning ... ok
+test fee_remit::tests::a_reconciliation_that_cannot_reach_the_mint_leaves_the_row_planned ... ok
+test fee_remit::tests::a_fee_bearing_payment_whose_prepared_input_fee_differs_from_the_actual_pays_once_and_the_wallet_loses_at_most_the_gross ... ok
+test fee_remit::tests::a_reserve_that_grows_between_estimate_and_payment_is_refused_before_spending ... ok
+test fee_remit::tests::a_spending_row_is_not_released_when_its_lease_expires_and_its_owner_pays_exactly_once ... ok
+test fee_remit::tests::above_the_resolved_maximum_is_refused ... ok
+test fee_remit::tests::a_zero_fee_reserve_invoices_the_gross_once ... ok
+test fee_remit::tests::a_spending_row_is_reconciled_by_its_bound_quote_not_by_an_expired_estimate ... ok
+test fee_remit::tests::a_bound_quote_expired_past_the_margin_is_held_and_its_owner_refuses_to_pay_it ... ok
+test fee_remit::tests::a_second_process_cannot_release_a_live_owners_planned_row_and_exactly_one_debit_happens ... ok
+test fee_remit::tests::a_payment_prepared_before_expiry_cannot_be_doubled_by_a_release_after_it ... ok
+test fee_remit::tests::full_jitter_stays_inside_zero_to_computed ... ok
+test fee_remit::tests::a_fee_reserve_that_leaves_too_little_or_nothing_is_refused_and_journaled ... ok
+test fee_remit::tests::dry_run_prints_the_plan_and_moves_nothing ... ok
+test fee_remit::tests::reconciliation_releases_only_terminal_quotes_own_rows_or_expired_leases ... ok
+test fee_remit::tests::retry_backoff_doubles_from_base_caps_at_thirty_minutes_and_resets_on_success ... ok
+test fee_remit::tests::retry_backoff_honours_explicit_bounds ... ok
+test fee_remit::tests::best_effort_catches_a_failed_attempt_and_leaves_the_balance_intact ... ok
+test fee_remit::tests::single_flight_admits_one_attempt_and_frees_the_slot_on_drop ... ok
+test fee_remit::tests::the_boot_delay_is_never_less_than_the_base_and_at_most_twice_it ... ok
+test fee_remit::tests::an_owner_whose_lease_ran_down_while_it_paused_is_refused_by_its_own_fence ... ok
+test fee_remit::tests::the_fake_wallet_models_the_sdks_proof_input_and_swap_fees_and_the_total_bound_refuses_them ... ok
+test fee_remit::tests::confirm_pays_once_takes_the_fee_out_of_the_gross_and_is_idempotent ... ok
+test fee_remit::tests::fee_aware_planning_sizes_the_invoice_so_a_fee_bearing_payment_fits_without_reserve_slack ... ok
+test fee_remit::tests::an_owner_that_outlives_its_lease_is_released_and_its_fence_then_changes_zero_rows ... ok
+test fee_remit::tests::fees_that_can_never_fit_are_refused_at_planning_not_at_payment ... ok
+test fee_remit::tests::interrupted_after_the_plan_is_reconciled_as_paid_without_a_second_melt ... ok
+test fee_remit::tests::a_release_decided_on_a_stale_planned_snapshot_cannot_revoke_a_later_admission ... ok
+test fee_remit::tests::an_owner_paused_after_its_quote_and_past_its_lease_is_released_and_never_pays_that_quote ... ok
+test fee_remit::tests::an_unpaid_or_pending_interrupted_attempt_is_reconciled_without_paying_twice ... ok
+test fee_remit::tests::recent_attempts_are_newest_first_and_bounded ... ok
+test fee_remit::tests::below_the_resolved_minimum_refuses_with_the_shortfall_and_journals_nothing ... ok
+test fee_remit::tests::a_spending_rows_bound_quote_decides_its_release_on_the_full_path ... ok
+test fee_remit::tests::two_racing_attempts_against_the_same_balance_record_exactly_one_remittance ... ok
+
+failures:
+
+---- fee_remit::tests::a_fee_bearing_total_that_exceeds_the_gross_by_the_fee_is_refused_before_any_swap_or_melt stdout ----
+
+thread 'fee_remit::tests::a_fee_bearing_total_that_exceeds_the_gross_by_the_fee_is_refused_before_any_swap_or_melt' (78592452) panicked at crates/maxplayer-core/src/fee_remit.rs:5081:22:
+expected MeltRefused, got Paid { remittance_id: "hash-12-2", net_sats: 12, melt_fee_sats: 4 }
+Accrued platform fee: 20 sats all-time — 0 sats remitted, 20 sats unremitted
+Destination: maxplayer@agi.cash (LNURL-pay; accepts 1 to 1000000 sats)
+Plan:
+  unremitted platform fee (gross): 20 sats
+  mint melt fee reserve (ceiling): 3 sats — taken out of the gross, never on top
+  invoice amount (maxplayer@agi.cash receives): 12 sats
+  leaves your wallet: at most 19 sats (≤ 20); unused reserve returns as change
+  expected proof fees (SDK estimate, bounded exactly at payment): 5 sats; actual proof input fee the SDK recomputes on the swapped proofs: 3 sats ⇒ worst case 19 sats leaves the wallet (≤ 20)
+  mint: https://mint.example (melt quote quote-lnbc-fake-12-2)
+  invoice payment hash: hash-12-2
+Journaled remittance hash-12-2 covering 2 receipts (owner fake-owner, lease until unix 400); paying...
+Re-planned: the payment quote's fee reserve is 7 sats (planned on 3 sats); invoice 12 sats would not confirm (invoice + reserve + actual proof input fee 3 sats + swap fee 1 sats = 23 sats would exceed the 20 sats accrued), invoice 8 sats will (at most 19 sats leaves the wallet, ≤ 20); payment quote paid-quote-lnbc-fake-8-3 raised at mint https://mint.example for 8 sats (fee reserve 7 sats); invoice payment hash: hash-8-3
+Payment quote paid-quote-lnbc-fake-8-3 raised at mint https://mint.example for 8 sats (fee reserve 7 sats, expires unix 18446744073709551615); fits the ceiling of 20 sats
+Prepared melt of quote paid-quote-lnbc-fake-8-3: proof input fee 4 sats (estimate; actual on the swapped proofs 3 sats), swap fee 1 sats (the wallet's proofs do not fit: a pre-melt swap will be performed); total debit 19 sats (8 invoice + 7 reserve + fees) fits the ceiling of 20 sats; proofs reserved in this wallet only, nothing posted yet
+Admitted to spend at unix 100: remittance hash-12-2 is now spending, bound to melt quote paid-quote-lnbc-fake-8-3 (lease until unix 400); from here only the mint's verdict on that quote resolves it
+PAID — remittance hash-12-2 settled
+  gross discharged: 20 sats
+  melt fee taken by the mint: 4 sats (quote paid-quote-lnbc-fake-8-3 reserved 7 sats; ceiling 20 sats held at the moment of spending; this is the SDK's fee_paid = Lightning fee + actual proof input fee)
+  estimated proof input fee (prepared): 4 sats — replaced by the actual fee inside the melt fee above, not added again; swap fee (charged at swap): 1 sats
+  actual debit: 17 sats = net + melt fee + swap fee
+  net paid to maxplayer@agi.cash: 12 sats
+  stays in your wallet (unused reserve): 3 sats
+  wallet balance now: 1000 sats at https://mint.example
+  receipts discharged: 2
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- fee_remit::tests::a_fee_bearing_schedule_whose_prepared_figures_fit_but_post_swap_arithmetic_does_not_is_refused_before_the_fence stdout ----
+
+thread 'fee_remit::tests::a_fee_bearing_schedule_whose_prepared_figures_fit_but_post_swap_arithmetic_does_not_is_refused_before_the_fence' (78592451) panicked at crates/maxplayer-core/src/fee_remit.rs:4973:22:
+expected MeltRefused, got Paid { remittance_id: "hash-12-2", net_sats: 12, melt_fee_sats: 3 }
+Recent attempts: none journaled yet
+Accrued platform fee: 20 sats all-time — 0 sats remitted, 20 sats unremitted
+Destination: maxplayer@agi.cash (LNURL-pay; accepts 1 to 1000000 sats)
+Plan:
+  unremitted platform fee (gross): 20 sats
+  mint melt fee reserve (ceiling): 3 sats — taken out of the gross, never on top
+  invoice amount (maxplayer@agi.cash receives): 12 sats
+  leaves your wallet: at most 19 sats (≤ 20); unused reserve returns as change
+  expected proof fees (SDK estimate, bounded exactly at payment): 5 sats; actual proof input fee the SDK recomputes on the swapped proofs: 3 sats ⇒ worst case 19 sats leaves the wallet (≤ 20)
+  mint: https://mint.example (melt quote quote-lnbc-fake-12-2)
+  invoice payment hash: hash-12-2
+Journaled remittance hash-12-2 covering 2 receipts (owner fake-owner, lease until unix 400); paying...
+Re-planned: the payment quote's fee reserve is 0 sats (planned on 3 sats); invoice 12 sats would not confirm (the wallet would swap to 14 sats and the SDK's actual proof input fee on those proofs is 3 sats, so the payment would need 15 sats and the SDK would refuse after its swap), invoice 15 sats will (at most 19 sats leaves the wallet, ≤ 20); payment quote paid-quote-lnbc-fake-15-3 raised at mint https://mint.example for 15 sats (fee reserve 0 sats); invoice payment hash: hash-15-3
+Payment quote paid-quote-lnbc-fake-15-3 raised at mint https://mint.example for 15 sats (fee reserve 0 sats, expires unix 18446744073709551615); fits the ceiling of 20 sats
+Prepared melt of quote paid-quote-lnbc-fake-15-3: proof input fee 4 sats (estimate; actual on the swapped proofs 3 sats), swap fee 1 sats (the wallet's proofs do not fit: a pre-melt swap will be performed); total debit 19 sats (15 invoice + 0 reserve + fees) fits the ceiling of 20 sats; proofs reserved in this wallet only, nothing posted yet
+Admitted to spend at unix 100: remittance hash-12-2 is now spending, bound to melt quote paid-quote-lnbc-fake-15-3 (lease until unix 400); from here only the mint's verdict on that quote resolves it
+PAID — remittance hash-12-2 settled
+  gross discharged: 20 sats
+  melt fee taken by the mint: 3 sats (quote paid-quote-lnbc-fake-15-3 reserved 0 sats; ceiling 20 sats held at the moment of spending; this is the SDK's fee_paid = Lightning fee + actual proof input fee)
+  estimated proof input fee (prepared): 4 sats — replaced by the actual fee inside the melt fee above, not added again; swap fee (charged at swap): 1 sats
+  actual debit: 16 sats = net + melt fee + swap fee
+  net paid to maxplayer@agi.cash: 12 sats
+  stays in your wallet (unused reserve): 4 sats
+  wallet balance now: 1000 sats at https://mint.example
+  receipts discharged: 2
+
+
+
+failures:
+    fee_remit::tests::a_fee_bearing_schedule_whose_prepared_figures_fit_but_post_swap_arithmetic_does_not_is_refused_before_the_fence
+    fee_remit::tests::a_fee_bearing_total_that_exceeds_the_gross_by_the_fee_is_refused_before_any_swap_or_melt
+
+test result: FAILED. 36 passed; 2 failed; 0 ignored; 0 measured; 1389 filtered out; finished in 0.19s
+
+error: test failed, to rerun pass `-p maxplayer-core --lib`
