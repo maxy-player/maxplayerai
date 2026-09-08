@@ -356,6 +356,10 @@ pub struct MeltPreparation {
     pub swap_fee_sats: u64,
     /// `PreparedMelt::requires_swap` — whether `confirm` will perform a pre-melt swap first.
     pub requires_swap: bool,
+    /// The active keyset's `input_fee_ppk` (NUT-02) at preparation — what `confirm` will charge per
+    /// proof when it RECOMPUTES the input fee on the swapped proofs (pinned `melt/saga/mod.rs:704`);
+    /// read as the fee on 1000 proofs, which is exactly ppk (`fees.rs:35–48`).
+    pub input_fee_ppk: u64,
     /// The four parts summed (saturating) — what `admits_total` compared against the ceiling.
     pub total_debit_sats: u64,
     pub expiry_unix: u64,
@@ -1288,6 +1292,22 @@ async fn expected_melt_fees(wallet: &Wallet, inputs_needed: Amount) -> Result<u6
     Ok((input_fee + swap_fee).to_u64())
 }
 
+/// The active keyset's NUT-02 `input_fee_ppk`, read through the SDK's fee function: the fee on
+/// 1000 proofs is ceil(ppk × 1000 / 1000) = ppk (pinned `fees.rs:35–48`, `wallet/mod.rs:356`).
+/// A cached metadata read — a GET at most, never a proof-bearing request.
+async fn active_keyset_input_fee_ppk(wallet: &Wallet) -> Result<u64, String> {
+    let active_keyset_id = wallet
+        .get_active_keyset()
+        .await
+        .map_err(|error| error.to_string())?
+        .id;
+    Ok(wallet
+        .get_keyset_count_fee(&active_keyset_id, 1000)
+        .await
+        .map_err(|error| error.to_string())?
+        .to_u64())
+}
+
 /// **Prepare a melt quote this wallet already holds, by id, bound on its TOTAL cost, and hand it
 /// back undecided.** The seller fee remittance's spending call since addendum 8 (§1.1–1.2): the
 /// quote was raised by [`melt_quote_async`] and its id is about to be bound to the row by the store
@@ -1459,6 +1479,23 @@ fn prepared_melt_thread(
                 ))),
             };
         }
+        // The keyset's ppk, for the caller's confirmability arithmetic (addendum 9 §1.1): the fee
+        // on 1000 proofs is exactly `input_fee_ppk`. A failed read cancels the preparation.
+        let input_fee_ppk = match active_keyset_input_fee_ppk(&wallet).await {
+            Ok(ppk) => ppk,
+            Err(error) => {
+                let refusal = WalletOpsError::Wallet(format!(
+                    "could not read the active keyset's input fee after preparing melt quote {}: {error}",
+                    quote.id
+                ));
+                return match prepared.cancel().await {
+                    Ok(()) => Err(refusal),
+                    Err(cancel_error) => Err(WalletOpsError::Wallet(format!(
+                        "{refusal}; AND cancelling the prepared melt failed: {cancel_error} (no fee-bearing request was posted)"
+                    ))),
+                };
+            }
+        };
         let preparation = MeltPreparation {
             mint_url: mint_url.clone(),
             quote_id: quote.id.clone(),
@@ -1467,6 +1504,7 @@ fn prepared_melt_thread(
             input_fee_sats,
             swap_fee_sats,
             requires_swap: prepared.requires_swap(),
+            input_fee_ppk,
             total_debit_sats,
             expiry_unix: quote.expiry,
         };
@@ -2056,6 +2094,7 @@ mod tests {
                 input_fee_sats: 0,
                 swap_fee_sats: 0,
                 requires_swap: false,
+                input_fee_ppk: 0,
                 total_debit_sats: 15,
                 expiry_unix: u64::MAX,
             },
@@ -2094,6 +2133,7 @@ mod tests {
                     input_fee_sats: 1,
                     swap_fee_sats: 0,
                     requires_swap: false,
+                    input_fee_ppk: 0,
                     total_debit_sats: 16,
                     expiry_unix: u64::MAX,
                 },

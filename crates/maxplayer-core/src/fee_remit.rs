@@ -176,7 +176,8 @@ use crate::seller_node::store::{
     RemitAttemptTrigger, RemitSettlement, RemittancePlan, RemittanceState, SellerStore, SettledBy,
 };
 use crate::wallet_ops::{
-    self, MeltCeiling, MeltEstimate, MeltOutcome, MeltQuoteState, MeltQuoteStatus, WalletOpsError,
+    self, MeltCeiling, MeltEstimate, MeltOutcome, MeltPreparation, MeltQuoteState, MeltQuoteStatus,
+    WalletOpsError,
 };
 
 /// How many journaled attempts the command prints, newest first.
@@ -1494,9 +1495,25 @@ fn remit_inner(
         }
     };
     let preparation = prepared.preparation.clone();
+    // 1c. Confirmability (addendum 9 §1.1): the SDK's confirm recomputes the input fee on the
+    //     proofs its swap yields and refuses AFTER the swap when they do not cover it. Run that
+    //     arithmetic now, before the fence: a refusal here cancels the prepared melt (local) and
+    //     takes the pre-fence release path — no fee-bearing request, no bound row.
+    let actual_input_fee_sats = match confirm_would_succeed(&preparation, gross) {
+        Ok(actual) => actual,
+        Err(reason) => {
+            if let Err(error) = effects.cancel_melt(prepared) {
+                let _ = writeln!(
+                    out,
+                    "  (cancelling the prepared melt failed: {error}; no fee-bearing request was posted; its local proof reservation may remain until a supported recovery path — owed — releases it)"
+                );
+            }
+            return refuse_before_fence(reason, store, out);
+        }
+    };
     let _ = writeln!(
         out,
-        "Prepared melt of quote {}: proof input fee {} sats, swap fee {} sats{}; total debit {} sats ({} invoice + {} reserve + fees) fits the ceiling of {gross} sats; proofs reserved in this wallet only, nothing posted yet",
+        "Prepared melt of quote {}: proof input fee {} sats (estimate; actual on the swapped proofs {actual_input_fee_sats} sats), swap fee {} sats{}; total debit {} sats ({} invoice + {} reserve + fees) fits the ceiling of {gross} sats; proofs reserved in this wallet only, nothing posted yet",
         preparation.quote_id,
         preparation.input_fee_sats,
         preparation.swap_fee_sats,
@@ -2106,6 +2123,80 @@ impl Drop for RemitPermit {
     }
 }
 
+/// NUT-02 (pinned `cdk/src/fees.rs:35–48`, reached from `wallet/mod.rs:319–352` and `:356`):
+/// fee = ceil(ppk × count / 1000).
+pub(crate) fn fee_for(input_fee_ppk: u64, count: usize) -> u64 {
+    (input_fee_ppk * count as u64).div_ceil(1000)
+}
+
+/// The denominations a power-of-two keyset hands back for `amount` under `SplitTarget::None`
+/// (CDK `Amount::split`, the split the swap uses for the melt's proofs at `swap/saga/mod.rs:
+/// 285–301` and for the change) — one proof per set bit, largest first.
+pub(crate) fn binary_split(amount: u64) -> Vec<u64> {
+    (0..64)
+        .rev()
+        .map(|bit| 1u64 << bit)
+        .filter(|denomination| amount & denomination != 0)
+        .collect()
+}
+
+/// **Will `confirm` succeed, under the fee metadata the preparation saw?** Addendum 9 §1.1, from
+/// pinned CDK 0.17.2 `MeltSaga::request_melt_with_options` (`melt/saga/mod.rs:647–760`): on a
+/// swap layout the wallet swaps to a target of invoice + reserve + the PREPARED input fee (`:678`),
+/// receives exactly that target's binary split (`swap/saga/mod.rs:285–301`), RECOMPUTES the input
+/// fee on that split (`:704`) and refuses — after the swap has been paid — when the target does not
+/// cover invoice + reserve + that actual fee (`:706–712`). The prepared `input_fee` is an estimate
+/// on the split of invoice + reserve BEFORE the fee is added (`:383–387`), so the two can differ.
+/// This is that arithmetic, run BEFORE the fence and before any fee-bearing effect: the target's
+/// split × the keyset's `input_fee_ppk`, ceil — deterministic for a power-of-two keyset. On an
+/// exact-fit layout (no swap) the melt sends the selected proofs and the recomputed fee is the
+/// prepared one (same proofs, same metadata).
+///
+/// Also requires the worst-case debit under the ACTUAL fee — invoice + reserve + actual input fee
+/// + swap fee — to fit `gross`. Returns the actual input fee; `Err` is the one printed line.
+///
+/// Bound, disclosed not solved (§1.5): fee metadata can change between prepare and confirm and the
+/// SDK takes no caller maximum; a change there is what the bound-Spending hold after the fence
+/// covers.
+pub(crate) fn confirm_would_succeed(preparation: &MeltPreparation, gross: u64) -> Result<u64, String> {
+    let need = preparation
+        .invoice_sats
+        .saturating_add(preparation.fee_reserve_sats);
+    let actual_input_fee_sats = if preparation.requires_swap {
+        let target_sats = need.saturating_add(preparation.input_fee_sats);
+        let split = binary_split(target_sats);
+        let actual = fee_for(preparation.input_fee_ppk, split.len());
+        let needed_after_swap = need.saturating_add(actual);
+        if target_sats < needed_after_swap {
+            return Err(format!(
+                "melt refused before spending: the wallet would swap to {target_sats} sats ({split:?}) for quote {} and the mint's actual proof input fee on those proofs is {actual} sats (prepared estimate {} sats at {} ppk), so {} sats invoice + {} sats fee reserve + {actual} sats would need {needed_after_swap} sats and the SDK would refuse AFTER paying the {} sats swap fee; the prepared melt was cancelled before any fee-bearing request",
+                preparation.quote_id,
+                preparation.input_fee_sats,
+                preparation.input_fee_ppk,
+                preparation.invoice_sats,
+                preparation.fee_reserve_sats,
+                preparation.swap_fee_sats
+            ));
+        }
+        actual
+    } else {
+        preparation.input_fee_sats
+    };
+    let worst_debit_sats = need
+        .saturating_add(actual_input_fee_sats)
+        .saturating_add(preparation.swap_fee_sats);
+    if worst_debit_sats > gross {
+        return Err(format!(
+            "melt refused before spending: quote {} would debit up to {worst_debit_sats} sats under the mint's actual proof input fee ({} sats invoice + {} sats fee reserve + {actual_input_fee_sats} sats actual proof input fee + {} sats swap fee) against a ceiling of {gross} sats; the prepared melt was cancelled before any fee-bearing request",
+            preparation.quote_id,
+            preparation.invoice_sats,
+            preparation.fee_reserve_sats,
+            preparation.swap_fee_sats
+        ));
+    }
+    Ok(actual_input_fee_sats)
+}
+
 /// Scripted effects for tests, shared with `seller_node::run`'s collect-path tests.
 #[cfg(test)]
 pub(crate) mod test_support {
@@ -2211,22 +2302,7 @@ pub(crate) mod test_support {
         pub(crate) requires_swap: bool,
     }
 
-    /// NUT-02 (pinned `cdk/src/fees.rs:35–48`, reached from `wallet/mod.rs:319–352` and `:356`):
-    /// fee = ceil(ppk × count / 1000).
-    pub(crate) fn fee_for(input_fee_ppk: u64, count: usize) -> u64 {
-        (input_fee_ppk * count as u64).div_ceil(1000)
-    }
-
-    /// The denominations a power-of-two keyset hands back for `amount` under `SplitTarget::None`
-    /// (CDK `Amount::split`, the split the swap uses for the melt's proofs at `swap/saga/mod.rs:
-    /// 285–301` and for the change) — one proof per set bit, largest first.
-    pub(crate) fn binary_split(amount: u64) -> Vec<u64> {
-        (0..64)
-            .rev()
-            .map(|bit| 1u64 << bit)
-            .filter(|denomination| amount & denomination != 0)
-            .collect()
-    }
+    pub(crate) use super::{binary_split, fee_for};
 
     /// One pre-melt swap the fake wallet performed inside `confirm` (CDK `melt/saga/mod.rs:
     /// 678–697` → `swap_no_reserve`): what it sent, what the mint kept as swap fee, what came back
@@ -2879,6 +2955,7 @@ pub(crate) mod test_support {
                 input_fee_sats,
                 swap_fee_sats,
                 requires_swap,
+                input_fee_ppk: self.input_fee_ppk,
                 total_debit_sats,
                 expiry_unix: quote.expiry_unix,
             };
@@ -4213,6 +4290,120 @@ mod tests {
         assert_eq!(estimate.expected_fees_sats, 5, "4 input + 1 swap");
         assert_eq!(estimate.expected_fees_note, None);
         assert_eq!(fake.pool_value(), Some(32));
+
+        // CONFIRM model (addendum 9 §1.3), against CDK's arithmetic, not the fake's preparation.
+        // (a) Prepared figures fit, post-swap arithmetic does not: invoice 12, reserve 0 ⇒ need 12
+        // = 8+4 ⇒ prepared input 2, swap 1, total 15 ≤ 20 admitted. confirm swaps the 32 to target
+        // 14 = [8, 4, 2] (three proofs ⇒ ACTUAL input 3), needs 12 + 0 + 3 = 15 > 14 ⇒ refused
+        // AFTER the swap: one swap, no melt, the swap fee gone, everything else still in the wallet.
+        assert_eq!(binary_split(14), vec![8, 4, 2]);
+        assert_eq!(binary_split(19), vec![16, 2, 1]);
+        assert_eq!(binary_split(0), Vec::<u64>::new());
+        let mut fake = Fake::new(|_| 0);
+        fake.input_fee_ppk = 1000;
+        fake.proofs = Some(fake_proofs(&[32]));
+        let ceiling = MeltCeiling {
+            max_debit_sats: 20,
+            invoice_sats: 12,
+            planned_quote_id: Some("quote-lnbc-fake-12-1".to_owned()),
+        };
+        let prepared = fake
+            .prepare_melt("paid-quote-lnbc-fake-12-1", &ceiling)
+            .expect("the prepared figures fit: 12 + 0 + 2 + 1 = 15 ≤ 20");
+        assert_eq!(prepared.preparation.input_fee_sats, 2);
+        assert_eq!(prepared.preparation.swap_fee_sats, 1);
+        assert_eq!(prepared.preparation.input_fee_ppk, 1000);
+        let refused = fake
+            .confirm_melt(prepared)
+            .expect_err("the SDK refuses after its swap");
+        match refused {
+            MeltFailure::Failed(reason) => assert!(
+                reason.contains("14 sats of proofs ([8, 4, 2]) do not cover 12 sats invoice + 0 sats fee reserve + 3 sats actual proof input fee (prepared estimate 2 sats); the 1 sats swap fee was charged"),
+                "{reason}"
+            ),
+            other => panic!("expected a post-swap refusal, got {other:?}"),
+        }
+        assert_eq!(fake.swaps.len(), 1, "the swap was posted");
+        assert_eq!(fake.swaps[0].sent, vec![32]);
+        assert_eq!(fake.swaps[0].target_sats, 14);
+        assert_eq!(fake.swaps[0].swap_fee_sats, 1);
+        assert_eq!(fake.swaps[0].received, vec![8, 4, 2]);
+        assert_eq!(fake.swaps[0].change, vec![16, 1]);
+        assert!(fake.melts.is_empty(), "no melt was posted");
+        assert_eq!(fake.pay_refusals.len(), 1);
+        assert_eq!(
+            fake.pool_value(),
+            Some(31),
+            "32 − 1 swap fee: change [16, 1] plus the swapped [8, 4, 2] are the wallet's"
+        );
+        assert_eq!(fake.proofs_spent, vec![vec![32]], "the 32 went to the swap");
+        // And §1.1 says so BEFORE the fence, from the same figures.
+        let refused = confirm_would_succeed(&fake_preparation(12, 0, 2, 1, 1000), 20)
+            .expect_err("predicted");
+        assert!(
+            refused.contains("swap to 14 sats ([8, 4, 2])")
+                && refused.contains("actual proof input fee on those proofs is 3 sats")
+                && refused.contains("would need 15 sats"),
+            "{refused}"
+        );
+
+        // (b) A genuinely confirmable payment: invoice 13, reserve 2 ⇒ need 15 = 8+4+2+1 ⇒ prepared
+        // input 4, swap 1, total 20 ≤ 20. confirm swaps to target 19 = [16, 2, 1] ⇒ ACTUAL input 3,
+        // needs 13 + 2 + 3 = 18 ≤ 19 ⇒ melt posted; the mint takes a 1-sat Lightning fee and returns
+        // 19 − 13 − 1 − 3 = 2 as change. `fee_paid` = 19 − 13 − 2 = 4 = Lightning 1 + actual input 3
+        // (inclusive, swap fee excluded). Wallet: 32 → change [8, 4] from the swap + [2] from the
+        // melt = 14; delta 18 = 13 + 1 + 3 + 1 ≤ gross 20.
+        let mut fake = Fake::new(|_| 2);
+        fake.input_fee_ppk = 1000;
+        fake.proofs = Some(fake_proofs(&[32]));
+        fake.melt_results = vec![Ok((13, 1))];
+        let ceiling = MeltCeiling {
+            max_debit_sats: 20,
+            invoice_sats: 13,
+            planned_quote_id: Some("quote-lnbc-fake-13-1".to_owned()),
+        };
+        let prepared = fake
+            .prepare_melt("paid-quote-lnbc-fake-13-1", &ceiling)
+            .expect("13 + 2 + 4 + 1 = 20 ≤ 20");
+        assert_eq!(
+            confirm_would_succeed(&prepared.preparation, 20),
+            Ok(3),
+            "actual input fee on [16, 2, 1]; 13 + 2 + 3 + 1 = 19 ≤ 20"
+        );
+        let outcome = fake.confirm_melt(prepared).expect("confirmable");
+        assert_eq!(outcome.paid_sats, 13);
+        assert_eq!(outcome.fee_sats, 4, "fee_paid = Lightning 1 + actual input 3");
+        assert_eq!(outcome.input_fee_sats, 4, "the PREPARED estimate, as the SDK reports it");
+        assert_eq!(outcome.swap_fee_sats, 1);
+        assert_eq!(fake.swaps.len(), 1);
+        assert_eq!(fake.swaps[0].received, vec![16, 2, 1]);
+        assert_eq!(fake.swaps[0].change, vec![8, 4]);
+        assert_eq!(fake.melts.len(), 1, "one melt");
+        assert_eq!(fake.pool_value(), Some(14), "32 − 13 − 1 − 3 − 1");
+        assert_eq!(32 - 14, 13 + 1 + 3 + 1, "the whole-wallet delta is the four terms");
+        assert!(32 - 14 <= 20, "≤ gross");
+    }
+
+    /// A `MeltPreparation` with the four fee figures and the keyset ppk, for the arithmetic tests.
+    fn fake_preparation(
+        invoice_sats: u64,
+        fee_reserve_sats: u64,
+        input_fee_sats: u64,
+        swap_fee_sats: u64,
+        input_fee_ppk: u64,
+    ) -> MeltPreparation {
+        MeltPreparation {
+            mint_url: "https://mint.example".to_owned(),
+            quote_id: "paid-quote-fixture".to_owned(),
+            invoice_sats,
+            fee_reserve_sats,
+            input_fee_sats,
+            swap_fee_sats,
+            requires_swap: input_fee_ppk > 0,
+            input_fee_ppk,
+            total_debit_sats: invoice_sats + fee_reserve_sats + input_fee_sats + swap_fee_sats,
+            expiry_unix: u64::MAX,
+        }
     }
 
     // Regression (i), addendum 8 §1.5: fee-bearing mint (1000 ppk), surplus funds in a layout that
