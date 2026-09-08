@@ -371,7 +371,10 @@ pub enum Refusal {
     /// The mint's melt fee reserve leaves nothing, leaves less than the minimum, or would take more
     /// out of the wallet than was accrued.
     ReserveDoesNotFit { gross: u64, reserve: u64 },
-    /// An earlier attempt is still settling at the mint (melt quote PENDING or unknown).
+    /// An earlier attempt's PLANNED row (or a legacy spending row with no quote bound) has a melt
+    /// quote the mint reports PENDING or unknown: a payment may be settling — hold. A bound
+    /// spending row in the same state is [`Refusal::SpendingHeld`] instead, so that it renders the
+    /// one `HELD:` line every bound non-PAID observation renders (addendum 7 §2).
     Settling { remittance_id: String },
     /// An earlier attempt's planned row belongs to another process whose lease has not run out, and
     /// the mint does not report its quote terminal (addendum 3 §2): UNPAID means "not yet", not
@@ -558,9 +561,10 @@ pub enum Reconcile {
 /// A **`spending` row bound to a quote** — every row this binary admits — has **no other
 /// transition here** (addendum 6 §1.2): on UNPAID at any age, FAILED, PENDING, UNKNOWN, or the
 /// wallet not knowing the quote, it is **held**, and its receipts with it, until the mint reports
-/// the quote PAID (PENDING / UNKNOWN as [`Refusal::Settling`], the rest as
-/// [`Refusal::SpendingHeld`] — both holds, nothing written). Nothing about it is inferred from a clock: `now_unix` is not consulted for a
-/// bound spending row. The reason is the mint itself: a payment its owner prepared under the
+/// the quote PAID — every one of those five observations as [`Refusal::SpendingHeld`], whose
+/// one-line read-out names the row, the bound quote, what the mint said and the held receipts
+/// (addendum 6 §1.3; addendum 7 §2); nothing written. Nothing about it is inferred from a clock:
+/// `now_unix` is not consulted for a bound spending row. The reason is the mint itself: a payment its owner prepared under the
 /// bound quote may still be on its way, and the mint (CDK 0.17.2 as the verdict at 6fc77e1 §4
 /// read it) pays an UNPAID **or FAILED** quote with no expiry check — so "FAILED" and "expired"
 /// are not cancellation, and a release on either could make the same gross payable twice. The
@@ -598,18 +602,6 @@ pub fn reconcile_decision(
     if status.is_some_and(|status| status.state == MeltQuoteState::Paid) {
         return Reconcile::Settle;
     }
-    // PENDING / UNKNOWN: a payment may be settling — hold, whatever the row (its own refusal, so
-    // the read-out says "settling", not "held").
-    if status.is_some_and(|status| {
-        matches!(
-            status.state,
-            MeltQuoteState::Pending | MeltQuoteState::Unknown
-        )
-    }) {
-        return Reconcile::Hold(Refusal::Settling {
-            remittance_id: row.remittance_id.clone(),
-        });
-    }
     let observed = match status {
         None => "this wallet holds no such melt quote".to_owned(),
         Some(status) => format!(
@@ -627,11 +619,26 @@ pub fn reconcile_decision(
             held_sats: row.gross_sats,
         })
     };
-    // A bound spending row: held on everything but PAID. No clock, no terminality inference.
+    // A bound spending row: held on everything but PAID — UNPAID, FAILED, PENDING, UNKNOWN, or the
+    // wallet not knowing the quote — as ONE refusal, so every such observation renders the same
+    // single `HELD:` line naming the row, the quote, what the mint said and the held receipts
+    // (addendum 6 §1.3; addendum 7 §2). No clock, no terminality inference.
     if let (true, Some(quote_id)) = (spending, bound) {
         return hold_spending(Some(quote_id));
     }
     // From here: a PLANNED row, or a legacy spending row with no quote bound.
+    // PENDING / UNKNOWN: a payment may be settling — hold, whatever the row (its own refusal, so
+    // the read-out says "settling", not "held": nothing is pinned to a spending mark here).
+    if status.is_some_and(|status| {
+        matches!(
+            status.state,
+            MeltQuoteState::Pending | MeltQuoteState::Unknown
+        )
+    }) {
+        return Reconcile::Hold(Refusal::Settling {
+            remittance_id: row.remittance_id.clone(),
+        });
+    }
     let unpaid_reason = match status {
         None => "the wallet never raised a melt quote for its invoice — no sats left the wallet"
             .to_owned(),
@@ -3054,16 +3061,32 @@ mod tests {
         let (outcome, out) = run_remit(&store, &mut fake, RemitTrigger::Collect, 101);
         assert_eq!(
             outcome,
-            RemitOutcome::Refused(Refusal::Settling {
+            RemitOutcome::Refused(Refusal::SpendingHeld {
                 remittance_id: "hash-9-2".to_owned(),
+                owner: "fake-owner".to_owned(),
+                spending_since_unix: 100,
+                quote_id: Some("paid-quote-lnbc-fake-9-2".to_owned()),
+                observed: format!(
+                    "mint https://mint.example reports melt quote q-pending PENDING (expiry unix {})",
+                    u64::MAX
+                ),
+                held_sats: 10,
             }),
-            "{out}"
+            "PENDING on a bound spending row is the same HELD refusal as every other non-PAID answer (addendum 7 §2): {out}"
         );
         assert!(
             out.contains(
-                "reports melt quote q-pending PENDING: the payment is still settling. REFUSED"
-            ),
+                "HELD: remittance hash-9-2 is SPENDING (admitted by fake-owner at unix 100), bound to melt quote paid-quote-lnbc-fake-9-2; mint https://mint.example reports melt quote q-pending PENDING"
+            ) && out.contains("10 sats of receipts stay pinned to it")
+                && out.contains("REFUSED — nothing moved by this run"),
             "{out}"
+        );
+        assert_eq!(
+            out.lines()
+                .filter(|line| line.starts_with("  HELD: remittance hash-9-2"))
+                .count(),
+            1,
+            "exactly one HELD line: {out}"
         );
         assert_eq!(
             store
@@ -3083,9 +3106,12 @@ mod tests {
         assert_eq!(attempts.len(), 2, "the failed melt and the pending refusal");
         assert_eq!(attempts[0].outcome, RemitAttemptOutcome::Refused);
         assert_eq!(attempts[0].remittance_id.as_deref(), Some("hash-9-2"));
-        assert_eq!(
-            attempts[0].detail,
-            "remittance hash-9-2 is still settling at the mint"
+        assert!(
+            attempts[0].detail.starts_with(
+                "HELD: remittance hash-9-2 is SPENDING (admitted by fake-owner at unix 100), bound to melt quote paid-quote-lnbc-fake-9-2; mint https://mint.example reports melt quote q-pending PENDING"
+            ),
+            "the journal carries the same HELD line the operator saw: {}",
+            attempts[0].detail
         );
 
         // UNPAID with a LIVE quote (expires at unix 2000): HOLD — our own row, and the lease (until
@@ -3858,18 +3884,17 @@ mod tests {
                 .is_none(),
             "no decision on a bound spending row carries a ReleaseOn"
         );
+        // PENDING / UNKNOWN on a bound spending row: the same HELD refusal as every other non-PAID
+        // answer, never the planned row's "settling" (addendum 7 §2).
         assert_eq!(
             reconcile_decision(&theirs, Some(&pending), "proc-a", 10_000),
-            Reconcile::Hold(Refusal::Settling {
-                remittance_id: "x".to_owned()
-            })
+            held(&theirs, "proc-b", Some(&pending)),
+            "PENDING holds a bound spending row as HELD"
         );
         assert_eq!(
-            reconcile_decision(&theirs, Some(&unknown), "proc-a", 10_000),
-            Reconcile::Hold(Refusal::Settling {
-                remittance_id: "x".to_owned()
-            }),
-            "UNKNOWN holds a spending row"
+            reconcile_decision(&mine, Some(&unknown), "proc-a", 10_000),
+            held(&mine, "proc-a", Some(&unknown)),
+            "UNKNOWN holds a bound spending row as HELD, ours included"
         );
         // A spending row admitted before v13 (no bound quote): the status is the invoice's; FAILED
         // or plain expiry releases it by the unbound-spending transition, as v12 did.
@@ -5076,13 +5101,13 @@ mod tests {
                 label: "pending",
                 state: MeltQuoteState::Pending,
                 a_pays: false,
-                hold_text: "reports melt quote paid-quote-lnbc-fake-13-2-a PENDING: the payment is still settling",
+                hold_text: "HELD: remittance hash-13-2-a is SPENDING (admitted by proc-a at unix 100), bound to melt quote paid-quote-lnbc-fake-13-2-a; mint https://mint.example reports melt quote paid-quote-lnbc-fake-13-2-a PENDING",
             },
             Arm {
                 label: "unknown",
                 state: MeltQuoteState::Unknown,
                 a_pays: false,
-                hold_text: "reports melt quote paid-quote-lnbc-fake-13-2-a UNKNOWN: the payment is still settling",
+                hold_text: "HELD: remittance hash-13-2-a is SPENDING (admitted by proc-a at unix 100), bound to melt quote paid-quote-lnbc-fake-13-2-a; mint https://mint.example reports melt quote paid-quote-lnbc-fake-13-2-a UNKNOWN",
             },
         ];
         for arm in &arms {
@@ -5130,29 +5155,39 @@ mod tests {
                             "[{}] B must neither plan, quote nor pay on a held row: {out}",
                             arm.label
                         );
-                        let expected_hold = match arm.state {
-                            MeltQuoteState::Pending | MeltQuoteState::Unknown => {
-                                RemitOutcome::Refused(Refusal::Settling {
-                                    remittance_id: X_ID.to_owned(),
-                                })
-                            }
-                            other => RemitOutcome::Refused(Refusal::SpendingHeld {
-                                remittance_id: X_ID.to_owned(),
-                                owner: "proc-a".to_owned(),
-                                spending_since_unix: 100,
-                                quote_id: Some(X_PAYMENT_QUOTE.to_owned()),
-                                observed: format!(
-                                    "mint https://mint.example reports melt quote {X_PAYMENT_QUOTE} {other} (expiry unix {})",
-                                    u64::MAX
-                                ),
-                                held_sats: 15,
-                            }),
-                        };
+                        // Addendum 7 §2: every bound non-PAID observation — FAILED, UNPAID, PENDING,
+                        // UNKNOWN — is the SAME refusal and renders the SAME single `HELD:` line.
+                        let expected_hold = RemitOutcome::Refused(Refusal::SpendingHeld {
+                            remittance_id: X_ID.to_owned(),
+                            owner: "proc-a".to_owned(),
+                            spending_since_unix: 100,
+                            quote_id: Some(X_PAYMENT_QUOTE.to_owned()),
+                            observed: format!(
+                                "mint https://mint.example reports melt quote {X_PAYMENT_QUOTE} {} (expiry unix {})",
+                                arm.state,
+                                u64::MAX
+                            ),
+                            held_sats: 15,
+                        });
                         assert_eq!(outcome, expected_hold, "[{}] {out}", arm.label);
                         assert!(
                             out.contains(arm.hold_text)
+                                && out.contains("15 sats of receipts stay pinned to it")
                                 && out.contains("REFUSED — nothing moved by this run"),
                             "[{}] {out}",
+                            arm.label
+                        );
+                        assert_eq!(
+                            out.lines()
+                                .filter(|line| line.starts_with("  HELD: remittance hash-13-2-a"))
+                                .count(),
+                            1,
+                            "[{}] exactly one HELD line, naming the row, on {trigger:?}: {out}",
+                            arm.label
+                        );
+                        assert!(
+                            !out.contains("still settling"),
+                            "[{}] a bound spending row is HELD, never merely 'settling': {out}",
                             arm.label
                         );
                         assert!(!out.contains("released 15 sats"), "[{}] {out}", arm.label);
