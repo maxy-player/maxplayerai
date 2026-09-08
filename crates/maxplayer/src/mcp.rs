@@ -138,6 +138,22 @@ fn instruction_guides() -> String {
     )
 }
 
+/// A tool description with the guides sentence appended as its final sentence.
+///
+/// Observed on a real Grok Bot box (2026-09-08): the handshake `instructions` WERE delivered, and
+/// the agent could quote them back later — but it read them once, at connect, summarised
+/// registration as "connected + 4 tools", and went straight to hiring. It reached the guides only
+/// under debugging pressure, after it had started spending. A one-shot preamble is read like a
+/// banner; a tool description is read like an instruction, in the turn the agent decides to call
+/// that tool. So the pointer rides exactly two descriptions: `post_job`, the first tool a new buyer
+/// calls and the one that spends money, and `collect`, the tool it reaches for when something has
+/// gone wrong. `get_job` and `award_claim` are deliberately left alone — two carriers are a
+/// pointer, four are noise. The existing text is not rewritten or reflowed; the sentence is the
+/// same shared one the handshake prints, from the same constant.
+fn with_guides(description: &str) -> String {
+    format!("{description} {}", instruction_guides())
+}
+
 fn compose_instructions(nix_available: bool) -> String {
     let guides = instruction_guides();
     let mut lines = vec![
@@ -209,7 +225,7 @@ fn tools() -> Value {
     json!([
         {
             "name": "post_job",
-            "description": "Publish a real maxplayer job offer (OFFER kind) to the configured maxplayer relay, then let the buyer daemon drive the award: once a payable seller claim appears the daemon auto-awards it under the hood, so the normal flow is just post_job then collect (two calls). max_sats caps what the daemon will commit to (defaults to amount_sats); it never auto-awards a claim it cannot pay. harness, harness_family, model and capabilities are ALL hard award filters (only a seller advertising them can be awarded), enforced identically on the manual and automatic award paths; model requires harness (the preset), and a harness_family given alongside harness must name the same harness it does. Omit them all and every claim passes exactly as before. Targeted seller p-tag is the documented default (pass seller_pubkey); set untargeted=true for an open offer. Optional repo+branch attach git delivery tags. CONTRIBUTION (freelance-PR) mode: supply target_repo_owner + target_repo_url + base_branch + base_oid to post a job-class=contribution offer against a repo you own (seller forks it and delivers a PR); these four are ALL-OR-NOTHING (a partial set is refused). Omit all four ⇒ from-scratch job. PAYMENT MODE: payment defaults to \"sat\" — a priced job that commits real money at award and needs a funded wallet. payment=\"none\" posts a FREE job instead: it requires amount_sats=0, commits nothing, needs no wallet and no mint, and is awarded only to a seller whose claim also says none (a seat advertising takes_no_payment). A free job settles through collect exactly like a priced one, but pays nothing. Never echoes secrets.",
+            "description": with_guides("Publish a real maxplayer job offer (OFFER kind) to the configured maxplayer relay, then let the buyer daemon drive the award: once a payable seller claim appears the daemon auto-awards it under the hood, so the normal flow is just post_job then collect (two calls). max_sats caps what the daemon will commit to (defaults to amount_sats); it never auto-awards a claim it cannot pay. harness, harness_family, model and capabilities are ALL hard award filters (only a seller advertising them can be awarded), enforced identically on the manual and automatic award paths; model requires harness (the preset), and a harness_family given alongside harness must name the same harness it does. Omit them all and every claim passes exactly as before. Targeted seller p-tag is the documented default (pass seller_pubkey); set untargeted=true for an open offer. Optional repo+branch attach git delivery tags. CONTRIBUTION (freelance-PR) mode: supply target_repo_owner + target_repo_url + base_branch + base_oid to post a job-class=contribution offer against a repo you own (seller forks it and delivers a PR); these four are ALL-OR-NOTHING (a partial set is refused). Omit all four ⇒ from-scratch job. PAYMENT MODE: payment defaults to \"sat\" — a priced job that commits real money at award and needs a funded wallet. payment=\"none\" posts a FREE job instead: it requires amount_sats=0, commits nothing, needs no wallet and no mint, and is awarded only to a seller whose claim also says none (a seat advertising takes_no_payment). A free job settles through collect exactly like a priced one, but pays nothing. Never echoes secrets."),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -297,7 +313,7 @@ fn tools() -> Value {
         },
         {
             "name": "collect",
-            "description": "Single-call buyer collect: if no accept-bind exists yet, accept the delivered claim itself (fetch the seller's result from the relay and record the co-signed pay-bind — the same accept path `maxplayer accept` runs), verify the delivery integrity (the delivered branch must tip at the accepted commit — the PayPathDeliveryVerifier tip-match — and the delivered tree must carry this job's execution sentinel), then materialize the files into <home>/results/<job_id>. What happens between verify and materialize depends on the mode the offer and claim AGREED on at accept, which collect reads off the local bind and never infers: a PRICED job (payment=sat) is auto-paid through the sealed money path (BudgetGate → PaymentService::run, single-redeem + mint-compat intact), and if the wallet holds no funds it refuses with a message pointing at `maxplayer wallet setup`. A FREE job (payment=none) pays nothing: no wallet is opened, no mint is contacted, no budget is charged, and the durable spend ledger is never even READ, so a buyer with no wallet at all — or with an unreadable spend ledger — can collect one; the integrity checks above still run in full, and a delivery that fails them materializes nothing. On integrity mismatch or a bad seller co-signature: refuses and does NOT pay. Idempotent: re-collecting re-materializes without a second payment. Returns {pay: {state, attempt_id, amount_sats, spent_total_sats}, commit_oid, path, files, agent_used, model_used}; for a free collect pay.state is \"none\", pay.attempt_id is null and pay.amount_sats is 0, because no payment attempt was ever made, and pay.spent_total_sats is ABSENT — a free collect reads no spend ledger, so it reports no total rather than a 0 that would read as \"you have spent nothing\"; read the standing total from `buyer status`. agent_used/model_used are the seller-claimed harness/model that produced the delivered result (null = the seller reported nothing; an attribution, never a verification). agent_used is the RESOLVED harness id (e.g. claude-agent-acp), a different vocabulary from post_job's harness label (claude) — never string-compare the two. Never echoes secrets.",
+            "description": with_guides("Single-call buyer collect: if no accept-bind exists yet, accept the delivered claim itself (fetch the seller's result from the relay and record the co-signed pay-bind — the same accept path `maxplayer accept` runs), verify the delivery integrity (the delivered branch must tip at the accepted commit — the PayPathDeliveryVerifier tip-match — and the delivered tree must carry this job's execution sentinel), then materialize the files into <home>/results/<job_id>. What happens between verify and materialize depends on the mode the offer and claim AGREED on at accept, which collect reads off the local bind and never infers: a PRICED job (payment=sat) is auto-paid through the sealed money path (BudgetGate → PaymentService::run, single-redeem + mint-compat intact), and if the wallet holds no funds it refuses with a message pointing at `maxplayer wallet setup`. A FREE job (payment=none) pays nothing: no wallet is opened, no mint is contacted, no budget is charged, and the durable spend ledger is never even READ, so a buyer with no wallet at all — or with an unreadable spend ledger — can collect one; the integrity checks above still run in full, and a delivery that fails them materializes nothing. On integrity mismatch or a bad seller co-signature: refuses and does NOT pay. Idempotent: re-collecting re-materializes without a second payment. Returns {pay: {state, attempt_id, amount_sats, spent_total_sats}, commit_oid, path, files, agent_used, model_used}; for a free collect pay.state is \"none\", pay.attempt_id is null and pay.amount_sats is 0, because no payment attempt was ever made, and pay.spent_total_sats is ABSENT — a free collect reads no spend ledger, so it reports no total rather than a 0 that would read as \"you have spent nothing\"; read the standing total from `buyer status`. agent_used/model_used are the seller-claimed harness/model that produced the delivered result (null = the seller reported nothing; an attribution, never a verification). agent_used is the RESOLVED harness id (e.g. claude-agent-acp), a different vocabulary from post_job's harness label (claude) — never string-compare the two. Never echoes secrets."),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -701,6 +717,57 @@ mod tests {
         McpState {
             home,
             instructions: compose_instructions(true),
+        }
+    }
+
+    // The docs pointer rides the two tool descriptions an agent reads at decision time. Observed on
+    // a real Grok Bot box (2026-09-08): the handshake `instructions` were delivered and quotable,
+    // and still skimmed past — the agent summarised registration as "connected + 4 tools" and went
+    // straight to hiring. `post_job` is the tool that spends money; `collect` is the one reached
+    // for when something has gone wrong. Asserted against the ONE shared constant (`crate::skill`)
+    // and the ONE shared sentence, never a copied URL; and the two OTHER tools are asserted clean,
+    // so a fifth copy cannot creep in without a reviewer deciding it should.
+    #[test]
+    fn post_job_and_collect_descriptions_end_with_the_guides_pointer() {
+        let guides = instruction_guides();
+        assert!(guides.contains(crate::skill::SKILL_URL));
+        let listed = tools();
+        let listed = listed.as_array().expect("tools array");
+        let description = |name: &str| {
+            listed
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("{name} tool listed"))["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{name} description is a string"))
+                .to_owned()
+        };
+
+        for carrier in ["post_job", "collect"] {
+            let text = description(carrier);
+            assert!(
+                text.ends_with(&guides),
+                "{carrier}'s description must END with the guides sentence, verbatim:\n{text}"
+            );
+            assert_eq!(
+                text.matches(crate::skill::SKILL_URL).count(),
+                1,
+                "{carrier} carries the URL exactly once:\n{text}"
+            );
+            // The original text is intact ahead of the pointer: still its own closing sentence.
+            assert!(
+                text.contains("Never echoes secrets. "),
+                "{carrier}'s existing text is appended to, not rewritten:\n{text}"
+            );
+        }
+
+        // Two carriers are a pointer; four are noise. A third is the ordering seat's call.
+        for quiet in ["get_job", "award_claim"] {
+            let text = description(quiet);
+            assert!(
+                !text.contains(crate::skill::SKILL_URL),
+                "{quiet} deliberately does not carry the docs pointer:\n{text}"
+            );
         }
     }
 
