@@ -2563,17 +2563,26 @@ mod tests {
         let mut usage = Vec::new();
         write_usage(&mut usage);
         let usage = String::from_utf8(usage).expect("utf8");
-        assert!(usage.contains(url), "`doctor --help` must point at the docs:\n{usage}");
+        assert!(
+            usage.contains(url),
+            "`doctor --help` must point at the docs:\n{usage}"
+        );
 
         #[cfg(feature = "wallet")]
         {
             let preamble = report_preamble(std::path::Path::new("/tmp/example-home"));
-            assert!(preamble.contains(url), "the doctor report must point at the docs:\n{preamble}");
+            assert!(
+                preamble.contains(url),
+                "the doctor report must point at the docs:\n{preamble}"
+            );
             assert!(
                 preamble.contains("home=/tmp/example-home"),
                 "the preamble still names the home it read:\n{preamble}"
             );
-            assert!(preamble.ends_with('\n'), "each preamble line is terminated:\n{preamble:?}");
+            assert!(
+                preamble.ends_with('\n'),
+                "each preamble line is terminated:\n{preamble:?}"
+            );
         }
     }
 

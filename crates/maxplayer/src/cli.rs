@@ -683,7 +683,10 @@ mod tests {
 
         let (code, out, _) = run_captured(["maxplayer", "--help"]);
         assert_eq!(code, 0);
-        assert!(out.contains(url), "`maxplayer --help` must point at the docs:\n{out}");
+        assert!(
+            out.contains(url),
+            "`maxplayer --help` must point at the docs:\n{out}"
+        );
         assert!(
             out.contains("maxplayer skill"),
             "`maxplayer --help` must list the skill subcommand:\n{out}"
@@ -693,16 +696,25 @@ mod tests {
         // is exactly the reader who needs the pointer.
         let (code, _, err) = run_captured(["maxplayer", "unknown"]);
         assert_eq!(code, 1);
-        assert!(err.contains(url), "usage on stderr must carry the pointer too:\n{err}");
+        assert!(
+            err.contains(url),
+            "usage on stderr must carry the pointer too:\n{err}"
+        );
 
         let (code, out, err) = run_captured(["maxplayer", "skill"]);
         assert_eq!(code, 0, "stderr={err}");
-        assert!(out.contains(url), "`maxplayer skill` must print the orientation URL:\n{out}");
+        assert!(
+            out.contains(url),
+            "`maxplayer skill` must print the orientation URL:\n{out}"
+        );
         assert!(
             out.contains(crate::skill::SKILL_INDEX_URL),
             "`maxplayer skill` must print the skill index URL:\n{out}"
         );
-        assert!(err.is_empty(), "`maxplayer skill` needs nothing and touches nothing:\n{err}");
+        assert!(
+            err.is_empty(),
+            "`maxplayer skill` needs nothing and touches nothing:\n{err}"
+        );
     }
 
     // The shape #570 is about: a sole `--help` on ANY registered subcommand — at every nesting depth

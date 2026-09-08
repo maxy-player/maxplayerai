@@ -824,7 +824,10 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         let mut home = home::bootstrap(&root).expect("bootstrap temp home");
-        assert!(home.config.seller.is_none(), "a fresh home has no [seller] yet");
+        assert!(
+            home.config.seller.is_none(),
+            "a fresh home has no [seller] yet"
+        );
 
         let options = SellOptions {
             non_interactive: true,
@@ -841,8 +844,14 @@ mod tests {
             )
         });
         let first = String::from_utf8_lossy(&err).into_owned();
-        assert!(first.contains("wrote [seller]"), "first run writes the seat:\n{first}");
-        assert!(first.contains(url), "first run must point at the docs:\n{first}");
+        assert!(
+            first.contains("wrote [seller]"),
+            "first run writes the seat:\n{first}"
+        );
+        assert!(
+            first.contains(url),
+            "first run must point at the docs:\n{first}"
+        );
 
         // A steady-state relaunch of the same seat is not a new seat: the pointer is not repeated.
         let mut home = home::bootstrap(&root).expect("reload persisted config");
@@ -856,13 +865,19 @@ mod tests {
                 )
             });
         let relaunch = String::from_utf8_lossy(&err);
-        assert!(!relaunch.contains(url), "a relaunch does not repeat the pointer:\n{relaunch}");
+        assert!(
+            !relaunch.contains(url),
+            "a relaunch does not repeat the pointer:\n{relaunch}"
+        );
 
         // And the seller's own `--help` carries it for the operator who has not run anything yet.
         let mut usage = Vec::new();
         sell_usage(&mut usage);
         let usage = String::from_utf8_lossy(&usage);
-        assert!(usage.contains(url), "`seller --help` must point at the docs:\n{usage}");
+        assert!(
+            usage.contains(url),
+            "`seller --help` must point at the docs:\n{usage}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
