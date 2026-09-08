@@ -30,8 +30,9 @@ const SUCCESS: i32 = 0;
 const USAGE_ERROR: i32 = 1;
 const RUNTIME_ERROR: i32 = 2;
 /// `remit` declined and moved nothing: nothing unremitted, a balance below the destination's
-/// minimum, a fee reserve that does not fit, or a payment still settling at the mint. Distinct from
-/// `SUCCESS` so a script cannot read a refusal as a payment.
+/// minimum, a fee reserve that does not fit, a planned attempt still settling at the mint, or a
+/// spending row HELD on its bound quote (addendum 6 §1.3). Distinct from `SUCCESS` so a script
+/// cannot read a refusal as a payment.
 const REFUSED: i32 = 3;
 
 /// What the arguments asked for.
@@ -302,9 +303,11 @@ pub(crate) fn render(
         };
         let state = match row.state {
             RemittanceState::Planned => "PLANNED (settling — re-run remit to reconcile)".to_owned(),
-            // Addendum 4 §1 / addendum 5 §1: the owner's compare-and-set admitted the melt and bound
-            // the quote it pays. Never released on time; reconciliation asks the mint about THAT
-            // quote — settles on PAID, releases on FAILED or UNPAID past expiry + margin, else holds.
+            // Addendum 4 §1 / addendum 5 §1 / addendum 6 §1.2: the owner's compare-and-set admitted
+            // the melt and bound the quote it pays. Reconciliation asks the mint about THAT quote —
+            // settles on PAID, otherwise HOLDS (UNPAID at any age, FAILED, PENDING, UNKNOWN, or no
+            // such quote): no clock, no terminal observation and no other process releases it; an
+            // operator decision does (none automated in this round).
             RemittanceState::Spending => format!(
                 "SPENDING (melt admitted, bound to melt quote {}; resolved only by the mint's verdict on that quote — re-run remit to reconcile)",
                 row.spending_quote_id

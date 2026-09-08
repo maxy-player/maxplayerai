@@ -4187,7 +4187,7 @@ impl SellerNodeRunner {
             }
             if started.elapsed() >= bound {
                 opline!(
-                    "seller node platform fee: INCIDENT — a remittance attempt is still in flight after the {}ms drain bound; abandoning the wait, not the attempt: its thread finishes on its own, and its planned row (if it journaled one) is reconciled at the next start",
+                    "seller node platform fee: INCIDENT — a remittance attempt is still in flight after the {}ms drain bound; abandoning the wait, not the attempt: its thread finishes on its own, and the row it journaled (if any — planned, or already admitted and SPENDING with a quote bound) is reconciled at the next start: settled if the mint reports its quote PAID, otherwise held",
                     bound.as_millis()
                 );
                 return;

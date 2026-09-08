@@ -2075,9 +2075,11 @@ impl SellerStore {
     /// ([`PlanRefused::DuplicateInvoice`]); or there is nothing unremitted.
     ///
     /// `owner` is the planning process's token and `lease_until_unix` how long its claim stands
-    /// (addendum 3 §2): only the owner pays this row
-    /// ([`Self::confirm_remittance_ownership`] immediately before spending), and another process may
-    /// release it on UNPAID / no-quote only once the lease has passed.
+    /// (addendum 3 §2): only the owner pays this row — its pre-spend fence
+    /// [`Self::admit_remittance_spend`] advances it to spending and binds the quote it pays — and,
+    /// while the row is still PLANNED, another process may release it on UNPAID / no-quote only once
+    /// the lease has passed. Once admitted (spending, quote bound) the lease no longer matters: the
+    /// row is held until the mint reports that quote PAID (addendum 6 §1.2).
     pub fn plan_remittance(
         &self,
         plan: &RemittancePlan,
@@ -2311,10 +2313,14 @@ impl SellerStore {
     /// error that aborts the run.
     ///
     /// The predicates, each on top of `remittance_id = :id AND state = 'planned'`:
-    /// - [`ReleaseOn::TerminalBoundQuote`] — a SPENDING row whose bound quote the mint reports
-    ///   terminal: `AND spending_since_unix IS NOT NULL AND spending_quote_id = :quote`. The only
-    ///   release a spending row has, and it names the quote observed terminal, so a release decided
-    ///   on some other quote's state changes nothing.
+    /// - [`ReleaseOn::TerminalBoundQuote`] — a SPENDING row, by its bound quote:
+    ///   `AND spending_since_unix IS NOT NULL AND spending_quote_id = :quote`. It names the quote,
+    ///   so a release decided on some other quote's state changes nothing. **No automatic caller**
+    ///   since addendum 6: `fee_remit::reconcile_decision` holds a bound spending row on everything
+    ///   but PAID (the mint pays an UNPAID or FAILED quote regardless of expiry, so no observation
+    ///   proves the bound quote cannot still debit); the transition and its tests are retained as
+    ///   the store's conditional primitive only. A bound spending row is released by nobody in this
+    ///   round.
     /// - [`ReleaseOn::TerminalUnboundSpending`] — a spending row a v12 binary admitted without
     ///   binding a quote: `AND spending_since_unix IS NOT NULL AND spending_quote_id IS NULL`.
     /// - [`ReleaseOn::TerminalQuotePlanned`] — a PLANNED row (never admitted) whose invoice's quote
