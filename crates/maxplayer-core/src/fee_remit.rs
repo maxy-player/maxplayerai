@@ -4285,14 +4285,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // Gate 2g (b2), addendum 5 §2 — the same pause, the mint's other verdict: A admitted X, bound Q,
-    // and paused before paying; while it is paused Q itself expires at the mint (130) and the
-    // spending margin passes — the clock, SHARED by A and B, moves to 200. B `--dry-run`: asks about
-    // Q by id, finds it UNPAID past expiry + margin — terminal — and releases X by the transition
-    // naming Q; the receipts return to unremitted by real SQL. B `--confirm` plans and pays a
-    // DISTINCT invoice Y. A resumes: it reads the clock fresh, refuses to pay a bound quote inside
-    // (here: past) its margin, journals the attempt failed, raises no other quote and does not
-    // touch the mint. One melt — Y's. Q is never paid.
+    // Gate 2g (b2), addendum 5 §2 — the same pause, the mint's other verdict: the mint stamps every
+    // quote it raises with expiry 130. A runs at 60 (lease until 360): Q is raised with 70 s of life
+    // — more than the margin — so A's fence admits X and binds Q; A pauses before paying. While it
+    // is paused the clock, SHARED by A and B, moves to 200: Q has expired and the spending margin
+    // has passed. B `--dry-run`: asks about Q by id, finds it UNPAID past expiry + margin —
+    // terminal — and releases X by the transition naming Q; the receipts return to unremitted by
+    // real SQL. B `--confirm` plans and pays a DISTINCT invoice Y. A resumes: it reads the clock
+    // fresh, refuses to pay a bound quote inside (here: past) its margin, journals the attempt
+    // failed, raises no other quote and does not touch the mint. One melt — Y's. Q is never paid.
     #[test]
     fn a_bound_quote_expired_past_the_margin_is_released_and_its_owner_then_refuses_to_pay_it() {
         let (store, root) = store_with_fees("bound-quote-expired", &[10, 5]);
@@ -4300,12 +4301,13 @@ mod tests {
         let db = root.join(STATE_DB_FILE);
         let melts = Arc::new(AtomicUsize::new(0));
         let registry = quote_registry();
-        let a = first_process(&registry);
+        let mut a = first_process(&registry);
+        a.quote_expiry_unix = 130;
         let clock = Arc::clone(&a.clock);
         let (a_result, b_results) = run_paused(
             &db,
             a,
-            100,
+            60,
             PauseAt::AfterAdmit,
             Gate::new(),
             Arc::clone(&melts),
@@ -4315,15 +4317,14 @@ mod tests {
                     .expect("query")
                     .expect("A's row");
                 assert_eq!(x.state, RemittanceState::Spending);
+                assert_eq!(x.spending_since_unix, Some(60));
                 assert_eq!(x.spending_quote_id.as_deref(), Some(X_PAYMENT_QUOTE));
-                // The mint: Q expires at 130. The clock both processes read moves to 200: past
-                // 130 + SPEND_MARGIN (60).
-                registry
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .get_mut(X_PAYMENT_QUOTE)
-                    .expect("Q")
-                    .expiry_unix = 130;
+                {
+                    let quotes = registry.lock().unwrap_or_else(|e| e.into_inner());
+                    assert_eq!(quotes[X_PAYMENT_QUOTE].expiry_unix, 130, "Q expires at 130");
+                    assert_eq!(quotes[X_PAYMENT_QUOTE].state, MeltQuoteState::Unpaid);
+                }
+                // The clock both processes read moves to 200: past 130 + SPEND_MARGIN (60).
                 let mut results = Vec::new();
                 let mut b = second_process(&registry, &melts);
                 b.clock = Arc::clone(&clock);
@@ -4816,12 +4817,21 @@ mod tests {
                     {
                         let mut b = second_process(&registry, &melts);
                         let (outcome, out) = run_remit(store_b, &mut b, trigger, now);
-                        assert_eq!(
-                            b.quote_status_calls.first().map(String::as_str),
-                            Some(X_PAYMENT_QUOTE),
-                            "[{}] B asks the mint about Q by id: {out}",
-                            arm.label
-                        );
+                        if arm.releases && trigger == RemitTrigger::Command {
+                            assert!(
+                                b.quote_status_calls.is_empty(),
+                                "[{}] X was released by the dry run: nothing in flight to reconcile: {out}",
+                                arm.label
+                            );
+                        } else {
+                            assert_eq!(
+                                b.quote_status_calls,
+                                vec![X_PAYMENT_QUOTE.to_owned()],
+                                "[{}] B asks the mint about Q by id, and about nothing else: {out}",
+                                arm.label
+                            );
+                            assert!(b.status_calls.is_empty(), "[{}] {out}", arm.label);
+                        }
                         if arm.releases {
                             if trigger == RemitTrigger::DryRun {
                                 assert_eq!(outcome, RemitOutcome::DryRun, "[{}] {out}", arm.label);
