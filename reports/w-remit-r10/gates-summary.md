@@ -35,10 +35,11 @@ runner ran); line 2 of every log states `.rs diff 31deed8..HEAD` = empty, so the
 |---|---|---|---|---|
 | 1 | `FAILED. 1434 passed; 1 failed; 2 ignored` (152.97 s) | `credential_proxy::tests::a_declared_over_cap_body_is_refused_before_the_upstream_sees_it` (known loopback flake, rounds 5–9; not a remitter test) | 44/44 `fee_remit::tests` ok | 101 — `money-path-ci-1-31deed8.log` 130,874 B `aaff9a64723ced37…` (line 1 `ab9260f`) |
 | 2 | `FAILED. 1434 passed; 1 failed; 2 ignored` (145.52 s) | `credential_proxy::tests::a_declared_over_cap_body_is_refused_before_the_upstream_sees_it` (same known flake) | 44/44 `fee_remit::tests` ok | 101 — `money-path-ci-2-31deed8.log` 130,762 B `39dbbb144783360f…` (line 1 `c7ebbb2`) |
-| 3 | pending | pending | pending | pending |
+| 3 | `FAILED. 1434 passed; 1 failed; 2 ignored` (147.49 s) | `credential_proxy::tests::a_declared_over_cap_body_is_refused_before_the_upstream_sees_it` (same known flake) | 44/44 `fee_remit::tests` ok | 101 — `money-path-ci-3-31deed8.log` 130,762 B `08270d43ced3fb82…` (line 1 `a476a9b`) |
 
-Known pre-existing flakes from rounds 5–9: `credential_proxy` loopback, `job_lifecycle` live-mint (minibits) — each run's
-names are read from its log, not assumed.
+All three runs: 1434 passed, the single failure is the pre-existing `credential_proxy` loopback flake (rounds 5–9; not on our
+added lines, not a remitter test); every `fee_remit::tests` case (44) passed in each run. `job_lifecycle` live-mint did not flake this time.
+Runner finished 20:50:17Z ("ALL DONE"); final copy pass to the seat folder: 58 files, all cmp-identical; `SHA256SUMS.txt` there (71 rows) is the manifest.
 
 ## 3. fmt / clippy mapped onto the added set a6217328..31deed8
 
