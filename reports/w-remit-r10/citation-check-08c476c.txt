@@ -1,0 +1,230 @@
+Every `<file>.rs:NNN` citation in body-r10.md resolved against the tree at 08c476c (post-remap).
+A bare `:NNN` inherits the last product .rs file named earlier on the same body line.
+
+body:11  fee_remit.rs:5642  ->  "invoice 1 + Lightning 0 + ACTUAL input 1 + swap 1 = 3"
+body:15  fee_remit.rs:946  ->  pub fn remit(
+body:15  fee_remit.rs:1045  ->  fn remit_inner(
+body:15  fee_remit.rs:348  ->  fn prepare_melt(
+body:15  fee_remit.rs:356  ->  fn confirm_melt(&mut self, prepared: PreparedMelt) -> Result<MeltOutcome, MeltFailure>;
+body:15  fee_remit.rs:360  ->  fn cancel_melt(&mut self, prepared: PreparedMelt) -> Result<(), MeltFailure>;
+body:15  fee_remit.rs:453  ->  fn prepare_melt(
+body:15  fee_remit.rs:475  ->  fn confirm_melt(&mut self, prepared: PreparedMelt) -> Result<MeltOutcome, MeltFailure> {
+body:15  fee_remit.rs:487  ->  fn cancel_melt(&mut self, prepared: PreparedMelt) -> Result<(), MeltFailure> {
+body:15  fee_remit.rs:1786  ->  let prepared = match effects.prepare_melt(&quote.quote_id, &ceiling) {
+body:15  fee_remit.rs:1931  ->  match effects.confirm_melt(prepared) {
+body:15  fee_remit.rs:1811  ->  if let Err(error) = effects.cancel_melt(prepared) {
+body:15  fee_remit.rs:1864  ->  if let Err(error) = effects.cancel_melt(prepared) {
+body:15  fee_remit.rs:1915  ->  let cancel_note = match effects.cancel_melt(prepared) {
+body:15  wallet_ops.rs:1577  ->  pub fn prepare_melt_payment_blocking(
+body:15  wallet_ops.rs:1590  ->  if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+body:15  wallet_ops.rs:1637  ->  fn prepared_melt_thread(
+body:15  wallet_ops.rs:1678  ->  if !ceiling.admits(invoice_sats, fee_reserve_sats) {
+body:15  wallet_ops.rs:56  ->  MeltExceedsCeiling {
+body:15  wallet_ops.rs:1709  ->  let input_fee_ppk = match active_keyset_input_fee_ppk(&wallet).await {
+body:15  wallet_ops.rs:1716  ->  return match prepared.cancel().await {
+body:15  wallet_ops.rs:479  ->  pub fn admits_confirmable(
+body:15  wallet_ops.rs:1733  ->  let bound = match ceiling.admits_confirmable(
+body:15  wallet_ops.rs:1782  ->  return match prepared.cancel().await {
+body:15  wallet_ops.rs:817  ->  /// the caller discard the credited outcome (a discarded outcome retries into an already-spent
+body:15  wallet_ops.rs:56  ->  MeltExceedsCeiling {
+body:15  wallet_ops.rs:1747  ->  } => WalletOpsError::MeltExceedsCeiling {
+body:15  wallet_ops.rs:89  ->  MeltWouldNotConfirm {
+body:15  wallet_ops.rs:1756  ->  WalletOpsError::MeltWouldNotConfirm {
+body:15  wallet_ops.rs:73  ->  MeltTotalExceedsCeiling {
+body:15  wallet_ops.rs:1771  ->  } => WalletOpsError::MeltTotalExceedsCeiling {
+body:15  wallet_ops.rs:606  ->  pub struct PreparedMeltPayment {
+body:15  wallet_ops.rs:629  ->  pub fn confirm(mut self) -> Result<MeltOutcome, WalletOpsError> {
+body:15  wallet_ops.rs:831  ->  Err(error) => {
+body:15  wallet_ops.rs:687  ->  }
+body:15  wallet_ops.rs:907  ->  if funded == 0 {
+body:15  wallet_ops.rs:645  ->  pub fn cancel(mut self) -> Result<(), WalletOpsError> {
+body:15  wallet_ops.rs:676  ->  impl Drop for PreparedMeltPayment {
+body:15  wallet_ops.rs:1352  ->  pub async fn pay_melt_quote_async(
+body:15  wallet_ops.rs:1396  ->  && !ceiling.admits(invoice_sats, fee_reserve_sats)
+body:15  wallet_ops.rs:1419  ->  .prepare_melt(&quote.id, HashMap::new())
+body:15  wallet_ops.rs:1427  ->  .confirm()
+body:15  wallet_ops.rs:2256  ->  pub fn pay_melt_quote_blocking(
+body:15  wallet_ops.rs:1285  ->  pub async fn melt_async(
+body:15  wallet_ops.rs:1304  ->  pub async fn melt_within_async(
+body:16  wallet_ops.rs:454  ->  pub struct MeltCeiling {
+body:16  wallet_ops.rs:468  ->  pub fn admits(&self, invoice_sats: u64, fee_reserve_sats: u64) -> bool {
+body:16  fee_remit.rs:1576  ->  if !ceiling.admits(quote.amount_sats, quote.fee_reserve_sats) {
+body:16  wallet_ops.rs:1678  ->  if !ceiling.admits(invoice_sats, fee_reserve_sats) {
+body:16  wallet_ops.rs:479  ->  pub fn admits_confirmable(
+body:16  wallet_ops.rs:507  ->  pub fn total_debit(
+body:16  fee_remit.rs:2494  ->  pub(crate) fn confirm_would_succeed(
+body:16  fee_remit.rs:1808  ->  let actual_input_fee_sats = match confirm_would_succeed(&preparation, gross) {
+body:16  wallet_ops.rs:1709  ->  let input_fee_ppk = match active_keyset_input_fee_ppk(&wallet).await {
+body:16  wallet_ops.rs:1533  ->  async fn active_keyset_input_fee_ppk(wallet: &Wallet) -> Result<u64, String> {
+body:16  wallet_ops.rs:582  ->  pub input_fee_ppk: u64,
+body:16  wallet_ops.rs:311  ->  pub(crate) fn fee_for(input_fee_ppk: u64, count: usize) -> u64 {
+body:16  wallet_ops.rs:318  ->  pub(crate) fn binary_split(amount: u64) -> Vec<u64> {
+body:16  wallet_ops.rs:331  ->  pub(crate) fn post_swap_figures(
+body:16  wallet_ops.rs:396  ->  pub fn confirm_bound(
+body:16  wallet_ops.rs:704  ->  /// quote past this is one the mint will never pay — terminal, like FAILED.
+body:16  fee_remit.rs:1811  ->  if let Err(error) = effects.cancel_melt(prepared) {
+body:16  fee_remit.rs:1546  ->  let refuse_before_fence = |reason: String,
+body:16  fee_remit.rs:1559  ->  "REFUSED before spending — {reason}; ceiling {gross} sats; nothing left the wallet; the row stays planned and 
+body:16  fee_remit.rs:1045  ->  fn remit_inner(
+body:16  fee_remit.rs:1576  ->  if !ceiling.admits(quote.amount_sats, quote.fee_reserve_sats) {
+body:16  fee_remit.rs:1714  ->  .replan_remittance(
+body:16  fee_remit.rs:1737  ->  "Re-planned: the payment quote's fee reserve is {live_reserve} sats (planned on {} sats); invoice {net} sats w
+body:16  fee_remit.rs:1763  ->  if quote_inside_margin(quote_now_unix) {
+body:16  fee_remit.rs:1786  ->  let prepared = match effects.prepare_melt(&quote.quote_id, &ceiling) {
+body:16  fee_remit.rs:1808  ->  let actual_input_fee_sats = match confirm_would_succeed(&preparation, gross) {
+body:16  fee_remit.rs:1835  ->  effects.after_quote(&planned, &quote);
+body:16  fee_remit.rs:1843  ->  .admit_remittance_spend(
+body:16  fee_remit.rs:1910  ->  if quote_inside_margin(pay_now_unix) {
+body:16  fee_remit.rs:1931  ->  match effects.confirm_melt(prepared) {
+body:16  fee_remit.rs:1864  ->  if let Err(error) = effects.cancel_melt(prepared) {
+body:16  fee_remit.rs:1915  ->  let cancel_note = match effects.cancel_melt(prepared) {
+body:16  fee_remit.rs:2455  ->  pub(crate) fn plan_confirmable_invoice(
+body:16  fee_remit.rs:560  ->  FeesDoNotFit {
+body:16  fee_remit.rs:1285  ->  return Ok(RemitOutcome::Refused(Refusal::FeesDoNotFit {
+body:16  fee_remit.rs:1367  ->  return Ok(RemitOutcome::Refused(Refusal::FeesDoNotFit {
+body:16  fee_remit.rs:1383  ->  return Ok(RemitOutcome::Refused(Refusal::FeesDoNotFit {
+body:16  wallet_ops.rs:292  ->  /// The mint's fee RESERVE on the paying quote: the ceiling on the LIGHTNING fee the mint may
+body:16  wallet_ops.rs:528  ->  /// The mint's fee RESERVE for this melt: the ceiling on the LIGHTNING fee it may keep (NUT-05);
+body:16  fee_remit.rs:1117  ->  "  mint {} reports melt quote {} PAID — recorded as settled by reconciliation: {} sats reached {}; Lightning f
+body:16  fee_remit.rs:1399  ->  "Plan:\n  unremitted platform fee (gross): {gross} sats\n  mint melt fee reserve (bounds the Lightning fee): {
+body:16  fee_remit.rs:1405  ->  "  expected proof fees (SDK estimate, bounded exactly at payment): {} sats = estimated proof input fee {planne
+body:16  fee_remit.rs:4091  ->  fn interrupted_after_the_plan_is_reconciled_as_paid_without_a_second_melt() {
+body:16  fee_remit.rs:5176  ->  fn a_fee_bearing_payment_whose_prepared_input_fee_differs_from_the_actual_pays_once_and_the_wallet_loses_at_mo
+body:17  store.rs:2101  ->  pub fn plan_remittance(
+body:17  store.rs:2122  ->  return Err(PlanRefused::InFlight(Box::new(active)));
+body:17  store.rs:1075  ->  CREATE UNIQUE INDEX IF NOT EXISTS fee_remittances_one_planned
+body:18  store.rs:2206  ->  pub fn admit_remittance_spend(
+body:18  store.rs:2180  ->  /// UPDATE fee_remittances SET spending_since_unix = :now, spending_quote_id = :quote
+body:18  fee_remit.rs:1843  ->  .admit_remittance_spend(
+body:18  fee_remit.rs:1859  ->  Err(lost) => {
+body:19  fee_remit.rs:788  ->  pub fn reconcile_decision(
+body:19  fee_remit.rs:802  ->  return Reconcile::Settle;
+body:19  fee_remit.rs:812  ->  Reconcile::Hold(Refusal::SpendingHeld {
+body:19  fee_remit.rs:821  ->  // A bound spending row: held on everything but PAID — UNPAID, FAILED, PENDING, UNKNOWN, or the
+body:19  fee_remit.rs:837  ->  return Reconcile::Hold(Refusal::Settling {
+body:19  store.rs:2199  ->  /// bound. Once admitted the row is HELD until the mint reports the bound quote PAID
+body:19  fee_remit.rs:587  ->  SpendingHeld {
+body:19  fee_remit.rs:665  ->  Self::SpendingHeld {
+body:19  fee_remit.rs:1910  ->  if quote_inside_margin(pay_now_unix) {
+body:19  fee_remit.rs:246  ->  pub const SPEND_MARGIN: Duration = Duration::from_secs(60);
+body:19  fee_remit.rs:1904  ->  // 3. Confirm the prepared melt of Q. First the local refusal of a quote inside its margin of
+body:20  store.rs:2438  ->  pub fn release_remittance(
+body:20  store.rs:2449  ->  ReleaseOn::TerminalBoundQuote { quote_id } => tx.execute(
+body:20  fee_remit.rs:609  ->  RowChangedUnderMe { remittance_id: String },
+body:20  fee_remit.rs:1147  ->  return Ok(RemitOutcome::Refused(Refusal::RowChangedUnderMe {
+body:20  store.rs:372  ->  TerminalBoundQuote { quote_id: String },
+body:20  store.rs:2449  ->  ReleaseOn::TerminalBoundQuote { quote_id } => tx.execute(
+body:20  store.rs:2355  ->  pub fn settle_remittance(
+body:21  run.rs:7210  ->  if remit_follows_collect(&collected) {
+body:21  run.rs:7239  ->  fn remit_platform_fee_after_collect(&self, job_id: &str) {
+body:21  run.rs:4235  ->  () = &mut remit_retry, if auto_remit && remit_retry_pending.is_none() => {
+body:21  run.rs:7316  ->  fn start_retry_remit(
+body:21  seller_fees.rs:418  ->  let outcome = remit(&store, &mut effects, trigger, now_unix, out)?;
+body:22  fee_remit.rs:1045  ->  fn remit_inner(
+body:22  fee_remit.rs:788  ->  pub fn reconcile_decision(
+body:22  fee_remit.rs:812  ->  Reconcile::Hold(Refusal::SpendingHeld {
+body:22  store.rs:2121  ->  if let Some(active) = Self::in_flight_remittance_in(&tx)? {
+body:22  seller_fees.rs:38  ->  const REFUSED: i32 = 3;
+body:22  seller_fees.rs:429  ->  fn exit_code_for(outcome: &maxplayer_core::fee_remit::RemitOutcome) -> i32 {
+body:23  wallet_ops.rs:1183  ->  if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+body:23  wallet_ops.rs:1316  ->  // deliberate action OUTSIDE the job-pay budget gate (BudgetGate is deliberately not wired in
+body:24  seller_fees.rs:110  ->  "--confirm" if remit => confirm = true,
+body:24  seller_fees.rs:413  ->  let trigger = if confirm {
+body:24  fee_remit.rs:526  ->  pub fn pays(self) -> bool {
+body:25  run.rs:4154  ->  let auto_remit = self.node.home().config.platform_fee.auto_remit;
+body:25  run.rs:4235  ->  () = &mut remit_retry, if auto_remit && remit_retry_pending.is_none() => {
+body:25  run.rs:4260  ->  () = self.remit_pacing_changed.notified(), if auto_remit => {
+body:25  run.rs:7240  ->  if !self.node.home().config.platform_fee.auto_remit {
+body:26  platform_fee.rs:68  ->  pub const PLATFORM_FEE_ADDRESS: &str = "maxplayer@agi.cash";
+body:28  fee_remit.rs:237  ->  pub const REMIT_LEASE: Duration = Duration::from_secs(5 * 60);
+body:28  fee_remit.rs:246  ->  pub const SPEND_MARGIN: Duration = Duration::from_secs(60);
+body:39  fee_remit.rs:5454  ->  fn a_fee_bearing_payment_at_a_19_sat_gross_the_prepared_estimate_would_refuse_pays_invoice_13_once()
+body:43  fee_remit.rs:5577  ->  fn a_3_sat_gross_with_no_reserve_at_1000_ppk_the_gross_probe_would_veto_pays_invoice_1_once() {
+body:43  fee_remit.rs:5685  ->  fn an_8_sat_gross_with_a_5_sat_reserve_at_1000_ppk_pays_invoice_1_once_within_the_gross() {
+body:47  store.rs:2274  ->  /// smaller or larger, whatever fits at the live reserve — BEFORE it prepares any spend. ONE
+body:47  store.rs:1133  ->  // existing offers — those jobs simply state no output type in their agent prompt — and is
+body:87  fee_remit.rs:3096  ->  assert_eq!(address.to_string(), "maxplayer@agi.cash");
+body:88  fee_remit.rs:3719  ->  "Destination: maxplayer@agi.cash (LNURL-pay; accepts 1 to 1000000 sats)",
+body:89  fee_remit.rs:3722  ->  "invoice amount (maxplayer@agi.cash receives): 13 sats",
+body:90  fee_remit.rs:3726  ->  "DRY RUN — nothing moved. Re-run with --confirm to pay 13 sats to maxplayer@agi.cash.",
+body:91  fee_remit.rs:3780  ->  "net paid to maxplayer@agi.cash: 13 sats",
+body:92  fee_remit.rs:3800  ->  row.destination, "maxplayer@agi.cash",
+body:93  fee_remit.rs:3838  ->  "paid 13 sats to maxplayer@agi.cash (melt fee 1 sats)"
+body:94  fee_remit.rs:3855  ->  out.contains("unix 100: operator (--confirm) attempt saw 15 sats unremitted — PAID: paid 13 sats to maxplayer@
+body:95  fee_remit.rs:3905  ->  out.contains("net paid to maxplayer@agi.cash: 10 sats"),
+body:96  fee_remit.rs:4174  ->  out.contains("Reconciling in-flight remittance hash-9-2 (planned at unix 100 by fake-owner, lease until unix 4
+body:98  platform_fee.rs:56  ->  ///   party that owes the fee. A seller-editable `fee_address` would let any seller point the
+body:114  platform_fee.rs:68  ->  pub const PLATFORM_FEE_ADDRESS: &str = "maxplayer@agi.cash";
+body:118  seller_fees.rs:418  ->  let outcome = remit(&store, &mut effects, trigger, now_unix, out)?;
+body:119  fee_remit.rs:2147  ->  pub fn remit_best_effort(
+body:120  fee_remit.rs:2170  ->  pub fn remit_live_best_effort(
+body:121  fee_remit.rs:2177  ->  Ok(mut effects) => remit_best_effort(store, &mut effects, trigger, now_unix),
+body:122  fee_remit.rs:4486  ->  let error = remit(&store, &mut fake, RemitTrigger::Command, 101, &mut out)
+body:123  fee_remit.rs:4512  ->  let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 100);
+body:124  fee_remit.rs:4559  ->  let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 102);
+body:125  fee_remit.rs:4587  ->  let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 104);
+body:126  fee_remit.rs:7573  ->  let outcome = remit(&store, &mut a, RemitTrigger::Collect, 100, &mut out);
+body:127  fee_remit.rs:7588  ->  let outcome = remit(&store, &mut b, RemitTrigger::Command, 401, &mut out);
+body:128  run.rs:3321  ->  crate::fee_remit::remit_best_effort(store, effects.as_mut(), trigger, now_unix())
+body:129  run.rs:3323  ->  None => crate::fee_remit::remit_live_best_effort(store, home, trigger, now_unix()),
+body:136  run.rs:303  ->  tokio::task::spawn_local(async move {
+body:137  run.rs:2093  ->  tokio::task::spawn_blocking(move || -> Result<(), DeliveryWorkdirError> {
+body:138  run.rs:6051  ->  tokio::task::spawn_local(async move {
+body:139  run.rs:7264  ->  let spawned = std::thread::Builder::new()
+body:140  run.rs:7327  ->  let spawned = std::thread::Builder::new()
+body:142  run.rs:4153  ->  // shared backoff re-arms this same timer through `remit_pacing_changed` (addendum 3 §3).
+body:143  run.rs:4159  ->  let remit_retry = tokio::time::sleep(self.remit_pacing_lock().boot_delay());
+body:144  run.rs:7308  ->  /// serving has ended (`remit_closed`), or the thread could not start. The loop re-arms the timer
+body:147  home.rs:1546  ->  fn default_allow_real_mints() -> bool {
+body:147  home.rs:1411  ->  #[serde(default = "default_allow_real_mints")]
+body:147  wallet_ops.rs:1183  ->  if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+body:147  seller_fees.rs:110  ->  "--confirm" if remit => confirm = true,
+body:147  seller_fees.rs:413  ->  let trigger = if confirm {
+body:147  fee_remit.rs:526  ->  pub fn pays(self) -> bool {
+body:149  seller_fees.rs:418  ->  let outcome = remit(&store, &mut effects, trigger, now_unix, out)?;
+body:149  run.rs:3321  ->  crate::fee_remit::remit_best_effort(store, effects.as_mut(), trigger, now_unix())
+body:149  run.rs:3323  ->  None => crate::fee_remit::remit_live_best_effort(store, home, trigger, now_unix()),
+body:149  fee_remit.rs:2147  ->  pub fn remit_best_effort(
+body:149  fee_remit.rs:2170  ->  pub fn remit_live_best_effort(
+body:149  fee_remit.rs:2177  ->  Ok(mut effects) => remit_best_effort(store, &mut effects, trigger, now_unix),
+body:149  fee_remit.rs:303  ->  pub(crate) fn fake_token(&self) -> Option<u64> {
+body:149  fee_remit.rs:2093  ->  ),
+body:149  fee_remit.rs:6051  ->  assert_eq!((rows[0].gross_sats, rows[0].net_sats), (20, 13));
+body:149  fee_remit.rs:7264  ->  for (trigger, now) in [(RemitTrigger::DryRun, 200), (RemitTrigger::Command, 201)] {
+body:149  fee_remit.rs:7327  ->  assert!(
+body:149  fee_remit.rs:4153  ->  
+body:149  fee_remit.rs:4159  ->  amount_sats: 9,
+body:149  fee_remit.rs:7308  ->  results
+body:153  platform_fee.rs:68  ->  pub const PLATFORM_FEE_ADDRESS: &str = "maxplayer@agi.cash";
+body:153  platform_fee.rs:56  ->  ///   party that owes the fee. A seller-editable `fee_address` would let any seller point the
+body:174  fee_remit.rs:1576  ->  if !ceiling.admits(quote.amount_sats, quote.fee_reserve_sats) {
+body:174  fee_remit.rs:1786  ->  let prepared = match effects.prepare_melt(&quote.quote_id, &ceiling) {
+body:174  fee_remit.rs:1808  ->  let actual_input_fee_sats = match confirm_would_succeed(&preparation, gross) {
+body:174  fee_remit.rs:1843  ->  .admit_remittance_spend(
+body:174  fee_remit.rs:1811  ->  if let Err(error) = effects.cancel_melt(prepared) {
+body:174  fee_remit.rs:1864  ->  if let Err(error) = effects.cancel_melt(prepared) {
+body:174  fee_remit.rs:1915  ->  let cancel_note = match effects.cancel_melt(prepared) {
+body:174  fee_remit.rs:1045  ->  fn remit_inner(
+body:174  fee_remit.rs:2030  ->  /// A `Duration` as whole unix seconds, for lease arithmetic.
+body:174  fee_remit.rs:5176  ->  fn a_fee_bearing_payment_whose_prepared_input_fee_differs_from_the_actual_pays_once_and_the_wallet_loses_at_mo
+body:174  fee_remit.rs:5207  ->  out.contains("Prepared melt of quote paid-quote-lnbc-fake-12-2: proof input fee 4 sats (estimate; actual on th
+body:174  fee_remit.rs:5248  ->  Some(4),
+body:174  fee_remit.rs:1557  ->  let _ = writeln!(
+body:174  fee_remit.rs:3619  ->  fn assert_refused_before_fence_row_stays_planned(
+body:174  fee_remit.rs:5873  ->  assert_refused_before_fence_row_stays_planned(&out, &rows[0], 20, "quote-lnbc-fake-12-2");
+body:174  fee_remit.rs:5967  ->  assert_refused_before_fence_row_stays_planned(&out, &rows[0], 20, "quote-lnbc-fake-12-2");
+body:174  fee_remit.rs:6172  ->  assert_refused_before_fence_row_stays_planned(&out, &rows[0], 15, "quote-lnbc-fake-13-2");
+body:188  home.rs:1445  ->  pub platform_fee: PlatformFeeConfig,
+body:188  lib.rs:47  ->  pub mod fee_remit;
+body:188  lib.rs:55  ->  #[cfg(feature = "wallet")]
+body:188  lib.rs:68  ->  #[cfg(feature = "wallet")]
+body:188  fee_remit.rs:5642  ->  "invoice 1 + Lightning 0 + ACTUAL input 1 + swap 1 = 3"
+body:192  fee_remit.rs:5280  ->  assert!(
+body:192  fee_remit.rs:5798  ->  fn a_fee_bearing_schedule_whose_prepared_figures_fit_but_post_swap_arithmetic_does_not_is_refused_before_the_f
+body:192  fee_remit.rs:5873  ->  assert_refused_before_fence_row_stays_planned(&out, &rows[0], 20, "quote-lnbc-fake-12-2");
+body:192  fee_remit.rs:3619  ->  fn assert_refused_before_fence_row_stays_planned(
+body:192  fee_remit.rs:5876  ->  assert_eq!(attempts[0].outcome, RemitAttemptOutcome::Failed);
+body:275  fee_remit.rs:5176  ->  fn a_fee_bearing_payment_whose_prepared_input_fee_differs_from_the_actual_pays_once_and_the_wallet_loses_at_mo
+body:275  fee_remit.rs:5318  ->  fn a_reserve_that_shrinks_between_estimate_and_payment_is_re_planned_once_and_pays_invoice_15()
+
+TOTAL 225 citations; out of range: 0
