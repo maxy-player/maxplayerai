@@ -9345,17 +9345,31 @@ mod tests {
 
         let boot = memory_index_budget_warning(path, IndexState::OverBudget { bytes: over })
             .expect("an over-budget index must warn at boot");
-        assert!(boot.contains(&over.to_string()), "names the real size: {boot}");
-        assert!(boot.contains(&MAX_MEMORY_INDEX_BYTES.to_string()), "names the budget: {boot}");
-        assert!(boot.contains("/seat/home/memory/MEMORY.md"), "names the path: {boot}");
-        assert!(boot.contains("TRUNCATED"), "says what happens to the prompt: {boot}");
+        assert!(
+            boot.contains(&over.to_string()),
+            "names the real size: {boot}"
+        );
+        assert!(
+            boot.contains(&MAX_MEMORY_INDEX_BYTES.to_string()),
+            "names the budget: {boot}"
+        );
+        assert!(
+            boot.contains("/seat/home/memory/MEMORY.md"),
+            "names the path: {boot}"
+        );
+        assert!(
+            boot.contains("TRUNCATED"),
+            "says what happens to the prompt: {boot}"
+        );
 
         for quiet in [
             IndexState::NoMemoryDir,
             IndexState::NoIndex,
             IndexState::Empty,
             IndexState::Fits { bytes: 12 },
-            IndexState::Fits { bytes: MAX_MEMORY_INDEX_BYTES },
+            IndexState::Fits {
+                bytes: MAX_MEMORY_INDEX_BYTES,
+            },
         ] {
             assert_eq!(
                 memory_index_budget_warning(path, quiet),
@@ -9366,15 +9380,24 @@ mod tests {
 
         let per_job = memory_index_truncated_warning(
             path,
-            IndexTruncation { shown_bytes: 65_000, total_bytes: over },
+            IndexTruncation {
+                shown_bytes: 65_000,
+                total_bytes: over,
+            },
         );
-        assert!(per_job.contains(&over.to_string()), "names the real size: {per_job}");
+        assert!(
+            per_job.contains(&over.to_string()),
+            "names the real size: {per_job}"
+        );
         assert!(
             per_job.contains(&MAX_MEMORY_INDEX_BYTES.to_string()),
             "names the budget: {per_job}"
         );
         assert!(per_job.contains("65000"), "names what survived: {per_job}");
-        assert!(per_job.contains("/seat/home/memory/MEMORY.md"), "names the path: {per_job}");
+        assert!(
+            per_job.contains("/seat/home/memory/MEMORY.md"),
+            "names the path: {per_job}"
+        );
         assert!(
             !per_job.contains("without memory"),
             "the old 'running the job without memory' wording is gone: {per_job}"

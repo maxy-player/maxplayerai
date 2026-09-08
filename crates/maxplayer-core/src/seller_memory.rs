@@ -536,27 +536,43 @@ mod tests {
             .expect("an over-bound index is not an error")
             .expect("and it still injects");
         let truncation = read.truncation.expect("the read reports what it cut");
-        assert_eq!(truncation.total_bytes, MAX_MEMORY_INDEX_BYTES + 1, "the real size is reported");
+        assert_eq!(
+            truncation.total_bytes,
+            MAX_MEMORY_INDEX_BYTES + 1,
+            "the real size is reported"
+        );
         assert!(
             read.section.len() <= MAX_MEMORY_INDEX_BYTES,
             "injected text incl. marker is {} bytes, over the {MAX_MEMORY_INDEX_BYTES} budget",
             read.section.len()
         );
         let (head, marker) = split_head_and_marker(&read.section);
-        assert_eq!(head.len(), truncation.shown_bytes, "shown_bytes is the surviving head");
+        assert_eq!(
+            head.len(),
+            truncation.shown_bytes,
+            "shown_bytes is the surviving head"
+        );
         assert!(
             head.chars().all(|c| c == 'x') && !head.is_empty(),
             "the head is the file's own text"
         );
-        assert_eq!(marker, truncation_marker(truncation.shown_bytes, truncation.total_bytes));
-        assert!(marker.contains(&MAX_MEMORY_INDEX_BYTES.to_string()), "marker names the budget");
+        assert_eq!(
+            marker,
+            truncation_marker(truncation.shown_bytes, truncation.total_bytes)
+        );
+        assert!(
+            marker.contains(&MAX_MEMORY_INDEX_BYTES.to_string()),
+            "marker names the budget"
+        );
         assert!(
             marker.contains(&(MAX_MEMORY_INDEX_BYTES + 1).to_string()),
             "marker names the actual size: {marker}"
         );
         // The section-only wrapper sees the same text.
         assert_eq!(
-            read_on_start_section(&dir, Some(&template)).expect("read").as_deref(),
+            read_on_start_section(&dir, Some(&template))
+                .expect("read")
+                .as_deref(),
             Some(read.section.as_str())
         );
         let _ = fs::remove_dir_all(&root);
@@ -602,8 +618,14 @@ mod tests {
             &head[head.len().saturating_sub(80)..]
         );
         assert!(index.starts_with(head), "the head is a prefix of the file");
-        assert_eq!(marker, truncation_marker(truncation.shown_bytes, truncation.total_bytes));
-        assert!(marker.starts_with("[maxplayer: MEMORY.md truncated"), "marker is the last line");
+        assert_eq!(
+            marker,
+            truncation_marker(truncation.shown_bytes, truncation.total_bytes)
+        );
+        assert!(
+            marker.starts_with("[maxplayer: MEMORY.md truncated"),
+            "marker is the last line"
+        );
         // Most of the budget is used: a cut that threw away far more than one line is a bug.
         assert!(
             read.section.len() > MAX_MEMORY_INDEX_BYTES - 256,
@@ -639,9 +661,16 @@ mod tests {
             head.chars().all(|c| c == '日') && !head.is_empty(),
             "head is whole characters only"
         );
-        assert_eq!(head.len() % 3, 0, "head length is a whole number of 3-byte chars");
+        assert_eq!(
+            head.len() % 3,
+            0,
+            "head length is a whole number of 3-byte chars"
+        );
         assert_eq!(head.len(), truncation.shown_bytes);
-        assert_eq!(marker, truncation_marker(truncation.shown_bytes, truncation.total_bytes));
+        assert_eq!(
+            marker,
+            truncation_marker(truncation.shown_bytes, truncation.total_bytes)
+        );
         // Also directly: the pure fitter produces a String that round-trips as valid UTF-8 bytes.
         let (fitted, _) = fit_index_to_budget(&index);
         assert!(std::str::from_utf8(fitted.as_bytes()).is_ok());
@@ -674,18 +703,42 @@ mod tests {
             "result incl. marker is {} bytes, over the budget",
             read.section.len()
         );
-        assert!(std::str::from_utf8(read.section.as_bytes()).is_ok(), "valid UTF-8");
+        assert!(
+            std::str::from_utf8(read.section.as_bytes()).is_ok(),
+            "valid UTF-8"
+        );
         let (head, marker) = split_head_and_marker(&read.section);
-        assert_eq!(marker, truncation_marker(truncation.shown_bytes, truncation.total_bytes));
-        assert!(marker.starts_with("[maxplayer: MEMORY.md truncated"), "marker is the final line");
+        assert_eq!(
+            marker,
+            truncation_marker(truncation.shown_bytes, truncation.total_bytes)
+        );
+        assert!(
+            marker.starts_with("[maxplayer: MEMORY.md truncated"),
+            "marker is the final line"
+        );
         // Non-empty head, cut inside the second line: the head keeps the file's leading LF and then
         // a run of `x` from the second line — NOT the empty string an offset-0 cut would have given.
-        assert!(!head.trim().is_empty(), "the head carries specialization, not an empty line");
-        assert!(head.starts_with('\n'), "the head is a prefix of the file, incl. its leading LF");
+        assert!(
+            !head.trim().is_empty(),
+            "the head carries specialization, not an empty line"
+        );
+        assert!(
+            head.starts_with('\n'),
+            "the head is a prefix of the file, incl. its leading LF"
+        );
         let second_line = &head[1..];
-        assert!(!second_line.is_empty(), "the cut landed inside the second line");
-        assert!(second_line.chars().all(|c| c == 'x'), "and kept only that line's own bytes");
-        assert!(index.is_char_boundary(head.len()), "the cut is on a char boundary");
+        assert!(
+            !second_line.is_empty(),
+            "the cut landed inside the second line"
+        );
+        assert!(
+            second_line.chars().all(|c| c == 'x'),
+            "and kept only that line's own bytes"
+        );
+        assert!(
+            index.is_char_boundary(head.len()),
+            "the cut is on a char boundary"
+        );
         assert_eq!(head.len(), truncation.shown_bytes);
         let _ = fs::remove_dir_all(&root);
     }
@@ -695,12 +748,18 @@ mod tests {
     fn inspect_index_reports_every_state_and_creates_nothing() {
         let root = temp_dir("inspect");
         let dir = memory_dir(&root);
-        assert_eq!(inspect_index(&dir).expect("no dir"), IndexState::NoMemoryDir);
+        assert_eq!(
+            inspect_index(&dir).expect("no dir"),
+            IndexState::NoMemoryDir
+        );
         assert!(!dir.exists(), "inspecting must not create memory/");
 
         fs::create_dir_all(&dir).expect("mkdir");
         assert_eq!(inspect_index(&dir).expect("no index"), IndexState::NoIndex);
-        assert!(!dir.join(MEMORY_INDEX_FILE).exists(), "inspecting must not create MEMORY.md");
+        assert!(
+            !dir.join(MEMORY_INDEX_FILE).exists(),
+            "inspecting must not create MEMORY.md"
+        );
 
         fs::write(dir.join(MEMORY_INDEX_FILE), "  \n\t\n").expect("write blank");
         assert_eq!(inspect_index(&dir).expect("blank"), IndexState::Empty);
@@ -716,7 +775,12 @@ mod tests {
         )
         .expect("write big");
         let over = inspect_index(&dir).expect("over");
-        assert_eq!(over, IndexState::OverBudget { bytes: MAX_MEMORY_INDEX_BYTES + 7 });
+        assert_eq!(
+            over,
+            IndexState::OverBudget {
+                bytes: MAX_MEMORY_INDEX_BYTES + 7
+            }
+        );
         assert_eq!(over.headroom_bytes(), None);
         let _ = fs::remove_dir_all(&root);
     }

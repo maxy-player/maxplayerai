@@ -205,7 +205,9 @@ fn an_over_budget_index_degrades_instead_of_blocking_the_job() {
     let mut runaway = format!("# Memory\n\n{brand}\n");
     let mut n = 0usize;
     while runaway.len() < MAX_MEMORY_INDEX_BYTES + 1 {
-        runaway.push_str(&format!("- lesson {n:06}: keep the buyer's task the subject of the reply\n"));
+        runaway.push_str(&format!(
+            "- lesson {n:06}: keep the buyer's task the subject of the reply\n"
+        ));
         n += 1;
     }
     runaway.truncate(MAX_MEMORY_INDEX_BYTES + 1); // ASCII filler ⇒ safe to cut anywhere
@@ -240,11 +242,15 @@ fn an_over_budget_index_degrades_instead_of_blocking_the_job() {
     );
     // The memory-off prompt is still the byte-for-byte prefix: truncation only APPENDS less.
     let baseline = job_prompt(&offer(), GIT_REMOTE, DEADLINE, None);
-    assert!(prompt.starts_with(&baseline), "the job is the normal job plus a (shorter) memory section");
+    assert!(
+        prompt.starts_with(&baseline),
+        "the job is the normal job plus a (shorter) memory section"
+    );
     // And the injected index text itself is within budget: the section is framing + index, so it is
     // bounded by the budget plus the default framing's own bytes (the template text and the memory
     // dir path it substitutes in).
-    let framing = DEFAULT_READ_ON_START_TEMPLATE.len() + memory_dir(&root).display().to_string().len();
+    let framing =
+        DEFAULT_READ_ON_START_TEMPLATE.len() + memory_dir(&root).display().to_string().len();
     assert!(
         section.len() <= MAX_MEMORY_INDEX_BYTES + framing,
         "truncated section is {} bytes; budget {MAX_MEMORY_INDEX_BYTES} + framing {framing}",
