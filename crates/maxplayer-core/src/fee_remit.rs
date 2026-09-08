@@ -1848,6 +1848,47 @@ pub(crate) mod test_support {
         Arc::new(Mutex::new(BTreeMap::new()))
     }
 
+    /// The fake WALLET's proofs — denominations in sats — SHARED between the Fakes of one test
+    /// (one `Arc`, addendum 6 §2.1): every payment selects exact denominations summing to
+    /// `amount + fee reserve` (as CDK's proof selection does) and removes them, so two payments
+    /// from one wallet spend DISJOINT proofs and a test can assert that a second payment was
+    /// refused by the STORE, not for want of funds. A Fake without proofs has unbounded funds.
+    pub(crate) type FakeProofs = Arc<Mutex<Vec<u64>>>;
+
+    pub(crate) fn fake_proofs(denominations: &[u64]) -> FakeProofs {
+        Arc::new(Mutex::new(denominations.to_vec()))
+    }
+
+    /// Exact-denomination selection, largest first: the proofs (removed from `available`) that sum
+    /// to exactly `need`, or `None` — nothing removed — when no such subset exists among the
+    /// largest-first picks.
+    fn select_exact(available: &mut Vec<u64>, need: u64) -> Option<Vec<u64>> {
+        let mut sorted = available.clone();
+        sorted.sort_unstable_by(|a, b| b.cmp(a));
+        let mut picked = Vec::new();
+        let mut remaining = need;
+        for denomination in sorted {
+            if denomination <= remaining {
+                picked.push(denomination);
+                remaining -= denomination;
+                if remaining == 0 {
+                    break;
+                }
+            }
+        }
+        if remaining != 0 {
+            return None;
+        }
+        for denomination in &picked {
+            let index = available
+                .iter()
+                .position(|candidate| candidate == denomination)
+                .expect("picked from available");
+            available.swap_remove(index);
+        }
+        Some(picked)
+    }
+
     /// Scripted effects. `reserve_for(amount)` is the mint's fee reserve policy at ESTIMATE time;
     /// `live_reserve_for`, when set, is the reserve the PAYMENT quote carries (the two can differ —
     /// addendum 3 §1); `melt_results` are consumed in order by payments; `status` answers the
@@ -1861,8 +1902,12 @@ pub(crate) mod test_support {
     /// Quote ids: the estimate for `bolt11` is `quote-{bolt11}`, the payment quote is
     /// `paid-quote-{bolt11}` — two quotes, two ids, as the wallet raises them. With a `registry`
     /// every quote raised is recorded there (UNPAID, expiring at `quote_expiry_unix`) and every
-    /// status query reads it; [`Self::pay_melt_quote`] pays only a quote that is UNPAID and not
-    /// expired, and marks it PAID.
+    /// status query reads it. [`Self::pay_melt_quote`] is shaped like the checksum-pinned CDK
+    /// 0.17.2 path the verdict at 6fc77e1 read (§4 B3), in two halves around `melt_gate`: the
+    /// WALLET half (ceiling, funds, and `prepare_melt`'s `expiry > now` check on the wallet's
+    /// clock) and the MINT half, which accepts an UNPAID **or FAILED** quote with NO expiry check
+    /// and rejects PENDING / PAID / UNKNOWN. A fake mint stricter than the dependency is what let
+    /// the round-4 defect through; this one is not.
     pub(crate) struct Fake {
         pub(crate) owner: String,
         pub(crate) invoice_tag: String,
@@ -1873,6 +1918,10 @@ pub(crate) mod test_support {
         pub(crate) melt_results: Vec<Result<(u64, u64), String>>,
         pub(crate) status: Result<Option<MeltQuoteStatus>, String>,
         pub(crate) registry: Option<QuoteRegistry>,
+        /// The wallet's proofs, shared with the other Fake of a two-owner test; `None` = unbounded.
+        pub(crate) proofs: Option<FakeProofs>,
+        /// The exact proofs each debit spent, in order (empty inner vec when `proofs` is `None`).
+        pub(crate) proofs_spent: Vec<Vec<u64>>,
         /// Expiry stamped on every quote this Fake raises (registry or not). Far future by default.
         pub(crate) quote_expiry_unix: u64,
         pub(crate) pay_request_error: Option<String>,
@@ -1884,7 +1933,9 @@ pub(crate) mod test_support {
         /// Actual payments (bolt11s), in order — the debits.
         pub(crate) melts: Vec<String>,
         pub(crate) ceiling_refusals: Vec<String>,
-        /// Payments the fake mint refused: the bound quote was not UNPAID, or had expired.
+        /// Payments refused after the ceiling and before any debit: by the WALLET (the quote had
+        /// expired at `prepare_melt`, or the proofs did not cover amount + reserve) or by the MINT
+        /// (the quote was PENDING, PAID or UNKNOWN — never for expiry, never for FAILED).
         pub(crate) pay_refusals: Vec<String>,
         pub(crate) status_calls: Vec<String>,
         /// Reconciliation queries BY QUOTE ID (a spending row's bound quote).
@@ -1897,7 +1948,10 @@ pub(crate) mod test_support {
         /// Pause point AFTER the compare-and-set admitted the melt and BEFORE the payment (addendum
         /// 4 §1): the row is `spending`, bound to its quote, while the paused side waits here.
         pub(crate) admit_gate: Option<Arc<Gate>>,
-        /// Pause point inside the payment itself, after the mint accepted the quote for paying.
+        /// Pause point inside the payment itself: AFTER the wallet's last local check (ceiling,
+        /// funds, `prepare_melt`'s expiry check) and BEFORE the request reaches the mint — the
+        /// suspension the verdict at 6fc77e1 traced (§4 B3, `AfterPrepare`). A quote that expires
+        /// while the payer waits here is still paid by the mint when the payer resumes.
         pub(crate) melt_gate: Option<Arc<Gate>>,
         /// Pause point AFTER reconciliation decided and BEFORE it writes (addendum 5 §2,
         /// `AfterDecision`): a test moves the row under a decided release here.
@@ -1924,6 +1978,8 @@ pub(crate) mod test_support {
                 melt_results: Vec::new(),
                 status: Ok(None),
                 registry: None,
+                proofs: None,
+                proofs_spent: Vec::new(),
                 quote_expiry_unix: u64::MAX,
                 pay_request_error: None,
                 pay_requests: 0,
@@ -1987,6 +2043,16 @@ pub(crate) mod test_support {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(quote_id.to_owned(), quote);
+            }
+        }
+
+        /// Reserved proofs go back to the shared wallet when a payment is refused after selection.
+        fn return_proofs(&self, selected: &[u64]) {
+            if let Some(proofs) = &self.proofs {
+                proofs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(selected);
             }
         }
 
@@ -2164,15 +2230,27 @@ pub(crate) mod test_support {
             })
         }
 
-        /// The payment, BY QUOTE ID, as the shipped one behaves: the quote must be one this wallet
-        /// raised and the mint must still accept it (UNPAID, not expired), its STORED amount and
-        /// reserve are re-checked against the ceiling BEFORE anything is spent — a refusal is not a
-        /// debit — then it pays and the quote is PAID for everyone reading the registry.
+        /// The payment, BY QUOTE ID, in the shape of the shipped path
+        /// (`wallet_ops::pay_quote_on_wallet` over CDK 0.17.2, as the verdict at 6fc77e1 §4 read
+        /// it) — two halves around `melt_gate`:
+        ///
+        /// **Wallet half** (nothing has left the wallet; a refusal here is not a debit): the quote
+        /// must be one this wallet raised; its STORED amount and reserve are re-checked against the
+        /// ceiling; the proofs must cover amount + reserve (exact denominations are selected and
+        /// reserved, as CDK selects them); `prepare_melt` refuses a quote whose `expiry` has passed
+        /// on the WALLET's clock, read now. Then the payer may pause at `melt_gate` — after its
+        /// last local check, before the request reaches the mint.
+        ///
+        /// **Mint half** (CDK mint `setup_melt`): the request is accepted when the quote is UNPAID
+        /// **or FAILED** — with NO expiry check, however long ago the quote expired — and rejected
+        /// when it is PENDING, PAID or UNKNOWN (reserved proofs return to the wallet). Accepted ⇒
+        /// the debit is counted, the quote is PAID for everyone reading the registry.
         fn pay_melt_quote(
             &mut self,
             quote_id: &str,
             ceiling: &MeltCeiling,
         ) -> Result<MeltOutcome, MeltFailure> {
+            // ---- wallet half ----
             let quote = match self.registered(quote_id) {
                 Some(quote) => quote,
                 None => {
@@ -2194,23 +2272,6 @@ pub(crate) mod test_support {
                     }
                 }
             };
-            if quote.state != MeltQuoteState::Unpaid {
-                let reason = format!(
-                    "mint https://mint.example refuses to pay melt quote {quote_id}: it is {}",
-                    quote.state
-                );
-                self.pay_refusals.push(reason.clone());
-                return Err(MeltFailure::Failed(reason));
-            }
-            let now = self.now_unix();
-            if u64::try_from(now).is_ok_and(|now| now > quote.expiry_unix) {
-                let reason = format!(
-                    "mint https://mint.example refuses to pay melt quote {quote_id}: it expired at unix {} (now {now})",
-                    quote.expiry_unix
-                );
-                self.pay_refusals.push(reason.clone());
-                return Err(MeltFailure::Failed(reason));
-            }
             if !ceiling.admits(quote.amount_sats, quote.fee_reserve_sats) {
                 let reason = format!(
                     "melt refused before spending: mint https://mint.example quote {quote_id} would debit {} sats ({} sats invoice + {} sats fee reserve; planned invoice {} sats) against a ceiling of {} sats; nothing left the wallet",
@@ -2223,10 +2284,59 @@ pub(crate) mod test_support {
                 self.ceiling_refusals.push(reason.clone());
                 return Err(MeltFailure::RefusedBeforeSpending(reason));
             }
+            let need = quote.amount_sats.saturating_add(quote.fee_reserve_sats);
+            let selected = match &self.proofs {
+                None => Vec::new(),
+                Some(proofs) => {
+                    let mut available = proofs.lock().unwrap_or_else(|e| e.into_inner());
+                    match select_exact(&mut available, need) {
+                        Some(selected) => selected,
+                        None => {
+                            let reason = format!(
+                                "wallet refuses to prepare melt quote {quote_id}: no exact proofs for {need} sats among {:?}",
+                                *available
+                            );
+                            self.pay_refusals.push(reason.clone());
+                            return Err(MeltFailure::Failed(reason));
+                        }
+                    }
+                }
+            };
+            let prepare_now = self.now_unix();
+            if u64::try_from(prepare_now).is_ok_and(|now| now > quote.expiry_unix) {
+                // CDK wallet `initialize_melt`: `expiry > unix_time()` at prepare — the wallet's
+                // clock, the LAST expiry check on the path; nothing after it looks at expiry.
+                self.return_proofs(&selected);
+                let reason = format!(
+                    "wallet refuses to prepare melt quote {quote_id}: it expired at unix {} (now {prepare_now})",
+                    quote.expiry_unix
+                );
+                self.pay_refusals.push(reason.clone());
+                return Err(MeltFailure::Failed(reason));
+            }
             if let Some(gate) = &self.melt_gate {
                 gate.arrive_and_wait();
             }
+            // ---- mint half ----
+            // The quote's state as the mint holds it NOW (the registry), not as the wallet loaded
+            // it before the pause: another process may have moved it meanwhile.
+            let state_at_mint = self
+                .registered(quote_id)
+                .map(|current| current.state)
+                .unwrap_or(quote.state);
+            if !matches!(
+                state_at_mint,
+                MeltQuoteState::Unpaid | MeltQuoteState::Failed
+            ) {
+                self.return_proofs(&selected);
+                let reason = format!(
+                    "mint https://mint.example refuses to pay melt quote {quote_id}: it is {state_at_mint}"
+                );
+                self.pay_refusals.push(reason.clone());
+                return Err(MeltFailure::Failed(reason));
+            }
             self.melts.push(quote.bolt11.clone());
+            self.proofs_spent.push(selected);
             if let Some(counter) = &self.melt_counter {
                 counter.fetch_add(1, Ordering::SeqCst);
             }
