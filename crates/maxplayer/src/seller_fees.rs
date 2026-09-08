@@ -1278,10 +1278,7 @@ mod tests {
             .expect("still in flight");
         assert_eq!(
             (row.state, row.spending_quote_id.as_deref()),
-            (
-                RemittanceState::Spending,
-                Some("paid-quote-never-raised")
-            ),
+            (RemittanceState::Spending, Some("paid-quote-never-raised")),
             "held: nothing written by either run"
         );
         let accrued = store.accrued_fees().expect("read");
