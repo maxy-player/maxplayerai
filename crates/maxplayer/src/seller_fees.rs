@@ -1024,11 +1024,13 @@ mod tests {
 
     // Addendum 6 §1.3: a HELD spending row (bound quote not PAID at the mint) exits the command
     // nonzero — REFUSED, the same code as every other refusal — on the dry run and on --confirm
-    // alike, so the stuck fee is visible to an operator and to anything scripting `remit`. The
-    // `HELD:` line itself is the core's (`fee_remit::Refusal::SpendingHeld`), asserted there on the
-    // full path; the live CLI entry point needs the packaged wallet to ask the mint, so the mapping
-    // is pinned here on the outcome the core returns for that row. Failed effects stay distinct
-    // (RUNTIME_ERROR): a hold is a refusal that moved nothing, not a broken payment.
+    // alike, so the stuck fee is visible to an operator and to anything scripting `remit`. This
+    // test pins the exit-code MAPPING on the outcomes the core returns and the shape of the core's
+    // `HELD:` line (`fee_remit::Refusal::SpendingHeld`); the command itself — dry run and
+    // `--confirm` through `run`, complete output, exact exit — is invoked by
+    // `a_held_spending_row_prints_one_held_line_and_exits_refused_on_dry_run_and_confirm` below.
+    // Failed effects stay distinct (RUNTIME_ERROR): a hold is a refusal that moved nothing, not a
+    // broken payment.
     #[test]
     fn a_held_spending_row_exits_refused_on_dry_run_and_confirm() {
         use maxplayer_core::fee_remit::{Refusal, RemitOutcome};
@@ -1135,6 +1137,170 @@ mod tests {
         );
         assert_eq!(code, USAGE_ERROR);
         assert!(String::from_utf8_lossy(&err).contains("contradict"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Addendum 7 §2.3 (addendum 6 §1.3): the REAL command, dry run and `--confirm`, on a store whose
+    // in-flight row is SPENDING and bound to a melt quote — through `run`, the shipped `LiveEffects`
+    // and the packaged wallet at this home. The bound quote id is one this wallet never raised, so
+    // the wallet's local lookup answers "no such quote" without a network call (the mint is asked
+    // only about a quote the wallet knows), and reconciliation HOLDS on that observation: the
+    // complete output carries exactly one `HELD:` line naming the row, the bound quote, the answer
+    // and the held sats, no plan and no payment, and the exit is REFUSED on both runs. The other
+    // four non-PAID answers (UNPAID, FAILED, PENDING, UNKNOWN) render the same line on the core's
+    // full path against the fake mint (`fee_remit::tests`, gate (d)); a real mint cannot be made to
+    // say PENDING offline.
+    #[test]
+    fn a_held_spending_row_prints_one_held_line_and_exits_refused_on_dry_run_and_confirm() {
+        use maxplayer_core::seller_node::STATE_DB_FILE;
+        use maxplayer_core::seller_node::store::RemittancePlan;
+        let root = temp_home("run-remit-held");
+        {
+            let store = SellerStore::open(root.join(STATE_DB_FILE)).expect("open store");
+            for (index, fee) in [10u64, 5].into_iter().enumerate() {
+                store
+                    .collect_receipt(
+                        &format!("receipt-{index}"),
+                        &format!("job-{index}"),
+                        fee * 10,
+                        ReceiptFees {
+                            mint_fee_sats: 1,
+                            fee_bps: 1000,
+                            fee_sats: fee,
+                        },
+                        index as i64 + 1,
+                    )
+                    .expect("collect");
+            }
+            let planned = store
+                .plan_remittance(
+                    &RemittancePlan {
+                        payment_hash: "hash-held".to_owned(),
+                        gross_sats: 15,
+                        net_sats: 13,
+                        melt_fee_reserve_sats: 2,
+                        destination: "maxplayer@agi.cash".to_owned(),
+                        bolt11: "lnbc-held".to_owned(),
+                        melt_quote_id: None,
+                    },
+                    "old-run",
+                    i64::MAX / 2,
+                    100,
+                )
+                .expect("plan");
+            assert_eq!(planned.state, RemittanceState::Planned);
+            let mut clock = || 100;
+            let admitted = store
+                .admit_remittance_spend(
+                    "hash-held",
+                    "old-run",
+                    "paid-quote-never-raised",
+                    60,
+                    &mut clock,
+                )
+                .expect("store")
+                .expect("admitted");
+            assert_eq!(admitted.state, RemittanceState::Spending);
+            assert_eq!(
+                admitted.spending_quote_id.as_deref(),
+                Some("paid-quote-never-raised")
+            );
+        }
+        for (args, label) in [
+            (
+                vec![
+                    "remit".to_owned(),
+                    "--home".to_owned(),
+                    root.display().to_string(),
+                ],
+                "dry run",
+            ),
+            (
+                vec![
+                    "remit".to_owned(),
+                    "--confirm".to_owned(),
+                    "--home".to_owned(),
+                    root.display().to_string(),
+                ],
+                "--confirm",
+            ),
+        ] {
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let code = run(&args, &mut out, &mut err);
+            let out = String::from_utf8(out).expect("utf8");
+            let err = String::from_utf8_lossy(&err);
+            assert_eq!(code, REFUSED, "[{label}] stderr={err} stdout={out}");
+            assert!(err.is_empty(), "[{label}] nothing on stderr: {err}");
+            assert!(
+                out.contains("Platform fee remittance — ") && out.contains("Recent attempts:"),
+                "[{label}] {out}"
+            );
+            assert!(
+                out.contains(
+                    "Reconciling in-flight remittance hash-held (planned at unix 100 by old-run, lease until unix"
+                ) && out.contains(
+                    ": 13 sats to maxplayer@agi.cash, gross 15 sats) — SPENDING since unix 100, bound to melt quote paid-quote-never-raised: asking the mint about that quote by id"
+                ),
+                "[{label}] {out}"
+            );
+            let held: Vec<&str> = out
+                .lines()
+                .filter(|line| line.starts_with("  HELD: remittance"))
+                .collect();
+            assert_eq!(held.len(), 1, "[{label}] exactly one HELD line: {out}");
+            assert!(
+                held[0].starts_with(
+                    "  HELD: remittance hash-held is SPENDING (admitted by old-run at unix 100), bound to melt quote paid-quote-never-raised; this wallet holds no such melt quote; 15 sats of receipts stay pinned to it — a spending row is released by nobody and on no clock; it settles only when the mint reports that quote PAID; an operator decision, not a timeout, resolves it. REFUSED — nothing moved by this run; re-run later to reconcile."
+                ),
+                "[{label}] the one HELD line, whole: {}",
+                held[0]
+            );
+            for forbidden in [
+                "Plan:",
+                "DRY RUN",
+                "Journaled",
+                "PAID —",
+                "still settling",
+                "released 15 sats",
+                "paying...",
+            ] {
+                assert!(
+                    !out.contains(forbidden),
+                    "[{label}] a held run must not print {forbidden:?}: {out}"
+                );
+            }
+        }
+        let store = SellerStore::open(root.join(STATE_DB_FILE)).expect("reopen");
+        let row = store
+            .in_flight_remittance()
+            .expect("query")
+            .expect("still in flight");
+        assert_eq!(
+            (row.state, row.spending_quote_id.as_deref()),
+            (
+                RemittanceState::Spending,
+                Some("paid-quote-never-raised")
+            ),
+            "held: nothing written by either run"
+        );
+        let accrued = store.accrued_fees().expect("read");
+        assert_eq!(
+            (
+                accrued.remitted_fee_sats,
+                accrued.in_flight_fee_sats,
+                accrued.unremitted_fee_sats
+            ),
+            (0, 15, 0),
+            "the receipts stay pinned to the held row"
+        );
+        let attempts = store.recent_remit_attempts(10).expect("attempts");
+        assert_eq!(
+            attempts.len(),
+            1,
+            "the --confirm hold is journaled; the dry run journals nothing: {attempts:?}"
+        );
+        assert_eq!(attempts[0].remittance_id.as_deref(), Some("hash-held"));
         let _ = std::fs::remove_dir_all(&root);
     }
 }
