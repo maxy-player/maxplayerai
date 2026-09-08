@@ -1,0 +1,72 @@
+citation remap 1a5c7c5 -> 240240c; hunks per file: fee_remit.rs=67, wallet_ops.rs=48, seller_fees.rs=0, run.rs=0, store.rs=4, home.rs=0, platform_fee.rs=0, lnurl_pay.rs=0, sell.rs=0, lib.rs=0
+body-line    21  run.rs           run.rs:7210–7211       -> run.rs:7210–7211
+body-line    21  run.rs           :7239                  -> :7239
+body-line    21  run.rs           :4235                  -> :4235
+body-line    21  run.rs           :7316                  -> :7316
+body-line    21  seller_fees.rs   seller_fees.rs:418     -> seller_fees.rs:418
+body-line    23  wallet_ops.rs    wallet_ops.rs:984      -> wallet_ops.rs:1183
+body-line    23  wallet_ops.rs    :1117                  -> :1316
+body-line    24  seller_fees.rs   seller_fees.rs:110     -> seller_fees.rs:110
+body-line    24  seller_fees.rs   :413                   -> :413
+body-line    24  fee_remit.rs     fee_remit.rs:511       -> fee_remit.rs:514
+body-line    25  run.rs           run.rs:4154–4166       -> run.rs:4154–4166
+body-line    25  run.rs           :4235                  -> :4235
+body-line    25  run.rs           :4260                  -> :4260
+body-line    25  run.rs           :7240                  -> :7240
+body-line    26  platform_fee.rs  platform_fee.rs:68     -> platform_fee.rs:68
+body-line    34  fee_remit.rs     :6941                  -> :7459
+body-line    34  fee_remit.rs     :1430                  -> LEFT (override)
+body-line    34  fee_remit.rs     :6191                  -> :6709
+body-line    34  fee_remit.rs     :6670                  -> :7188
+body-line    34  fee_remit.rs     :5408                  -> :5926
+body-line    34  fee_remit.rs     :3949                  -> :4212
+body-line    34  run.rs           run.rs:13712           -> run.rs:13712
+body-line    34  fee_remit.rs     fee_remit.rs:5602      -> fee_remit.rs:6120
+body-line    34  fee_remit.rs     :6056                  -> :6574
+body-line    34  fee_remit.rs     :6364                  -> :6882
+body-line    34  fee_remit.rs     :6513                  -> :7031
+body-line    34  fee_remit.rs     :5701                  -> :6219
+body-line    34  fee_remit.rs     :5825                  -> :6343
+body-line    34  fee_remit.rs     :5949                  -> :6467
+body-line    34  store.rs         store.rs:4494          -> store.rs:4593
+body-line    34  fee_remit.rs     fee_remit.rs:184       -> fee_remit.rs:186
+body-line    36  seller_fees.rs   seller_fees.rs:388     -> seller_fees.rs:388
+body-line    36  seller_fees.rs   :429                   -> :429
+body-line    36  seller_fees.rs   :38                    -> :38
+body-line    36  seller_fees.rs   :1040                  -> :1040
+body-line    36  seller_fees.rs   :1160                  -> :1160
+body-line    36  store.rs         store.rs:47            -> store.rs:47
+body-line    40  mod.rs           mod.rs:356–369         -> CDK/other file, left
+body-line    40  mod.rs           mod.rs:286–460         -> CDK/other file, left
+body-line    40  cdk              :687–697               -> CDK bare, left
+body-line    40  cdk              :907–911               -> CDK bare, left
+body-line    40  mod.rs           mod.rs:515             -> CDK/other file, left
+body-line    40  cdk              :831–887               -> CDK bare, left
+body-line    40  mod.rs           mod.rs:673             -> CDK/other file, left
+body-line    40  cdk              :817–831               -> CDK bare, left
+body-line    40  wallet_ops.rs    :1377                  -> :1577
+body-line    40  wallet_ops.rs    :1437                  -> :1637
+body-line    40  wallet_ops.rs    :408                   -> :606
+body-line    40  wallet_ops.rs    :294                   -> :479 (`admits_confirmable`, which replaced `admits_total` in round 9) (override)
+body-line    40  wallet_ops.rs    :311                   -> :507
+body-line    40  mod.rs           mod.rs:383–399         -> CDK/other file, left
+body-line    40  cdk              :678                   -> CDK bare, left
+body-line    40  cdk              :704                   -> CDK bare, left
+body-line    40  cdk              :706–712               -> CDK bare, left
+body-line    42  seller_fees.rs   seller_fees.rs:1160    -> seller_fees.rs:1160
+body-line    42  run.rs           run.rs:3686            -> run.rs:3686
+body-line    42  fee_remit.rs     fee_remit.rs:158       -> fee_remit.rs:160
+body-line    42  fee_remit.rs     fee_remit.rs:184       -> fee_remit.rs:186
+body-line    48  wallet_ops.rs    wallet_ops.rs:1498     -> LEFT (override)
+body-line    48  ?                :1504–1507             -> LEFT (override)
+body-line    48  fee_remit.rs     fee_remit.rs:1624–1628 -> LEFT (override)
+body-line    48  ?                :1646–1657             -> LEFT (override)
+body-line    48  wallet_ops.rs    wallet_ops.rs:1595     -> wallet_ops.rs:1837
+body-line    48  fee_remit.rs     fee_remit.rs:1753      -> fee_remit.rs:1941
+body-line    48  fee_remit.rs     :238                   -> wallet_ops.rs:288 (override)
+body-line    48  fee_remit.rs     :4712                  -> :4969
+body-line    52  lnurl_pay.rs     lnurl_pay.rs:27        -> LEFT (override)
+body-line    52  seller_fees.rs   seller_fees.rs:20      -> LEFT (override)
+body-line    52  ?                :1086                  -> LEFT (override)
+body-line    52  ?                :1126–1153             -> LEFT (override)
+total 70  remapped 49  left-as-is 21  ambiguous 0  unresolved 0
