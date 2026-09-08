@@ -2226,6 +2226,7 @@ pub(crate) mod test_support {
     ///   `input_fee` = fee on that count (`:384–387`), selection target `need + input_fee`
     ///   (`:389`), largest-first proofs until they cover the target plus their own input fee
     ///   (`select_proofs(…, true)`, `:391–397`), `swap_fee` = fee on the proofs picked (`:403`).
+    ///
     /// A Fake without a pool has unbounded funds: one notional proof is swapped.
     pub(crate) fn layout(
         input_fee_ppk: u64,
@@ -4149,8 +4150,8 @@ mod tests {
         let delta = before - after;
         assert_eq!(
             delta,
-            12 + 0 + 2 + 1,
-            "amount + fee paid + input fee + swap fee"
+            12 + 2 + 1,
+            "amount + input fee + swap fee (the mint took no fee: fee paid 0)"
         );
         assert!(
             delta <= 20,
@@ -4324,7 +4325,8 @@ mod tests {
             Some(14),
             "32 − 1 swap fee − 14 − 1 input fee − 2 fee paid"
         );
-        assert!(32 - 14 <= 20, "the wallet lost 18 sats against 20 accrued");
+        let lost = 32 - fake.pool_value().expect("pool");
+        assert!(lost <= 20, "the wallet lost {lost} sats against 20 accrued");
         let rows = store.remittances().expect("rows");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].state, RemittanceState::Settled);

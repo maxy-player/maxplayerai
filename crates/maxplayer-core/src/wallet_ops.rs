@@ -1304,6 +1304,7 @@ async fn expected_melt_fees(wallet: &Wallet, inputs_needed: Amount) -> Result<u6
 /// 4. under it ⇒ returns a [`PreparedMeltPayment`] whose [`PreparedMeltPayment::confirm`] performs
 ///    the swap (if any) and the melt request — the only spend on this path — and whose
 ///    [`PreparedMeltPayment::cancel`] (or drop) releases it.
+///
 /// Same mint resolution and `allow_real_mints` gate as every melt here. The operator's
 /// `melt_within_*` path does NOT use this: it keeps its reserve-only ceiling (addendum 8 §6).
 pub fn prepare_melt_payment_blocking(
