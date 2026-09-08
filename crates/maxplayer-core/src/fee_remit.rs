@@ -2787,6 +2787,12 @@ pub(crate) mod test_support {
         /// before addendum 8); positive ⇒ every payment takes the SDK's swap branch and pays a
         /// proof-input fee and a swap fee on top of amount + reserve (see [`layout`]).
         pub(crate) input_fee_ppk: u64,
+        /// When set, the proof input fee `prepare_melt` REPORTS on its selection is this figure
+        /// instead of the layout's — the fee-metadata drift model (round 9 plan §5 §1.4(b)): the
+        /// SDK computes the prepared fee from the selected proofs' keyset, the swap lands on the
+        /// active keyset, and the two can disagree; the actual fee `confirm` recomputes on the
+        /// swapped proofs is unaffected. Only the PREPARED figure moves.
+        pub(crate) prepared_input_override: Option<u64>,
         /// The exact proofs each debit spent, in order (empty inner vec when `proofs` is `None`).
         pub(crate) proofs_spent: Vec<Vec<u64>>,
         /// When set, the observational balance read after a confirmed melt fails (addendum 9 §2.3):
@@ -2853,6 +2859,7 @@ pub(crate) mod test_support {
                 max_msat: 1_000_000_000,
                 reserve_for: Box::new(reserve_for),
                 live_reserve_for: None,
+                prepared_input_override: None,
                 melt_results: Vec::new(),
                 status: Ok(None),
                 registry: None,
@@ -3235,6 +3242,9 @@ pub(crate) mod test_support {
                 swap_fee_sats,
                 requires_swap,
             } = layout;
+            // Fee-metadata drift knob: the PREPARED figure the SDK reports may differ from the
+            // layout's; the actual fee on the swapped proofs (recomputed by the bound) does not.
+            let input_fee_sats = self.prepared_input_override.unwrap_or(input_fee_sats);
             let prepare_now = self.now_unix();
             if u64::try_from(prepare_now).is_ok_and(|now| now > quote.expiry_unix) {
                 // CDK wallet `initialize_melt`: `expiry > unix_time()` at prepare — the wallet's
@@ -4940,27 +4950,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // Regression (ii), addendum 9 §1.4: the prepared figures FIT but the post-swap arithmetic does
-    // not. Same seller, mint and layout; the payment quote's reserve shrank 3 → 0 (addendum 3 §1
-    // allows it), so need = 12 = 8+4 ⇒ prepared input 2, swap 1, total 12 + 0 + 2 + 1 = 15 ≤ 20 —
-    // the total bound ADMITS it. But confirm would swap to 14 = [8, 4, 2] ⇒ actual input 3 ⇒ needs
-    // 15 > 14: pinned CDK refuses AFTER paying the swap (`melt/saga/mod.rs:704–712`) — and on this
-    // path that would land after the fence, leaving a bound Spending row held. The §1.1 check runs
-    // that arithmetic BEFORE the fence: refused, the prepared melt cancelled (local), no swap, no
-    // melt, wallet delta exactly 0, no request posted (the quote is still UNPAID), the row released
-    // (Planned → Failed, receipts back), one REFUSED line naming the target, the actual fee and the
-    // estimate. Until round 8 the fake let this schedule "succeed" (verdict da0ee92 §4.4).
+    // Regression (ii), addendum 9 §1.4 / addendum 10 §1.1: the prepared figures FIT but the
+    // post-swap arithmetic does not. Same seller, mint and layout, reserve 3 at estimate AND at
+    // payment (so addendum 10 §1.4's re-plan has nothing to do — its schedule, the reserve
+    // shrinking 3 → 0, now legitimately re-plans and pays: see `a_reserve_that_shrinks_…` below),
+    // but the SDK's PREPARED input fee on the selection is 0 (fee-metadata drift: the selected
+    // proofs' keyset reports no fee; the swap lands on the active 1000-ppk keyset), so need = 15 =
+    // 8+4+2+1 with a prepared total of 15 + 0 + 1 = 16 ≤ 20 — the prepared total ADMITS it. But
+    // confirm would swap to 15 = [8, 4, 2, 1] ⇒ actual input 4 ⇒ needs 19 > 15: pinned CDK refuses
+    // AFTER paying the swap (`melt/saga/mod.rs:704–712`) — and on this path that would land after
+    // the fence, leaving a bound Spending row held. The §1.1 bound runs that arithmetic BEFORE the
+    // fence: refused, the prepared melt cancelled (local), no swap, no melt, wallet delta exactly 0,
+    // no request posted (the quote is still UNPAID), the row released (Planned → Failed, receipts
+    // back), one REFUSED line naming the target, the actual fee and the estimate. Until round 8 the
+    // fake let the old schedule "succeed" (verdict da0ee92 §4.4).
     #[test]
     fn a_fee_bearing_schedule_whose_prepared_figures_fit_but_post_swap_arithmetic_does_not_is_refused_before_the_fence()
      {
         let (store, root) = store_with_fees("fee-bearing-post-swap", &[10, 10]);
         let mut fake = Fake::new(|_| 3);
-        fake.live_reserve_for = Some(Box::new(|_| 0));
+        fake.prepared_input_override = Some(0);
         fake.input_fee_ppk = 1000;
         fake.proofs = Some(fake_proofs(&[32]));
         let registry = quote_registry();
         fake.registry = Some(Arc::clone(&registry));
-        fake.melt_results = vec![Ok((12, 0))];
+        fake.melt_results = vec![Ok((12, 3))];
         let (outcome, out) = run_remit(&store, &mut fake, RemitTrigger::Command, 100);
         match &outcome {
             RemitOutcome::MeltRefused {
@@ -4970,7 +4984,7 @@ mod tests {
                 assert_eq!(remittance_id, "hash-12-2");
                 assert_eq!(
                     reason,
-                    "melt refused before spending: the wallet would swap to 14 sats ([8, 4, 2]) for mint https://mint.example quote paid-quote-lnbc-fake-12-2 and the mint's actual proof input fee on those proofs is 3 sats (prepared estimate 2 sats at 1000 ppk), so 12 sats invoice + 0 sats fee reserve + 3 sats would need 15 sats and the SDK would refuse AFTER paying the 1 sats swap fee; the prepared melt was cancelled before any fee-bearing request"
+                    "melt refused before spending: the wallet would swap to 15 sats ([8, 4, 2, 1]) for mint https://mint.example quote paid-quote-lnbc-fake-12-2 and the mint's actual proof input fee on those proofs is 4 sats (prepared estimate 0 sats at 1000 ppk), so 12 sats invoice + 3 sats fee reserve + 4 sats would need 19 sats and the SDK would refuse AFTER paying the 1 sats swap fee; the prepared melt was cancelled before any fee-bearing request"
                 );
             }
             other => panic!("expected MeltRefused, got {other:?}\n{out}"),
