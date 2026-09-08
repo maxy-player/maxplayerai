@@ -88,9 +88,16 @@
 //! - the host's reads of the exchange files are hardened ([`read_exchange_file`], above), so a live
 //!   job cannot park or exhaust the host through the channel;
 //! - the reap is MANDATORY ([`reap_other_processes`]): it always runs, and a `/proc` that cannot be
-//!   listed or a survivor that will not die fails the delivery closed. It is gated on the environment
-//!   the host set at `docker run` ([`CONTAINER_DELIVERY_ENV`]), read once before the agent exists —
-//!   never on a sentinel file, which a root job could unlink to skip it;
+//!   listed or a survivor that will not die fails the delivery closed. It classifies a thread group
+//!   by ALL of its tasks. A group is dead only when every entry of `/proc/<tgid>/task/` is `Z` or
+//!   `X`. A zombie leader with a live sibling thread is live, and the reap kills it. The reason:
+//!   `/proc/<tgid>/status` reports the leader only, and Linux keeps an exited leader as a zombie
+//!   while a sibling thread runs. An enumeration that fails part way refuses the delivery, because
+//!   an incomplete listing proves nothing. The reap is gated on the environment the host set at
+//!   `docker run` ([`CONTAINER_DELIVERY_ENV`]), read once before the agent exists — never on a
+//!   sentinel file, which a root job could unlink to skip it. `tests/reap_isolated_linux.rs` runs the
+//!   real reaper against such a survivor; `scripts/reap-isolated-test.sh` runs that test in a
+//!   fresh container;
 //! - a seat whose daemon runs as uid 0 puts the job at root INSIDE the container, where this same-uid
 //!   boundary is weakest, so container delivery is not the default there: it takes an explicit
 //!   `[sandbox] container_delivery = true` (`SandboxConfig::container_delivery_enabled`).
@@ -1452,8 +1459,17 @@ fn restrict_mode(path: &Path, mode: u32) -> Result<(), OrchestratorError> {
 /// double-forked survivor the agent left behind — the one thing that could re-point the delivery
 /// branch, plant a config, or read the fresh token between the gate and the push. Fails closed when
 /// anything survives, and when `/proc` cannot be listed at all.
+///
+/// The survivor test is by TASK, not by process ([`other_live_pids`]). A thread group is dead only
+/// when every one of its tasks is `Z` or `X`. A group whose leader is a zombie while a sibling thread
+/// lives is live: `kill(tgid, SIGKILL)` reaches every thread of the group, and the next listing sees
+/// the group dead, or gone. An enumeration error at any level refuses the delivery.
+///
+/// ⚠ `pub` for ONE caller: `tests/reap_isolated_linux.rs`, which runs this function against a real
+/// zombie-leader survivor as the only process tree of a fresh container. Never call it on a host:
+/// it SIGKILLs every process but pid 1 and the caller.
 #[cfg(all(feature = "wallet", target_os = "linux"))]
-fn reap_other_processes() -> Result<(), OrchestratorError> {
+pub fn reap_other_processes() -> Result<(), OrchestratorError> {
     reap_with(other_live_pids, kill_pid, std::thread::sleep)
 }
 
@@ -1461,7 +1477,7 @@ fn reap_other_processes() -> Result<(), OrchestratorError> {
 /// container empty with, so the reap fails CLOSED: no marker, no token, no push. (The entry refuses
 /// before the agent runs on such a build; this is the second lock.)
 #[cfg(all(feature = "wallet", not(target_os = "linux")))]
-fn reap_other_processes() -> Result<(), OrchestratorError> {
+pub fn reap_other_processes() -> Result<(), OrchestratorError> {
     reap_with(
         || {
             Err(OrchestratorError::Io(
@@ -1518,35 +1534,108 @@ fn kill_pid(pid: u32) {
     }
 }
 
-/// Every pid in `/proc` except 1 and this process that is not already a zombie or dead.
+/// Every thread group in `/proc` except pid 1 and this process that still has a live task.
+///
+/// `/proc` lists thread-group ids, and `/proc/<tgid>/status` reports the state of the group LEADER
+/// only. Linux keeps an exited leader as a zombie while a sibling thread lives (`exit_notify` reaps
+/// the leader only when the thread group is empty). A leader-only test therefore misses a group whose
+/// worker thread runs, and that worker shares the orchestrator's uid. The rule here is by task: a
+/// group is dead only when every entry of `/proc/<tgid>/task/` is `Z` or `X`. One task in any other
+/// state makes the group live. A group whose directory is gone between the listing and the read is
+/// dead.
+///
+/// Fails closed. Each of these is an [`OrchestratorError::Io`], never a guess, because an incomplete
+/// enumeration is not proof of emptiness:
+/// - `/proc` cannot be listed, or the listing fails part way (no entry is dropped);
+/// - a `task/` directory or a `status` file cannot be read for a reason other than "gone";
+/// - a `task/` entry is not a tid, or a `status` file has no `State:` line.
 #[cfg(all(feature = "wallet", target_os = "linux"))]
 fn other_live_pids() -> Result<Vec<u32>, OrchestratorError> {
     let me = std::process::id();
     let entries = std::fs::read_dir("/proc")
         .map_err(|error| OrchestratorError::Io(format!("list /proc: {error}")))?;
     let mut live = Vec::new();
-    for entry in entries.flatten() {
-        let Some(pid) = entry
+    for entry in entries {
+        let entry = entry.map_err(|error| OrchestratorError::Io(format!("list /proc: {error}")))?;
+        // `/proc` also holds `self`, `sys`, `net`, …: only a numeric name is a thread group.
+        let Some(tgid) = entry
             .file_name()
             .to_str()
             .and_then(|n| n.parse::<u32>().ok())
         else {
             continue;
         };
-        if pid == 1 || pid == me {
+        if tgid == 1 || tgid == me {
             continue;
         }
-        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
-        let state = status
-            .lines()
-            .find_map(|line| line.strip_prefix("State:"))
-            .and_then(|rest| rest.trim().chars().next());
-        if matches!(state, Some('Z') | Some('X')) {
-            continue;
+        if thread_group_is_live(tgid)? {
+            live.push(tgid);
         }
-        live.push(pid);
     }
     Ok(live)
+}
+
+/// Whether ANY task of thread group `tgid` is in a state other than `Z` (zombie) or `X` (dead).
+/// `Ok(false)` when every task is `Z`/`X`, or when the group is gone. Any other failure is `Err`.
+#[cfg(all(feature = "wallet", target_os = "linux"))]
+fn thread_group_is_live(tgid: u32) -> Result<bool, OrchestratorError> {
+    let task_dir = format!("/proc/{tgid}/task");
+    let tasks = match std::fs::read_dir(&task_dir) {
+        Ok(tasks) => tasks,
+        Err(error) if task_is_gone(&error) => return Ok(false),
+        Err(error) => {
+            return Err(OrchestratorError::Io(format!("list {task_dir}: {error}")));
+        }
+    };
+    for task in tasks {
+        let task =
+            task.map_err(|error| OrchestratorError::Io(format!("list {task_dir}: {error}")))?;
+        let name = task.file_name();
+        let Some(tid) = name.to_str().and_then(|n| n.parse::<u32>().ok()) else {
+            return Err(OrchestratorError::Io(format!(
+                "unexpected entry {name:?} in {task_dir}; refusing to classify the group"
+            )));
+        };
+        match task_state(&format!("{task_dir}/{tid}/status"))? {
+            // The task exited between the listing and the read, or it is a zombie or dead.
+            None | Some('Z') | Some('X') => {}
+            Some(_) => return Ok(true),
+        }
+    }
+    Ok(false)
+}
+
+/// The first character of the `State:` line of a `/proc/…/status` file. `Ok(None)` when the task is
+/// gone. `Err` when the file cannot be read for any other reason, or has no `State:` line.
+#[cfg(all(feature = "wallet", target_os = "linux"))]
+fn task_state(status_path: &str) -> Result<Option<char>, OrchestratorError> {
+    let status = match std::fs::read_to_string(status_path) {
+        Ok(status) => status,
+        Err(error) if task_is_gone(&error) => return Ok(None),
+        Err(error) => {
+            return Err(OrchestratorError::Io(format!(
+                "read {status_path}: {error}"
+            )));
+        }
+    };
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("State:"))
+        .and_then(|rest| rest.trim().chars().next())
+        .map(Some)
+        .ok_or_else(|| {
+            OrchestratorError::Io(format!(
+                "{status_path} has no State: line; refusing to classify the task"
+            ))
+        })
+}
+
+/// Whether a `/proc` read failed because the task no longer exists. procfs answers `ENOENT` when the
+/// tid is not found at lookup, and `ESRCH` when the task exits between the open and the read. Both
+/// name a task that is gone, and neither can hide a live one.
+#[cfg(all(feature = "wallet", target_os = "linux"))]
+fn task_is_gone(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
 }
 
 #[cfg(test)]
