@@ -1,0 +1,100 @@
+greps at 036302b1311f9d93fa82bc02b731630288aad647 (worktree HEAD = 036302b, reports-only after 1a5c7c5; .rs identical to 1a5c7c5: 0 rs files differ)
+## gate 1
+1546:fn default_allow_real_mints() -> bool {
+1547-    true
+1548-}
+1411:    #[serde(default = "default_allow_real_mints")]
+984:    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+1044:    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+1119:    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+1164:    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+1390:    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+1633:    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+1688:    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+1727:    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+972:pub async fn send_async(
+1025:pub async fn receive_async(
+1105:pub async fn melt_within_async(
+1153:pub async fn pay_melt_quote_async(
+1377:pub fn prepare_melt_payment_blocking(
+1623:pub async fn melt_quote_async(
+1678:pub async fn melt_status_for_quote_async(
+110:            "--confirm" if remit => confirm = true,
+413:    let trigger = if confirm {
+511:    pub fn pays(self) -> bool {
+512-        !matches!(self, Self::DryRun)
+513-    }
+## gate 2a
+crates/maxplayer/src/seller_fees.rs:418:    let outcome = remit(&store, &mut effects, trigger, now_unix, out)?;
+crates/maxplayer-core/src/fee_remit.rs:1965:        Ok(mut effects) => remit_best_effort(store, &mut effects, trigger, now_unix),
+crates/maxplayer-core/src/fee_remit.rs:4199:        let error = remit(&store, &mut fake, RemitTrigger::Command, 101, &mut out)
+crates/maxplayer-core/src/fee_remit.rs:4225:        let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 100);
+crates/maxplayer-core/src/fee_remit.rs:4272:        let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 102);
+crates/maxplayer-core/src/fee_remit.rs:4300:        let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 104);
+crates/maxplayer-core/src/fee_remit.rs:6531:            let outcome = remit(&store, &mut a, RemitTrigger::Collect, 100, &mut out);
+crates/maxplayer-core/src/fee_remit.rs:6546:            let outcome = remit(&store, &mut b, RemitTrigger::Command, 401, &mut out);
+crates/maxplayer-core/src/seller_node/run.rs:3321:            crate::fee_remit::remit_best_effort(store, effects.as_mut(), trigger, now_unix())
+crates/maxplayer-core/src/seller_node/run.rs:3323:        None => crate::fee_remit::remit_live_best_effort(store, home, trigger, now_unix()),
+crates/maxplayer-core/src/seller_node/run.rs:13752:        let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 5001);
+crates/maxplayer-core/src/seller_node/run.rs:13760:        let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 5002);
+crates/maxplayer-core/src/seller_node/run.rs:13818:        let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 5003);
+crates/maxplayer-core/src/seller_node/run.rs:13843:        let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 5004);
+crates/maxplayer-core/src/seller_node/run.rs:13876:        let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 5005);
+crates/maxplayer-core/src/seller_node/run.rs:14850:        let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 100);
+crates/maxplayer-core/src/fee_remit.rs:1935:pub fn remit_best_effort(
+crates/maxplayer-core/src/fee_remit.rs:1958:pub fn remit_live_best_effort(
+crates/maxplayer-core/src/seller_node/run.rs:3666:    async fn drain_remit_in_flight(&self) {
+crates/maxplayer-core/src/seller_node/run.rs:4041:        self.drain_remit_in_flight().await;
+crates/maxplayer-core/src/seller_node/run.rs:4159:        let remit_retry = tokio::time::sleep(self.remit_pacing_lock().boot_delay());
+303:    tokio::task::spawn_local(async move {
+1785:            handles.push(tokio::spawn(async move {
+2093:    tokio::task::spawn_blocking(move || -> Result<(), DeliveryWorkdirError> {
+6051:            tokio::task::spawn_local(async move {
+7264:        let spawned = std::thread::Builder::new()
+7327:        let spawned = std::thread::Builder::new()
+7771:        let waiter = tokio::spawn(async move { waiting.acquire_unreserved().await.is_some() });
+14306:        let loop_handle = local.spawn_local(async move { runner.run().await });
+14437:        let loop_handle = local.spawn_local(async move { runner.run().await });
+14557:        let loop_handle = local.spawn_local(async move { runner.run().await });
+14640:        let loop_handle = local.spawn_local(async move { runner.run().await });
+14930:        let loop_handle = local.spawn_local(async move { runner.run().await });
+15065:        let loop_handle = local.spawn_local(async move { runner.run().await });
+15134:        let loop_handle = local.spawn_local(async move { runner.run().await });
+15239:        let loop_handle = local.spawn_local(async move { runner.run().await });
+15330:        let loop_handle = local.spawn_local(async move { runner.run().await });
+16418:        let handle = tokio::spawn(supervise_harness_probe(Arc::clone(&roster), 0, async {
+4159:        let remit_retry = tokio::time::sleep(self.remit_pacing_lock().boot_delay());
+## gate 3
+      38
+1a5c7c5:crates/maxplayer-core/src/platform_fee.rs:68:pub const PLATFORM_FEE_ADDRESS: &str = "maxplayer@agi.cash";
+1a5c7c5:crates/maxplayer-core/src/platform_fee.rs:220:        assert_eq!(PLATFORM_FEE_ADDRESS, "maxplayer@agi.cash");
+  14 crates/maxplayer-core/src/fee_remit.rs
+   5 crates/maxplayer-core/src/lnurl_pay.rs
+   2 crates/maxplayer-core/src/platform_fee.rs
+   1 crates/maxplayer-core/src/seller_node/run.rs
+   6 crates/maxplayer-core/src/seller_node/store.rs
+  10 crates/maxplayer/src/seller_fees.rs
+crates/maxplayer-core/src/lnurl_pay.rs: 705 737 755 756 757
+crates/maxplayer-core/src/fee_remit.rs: 2898 3438 3441 3445 3499 3519 3557 3574 3624 3893 3897 4632 4990 4993
+crates/maxplayer-core/src/seller_node/store.rs: 3888 4030 4408 4409 4727 4830
+crates/maxplayer-core/src/seller_node/run.rs: 14871
+crates/maxplayer/src/seller_fees.rs: 688 708 730 752 773 774 775 776 1188 1251
+crates/maxplayer-core/src/lnurl_pay.rs:656:pub(crate) mod test_support {
+crates/maxplayer-core/src/lnurl_pay.rs:699:mod tests {
+crates/maxplayer/src/seller_fees.rs:500:mod tests {
+crates/maxplayer-core/src/fee_remit.rs:2352:pub(crate) mod test_support {
+crates/maxplayer-core/src/fee_remit.rs:3364:mod tests {
+crates/maxplayer-core/src/platform_fee.rs:127:mod tests {
+crates/maxplayer-core/src/seller_node/store.rs:2840:mod tests {
+crates/maxplayer-core/src/seller_node/run.rs:7937:mod tests {
+1a5c7c5:crates/maxplayer-core/src/platform_fee.rs:56:///   party that owes the fee. A seller-editable `fee_address` would let any seller poi
+## gate 4 spend edge
+1576:    let prepared = match effects.prepare_melt(&quote.quote_id, &ceiling) {
+1600:            if let Err(error) = effects.cancel_melt(prepared) {
+1653:            if let Err(error) = effects.cancel_melt(prepared) {
+1704:        let cancel_note = match effects.cancel_melt(prepared) {
+1720:    match effects.confirm_melt(prepared) {
+ 1 file changed, 1291 insertions(+), 3 deletions(-)
+## gate 4 census (added lines a6217328..1a5c7c5, *.rs)
+   14773
+send_async 0 · prepare_send 0 · send_blocking 0 · pay_invoice 0 · melt_blocking 0 · melt_async 3 · melt_within_async 8 · melt_within_blocking 2 · melt_quote_async 15 · melt_status_for_quote_async 4 · pay_melt_quote_async 8 · pay_melt_quote_blocking 5 · prepare_melt 58 · confirm_melt 15 · cancel_melt 7 · prepare_melt_payment_blocking 18 · prepared_melt_thread 2 · PreparedMeltPayment 18 · MeltCeiling 34 · admits_total 15 · confirm_would_succeed 6 · plan_confirmable_invoice 8 · admit_remittance_spend 18 · release_remittance 19 · ReleaseOn 56 · TerminalBoundQuote 8 · SpendingHeld 23 · plan_remittance 29 · expected_fees_sats 19 · expected_melt_fees 2 · input_fee_ppk 62 · fee_paid 24 · 

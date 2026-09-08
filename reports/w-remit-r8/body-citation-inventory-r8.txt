@@ -1,0 +1,165 @@
+citations at 1a5c7c5 (rs) / <final> (docs) — every product file:line cited by body-r8-final-draft.md, with the source line
+fee_remit.rs:
+158://! `a_spending_row_is_never_released_by_reconciliation_only_settled`). What "at most one debit"
+184://! quotes regardless of expiry, as the inspected CDK 0.17.2 implementation does. What each shares
+225:pub const REMIT_LEASE: Duration = Duration::from_secs(5 * 60);
+234:pub const SPEND_MARGIN: Duration = Duration::from_secs(60);
+238:pub enum MeltFailure {
+335:fn prepare_melt(
+343:fn confirm_melt(&mut self, prepared: PreparedMelt) -> Result<MeltOutcome, MeltFailure>;
+347:fn cancel_melt(&mut self, prepared: PreparedMelt) -> Result<(), MeltFailure>;
+440:fn prepare_melt(
+445:wallet_ops::prepare_melt_payment_blocking(&self.home, quote_id, None, ceiling)
+460:fn confirm_melt(&mut self, prepared: PreparedMelt) -> Result<MeltOutcome, MeltFailure> {
+463:.confirm()
+472:fn cancel_melt(&mut self, prepared: PreparedMelt) -> Result<(), MeltFailure> {
+511:pub fn pays(self) -> bool {
+572:SpendingHeld {
+594:RowChangedUnderMe { remittance_id: String },
+650:Self::SpendingHeld {
+773:pub fn reconcile_decision(
+786:if status.is_some_and(|status| status.state == MeltQuoteState::Paid) {
+797:Reconcile::Hold(Refusal::SpendingHeld {
+810:if let (true, Some(quote_id)) = (spending, bound) {
+822:return Reconcile::Hold(Refusal::Settling {
+931:pub fn remit(
+1030:fn remit_inner(
+1132:return Ok(RemitOutcome::Refused(Refusal::RowChangedUnderMe {
+1325:return Ok(RemitOutcome::Refused(Refusal::FeesDoNotFit {
+1358:return Ok(RemitOutcome::Refused(Refusal::FeesDoNotFit {
+1409:let planned = match store.plan_remittance(&plan, effects.owner(), lease_until_unix, now_unix) {
+1576:let prepared = match effects.prepare_melt(&quote.quote_id, &ceiling) {
+1597:let actual_input_fee_sats = match confirm_would_succeed(&preparation, gross) {
+1600:if let Err(error) = effects.cancel_melt(prepared) {
+1624:effects.after_quote(&planned, &quote);
+1631:store
+1646:let admitted = match admitted {
+1653:if let Err(error) = effects.cancel_melt(prepared) {
+1693:// 3. Confirm the prepared melt of Q. First the local refusal of a quote inside its margin of
+1698:let pay_now_unix = effects.now_unix();
+1704:let cancel_note = match effects.cancel_melt(prepared) {
+1720:match effects.confirm_melt(prepared) {
+1753:"PAID — remittance {} settled\n  gross discharged: {} sats\n  melt fee taken by the mint: {} sats (quote {} reserved {} 
+1935:pub fn remit_best_effort(
+1958:pub fn remit_live_best_effort(
+1965:Ok(mut effects) => remit_best_effort(store, &mut effects, trigger, now_unix),
+2231:pub(crate) fn fee_for(input_fee_ppk: u64, count: usize) -> u64 {
+2238:pub(crate) fn binary_split(amount: u64) -> Vec<u64> {
+2251:pub(crate) fn post_swap_figures(
+2272:pub(crate) fn plan_confirmable_invoice(
+2305:pub(crate) fn confirm_would_succeed(
+2322:"melt refused before spending: the wallet would swap to {target_sats} sats ({split:?}) for quote {} and the mint's actua
+2461:pub(crate) struct FakeSwap {
+2636:pub(crate) swaps: Vec<FakeSwap>,
+2672:pub(crate) melt_gate: Option<Arc<Gate>>,
+3167:fn confirm_melt(&mut self, prepared: PreparedMelt) -> Result<MeltOutcome, MeltFailure> {
+3949:fn an_unpaid_or_pending_interrupted_attempt_is_reconciled_without_paying_twice() {
+4405:fn the_fake_wallet_models_the_sdks_proof_input_and_swap_fees_and_the_total_bound_refuses_them()
+4620:fn a_fee_bearing_payment_whose_prepared_input_fee_differs_from_the_actual_pays_once_and_the_wallet_loses_at_most_the_gro
+4632:out.contains("invoice amount (maxplayer@agi.cash receives): 12 sats"),
+4712:fn a_failed_balance_read_after_a_fee_bearing_payment_prints_unknown_and_no_false_warning() {
+4762:fn a_fee_bearing_schedule_whose_prepared_figures_fit_but_post_swap_arithmetic_does_not_is_refused_before_the_fence()
+4781:"melt refused before spending: the wallet would swap to 14 sats ([8, 4, 2]) for quote paid-quote-lnbc-fake-12-2 and the 
+4871:fn a_fee_bearing_total_that_exceeds_the_gross_by_the_fee_is_refused_before_any_swap_or_melt() {
+4978:fn fee_aware_planning_sizes_the_invoice_so_a_fee_bearing_payment_fits_without_reserve_slack() {
+5046:fn fees_that_can_never_fit_are_refused_at_planning_not_at_payment() {
+5089:fn a_reserve_that_grows_between_estimate_and_payment_is_refused_before_spending() {
+5408:fn a_spending_row_is_never_released_by_reconciliation_only_settled() {
+5602:fn a_second_process_cannot_release_a_live_owners_planned_row_and_exactly_one_debit_happens() {
+5701:fn a_spending_row_is_not_released_when_its_lease_expires_and_its_owner_pays_exactly_once() {
+5825:fn an_owner_that_outlives_its_lease_is_released_and_its_fence_then_changes_zero_rows() {
+5949:fn an_owner_whose_lease_ran_down_while_it_paused_is_refused_by_its_own_fence() {
+6056:fn a_spending_row_is_reconciled_by_its_bound_quote_not_by_an_expired_estimate() {
+6191:fn a_bound_quote_expired_past_the_margin_is_held_and_its_owner_refuses_to_pay_it() {
+6364:fn an_owner_paused_after_its_quote_and_past_its_lease_is_released_and_never_pays_that_quote() {
+6513:fn a_release_decided_on_a_stale_planned_snapshot_cannot_revoke_a_later_admission() {
+6670:fn a_spending_rows_bound_quote_decides_its_release_on_the_full_path() {
+6941:fn a_payment_prepared_before_expiry_cannot_be_doubled_by_a_release_after_it() {
+wallet_ops.rs:
+49:MeltExceedsCeiling {
+66:MeltTotalExceedsCeiling {
+270:pub struct MeltCeiling {
+284:pub fn admits(&self, invoice_sats: u64, fee_reserve_sats: u64) -> bool {
+294:pub fn admits_total(
+311:pub fn total_debit(
+384:pub input_fee_ppk: u64,
+408:pub struct PreparedMeltPayment {
+545:#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+984:if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+1030:if token.is_empty() {
+1086:pub async fn melt_async(
+1105:pub async fn melt_within_async(
+1117:// deliberate action OUTSIDE the job-pay budget gate (BudgetGate is deliberately not wired in
+1153:pub async fn pay_melt_quote_async(
+1199:return Err(WalletOpsError::MeltExceedsCeiling {
+1220:.prepare_melt(&quote.id, HashMap::new())
+1228:.confirm()
+1333:async fn active_keyset_input_fee_ppk(wallet: &Wallet) -> Result<u64, String> {
+1377:pub fn prepare_melt_payment_blocking(
+1390:if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+1437:fn prepared_melt_thread(
+1479:return Err(WalletOpsError::MeltExceedsCeiling {
+1498:}
+1504:let swap_fee_sats = prepared.swap_fee().to_u64();
+1515:let refusal = WalletOpsError::MeltTotalExceedsCeiling {
+1572:let _ = runtime.block_on(prepared.cancel());
+1576:let verdict = command.recv();
+1580:.confirm()
+1595:let spent = paid_sats
+1613:.block_on(prepared.cancel())
+1653:let note = format!("keyset input_fee_ppk not readable: {reason}");
+1678:pub async fn melt_status_for_quote_async(
+1704:Ok(Some(MeltQuoteStatus {
+1720:pub async fn melt_status_for_invoice_async(
+2009:pub fn pay_melt_quote_blocking(
+2231:Ok(Some(outcome))
+2272:let rendered = format!("{outcome:?}");
+2322:let err = remove_mint(&mut home, crate::home::DEFAULT_MINIBITS_MINT_URL).expect_err("pin");
+seller_fees.rs:
+20://! `wallet_ops::prepare_melt_payment_blocking` → `PreparedMeltPayment::confirm`: the payment quote
+38:const REFUSED: i32 = 3;
+110:"--confirm" if remit => confirm = true,
+388:fn remit_live(home: Option<PathBuf>, confirm: bool, out: &mut dyn Write) -> Result<i32, String> {
+413:let trigger = if confirm {
+418:let outcome = remit(&store, &mut effects, trigger, now_unix, out)?;
+429:fn exit_code_for(outcome: &maxplayer_core::fee_remit::RemitOutcome) -> i32 {
+1040:fn a_held_spending_row_exits_refused_on_dry_run_and_confirm() {
+1086:
+1126:assert!(out.contains("0 sats unremitted"), "{out}");
+1160:fn a_held_spending_row_prints_one_held_line_and_exits_refused_on_dry_run_and_confirm() {
+run.rs:
+3321:crate::fee_remit::remit_best_effort(store, effects.as_mut(), trigger, now_unix())
+3323:None => crate::fee_remit::remit_live_best_effort(store, home, trigger, now_unix()),
+3686:"seller node platform fee: INCIDENT — a remittance attempt is still in flight after the {}ms drain bound; abandoning the
+4154:let auto_remit = self.node.home().config.platform_fee.auto_remit;
+4235:() = &mut remit_retry, if auto_remit && remit_retry_pending.is_none() => {
+4260:() = self.remit_pacing_changed.notified(), if auto_remit => {
+7210:if remit_follows_collect(&collected) {
+7239:fn remit_platform_fee_after_collect(&self, job_id: &str) {
+7240:if !self.node.home().config.platform_fee.auto_remit {
+7316:fn start_retry_remit(
+13712:fn a_failed_remittance_leaves_the_receipt_journaled_the_job_paid_and_the_balance_intact() {
+store.rs:
+47:pub const SCHEMA_VERSION: i64 = 13;
+354:TerminalBoundQuote { quote_id: String },
+1057:CREATE UNIQUE INDEX IF NOT EXISTS fee_remittances_one_planned
+2083:pub fn plan_remittance(
+2103:if let Some(active) = Self::in_flight_remittance_in(&tx)? {
+2104:return Err(PlanRefused::InFlight(Box::new(active)));
+2186:pub fn admit_remittance_spend(
+2255:pub fn settle_remittance(
+2338:pub fn release_remittance(
+2349:ReleaseOn::TerminalBoundQuote { quote_id } => tx.execute(
+4494:fn the_spend_fence_admits_only_the_owner_of_a_planned_row_with_lease_to_spare_and_only_once() {
+home.rs:
+1445:pub platform_fee: PlatformFeeConfig,
+1448:#[serde(default, skip_serializing_if = "BuyerReservationFloorConfig::is_default")]
+platform_fee.rs:
+56:///   party that owes the fee. A seller-editable `fee_address` would let any seller point the
+68:pub const PLATFORM_FEE_ADDRESS: &str = "maxplayer@agi.cash";
+lnurl_pay.rs:
+27://! ([`crate::fee_remit`], through `wallet_ops::prepare_melt_payment_blocking` →
+lib.rs:
+47:pub mod fee_remit;
+55:#[cfg(feature = "wallet")]
+60:pub mod long_poll;
