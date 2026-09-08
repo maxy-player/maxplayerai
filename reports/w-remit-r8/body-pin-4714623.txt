@@ -1,0 +1,8 @@
+PR #979 body pin — round 8
+final head: 471462350fc7551b5fafb0d1a8ee9d5bc4f596b2 (4714623); executable head 1a5c7c55665b5c207a98eb2a003b164de9641189
+edited: 2026-09-08T10:53:59Z via gh pr edit 979 --body-file reports/w-remit-r8/body-r8-final.md
+local  body-r8-final.md: 65217 bytes sha256 d5bfc1958fadbcd8ef4255d2dcc5fee21b537661dc88d4fe64d0a23067f80e1b
+readback (gh pr view 979 --json body -q .body): 65218 bytes sha256 3f862b0828314a585ffca754e4d3c48f166950aeed71081d9e94571d477dcd2a (GitHub appends one trailing newline)
+this pin file and body-r8-final.md are committed AFTER the final head, as the round-7 pin was.
+CI on 4714623: see below (appended when read)
+CI on 4714623: run 34217843662 completed success 2026-09-08T11:07:41Z; jobs: Build & test (acp) success; Build & test (default features) success; Money-path tests success; Test the full shipped feature combo (acp + wallet) success; JS test suites (web/app, web/network) success; Build (no default features) success; Release workflow gates success — read at 2026-09-08T11:08:43Z via gh run view (Vercel 'Authorization required to deploy' is an authorization status on the fork PR, not a check). All round-7/8 heads green: 24ba082 (34200030811), da0ee92 (34202015987), 1a5c7c5 (34213151371), 036302b (34215238371), 4714623 (34217843662).
