@@ -281,8 +281,12 @@ impl MeltCeiling {
         swap_fee_sats: u64,
     ) -> bool {
         invoice_sats == self.invoice_sats
-            && Self::total_debit(invoice_sats, fee_reserve_sats, input_fee_sats, swap_fee_sats)
-                <= self.max_debit_sats
+            && Self::total_debit(
+                invoice_sats,
+                fee_reserve_sats,
+                input_fee_sats,
+                swap_fee_sats,
+            ) <= self.max_debit_sats
     }
 
     /// The four parts summed, saturating — the figure the bound compares and the refusal names.
@@ -407,10 +411,7 @@ impl PreparedMeltPayment {
         self.decide(PreparedCommand::Cancel).map(|_| ())
     }
 
-    fn decide(
-        &mut self,
-        command: PreparedCommand,
-    ) -> Result<Option<MeltOutcome>, WalletOpsError> {
+    fn decide(&mut self, command: PreparedCommand) -> Result<Option<MeltOutcome>, WalletOpsError> {
         let Some(sender) = self.command.take() else {
             return Err(WalletOpsError::Wallet(
                 "the prepared melt was already decided".to_owned(),
@@ -1345,7 +1346,8 @@ pub fn prepare_melt_payment_blocking(
         Err(_) => {
             let _ = thread.join();
             Err(WalletOpsError::Wallet(
-                "the melt thread ended before reporting its preparation; nothing was posted".to_owned(),
+                "the melt thread ended before reporting its preparation; nothing was posted"
+                    .to_owned(),
             ))
         }
     }
@@ -1958,16 +1960,31 @@ mod tests {
             invoice_sats: 13,
             planned_quote_id: Some("q-estimate".to_owned()),
         };
-        assert!(ceiling.admits(13, 2), "the two-figure check admits 13 + 2 = 15");
+        assert!(
+            ceiling.admits(13, 2),
+            "the two-figure check admits 13 + 2 = 15"
+        );
         assert!(
             !ceiling.admits_total(13, 2, 4, 1),
             "13 + 2 + 4 + 1 = 20 exceeds the 15-sat gross once the SDK's fees are counted"
         );
         assert_eq!(MeltCeiling::total_debit(13, 2, 4, 1), 20);
-        assert!(ceiling.admits_total(13, 2, 0, 0), "zero fees: same as the two-figure bound");
-        assert!(!ceiling.admits_total(13, 2, 1, 0), "one sat of proof fee over the gross is refused");
-        assert!(!ceiling.admits_total(13, 2, 0, 1), "so is one sat of swap fee");
-        assert!(ceiling.admits_total(13, 0, 1, 1), "fees fit when the reserve leaves room: 13 + 0 + 1 + 1 = 15");
+        assert!(
+            ceiling.admits_total(13, 2, 0, 0),
+            "zero fees: same as the two-figure bound"
+        );
+        assert!(
+            !ceiling.admits_total(13, 2, 1, 0),
+            "one sat of proof fee over the gross is refused"
+        );
+        assert!(
+            !ceiling.admits_total(13, 2, 0, 1),
+            "so is one sat of swap fee"
+        );
+        assert!(
+            ceiling.admits_total(13, 0, 1, 1),
+            "fees fit when the reserve leaves room: 13 + 0 + 1 + 1 = 15"
+        );
         assert!(
             !ceiling.admits_total(12, 0, 0, 0),
             "a different invoice amount than the one planned is refused even when it fits"
@@ -2099,8 +2116,14 @@ mod tests {
         .cancel()
         .expect("cancel relays Ok");
 
-        let none_for_confirm = fixture(|_| Ok(None)).confirm().expect_err("no outcome is an error");
-        assert!(none_for_confirm.to_string().contains("reported no outcome for a confirm"));
+        let none_for_confirm = fixture(|_| Ok(None))
+            .confirm()
+            .expect_err("no outcome is an error");
+        assert!(
+            none_for_confirm
+                .to_string()
+                .contains("reported no outcome for a confirm")
+        );
 
         let failed = fixture(|_| Err(WalletOpsError::Wallet("mint said no".to_owned())))
             .confirm()
