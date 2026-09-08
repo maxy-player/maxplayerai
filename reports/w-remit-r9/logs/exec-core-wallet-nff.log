@@ -1,0 +1,1698 @@
+b1ef0996265305755caa340986d35f805a75fb21
+exec head 2521a44; .rs diff to HEAD: 
+$ cargo test -p maxplayer-core --features wallet --no-fail-fast
+   Compiling maxplayer-core v0.5.7 (/Users/forge/forge/v2/wt/w-seller-fee-stage2a-remit/crates/maxplayer-core)
+warning: unused import: `PaymentState`
+    --> crates/maxplayer-core/src/payment_wallet.rs:2334:9
+     |
+2334 |         PaymentState, ReceiptAuthority, ResultId,
+     |         ^^^^^^^^^^^^
+     |
+     = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `EMFILE_LEG_ENV` is never used
+   --> crates/maxplayer-core/src/delivery_git.rs:667:11
+    |
+667 |     const EMFILE_LEG_ENV: &str = "MAXPLAYER_EMFILE_LEG";
+    |           ^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `EMFILE_FD_CEILING` is never used
+   --> crates/maxplayer-core/src/delivery_git.rs:671:11
+    |
+671 |     const EMFILE_FD_CEILING: usize = 64;
+    |           ^^^^^^^^^^^^^^^^^
+
+warning: constant `EMFILE_DELIVERIES` is never used
+   --> crates/maxplayer-core/src/delivery_git.rs:676:11
+    |
+676 |     const EMFILE_DELIVERIES: usize = 80;
+    |           ^^^^^^^^^^^^^^^^^
+
+warning: constant `RAISE_CHILD_ENV` is never used
+    --> crates/maxplayer-core/src/buyer/mod.rs:3171:11
+     |
+3171 |     const RAISE_CHILD_ENV: &str = "MAXPLAYER_RAISE_NOFILE_CHILD";
+     |           ^^^^^^^^^^^^^^^
+
+warning: struct `AcceptDelivery` is never constructed
+    --> crates/maxplayer-core/src/payment_wallet.rs:2340:12
+     |
+2340 |     struct AcceptDelivery;
+     |            ^^^^^^^^^^^^^^
+
+warning: function `git_delivery_for_key` is never used
+    --> crates/maxplayer-core/src/payment_wallet.rs:4390:8
+     |
+4390 |     fn git_delivery_for_key(key: &PaymentKey) -> GitDelivery {
+     |        ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `odd_secret_key` is never used
+    --> crates/maxplayer-core/src/payment_wallet.rs:4495:8
+     |
+4495 |     fn odd_secret_key() -> SecretKey {
+     |        ^^^^^^^^^^^^^^
+
+warning: struct `NostrRecipientSend` is never constructed
+    --> crates/maxplayer-core/src/payment_wallet.rs:4527:12
+     |
+4527 |     struct NostrRecipientSend;
+     |            ^^^^^^^^^^^^^^^^^^
+
+warning: fields `base_url_env`, `default_upstream`, `placeholder_prefix`, and `placeholder_random_len` are never read
+    --> crates/maxplayer-core/src/seller_exec.rs:2518:5
+     |
+2514 | struct ContainedCred {
+     |        ------------- fields in this struct
+...
+2518 |     base_url_env: &'static str,
+     |     ^^^^^^^^^^^^
+2519 |     /// The vendor default upstream, used when the operator set no `base_url_env`.
+2520 |     default_upstream: &'static str,
+     |     ^^^^^^^^^^^^^^^^
+2521 |     /// The placeholder's vendor prefix (so a client that shape-validates locally does not refuse).
+2522 |     placeholder_prefix: &'static str,
+     |     ^^^^^^^^^^^^^^^^^^
+2523 |     /// Random characters after the prefix, chosen to match the vendor credential's length.
+2524 |     placeholder_random_len: usize,
+     |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `maxplayer-core` (lib test) generated 10 warnings (run `cargo fix --lib -p maxplayer-core --tests` to apply 1 suggestion)
+warning: struct `AgentMessageCapture` is never constructed
+   --> crates/maxplayer-core/src/engine.rs:246:19
+    |
+246 | pub(crate) struct AgentMessageCapture {
+    |                   ^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: methods `observe` and `into_last_message` are never used
+   --> crates/maxplayer-core/src/engine.rs:255:19
+    |
+250 | impl AgentMessageCapture {
+    | ------------------------ methods in this implementation
+...
+255 |     pub(crate) fn observe(&mut self, event: RunEvent<'_>) {
+    |                   ^^^^^^^
+...
+268 |     pub(crate) fn into_last_message(self) -> Option<String> {
+    |                   ^^^^^^^^^^^^^^^^^
+
+warning: associated function `adopt` is never used
+  --> crates/maxplayer-core/src/sandbox_netns.rs:75:8
+   |
+72 | impl NetnsHolder {
+   | ---------------- associated function in this implementation
+...
+75 |     fn adopt(name: String) -> Self {
+   |        ^^^^^
+
+warning: function `job_diagnostics_dir` is never used
+    --> crates/maxplayer-core/src/seller_exec.rs:1337:4
+     |
+1337 | fn job_diagnostics_dir(workdir: &Path) -> Option<PathBuf> {
+     |    ^^^^^^^^^^^^^^^^^^^
+
+warning: `maxplayer-core` (lib) generated 5 warnings (1 duplicate)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.74s
+     Running unittests src/lib.rs (target/debug/deps/maxplayer_core-5299820283977d28)
+
+running 1429 tests
+test agent_presets::tests::every_builtin_preset_maps_to_a_family_in_the_vocabulary ... ok
+test agent_presets::tests::casing_and_whitespace_reach_the_same_family ... ok
+test agent_presets::tests::prerequisite_lookup_normalizes_like_the_resolver ... ok
+test agent_presets::tests::a_custom_preset_named_exactly_a_family_reaches_that_family ... ok
+test agent_presets::tests::custom_and_unknown_presets_have_no_prerequisite ... ok
+test agent_presets::tests::every_builtin_preset_states_an_auth_prerequisite ... ok
+test agent_presets::tests::an_unlabelled_or_custom_preset_advertises_no_family ... ok
+test agent_presets::tests::adapter_host_follows_the_sandbox_mode ... ok
+test agent_presets::tests::the_preset_and_family_vocabularies_are_separate_objects ... ok
+test agent_presets::tests::the_family_vocabulary_is_sorted_and_free_of_duplicates ... ok
+test agent_presets::tests::builtin_presets_resolve_to_binary_or_install_hint ... ok
+test agent_presets::tests::container_mode_resolves_builtins_bare_without_touching_the_host ... ok
+test agent_presets::tests::custom_preset_overrides_builtin ... ok
+test agent_presets::tests::custom_preset_resolves_to_configured_argv ... ok
+test agent_presets::tests::detect_excludes_custom_preset_with_unresolvable_argv0 ... ok
+test agent_presets::tests::unknown_preset_error_lists_builtins_and_configured_names ... ok
+test agent_presets::tests::unknown_preset_errors ... ok
+test agent_presets::tests::detect_includes_custom_preset_with_existing_file_path ... ok
+test announce::tests::dispatch_returns_immediately_even_for_a_hung_sink ... ok
+test announce::tests::envelope_is_versioned_and_complete ... ok
+test announce::tests::delivered_carries_the_delivery_facts ... ok
+test announce::tests::claimed_carries_the_claim_facts ... ok
+test announce::tests::refused_carries_the_reason_code ... ok
+test announce::tests::reconcile_and_failed_carry_reasons ... ok
+test announce::tests::collected_carries_the_payment_facts ... ok
+test authorize_pay::tests::authorize_pay_refuses_an_inadmissible_hop_with_zero_spend_and_no_pairing ... ok
+test authorize_pay::free_lane_tests::authorize_pay_refuses_a_free_bind_at_entry_and_burns_no_budget ... ok
+test authorize_pay::tests::authorize_pay_refuses_forged_seller_signature_with_zero_spend ... ok
+test authorize_pay::tests::authorize_pay_refuses_tampered_preimage_field_with_zero_spend ... ok
+test authorize_pay::tests::authorize_pay_refuses_buyer_hash_mismatch_vs_advertised_commit ... ok
+test authorize_pay::tests::direct_swap_input_fee_must_not_bypass_the_per_job_cap ... ok
+test authorize_pay::tests::nip42_auth_wait_fails_closed_on_authentication_failed ... ok
+test authorize_pay::tests::authorize_pay_refuses_contribution_class_without_binds ... ok
+test authorize_pay::tests::nip42_auth_wait_fails_closed_on_channel_closed ... ok
+test announce::tests::empty_command_is_a_noop_no_spawn ... ok
+test authorize_pay::tests::nip42_auth_wait_fails_closed_on_shutdown ... ok
+test authorize_pay::tests::nip42_auth_wait_true_only_on_authenticated ... ok
+test authorize_pay::tests::authorize_pay_refuses_empty_buyer_hash_without_burn ... ok
+test authorize_pay::tests::pay_plan_empty_creq_uses_configured_mint ... ok
+test authorize_pay::tests::pay_plan_hops_when_the_configured_mint_is_not_listed_but_the_target_is_admissible ... ok
+test authorize_pay::tests::pay_plan_is_direct_when_configured_mint_is_listed ... ok
+test authorize_pay::tests::pay_plan_real_mint_admitted_when_flag_true ... ok
+test authorize_pay::tests::pay_plan_real_mint_refused_when_flag_false ... ok
+test authorize_pay::tests::pay_plan_refuses_a_no_overlap_hop_under_the_default_posture ... ok
+test authorize_pay::tests::pay_plan_refuses_when_no_overlap_and_no_accepted_mint_is_admissible ... ok
+test authorize_pay::tests::receipt_created_at_is_fresh_wall_clock_not_digest_derived ... ok
+test authorize_pay::tests::the_cap_is_charged_the_hop_cost_and_the_direct_amount ... ok
+test authorize_pay::free_lane_tests::the_same_request_in_sat_mode_gets_past_the_mode_guard ... ok
+test budget::tests::attempt_id_retry_does_not_double_count_spent ... ok
+test budget::tests::boundary_per_job_pass_then_plus_one_refuse ... ok
+test authorize_pay::tests::sealed_realized_mint_stabilizes_attempt_id_across_config_default_change ... ok
+test authorize_pay::tests::receipt_event_binds_cosigned_content_with_fresh_created_at ... ok
+test authorize_pay::tests::receipt_preimage_digest_is_independent_of_realized_mint ... ok
+test budget::tests::default_config_binds_the_shipped_30k_per_job_gate ... ok
+test budget::tests::concurrent_same_attempt_id_counts_spent_once ... ok
+test budget::tests::exceed_per_job_refuses_with_distinct_error ... ok
+test authorize_pay::tests::authorize_pay_refuses_ext_locator_via_pay_path_verifier ... ok
+test budget::tests::from_config_binds_cap_not_tool_args ... ok
+test announce::tests::missing_command_is_fail_soft ... ok
+test authorize_pay::tests::nip42_auth_wait_fails_closed_on_timeout ... ok
+test authorize_pay::tests::cosig_refusal_diagnostic_carries_every_field_and_no_secret ... ok
+test budget::tests::operator_completion_reattempt_reuses_the_charge_without_double_counting ... ok
+test budget::tests::per_job_over_cap_refuses_distinctly ... ok
+test budget::tests::refuse_before_effect ... ok
+test budget::tests::durable_refuse_leaves_spent_file_unchanged ... ok
+test budget::tests::durable_spent_survives_reload_write_before_effect ... ok
+test budget::tests::attempt_id_write_before_effect_and_survives_reload ... ok
+test buyer::lifecycle::free_lane_tests::a_free_claim_carrying_a_creq_is_refused ... ok
+test buyer::lifecycle::free_lane_tests::a_free_award_needs_both_ends_and_every_mixed_combination_refuses ... ok
+test buyer::lifecycle::free_lane_tests::a_silent_zero_amount_job_is_never_run_free ... ok
+test buyer::lifecycle::free_lane_tests::the_manual_award_path_applies_the_free_lane_filters_too ... ok
+test buyer::lifecycle::tests::a_claim_failing_both_reports_the_family_refusal ... ok
+test budget::tests::fold_dedups_repeated_attempt_ids_but_counts_keyless ... ok
+test budget::tests::hop_fee_reserve_credit_reconciles_spent_to_real_outlay_durably_and_at_most_once ... ok
+test buyer::lifecycle::tests::a_confirmed_empty_read_still_parks ... ok
+test buyer::lifecycle::tests::a_family_request_matches_only_a_seat_that_advertises_it ... ok
+test buyer::lifecycle::tests::a_family_that_contradicts_the_preset_is_refused_on_a_seat_that_advertises_both ... ok
+test buyer::lifecycle::tests::a_foreign_model_only_offer_is_refused_at_award_and_parks_saying_why ... ok
+test buyer::lifecycle::tests::a_foreign_offer_naming_a_bogus_family_is_refused_on_both_paths_and_parks_blaming_the_request ... ok
+test buyer::lifecycle::tests::a_job_requesting_a_harness_is_never_awarded_to_a_claim_without_it ... ok
+test budget::tests::malformed_ledger_line_fails_closed ... ok
+test buyer::lifecycle::tests::a_model_matches_only_when_paired_with_its_own_family ... ok
+test buyer::lifecycle::tests::a_model_request_without_a_harness_preset_is_refused_not_ignored ... ok
+test budget::tests::legacy_spent_toml_migrates_as_opening_base ... ok
+test buyer::lifecycle::tests::a_preset_and_a_model_derive_the_family_instead_of_refusing ... ok
+test announce::tests::capturing_sink_receives_exactly_one_json_per_event ... ok
+test budget::tests::two_handles_interleaved_spends_fold_to_full_sum ... ok
+test buyer::lifecycle::tests::a_carried_license_keeps_the_first_transmission_refusal_immediate ... ok
+test buyer::lifecycle::tests::a_crashed_refusal_releases_its_reservation_on_the_next_call ... ok
+test authorize_pay::tests::buyer_refuses_a_delivery_with_no_sentinel ... ok
+test buyer::lifecycle::tests::a_confirmed_attempt_missing_its_row_repairs_without_any_network ... ok
+test buyer::lifecycle::tests::a_request_matching_no_claim_parks_with_an_actionable_reason ... ok
+test authorize_pay::tests::buyer_accepts_a_delivery_carrying_this_jobs_sentinel ... ok
+test buyer::lifecycle::tests::an_exhausted_retry_budget_parks_on_the_read_not_the_offer ... ok
+test buyer::lifecycle::tests::a_recorded_award_publishes_nothing_and_reserves_nothing ... ok
+test buyer::lifecycle::tests::an_unanswered_read_does_not_park_the_job ... ok
+test buyer::lifecycle::tests::an_unknown_harness_family_is_refused_even_when_the_claim_advertises_it ... ok
+test buyer::lifecycle::tests::an_offer_sourced_request_refuses_a_non_matching_claim_on_both_paths ... ok
+test buyer::lifecycle::tests::an_unknown_token_is_a_different_refusal_from_a_missing_one ... ok
+test buyer::lifecycle::tests::a_pending_attempt_on_a_spent_job_still_resolves_and_lands_its_row ... ok
+test buyer::lifecycle::tests::a_published_award_is_recorded_at_the_single_seam ... ok
+test buyer::lifecycle::tests::an_unstated_seat_cannot_satisfy_a_family_request ... ok
+test buyer::lifecycle::tests::a_refusal_on_a_resend_holds_everything ... ok
+test authorize_pay::tests::buyer_refuses_a_replayed_sentinel_from_a_different_job ... ok
+test buyer::lifecycle::tests::a_relay_refusal_is_terminal_and_releases_the_funds ... ok
+test buyer::lifecycle::tests::award_step_decides_every_cell_of_the_state_product ... ok
+test buyer::lifecycle::tests::a_released_legacy_reservation_probes_and_repairs_rather_than_republishing ... ok
+test buyer::lifecycle::tests::confirmed_reads_park_regardless_of_earlier_unanswered_ones ... ok
+test buyer::lifecycle::tests::both_award_paths_read_the_capability_request_off_the_offer ... ok
+test announce::tests::run_sink_kills_a_hung_sink_at_the_bound ... ok
+test buyer::lifecycle::tests::display_only_fields_never_reach_the_award_filter ... ok
+test buyer::lifecycle::tests::an_unrepairable_public_award_refuses_and_writes_nothing ... ok
+test buyer::lifecycle::tests::missing_capabilities_are_named_individually ... ok
+test buyer::lifecycle::tests::every_award_entry_point_applies_the_capability_predicate ... ok
+test buyer::lifecycle::tests::named_claim_awardable_accepts_live_payable_within_max ... ok
+test buyer::lifecycle::tests::named_claim_not_found_refused ... ok
+test buyer::lifecycle::tests::named_claim_not_live_refused ... ok
+test buyer::lifecycle::tests::award_prepare_failure_releases_the_reservation ... ok
+test buyer::lifecycle::tests::named_claim_over_max_sats_refused ... ok
+test buyer::lifecycle::tests::a_legacy_reservation_with_confirmed_absence_refuses_and_releases ... ok
+test buyer::lifecycle::tests::named_claim_unpayable_mint_refused ... ok
+test buyer::lifecycle::tests::no_capability_request_awards_exactly_as_before ... ok
+test buyer::lifecycle::tests::a_stale_carried_license_cannot_terminalize_after_a_concurrent_transmission ... ok
+test buyer::lifecycle::tests::no_harness_request_awards_exactly_as_before ... ok
+test buyer::lifecycle::tests::plan_rearm_skips_only_when_already_awarded ... ok
+test buyer::lifecycle::tests::select_awardable_claim_consults_the_capability_predicate ... ok
+test buyer::lifecycle::tests::select_picks_live_payable_claim ... ok
+test buyer::lifecycle::tests::select_skips_claim_priced_off_the_offer ... ok
+test buyer::lifecycle::tests::select_skips_claim_with_no_payable_mint ... ok
+test buyer::lifecycle::tests::select_skips_non_live_claim ... ok
+test buyer::lifecycle::tests::select_skips_when_offer_over_max_sats ... ok
+test buyer::lifecycle::tests::already_awarded_confirms_a_stranded_pending_attempt ... ok
+test buyer::lifecycle::tests::the_capability_clause_survives_the_real_deadline_demotion ... ok
+test buyer::lifecycle::tests::the_offer_absent_park_reason_names_the_answer_it_rests_on ... ok
+test buyer::lifecycle::tests::the_park_reason_declines_to_blame_capability_when_it_was_not_the_obstacle ... ok
+test buyer::lifecycle::tests::the_unreadable_park_reason_never_asserts_the_offer_is_gone ... ok
+test buyer::lifecycle::tests::the_post_time_gate_refuses_exactly_what_the_predicate_can_never_pass ... ok
+test buyer::relay::tests::a_relay_that_accepts_nothing_is_reported_as_refused ... ok
+test buyer::lock::tests::second_acquire_fails_closed_while_first_is_held ... ok
+test buyer::lifecycle::tests::award_refused_signs_nothing_and_writes_no_row ... ok
+test buyer::lifecycle::tests::an_unrecorded_public_award_is_repaired_rather_than_published_again ... ok
+test buyer::relay::tests::a_stalled_relay_actor_cannot_park_the_caller ... ok
+test buyer::lifecycle::tests::an_unresolved_send_holds_funds_and_a_retry_resends_the_identical_bytes ... ok
+test buyer::signer::tests::a_stalled_signer_round_trip_is_bounded_and_leaves_the_caller_usable ... ok
+test buyer::relay::tests::spawn_returns_immediately_when_the_relay_is_unreachable ... ok
+test buyer::signer::tests::actor_serves_pubkey_and_never_the_secret ... ok
+test buyer::lifecycle::tests::dead_job_releases_through_reconcile ... ok
+test buyer::lifecycle::tests::an_unverifiable_presence_refuses_rather_than_publishing ... ok
+test buyer::lifecycle::tests::settle_flips_only_after_pay_succeeds ... ok
+test buyer::lifecycle::tests::payment_uncertain_is_kept_not_released ... ok
+test buyer::store::tests::a_v4_awards_table_gains_attribution_columns_on_open ... ok
+test buyer::store::tests::attempt_states_move_one_way_from_pending_only ... ok
+test buyer::lifecycle::tests::n_equal_agents_cannot_overspend_the_shared_budget ... ok
+test buyer::lifecycle::tests::crash_between_pay_and_flip_never_overstates_available_and_reconcile_converges ... ok
+test buyer::store::tests::a_pre_column_attempt_row_backfills_conservative_defaults_on_open ... ok
+test buyer::store::tests::available_is_the_wallet_ceiling ... ok
+test buyer::store::tests::a_v5_store_gains_the_attempt_table_on_open ... ok
+test buyer::store::tests::award_attribution_is_null_at_award_and_written_at_settlement ... ok
+test buyer::store::tests::attempt_sweep_queries_select_their_work_sets_only ... ok
+test buyer::store::tests::award_attribution_is_write_once_and_null_never_erases ... ok
+test buyer::store::tests::begin_award_attempt_pins_once_and_a_rival_candidate_gets_the_original_back ... ok
+test buyer::store::tests::convert_without_prior_reservation_inserts_spent_row ... ok
+test buyer::store::tests::awarded_unsettled_follows_the_reservation_ledger ... ok
+test buyer::store::tests::open_is_wal_and_carries_schema_and_start ... ok
+test buyer::store::tests::open_never_downgrades_a_higher_schema_version ... ok
+test buyer::store::tests::re_award_same_amount_idempotent_different_amount_refused ... ok
+test buyer::lifecycle::tests::the_money_lock_closes_the_award_snapshot_vs_settle_melt_race ... ok
+test buyer::store::tests::pending_award_lifecycle_parks_with_reason_and_rearms ... ok
+test buyer::store::tests::reconcile_paid_job_converts_dangling_reserve_to_spent ... ok
+test buyer::store::tests::record_attempt_send_returns_the_prior_count_and_increments_durably ... ok
+test buyer::store::tests::open_migrates_v1_db_forward ... ok
+test buyer::store::tests::regression_completed_spend_not_double_counted_against_live_wallet ... ok
+test buyer::store::tests::release_never_frees_spent_and_noop_when_absent ... ok
+test buyer::store::tests::tooth1_over_available_award_refused_zero_reserve_written ... ok
+test buyer::store::tests::released_row_can_be_re_reserved ... ok
+test buyer::store::tests::refused_reserved_and_pending_attempt_work_sets_select_correctly ... ok
+test buyer::store::tests::tooth3_reserve_to_spent_is_exactly_once ... ok
+test buyer::store::tests::tooth4_release_of_dead_job_reclaims_funds_for_a_new_award ... ok
+test buyer::store::tests::unattributed_settled_awards_selects_spent_null_rows_only ... ok
+test buyer::tests::a_free_collect_response_carries_no_spend_total ... ok
+test buyer::tests::a_free_settle_logs_free_and_a_paid_settle_logs_the_amount ... ok
+test buyer::tests::a_kept_reservation_reports_its_age_so_a_ramp_is_visible_while_it_happens ... ok
+test buyer::store::tests::tooth5_reconcile_on_restart_reclaims_stale_reservation ... ok
+test buyer::tests::a_capability_missing_for_an_already_settled_job_is_a_no_op ... ok
+test buyer::tests::a_capability_missing_from_a_non_awarded_pubkey_does_not_release ... ok
+test buyer::tests::a_capability_missing_from_the_awarded_seller_releases_the_reservation ... ok
+test buyer::tests::a_pass_holding_no_reservation_prints_no_age_at_all ... ok
+test buyer::tests::a_delivery_failed_for_an_already_settled_job_is_a_no_op ... ok
+test buyer::tests::a_delivery_failed_from_a_non_awarded_pubkey_does_not_release ... ok
+test buyer::tests::a_delivery_failed_from_the_awarded_seller_releases_the_reservation ... ok
+test buyer::store::tests::tooth2_concurrent_awards_serialized_exactly_one_wins ... ok
+test buyer::tests::a_no_sentinel_for_an_already_settled_job_is_a_no_op ... ok
+test buyer::tests::a_no_sentinel_from_a_non_awarded_pubkey_does_not_release ... ok
+test buyer::tests::a_pre_award_at_capacity_decline_does_not_release ... ok
+test buyer::tests::a_pre_award_below_rate_decline_does_not_release ... ok
+test buyer::tests::a_no_sentinel_from_the_awarded_seller_releases_the_reservation ... ok
+test buyer::tests::a_pre_award_capability_missing_for_a_job_we_never_awarded_does_not_release ... ok
+test buyer::tests::an_attempted_payment_is_distinguishable_from_one_never_attempted ... ok
+test buyer::tests::an_auto_award_park_line_carries_the_job_id_and_the_reason ... ok
+test budget::tests::budget_lock_serializes_reserve_and_dedupes_attempt_id ... ok
+test buyer::tests::an_execution_failed_for_an_already_settled_job_is_a_no_op ... ok
+test buyer::tests::an_execution_failed_from_a_non_awarded_pubkey_does_not_release ... ok
+test buyer::tests::a_lost_subscription_degrades_to_timer_only_instead_of_stopping ... ok
+test buyer::tests::an_execution_failed_from_the_awarded_seller_releases_the_reservation ... ok
+test buyer::tests::an_unknown_reason_code_is_fail_closed_and_does_not_release ... ok
+test buyer::tests::attempt_relay_falls_back_to_config_for_the_migration_sentinel ... ok
+test buyer::ingest_sig_it::a_signature_invalid_event_is_dropped_at_client_ingest_before_any_consumer ... ok
+test buyer::tests::get_job_response_serializes_a_committed_award_beside_the_flattened_view ... ok
+test buyer::tests::get_job_response_serializes_awarded_delivery_pending_only_while_unsettled ... ok
+test buyer::tests::a_present_claim_does_not_certify_an_empty_offer_read_as_absence ... ok
+test buyer::tests::get_job_timeout_rpc_boundary_rejects_above_cap_and_accepts_cap_or_default ... ok
+test buyer::tests::heal_backfills_attribution_for_settled_awards_from_the_bind ... ok
+test buyer::tests::log_safe_agent_strips_control_and_invisible_bytes_and_caps ... ok
+test buyer::tests::merge_progress_keeps_the_more_advanced ... ok
+test buyer::tests::merge_progress_ranks_attempted_above_none_and_below_uncertain ... ok
+test buyer::tests::past_pay_window_flips_exactly_after_the_grace ... ok
+test buyer::tests::pinned_claim_conflict_refuses_only_a_contradicting_name ... ok
+test buyer::tests::plan_reconcile_maps_each_reserved_job ... ok
+test buyer::tests::plan_reconcile_missing_payable_defaults_to_kept ... ok
+test buyer::tests::post_job_payment_none_requires_a_zero_amount_and_is_refused_otherwise ... ok
+test buyer::tests::post_job_refuses_an_unrecognized_payment_value_rather_than_defaulting_to_sat ... ok
+test buyer::tests::post_job_without_a_payment_parameter_posts_sat_and_emits_no_payment_tag ... ok
+test buyer::tests::a_settle_invalidates_the_stale_reconcile_snapshot ... ok
+test buyer::tests::a_starved_offer_with_a_live_claim_never_parks_the_retryable_intent ... ok
+test buyer::tests::resume_crossed_deadline_blocks_only_a_pending_attempt_past_its_deadline ... ok
+test buyer::tests::scan_payment_progress_absent_journal_is_empty ... ok
+test buyer::tests::scan_payment_progress_folds_intent_to_attempted ... ok
+test buyer::tests::scan_payment_progress_unfoldable_journal_is_uncertain ... ok
+test buyer::tests::a_third_partys_junk_delivery_cannot_hold_the_refund ... ok
+test buyer::tests::spend_refusal_lines_carry_the_shortfall_numbers_in_role ... ok
+test buyer::tests::reconcile_passes_never_overlap ... ok
+test buyer::tests::a_present_offer_is_returned_confirmed_and_by_exact_id ... ok
+test buyer::tests::a_refused_offer_read_is_not_certified_as_absence_even_with_a_live_claim ... ok
+test buyer::tests::terminalize_absent_attempt_releases_only_when_it_wins_the_transition ... ok
+test buyer::tests::the_attempt_shield_keeps_dead_jobs_but_still_converges_paid_ones ... ok
+test buyer::tests::an_expired_award_retry_terminalizes_and_answers_without_wedging_the_daemon ... ok
+test buyer::tests::the_disabled_floor_is_the_identity_function_across_every_input ... ok
+test buyer::tests::the_enabled_floor_releases_only_a_never_attempted_reservation_past_its_grace ... ok
+test buyer::tests::an_unrepairable_heal_parks_the_intent_so_the_debt_is_visible ... ok
+test buyer::tests::delivery_watcher_refuses_a_forged_delivery_and_spends_nothing ... ok
+test buyer::tests::the_reconcile_reports_every_pass_including_the_one_that_did_nothing ... ok
+test buyer::tests::the_reservation_floor_ships_disabled ... ok
+test buyer::tests::the_undispatchable_arms_reason_code_is_releasable ... ok
+test buyer::tests::get_job_surfaces_a_committed_award_while_accepted_stays_null ... ok
+test buyer::tests::reconcile_leaves_a_pending_attempts_reservation_alone ... ok
+test buyer_fund::tests::blocking_open_refuses_inside_runtime ... ok
+test buyer_fund::tests::default_config_mint_is_the_shipped_minibits_default ... ok
+test buyer::tests::the_watcher_wakes_on_both_results_and_feedback ... ok
+test buyer_fund::tests::open_wallet_refuses_real_mint_when_disallowed ... ok
+test buyer_fund::tests::seed_is_deterministic_64_bytes ... ok
+test buyer::tests::the_attempt_sweep_drives_all_three_legs_and_holds_inside_the_window ... ok
+test capability::tests::every_token_in_the_vocabulary_has_a_probe_command ... ok
+test capability::tests::probing::a_docker_policy_probes_inside_the_container_and_never_bare_on_the_host ... ok
+test capability::tests::probing::a_pass_through_policy_probes_the_bare_command ... ok
+test capability::tests::probing::a_probe_that_cannot_be_rendered_fails_the_whole_set ... ok
+test capability::tests::probing::a_probe_that_cannot_be_run_fails_the_whole_set ... ok
+test capability::tests::probing::a_stock_image_with_no_toolchain_advertises_nothing ... ok
+test capability::tests::probing::only_the_tokens_that_actually_resolved_are_advertised ... ok
+test capability::tests::probing::the_probe_runs_through_the_sandbox_launcher ... ok
+test capability::tests::the_vocabulary_is_sorted_and_free_of_duplicates ... ok
+test checks::tests::attestation_round_trip_is_deterministic_and_job_bound ... ok
+test checks::tests::base_validation_refuses_each_reserved_blob_and_nested_lock_is_hashed ... ok
+test checks::tests::cargo_test_scope_rule_is_about_cargo_not_the_second_token ... ok
+test checks::tests::container_digest_is_accepted_and_missing_digest_notation_refused ... ok
+test checks::tests::declaration_accepts_nix_default_and_non_root_flake_path ... ok
+test checks::tests::declaration_refuses_absolute_and_parent_flake_paths ... ok
+test checks::tests::declaration_refuses_tagged_image_shell_unknown_schema_and_empty_argv ... ok
+test checks::tests::feature_flag_reader_sees_every_cargo_spelling_of_one_feature ... ok
+test checks::tests::line_reader_counts_exact_content_not_mentions ... ok
+test checks::tests::malformed_attestation_is_an_error ... ok
+test checks::tests::outcome_consumers_match_every_variant_and_cause ... ok
+test checks::tests::reject_reason_vocabulary_is_closed_and_exact ... ok
+test checks::tests::suite_and_install_readers_accept_only_the_declared_forms ... ok
+test checks::tests::the_five_cargo_row_declaration_this_repo_shipped_is_rejected ... ok
+test checks::tests::the_flake_declares_the_node_the_check_rows_need ... ok
+test checks::tests::this_repos_own_declaration_parses_and_stays_hermetic ... ok
+test codex_subscription::tests::codex_subscription_checks_and_reads_the_same_open_file ... ok
+test codex_subscription::tests::codex_subscription_gateway_auth_request_contains_placeholders_only ... ok
+test codex_subscription::tests::codex_subscription_reads_only_a_live_access_session ... ok
+test codex_subscription::tests::codex_subscription_refuses_a_token_that_cannot_outlive_the_job_margin ... ok
+test codex_subscription::tests::codex_subscription_refuses_group_or_world_access_to_the_auth_file ... ok
+test codex_subscription::tests::codex_subscription_refuses_malformed_or_incomplete_auth_data_without_echoing_it ... ok
+test buyer::tests::the_pinned_sellers_delivery_holds_the_refund ... ok
+test collect::tests::collect_folds_accept_then_refuses_forged_cosig_zero_spend ... ok
+test collect::tests::collect_forged_cosig_blocks_pay_and_materialize_zero_spend ... ok
+test collect::tests::materialize_delivery_refuses_missing_commit ... ok
+test collect::tests::materialize_delivery_writes_files_and_is_idempotent ... ok
+test collect::tests::results_dest_defaults_to_job_and_refuses_traversal ... ok
+test contribution::tests::base_oid_requires_exactly_40_lowercase_hex ... ok
+test contribution::tests::base_requires_full_oid ... ok
+test contribution::tests::content_gate_floor_refuses_only_empty ... ok
+test contribution::tests::content_policy_scopes_paths_and_size ... ok
+test contribution::tests::contribution_offer_is_served_when_enabled ... ok
+test contribution::tests::contribution_offer_refused_when_disabled ... ok
+test contribution::tests::from_scratch_offer_is_never_gated_by_contribution_flag ... ok
+test contribution::tests::malformed_contribution_is_refused_under_either_flag ... ok
+test contribution::tests::malformed_contribution_offer_fails_closed_never_from_scratch ... ok
+test contribution::tests::non_contribution_tags_parse_to_none ... ok
+test contribution::tests::offer_tags_round_trip_through_parse ... ok
+test contribution::tests::pin_rejects_bare_name_without_owner ... ok
+test contribution::tests::seller_result_parts_round_trip_through_buyer_parse_and_tuple_verify ... ok
+test contribution::tests::tuple_canonical_json_is_domain_prefixed_locked_order ... ok
+test contribution::tests::tuple_digest_binds_every_field ... ok
+test contribution::tests::tuple_sign_verify_round_trip_and_wrong_key_refused ... ok
+test contribution::tests::unique_branch_carries_full_job_id_not_prefix ... ok
+test credential_proxy::tests::a_body_only_placeholder_does_not_identify_a_job ... ok
+test buyer::wallet_actor::tests::concurrent_callers_are_serialized_through_one_slot ... ok
+test buyer_fund::tests::open_wallet_at_mint_binds_to_realized_non_default_mint ... ok
+test credential_proxy::tests::a_body_that_goes_silent_is_dropped_at_the_idle_deadline ... ok
+test buyer::tests::second_buyer_on_same_home_fails_closed ... ok
+test buyer::tests::status_reports_unconfigured_db_proofs_with_both_totals ... ok
+test buyer::tests::status_round_trips_over_the_socket ... ok
+test credential_proxy::tests::a_leg_listener_serves_only_credentials_that_listed_its_authority ... ok
+test buyer_fund::tests::wallet_opens_at_the_configured_mint ... ok
+test buyer::tests::steady_non_actionable_traffic_does_not_starve_the_backstop_sweep ... ok
+test credential_proxy::tests::a_non_utf8_response_header_is_scrubbed_as_raw_bytes ... ok
+test credential_proxy::tests::a_redirect_chain_is_judged_against_the_original_not_the_previous_hop ... ok
+test credential_proxy::tests::a_body_still_open_is_already_relayed_and_answered_by_the_upstream ... ok
+test credential_proxy::tests::a_single_upstream_credential_is_decided_exactly_as_before ... ok
+test credential_proxy::tests::a_slow_but_talking_body_is_not_cut_off_by_the_idle_deadline ... ok
+test credential_proxy::tests::a_stalled_credential_prefix_is_never_released ... ok
+test credential_proxy::tests::a_stalled_ordinary_body_is_forwarded_in_full_on_arrival_without_eof ... ok
+test credential_proxy::tests::a_declared_over_cap_body_is_refused_before_the_upstream_sees_it ... FAILED
+test credential_proxy::tests::allowlist_matches_across_default_port ... ok
+test credential_proxy::tests::a_placeholder_planted_in_the_request_body_never_becomes_the_real_credential ... ok
+test credential_proxy::tests::a_real_credential_echoed_in_a_response_header_is_scrubbed ... ok
+test credential_proxy::tests::a_real_credential_echoed_in_the_response_body_is_scrubbed_to_the_placeholder ... ok
+test credential_proxy::tests::abandoning_the_client_tears_down_the_credential_bearing_upstream_request ... ok
+test credential_proxy::tests::an_unnameable_redirect_endpoint_is_refused ... ok
+test buyer::tests::the_reconcile_cannot_release_a_reservation_mid_settle ... ok
+test credential_proxy::tests::authority_of_parses_scheme_host_port ... ok
+test credential_proxy::tests::authorize_refuses_a_non_allowlisted_destination_without_substitution ... ok
+test credential_proxy::tests::authorize_refuses_when_no_known_placeholder_is_present ... ok
+test credential_proxy::tests::authorize_substitutes_real_credential_for_an_approved_destination ... ok
+test credential_proxy::tests::authorize_substitutes_whichever_header_carries_the_placeholder ... ok
+test credential_proxy::tests::base64url_matches_rfc4648_vectors_unpadded ... ok
+test credential_proxy::tests::base64url_uses_the_url_safe_alphabet_not_standard ... ok
+test credential_proxy::tests::codex_session_decision_debug_text_redacts_real_values ... ok
+test credential_proxy::tests::a_request_is_refused_from_its_headers_while_its_body_is_still_open ... ok
+test buyer::tests::a_deadline_crossed_while_queued_refuses_instead_of_transmitting_late ... ok
+test credential_proxy::tests::codex_session_refuses_unapproved_methods_paths_and_headers ... ok
+test credential_proxy::tests::codex_session_response_scrub_catches_both_values_across_chunks ... ok
+test credential_proxy::tests::codex_session_rewrites_both_exact_headers_for_an_approved_request ... ok
+test credential_proxy::tests::an_h2c_request_is_served_forwarded_and_substituted ... ok
+test buyer::tests::a_sweep_deadline_crossed_while_waiting_for_the_money_lock_transmits_nothing ... ok
+test credential_proxy::tests::mint_jwt_placeholder_differs_per_call ... ok
+test credential_proxy::tests::mint_jwt_placeholder_exp_is_in_the_future ... ok
+test credential_proxy::tests::mint_jwt_placeholder_is_three_unpadded_base64url_segments ... ok
+test credential_proxy::tests::placeholder_is_format_plausible_and_not_the_real_credential ... ok
+test credential_proxy::tests::a_configured_port_range_binds_inside_it_and_an_unset_one_stays_ephemeral ... ok
+test credential_proxy::tests::an_encoded_upstream_response_is_refused_and_identity_is_requested ... ok
+test credential_proxy::tests::codex_session_proxy_keeps_the_body_and_scrubs_both_response_values ... ok
+test credential_proxy::tests::redirect_off_the_paired_upstream_is_refused ... ok
+test credential_proxy::tests::redirect_that_stays_on_the_paired_upstream_is_approved ... ok
+test credential_proxy::tests::redirect_to_a_different_registered_upstream_is_refused ... ok
+test credential_proxy::tests::register_refuses_an_empty_upstream_list ... ok
+test credential_proxy::tests::register_refuses_an_unapproved_upstream ... ok
+test credential_proxy::tests::register_refuses_two_entries_naming_one_authority ... ok
+test credential_proxy::tests::small_keepalive_chunks_stream_through_without_waiting_for_eof_or_idle ... ok
+test credential_proxy::tests::straddle_prefix_len_finds_the_longest_suffix_that_is_a_credential_prefix ... ok
+test credential_proxy::tests::an_exhausted_port_range_fails_instead_of_falling_back ... ok
+test credential_proxy::tests::the_primary_path_ignores_extra_legs ... ok
+test credential_proxy::tests::codex_session_proxy_does_not_follow_a_same_host_redirect ... ok
+test credential_proxy::tests::dropping_the_proxy_revokes_connections_it_has_already_accepted ... ok
+test credential_proxy::tests::the_response_scrub_catches_a_credential_split_across_chunks ... ok
+test credential_proxy::tests::the_response_scrub_handles_adjacent_values_without_reprocessing_output ... ok
+test credential_proxy::tests::proxy_refuses_when_no_known_placeholder_is_present ... ok
+test crossmint::tests::a_sealed_source_is_honored_at_pay_and_never_re_selected ... ok
+test crossmint::tests::buyer_mint_in_accepted_set_pays_direct_without_hopping ... ok
+test crossmint::tests::buyer_mint_listed_but_not_first_still_pays_direct ... ok
+test crossmint::tests::empty_accepted_set_pays_direct_at_the_buyer_mint ... ok
+test crossmint::tests::hop_journal_round_trips_both_quote_ids ... ok
+test crossmint::tests::hop_refuses_when_no_accepted_mint_passes_the_fence ... ok
+test crossmint::tests::hop_skips_unfenced_entries_and_lands_on_the_first_admissible_one ... ok
+test crossmint::tests::hop_target_selection_is_deterministic_first_admissible ... ok
+test crossmint::tests::hop_to_a_real_mint_plans_once_the_operator_opts_in ... ok
+test crossmint::tests::no_overlap_plans_a_hop_from_the_buyer_mint_to_an_accepted_mint ... ok
+test crossmint::tests::planned_cost_counts_melt_amount_fee_reserve_and_input_fee ... ok
+test crossmint::tests::planned_cost_refuses_on_overflow_instead_of_saturating ... ok
+test crossmint::tests::select_falls_back_to_the_default_when_no_accepted_mint_covers ... ok
+test crossmint::tests::select_ignores_a_covering_unconfigured_discovered_mint ... ok
+test crossmint::tests::select_is_deterministic_first_covering_in_seller_order ... ok
+test crossmint::tests::select_prefers_a_covering_accepted_mint_so_the_prefunded_balance_pays_direct ... ok
+test crossmint::tests::select_skips_a_fence_disallowed_mint_even_when_it_is_covered ... ok
+test crossmint::tests::the_direct_path_seals_the_mint_it_realizes_at ... ok
+test crossmint::tests::the_sealed_source_replans_into_the_same_plan ... ok
+test crossmint::tests::unfenced_buyer_mint_is_refused_before_planning_a_hop ... ok
+test crossmint_hop::tests::a_cap_one_sat_under_the_planned_cost_means_no_melt_is_attempted_at_all ... ok
+test crossmint_hop::tests::a_cap_sized_to_the_delivered_amount_does_not_authorize_the_hop_that_delivers_it ... ok
+test crossmint_hop::tests::a_clean_hop_melts_once_mints_once_and_journals_the_pairing_before_the_melt ... ok
+test crossmint_hop::tests::a_dearer_replacement_quote_refuses_by_cost_comparison_not_budget_cap ... ok
+test crossmint_hop::tests::a_failed_melt_supersedes_the_same_invoice_and_settles ... ok
+test crossmint_hop::tests::a_failed_melt_with_issued_target_completes_without_touching_either_mint ... ok
+test crossmint_hop::tests::a_failed_melt_with_paid_target_uses_the_existing_strand_path ... ok
+test crossmint_hop::tests::a_failed_melt_with_pending_target_refuses_without_raising_a_quote ... ok
+test crossmint_hop::tests::a_failed_melt_with_unreachable_recovery_refuses_without_melting_again ... ok
+test crossmint_hop::tests::a_pending_melt_refuses_instead_of_melting_again ... ok
+test crossmint_hop::tests::a_replacement_quote_above_the_fee_buffer_refuses_naming_the_recorded_ceiling ... ok
+test crossmint_hop::tests::a_replacement_quote_within_the_fee_buffer_proceeds ... ok
+test crossmint_hop::tests::a_second_pairing_for_one_attempt_is_refused_rather_than_melted ... ok
+test crossmint_hop::tests::a_settled_hop_touches_neither_mint_again ... ok
+test credential_proxy::tests::h2_multiplexing_cannot_exceed_the_aggregate_in_flight_ceiling ... ok
+test crossmint_hop::tests::a_superseding_melt_journals_before_the_replacement_fires ... ok
+test crossmint_hop::tests::a_supersession_does_not_grow_budget_spent_or_mint_a_replacement_charge_key ... ok
+test crossmint_hop::tests::a_stale_concurrent_supersession_cannot_replace_the_journal_tail ... ok
+test crossmint_hop::tests::a_sweep_that_covered_one_mint_refuses_to_call_the_hop_swept ... ok
+test crossmint_hop::tests::a_supersession_is_durable_when_the_melt_effect_fails_before_firing_and_recovery_uses_it ... ok
+test crossmint_hop::tests::a_zero_fee_buffer_makes_the_within_buffer_replacement_refuse ... ok
+test crossmint_hop::tests::authorized_hop_cost_adds_multiplier_times_the_mint_fee_reserve ... ok
+test crossmint_hop::tests::a_torn_final_record_refuses_rather_than_being_parsed_around ... ok
+test crossmint_hop::tests::bounded_classifies_5xx_timeout_and_transport_as_mint_unreachable ... ok
+test credential_proxy::tests::proxy_returns_403_for_a_non_allowlisted_destination ... ok
+test credential_proxy::tests::proxy_substitutes_and_forwards_to_an_approved_upstream ... ok
+test crossmint_hop::tests::duplicate_planned_refuses_until_the_prior_planned_is_superseded ... ok
+test crossmint_hop::tests::hop_credits_nothing_when_the_actual_fee_equals_the_reserve ... ok
+test crossmint_hop::tests::hop_reconciles_the_unused_fee_reserve_when_the_actual_fee_is_lower ... ok
+test crossmint_hop::tests::issuing_less_than_the_pinned_delivery_amount_refuses ... ok
+test crossmint_hop::tests::kill_between_melt_and_mint_pays_once_on_restart_and_reports_the_strand ... ok
+test crossmint_hop::tests::no_failing_leg_leaves_a_completion_record_behind ... ok
+test crossmint_hop::tests::recovered_melt_reconciles_nothing ... ok
+test crossmint_hop::tests::replacement_cost_over_remaining_source_coverage_refuses_before_journal ... ok
+test crossmint_hop::tests::the_file_journal_round_trips_a_pairing_supersession_and_completion ... ok
+test crossmint_hop::tests::three_supersessions_mean_the_fourth_failed_active_quote_exhausts_without_settlement ... ok
+test delivery::tests::commit_oid_requires_full_hex ... ok
+test delivery::tests::git_command_failed_carries_the_cause_so_two_failures_do_not_render_alike ... ok
+test delivery::tests::git_delivery_binds_commit_oid_and_derives_fork_kind ... ok
+test delivery::tests::verified_delivery_refuses_a_different_fetched_tip ... ok
+test credential_proxy::tests::the_proxy_accepts_an_h2c_prior_knowledge_connection ... ok
+test delivery_git::contribution_tests::base_absent_from_pinned_target_fails_closed ... ok
+test delivery_git::contribution_tests::base_from_pin_finds_ancestor_base ... ok
+test delivery_git::contribution_tests::content_gate_refuses_empty_diff ... ok
+test credential_proxy::tests::the_listener_a_request_arrives_on_selects_the_upstream ... ok
+test credential_proxy::tests::the_proxy_still_serves_http1_on_the_same_listener ... ok
+test crossmint_hop::tests::crossmint_hop_plan_quotes_classifies_502_as_mint_unreachable_without_journal ... ok
+test crossmint_hop::tests::crossmint_hop_plan_quotes_classifies_connection_refused_without_journal ... ok
+test delivery_git::contribution_tests::deep_history_contribution_verifies ... ok
+test crossmint_hop::tests::crossmint_hop_recovery_source_quote_502_refuses_without_supersession_record ... ok
+test delivery_git::contribution_tests::pay_path_contribution_verify_refuses_ext_transport ... ok
+test delivery_git::tests::fetch_tip_match_returns_retained_commit ... ok
+test delivery_git::contribution_tests::content_gate_scope_out_of_scope_refuses_in_scope_passes ... ok
+test delivery_git::contribution_tests::retention_survives_fork_deletion_and_merges_from_local_oid ... ok
+test delivery_git::tests::malformed_branch_refuses_before_creating_the_store_repo ... ok
+test delivery_git::contribution_tests::seller_snapshot_contribution_is_accepted_by_buyer_verify ... ok
+test delivery_git::tests::verify_delivery_without_system_git ... ok
+test delivery_orchestrator::tests::backoff_is_exponential_and_capped ... ok
+test delivery_orchestrator::tests::phase1_inputs_round_trip ... ok
+test delivery_orchestrator::tests::push_does_not_retry_a_permission_failure ... ok
+test delivery_orchestrator::tests::push_gives_up_after_the_attempt_bound ... ok
+test delivery_orchestrator::tests::push_retries_a_transient_failure_then_succeeds ... ok
+test delivery_orchestrator::tests::read_delivery_oid_rejects_garbage ... ok
+test delivery_orchestrator::tests::retryable_classification ... ok
+test delivery_orchestrator::tests::run_phase1_entry_runs_child_gates_and_deletes_inputs ... ok
+test delivery_orchestrator::tests::run_phase1_from_scratch_delivers_a_gated_commit ... ok
+test delivery_git::tests::pay_path_verifier_allows_local_path_only_via_bare_inner_in_tests ... ok
+test delivery_orchestrator::tests::run_phase1_gate_refuses_when_the_agent_wrote_nothing ... ok
+test delivery_sentinel::tests::a_job_hash_reachable_only_through_the_path_label_does_not_count ... ok
+test delivery_sentinel::tests::a_manifest_does_not_satisfy_a_different_job ... ok
+test delivery_sentinel::tests::marker_without_the_job_hash_is_not_a_sentinel ... ok
+test delivery_sentinel::tests::rendered_manifest_is_recognised_for_its_own_job ... ok
+test delivery_transport::tests::allowlisted_wrapper_refuses_ext_before_inner ... ok
+test delivery_transport::tests::allows_https_and_relay_git ... ok
+test delivery_transport::tests::refuses_credentials_in_url ... ok
+test delivery_transport::tests::refuses_ext_file_ssh_and_local ... ok
+test delivery_transport::tests::relay_git_helper_detects_path_shape ... ok
+test driver::acp::usage_tests::absent_usage_stays_absent_never_fabricated ... ok
+test driver::acp::usage_tests::acp_native_usage_is_captured_from_the_prompt_result ... ok
+test driver::acp::usage_tests::compat_acp_spec_usage_shape_incl_cursor_baseline ... ok
+test driver::acp::usage_tests::compat_claude_code_acp_prompt_result_usage ... ok
+test driver::acp::usage_tests::compat_codex_token_usage_shape ... ok
+test driver::acp::usage_tests::compat_usage_under_meta_extension_point ... ok
+test driver::acp::usage_tests::partial_capture_never_reports_a_total ... ok
+test driver::acp::usage_tests::reasoning_is_summed_into_total_when_present ... ok
+test driver::mock::tests::cancel_mid_script_terminates_with_cancelled_without_post_cancel_updates ... ok
+test driver::mock::tests::ext_method_is_surfaced_unmodified ... ok
+test driver::mock::tests::permission_requests_route_to_allow_and_deny_outcomes ... ok
+test driver::mock::tests::scripted_driver_run_appends_events_to_log ... ok
+test driver::mock::tests::scripted_turn_yields_updates_in_order_and_turn_ended ... ok
+test durable::tests::write_atomic_creates_missing_dir ... ok
+test durable::tests::write_atomic_replaces_and_leaves_no_temp ... ok
+test engine::tests::a_clean_run_still_surfaces_a_shutdown_error ... ok
+test engine::tests::a_run_error_is_not_masked_by_a_failing_shutdown ... ok
+test engine::tests::a_turn_that_said_nothing_captures_none ... ok
+test engine::tests::agent_message_chunks_are_logged_for_audit ... ok
+test engine::tests::post_terminal_updates_are_dropped ... ok
+test engine::tests::run_job_appends_events_to_log ... ok
+test delivery_orchestrator::tests::run_phase2_entry_fails_closed_on_a_bad_remote ... ok
+test engine::tests::run_job_feeds_the_capture_the_agents_last_message ... ok
+test engine::tests::shutdown_runs_when_an_early_question_mark_fails_the_run ... ok
+test engine::tests::run_job_threads_driver_usage_into_outcome ... ok
+test engine::tests::the_capture_keeps_the_agents_last_non_empty_message ... ok
+test env_provision::tests::captured_declaration_bytes_are_the_exact_base_blob ... ok
+test env_provision::tests::compose_places_launcher_outermost_for_both_postures ... ok
+test env_provision::tests::container_prefixes_are_exact_for_provision_and_checks ... ok
+test env_provision::tests::container_pull_is_followed_by_digest_probe_and_exact_comparison ... ok
+test env_provision::tests::every_refusal_has_execution_failed_unprovisionable_feedback ... ok
+test env_provision::tests::nix_prefix_is_exact_for_root_nested_default_and_named_devshells ... ok
+test env_provision::tests::nix_warms_once_with_the_provision_prefix_and_returns_requested_prefix ... ok
+test env_provision::tests::posture_and_error_matches_are_exhaustive ... ok
+test env_provision::tests::provisioning_failures_are_infrastructure_even_for_status_101 ... ok
+test env_provision::tests::resolve_backend_refuses_missing_image_and_preserves_pinned_image ... ok
+test env_provision::tests::unavailable_container_runtime_and_nonzero_commands_keep_exact_error_facts ... ok
+test engine::tests::stream_without_terminal_appends_failed_and_returns_err ... ok
+test episode::tests::append_then_read_round_trips_and_is_durable_jsonl ... ok
+test episode::tests::entries_skips_corrupt_lines_and_tolerates_absent_file ... ok
+test episode::tests::refused_episode_serializes_without_delivery_or_usage_noise ... ok
+test episode::tests::schema_version_is_one_and_unknown_fields_are_tolerated ... ok
+test fee_remit::tests::a_balance_under_the_threshold_or_at_zero_neither_escalates_nor_resets_the_backoff ... ok
+test episode::tests::last_delivered_paid_finds_the_newest_for_the_job ... ok
+test fee_remit::tests::a_failed_balance_read_after_a_fee_bearing_payment_prints_unknown_and_no_false_warning ... ok
+test delivery_git::tests::moved_tip_refuses_the_stale_advertised_oid ... ok
+test fee_remit::tests::a_bound_quote_expired_past_the_margin_is_held_and_its_owner_refuses_to_pay_it ... ok
+test fee_remit::tests::a_fee_bearing_payment_at_a_19_sat_gross_the_prepared_estimate_would_refuse_pays_invoice_13_once ... ok
+test fee_remit::tests::a_fee_bearing_payment_whose_prepared_input_fee_differs_from_the_actual_pays_once_and_the_wallet_loses_at_most_the_gross ... ok
+test fee_remit::tests::a_fee_bearing_schedule_whose_prepared_figures_fit_but_post_swap_arithmetic_does_not_is_refused_before_the_fence ... ok
+test fee_remit::tests::a_fee_bearing_total_that_exceeds_the_gross_by_the_fee_is_refused_before_any_swap_or_melt ... ok
+test delivery_git::contribution_tests::swapped_base_that_is_not_an_ancestor_refused ... ok
+test delivery_git::contribution_tests::seller_snapshot_without_base_oid_is_refused_not_descendant ... ok
+test fee_remit::tests::a_reconciliation_that_cannot_reach_the_mint_leaves_the_row_planned ... ok
+test fee_remit::tests::a_reserve_that_grows_between_estimate_and_payment_is_refused_before_spending ... ok
+test fee_remit::tests::a_reserve_that_shrinks_between_estimate_and_payment_is_re_planned_once_and_pays_invoice_15 ... ok
+test fee_remit::tests::a_spending_row_is_never_released_by_reconciliation_only_settled ... ok
+test fee_remit::tests::a_fee_reserve_that_leaves_too_little_or_nothing_is_refused_and_journaled ... ok
+test fee_remit::tests::a_payment_prepared_before_expiry_cannot_be_doubled_by_a_release_after_it ... ok
+test fee_remit::tests::a_second_process_cannot_release_a_live_owners_planned_row_and_exactly_one_debit_happens ... ok
+test delivery_git::contribution_tests::unrelated_history_refused_as_not_descendant ... ok
+test fee_remit::tests::a_zero_fee_reserve_invoices_the_gross_once ... ok
+test fee_remit::tests::above_the_resolved_maximum_is_refused ... ok
+test fee_remit::tests::a_spending_row_is_not_released_when_its_lease_expires_and_its_owner_pays_exactly_once ... ok
+test fee_remit::tests::a_spending_row_is_reconciled_by_its_bound_quote_not_by_an_expired_estimate ... ok
+test fee_remit::tests::a_release_decided_on_a_stale_planned_snapshot_cannot_revoke_a_later_admission ... ok
+test fee_remit::tests::an_owner_that_outlives_its_lease_is_released_and_its_fence_then_changes_zero_rows ... ok
+test fee_remit::tests::an_owner_paused_after_its_quote_and_past_its_lease_is_released_and_never_pays_that_quote ... ok
+test fee_remit::tests::best_effort_catches_a_failed_attempt_and_leaves_the_balance_intact ... ok
+test fee_remit::tests::below_the_resolved_minimum_refuses_with_the_shortfall_and_journals_nothing ... ok
+test fee_remit::tests::an_unpaid_or_pending_interrupted_attempt_is_reconciled_without_paying_twice ... ok
+test fee_remit::tests::confirm_pays_once_takes_the_fee_out_of_the_gross_and_is_idempotent ... ok
+test fee_remit::tests::full_jitter_stays_inside_zero_to_computed ... ok
+test fee_remit::tests::dry_run_prints_the_plan_and_moves_nothing ... ok
+test delivery_git::tests::pay_path_verifier_refuses_ext_before_fetch ... ok
+test fee_remit::tests::reconciliation_releases_only_terminal_quotes_own_rows_or_expired_leases ... ok
+test fee_remit::tests::retry_backoff_doubles_from_base_caps_at_thirty_minutes_and_resets_on_success ... ok
+test fee_remit::tests::retry_backoff_honours_explicit_bounds ... ok
+test fee_remit::tests::single_flight_admits_one_attempt_and_frees_the_slot_on_drop ... ok
+test fee_remit::tests::the_boot_delay_is_never_less_than_the_base_and_at_most_twice_it ... ok
+test fee_remit::tests::the_fake_wallet_models_the_sdks_proof_input_and_swap_fees_and_the_total_bound_refuses_them ... ok
+test fee_remit::tests::an_owner_whose_lease_ran_down_while_it_paused_is_refused_by_its_own_fence ... ok
+test format::tests::artifact_check_accepts_inline_utf8_for_text ... ok
+test format::tests::artifact_check_rejects_mime_mismatch ... ok
+test format::tests::artifact_check_requires_inline_bytes ... ok
+test format::tests::json_check_rejects_invalid_json ... ok
+test format::tests::json_shape_check_rejects_wrong_structure ... ok
+test format::tests::parse_accepts_mime_plus_shape_token ... ok
+test format::tests::text_check_requires_utf8 ... ok
+test gateway::creq_tests::claim_carries_creq ... ok
+test fee_remit::tests::fees_that_can_never_fit_are_refused_at_planning_not_at_payment ... ok
+test gateway::creq_tests::claim_creq_tag_parses_back ... ok
+test gateway::creq_tests::creq_roundtrip ... ok
+test gateway::free_lane_tests::a_claim_carries_a_creq_xor_a_payment_none_tag_and_never_both ... ok
+test gateway::free_lane_tests::an_offer_with_no_payment_tag_is_read_as_paid_and_one_that_states_none_is_read_as_free ... ok
+test gateway::free_lane_tests::a_free_offer_still_carries_the_required_amount_tag_at_zero ... ok
+test gateway::free_lane_tests::payment_mode_is_read_only_from_the_tag_and_never_inferred_from_an_amount ... ok
+test gateway::tests::an_absent_capability_request_posts_a_byte_identical_offer ... ok
+test gateway::tests::claim_advertises_its_harnesses_in_order ... ok
+test gateway::tests::claim_and_award_use_split_maxplayer_kinds ... ok
+test gateway::tests::every_lifecycle_draft_roots_its_offer_e_tag ... ok
+test gateway::tests::git_result_cannot_redirect_away_from_the_offered_repo_or_branch ... ok
+test gateway::tests::git_result_parses_repo_branch_and_full_commit_oid ... ok
+test gateway::tests::git_result_refuses_an_abbreviated_commit_oid ... ok
+test gateway::tests::legacy_mobee_v0_offer_is_rejected_under_v1 ... ok
+test gateway::tests::offer_carries_a_requested_agent_or_nothing_at_all ... ok
+test gateway::tests::offer_carries_the_capability_request_across_the_wire ... ok
+test gateway::tests::parse_offer_round_trips_locked_tags ... ok
+test gateway::tests::offer_draft_uses_locked_job_microstandard_tags ... ok
+test gateway::tests::receipt_draft_binds_delivery_and_echoes_exec_metadata ... ok
+test gateway::tests::reject_draft_carries_root_reply_commit_reason_and_safe_content ... ok
+test gateway::tests::result_and_receipt_keep_market_tags_outside_driver ... ok
+test gateway::tests::result_draft_carries_seller_claimed_exec_metadata_after_sig ... ok
+test gateway::tests::settled_offer_id_reads_the_root_offer_of_a_receipt_only ... ok
+test gateway::tests::targeting_helpers_fail_closed_for_targeted_offers ... ok
+test gateway::tests::untargeted_offer_draft_omits_seller_tag ... ok
+test gateway::tests::the_capability_request_reader_normalizes_a_hand_written_offer ... ok
+test git_transport::tests::allowlist_refused_before_any_network ... ok
+test fee_remit::tests::fee_aware_planning_sizes_the_invoice_so_a_fee_bearing_payment_fits_without_reserve_slack ... ok
+test git_transport::tests::header_none_for_public_https ... ok
+test git_transport::tests::ls_legs_hit_info_refs_post_legs_hit_service ... ok
+test git_transport::tests::delivery_ref_single_sources_scope_and_push ... ok
+test git_transport::tests::nip98_header_rejects_bad_key ... ok
+test fee_remit::tests::interrupted_after_the_plan_is_reconciled_as_paid_without_a_second_melt ... ok
+test git_transport::tests::nip98_header_binds_repo_root_and_verifies ... ok
+test git_transport::tests::service_url_trims_one_trailing_slash_only ... ok
+test git_transport::tests::upload_pack_ls_hits_info_refs ... ok
+test heartbeat::free_lane_tests::a_free_seat_round_trips_and_still_must_publish_a_mint ... ok
+test heartbeat::free_lane_tests::only_an_opted_in_seat_advertises_takes_payment_none_and_rate_zero_is_not_that_statement ... ok
+test heartbeat::tests::a_half_written_harness_model_tag_is_skipped_not_half_decoded ... ok
+test git_transport::tests::nip98_header_scoped_carries_one_ref_tag_and_verifies ... ok
+test heartbeat::tests::a_harness_with_no_model_shifts_nothing_else ... ok
+test heartbeat::tests::a_reader_treats_a_whitespace_only_wire_value_as_unstated ... ok
+test heartbeat::tests::a_partial_or_unknown_admission_policy_is_unstated ... ok
+test git_transport::tests::nip98_header_unscoped_has_no_ref_tag ... ok
+test heartbeat::tests::a_roster_name_with_no_wire_family_contributes_no_model ... ok
+test heartbeat::tests::a_seat_stating_no_mint_is_not_a_resolvable_seat ... ok
+test heartbeat::tests::a_seat_that_observed_no_model_emits_no_model_tag ... ok
+test heartbeat::tests::a_seat_that_states_no_capability_emits_no_capability_tags ... ok
+test heartbeat::tests::a_seller_stating_no_harness_omits_the_roster_tag ... ok
+test heartbeat::tests::a_stated_capability_round_trips_through_the_beat ... ok
+test heartbeat::tests::a_whitespace_padded_advertisement_still_matches_the_buyer_that_names_it ... ok
+test heartbeat::tests::accepting_means_serving_not_a_free_slot ... ok
+test heartbeat::tests::accepting_stays_y_while_busy_and_queue_depth_carries_the_load ... ok
+test heartbeat::tests::admission_is_beat_only_and_additive ... ok
+test heartbeat::tests::admission_wire_values_round_trip ... ok
+test heartbeat::tests::advertises_every_harness_in_preference_order ... ok
+test heartbeat::tests::an_absent_admission_tag_is_unknown_never_no ... ok
+test heartbeat::tests::an_observed_model_is_advertised_under_its_harnesss_wire_family ... ok
+test heartbeat::tests::admission_advertisement_table ... ok
+test heartbeat::tests::an_older_beat_without_capability_tags_still_parses ... ok
+test heartbeat::tests::display_only_fields_ride_the_beat_and_never_the_claim ... ok
+test heartbeat::tests::enabled_respects_env_override ... ok
+test heartbeat::tests::families_are_derived_from_the_advertised_roster ... ok
+test fee_remit::tests::recent_attempts_are_newest_first_and_bounded ... ok
+test heartbeat::tests::from_tags_is_the_exact_mirror_of_the_write_path ... ok
+test heartbeat::tests::from_tags_reads_a_claim_which_carries_no_display_fields ... ok
+test heartbeat::tests::hardware_is_unreachable_from_the_filterable_surface ... ok
+test heartbeat::tests::heartbeat_addressable ... ok
+test heartbeat::tests::interval_respects_config ... ok
+test heartbeat::tests::one_family_keeps_distinct_models_and_collapses_identical_ones ... ok
+test heartbeat::tests::parse_rejects_wrong_kind_and_missing_guards ... ok
+test heartbeat::tests::queue_depth_is_the_depth_not_a_busy_flag ... ok
+test heartbeat::tests::reader_round_trip ... ok
+test heartbeat::tests::stall_missed_intervals_respects_env_and_clamps ... ok
+test heartbeat::tests::the_announcement_carries_every_stated_capability_field ... ok
+test heartbeat::tests::the_announcement_carries_exactly_the_spec_4_2_tag_set ... ok
+test heartbeat::tests::the_beat_and_the_claim_spell_every_filterable_field_identically ... ok
+test heartbeat::tests::the_beat_carries_the_models_the_roster_observed ... ok
+test heartbeat::tests::the_buyer_reader_resolves_mints_and_agents_from_the_announcement ... ok
+test heartbeat::tests::the_terminal_beat_is_accepting_n_whatever_the_seat_was_doing ... ok
+test heartbeat::tests::the_terminal_beat_replaces_the_live_one_at_the_same_address ... ok
+test home::tests::a_file_credential_without_legs_parses_unchanged ... ok
+test home::tests::a_list_of_endpoint_flags_parses_in_order ... ok
+test home::tests::a_credential_leg_parses_with_its_own_flags_and_upstream ... ok
+test home::tests::a_wire_form_buyer_pubkey_is_wire_shaped ... ok
+test home::tests::a_real_curve_point_is_reachable ... ok
+test home::tests::a_wire_shaped_entry_with_no_curve_point_is_not_reachable ... ok
+test home::tests::accepted_mints_default ... ok
+test home::tests::a_padded_endpoint_flag_is_refused_not_trimmed ... ok
+test home::tests::an_empty_endpoint_flag_list_is_refused ... ok
+test home::tests::an_entry_that_can_never_match_a_wire_pubkey_is_not_wire_shaped ... ok
+test home::tests::an_endpoint_flag_containing_whitespace_is_refused_rather_than_split ... ok
+test home::tests::agents_table_parses_round_trips_and_refuses_string_argv ... ok
+test home::tests::bootstrap_does_not_invent_profile ... ok
+test home::tests::bootstrap_is_idempotent_and_preserves_key ... ok
+test home::tests::bootstrap_makes_home_and_wallet_dirs_owner_only ... ok
+test home::tests::bootstrap_rechmods_too_open_existing_key ... ok
+test home::tests::bootstrap_tightens_an_existing_too_open_home ... ok
+test home::tests::codex_subscription_config_parses_under_the_docker_sandbox ... ok
+test home::tests::default_home_dir_honors_maxplayer_home ... ok
+test home::tests::bootstrap_migrates_dead_cashu_space_mint ... ok
+test home::tests::default_home_guard_does_not_false_positive ... ok
+test home::tests::default_home_guard_refuses_when_only_old_home_exists ... ok
+test home::tests::default_rate_sats_is_the_market_floor ... ok
+test home::tests::documented_config_round_trips_and_warns_of_real_money ... ok
+test home::tests::deprecated_buzz_table_remains_parse_tolerated_but_ignored ... ok
+test home::tests::env_layer_overrides_nested_field ... ok
+test home::tests::env_layer_refusal_names_only_the_offender_beside_valid_vars ... ok
+test home::tests::env_layer_refusal_names_a_nested_variable ... ok
+test home::tests::env_layer_refusal_names_the_single_underscore_footgun ... ok
+test home::tests::env_layer_refuses_malformed_value_naming_the_key ... ok
+test home::tests::env_layer_refuses_unknown_variable ... ok
+test home::tests::env_layer_wins_over_file_and_defaults ... ok
+test home::tests::env_only_boots_buyer_and_seller_without_a_file ... ok
+test home::tests::hop_fee_buffer_multiplier_defaults_to_two_and_zero_is_exact ... ok
+test home::tests::legacy_mint_url_migrates ... ok
+test home::tests::platform_fee_auto_remit_defaults_on_and_the_switch_cannot_touch_rate_or_address ... ok
+test home::tests::reserved_env_seams_never_reach_the_config_layer ... ok
+test home::tests::sandbox_launcher_empty_argv_error_names_sandbox_field_not_agent_command ... ok
+test home::tests::pre_upgrade_profile_without_about_provenance_still_parses ... ok
+test home::tests::bootstrap_writes_defaults_key_and_wallet_dir ... ok
+test home::tests::save_and_reload_profile_round_trip ... ok
+test home::tests::shipped_default_git_base_is_on_the_launch_relay ... ok
+test home::tests::shipped_default_relay_is_the_maxplayer_launch_relay ... ok
+test home::tests::shipped_defaults_are_real_money_and_the_fence_admits_them ... ok
+test home::tests::the_criterion_never_groups_typed_hex_with_the_forms_that_match_nobody ... ok
+test home::tests::the_old_single_string_endpoint_arg_spelling_still_parses ... ok
+test home::tests::the_onboarding_template_does_not_claim_the_probe_runs_on_the_host ... ok
+test home::tests::the_onboarding_template_points_at_the_account_linking_step ... ok
+test home::tests::unknown_toml_field_refuses ... ok
+test job_lifecycle::free_lane_tests::a_free_accept_requires_no_creq_and_a_zero_signed_amount ... ok
+test home::tests::save_does_not_persist_env_override_values ... ok
+test job_lifecycle::free_lane_tests::the_accept_resolves_the_mode_from_both_signed_statements_and_refuses_every_mix ... ok
+test job_lifecycle::free_lane_tests::the_claim_view_reads_the_sellers_payment_statement_off_the_tag ... ok
+test job_lifecycle::free_lane_tests::the_posted_offer_draft_carries_the_requested_mode ... ok
+test job_lifecycle::tests::a_claims_capability_reaches_the_award_predicate_from_the_tags_the_seller_emitted ... ok
+test job_lifecycle::tests::accept_bind_deserializes_legacy_json_without_realized_mint ... ok
+test home::tests::save_persists_explicitly_chosen_field ... ok
+test git_transport::tests::blocking_request_runs_off_the_async_runtime ... ok
+test job_lifecycle::tests::accept_bind_seals_delivery_mint_distinct_from_funding_on_cross_mint ... ok
+test job_lifecycle::free_lane_tests::the_post_gate_is_mode_conditional_and_the_dust_guard_is_still_there ... ok
+test heartbeat::tests::a_stated_capability_survives_a_real_relay_round_trip ... ok
+test job_lifecycle::tests::accept_contribution_records_offer_authority_and_store_ref ... ok
+test job_lifecycle::tests::accept_contribution_refuses_echo_base_mismatch ... ok
+test job_lifecycle::tests::accept_contribution_refuses_echo_target_mismatch ... ok
+test job_lifecycle::tests::accept_contribution_requires_a_contribution_result ... ok
+test job_lifecycle::tests::accept_malformed_contribution_offer_fails_closed_not_from_scratch ... ok
+test job_lifecycle::tests::accept_verify_creq_is_strict_and_fail_closed ... ok
+test job_lifecycle::tests::agreeing_awards_are_not_ambiguous_and_repair_from_the_earliest ... ok
+test job_lifecycle::tests::accept_bind_round_trips_on_disk ... ok
+test job_lifecycle::tests::an_award_missing_any_field_the_ledger_needs_refuses_to_parse ... ok
+test job_lifecycle::tests::assert_authorize_matches_bind_refuses_seller_mismatch ... ok
+test job_lifecycle::tests::authorize_from_bind_refuses_amount_drift ... ok
+test job_lifecycle::tests::authorize_from_bind_requires_buyer_tip_match_hash ... ok
+test job_lifecycle::tests::authorize_request_from_bind_threads_contribution ... ok
+test job_lifecycle::tests::byte_equal_explicit_matches_bind_request ... ok
+test job_lifecycle::tests::budget_cap_guard_over_cap_refuses_at_and_under_cap_pass ... ok
+test job_lifecycle::tests::claims_and_results_are_not_inputs_to_offer_absence_certification ... ok
+test job_lifecycle::tests::accept_bind_pending_then_finalize_durability ... ok
+test job_lifecycle::tests::contribution_offer_view_parses_pins_and_malformed_is_none ... ok
+test job_lifecycle::tests::delivered_claim_past_deadline_within_pay_window_stays_payable ... ok
+test job_lifecycle::tests::delivered_claim_past_pay_window_is_expired ... ok
+test job_lifecycle::tests::accept_claim_sync_refuses_inside_runtime ... ok
+test job_lifecycle::tests::disagreeing_awards_refuse_rather_than_pick_one ... ok
+test job_lifecycle::tests::explicit_and_bind_forms_build_identical_request ... ok
+test job_lifecycle::tests::explicit_form_seals_repo_and_branch_from_bind ... ok
+test job_lifecycle::tests::fill_explicit_overwrites_caller_accepted_mints_with_bind ... ok
+test job_lifecycle::tests::foreign_seller_delivery_does_not_rescue_expired_claim ... ok
+test job_lifecycle::tests::from_scratch_offer_resolves_to_no_contribution ... ok
+test job_lifecycle::tests::accept_bind_write_is_atomic_no_temp_leftover_and_durable_overwrite ... ok
+test job_lifecycle::tests::liveness_flips_with_injected_now_only ... ok
+test job_lifecycle::tests::no_deadline_preserves_status_and_error_never_live ... ok
+test job_lifecycle::tests::ok_false_classification_pins_every_prefix_to_its_verdict ... ok
+test job_lifecycle::tests::only_an_explicit_ok_false_can_refuse ... ok
+test job_lifecycle::tests::post_job_contribution_bad_fields_refuse ... ok
+test job_lifecycle::tests::post_job_contribution_refuses_ext_url_at_post ... ok
+test job_lifecycle::tests::post_job_contribution_requires_exactly_40_lowercase_hex_base_oid ... ok
+test job_lifecycle::tests::post_job_contribution_round_trip_offer_tags_bind_to_offer_values ... ok
+test job_lifecycle::tests::post_job_deadline_future_accepted ... ok
+test job_lifecycle::tests::post_job_deadline_omitted_defaults_to_one_hour_from_now ... ok
+test job_lifecycle::tests::post_job_deadline_past_refused_names_field_and_values ... ok
+test job_lifecycle::tests::concurrent_accepts_for_different_results_bind_exactly_one ... ok
+test job_lifecycle::tests::empty_seller_sig_does_not_occupy_settlement_slot_later_valid_binds ... ok
+test job_lifecycle::tests::post_job_deadline_zero_refused ... ok
+test job_lifecycle::tests::post_job_emits_the_capability_request_it_was_given ... ok
+test job_lifecycle::tests::post_job_from_scratch_emits_byte_identical_tags ... ok
+test job_lifecycle::tests::post_job_refuses_a_request_no_seat_could_satisfy ... ok
+test job_lifecycle::tests::get_job_sync_refuses_inside_runtime ... ok
+test job_lifecycle::tests::processing_claim_before_deadline_is_live_newest_wins ... ok
+test job_lifecycle::tests::processing_claim_past_deadline_without_delivery_is_expired_not_live ... ok
+test fee_remit::tests::a_spending_rows_bound_quote_decides_its_release_on_the_full_path ... ok
+test job_lifecycle::tests::readiness_is_one_shared_definition ... ok
+test job_lifecycle::tests::red_prove_has_award_async_returns_true_for_a_known_award ... ignored, needs a live relay and a real home; run explicitly with --ignored
+test job_lifecycle::tests::result_attribution_reads_the_exec_metadata_the_seller_stamps ... ok
+test job_lifecycle::tests::select_never_picks_a_live_non_awarded_claim_over_the_award ... ok
+test job_lifecycle::tests::select_refuses_an_expired_award_so_it_never_pays ... ok
+test job_lifecycle::tests::post_job_over_budget_cap_refused_before_wallet_or_publish ... ok
+test job_lifecycle::tests::select_refuses_when_the_awarded_claim_is_absent_from_the_view ... ok
+test job_lifecycle::tests::select_refuses_when_the_awarded_seller_has_not_delivered ... ok
+test job_lifecycle::tests::select_resolution_is_invariant_under_live_claim_churn ... ok
+test job_lifecycle::tests::post_job_refuses_missing_seller_without_untargeted ... ok
+test job_lifecycle::tests::select_resolves_the_awarded_claim_even_when_a_newer_claim_is_live ... ok
+test job_lifecycle::tests::select_result_refuses_cross_authored_explicit_result_id ... ok
+test job_lifecycle::tests::single_settlement_refuses_different_result_and_is_idempotent_on_same ... ok
+test job_lifecycle::tests::send_refuses_to_transmit_bytes_that_are_not_the_pinned_event ... ok
+test job_lifecycle::tests::the_seller_is_the_p_tag_that_is_not_us_whatever_order_it_appears_in ... ok
+test kinds::tests::trade_path_kinds_are_the_contiguous_maxplayer_block ... ok
+test kinds::tests::heartbeat_is_addressable_replaceable ... ok
+test lnurl_pay::tests::address_refuses_every_malformed_shape ... ok
+test lnurl_pay::tests::address_parses_user_at_host_and_builds_the_https_well_known_url ... ok
+test lnurl_pay::tests::driver_refuses_an_http_url_before_touching_the_fetcher ... ok
+test job_lifecycle::tests::post_job_sync_refuses_inside_runtime ... ok
+test lnurl_pay::tests::invoice_response_accepts_a_matching_unexpired_bolt11_and_returns_its_payment_hash ... ok
+test lnurl_pay::tests::driver_resolves_well_known_then_callback_and_refuses_a_non_200_or_a_redirect ... ok
+test lnurl_pay::tests::millisat_conversions_round_the_right_way_at_the_boundaries ... ok
+test lnurl_pay::tests::pay_request_parses_the_measured_shape_and_builds_the_invoice_url ... ok
+test lnurl_pay::tests::pay_request_refuses_a_service_error_wrong_tag_and_missing_tag ... ok
+test lnurl_pay::tests::pay_request_refuses_every_bad_callback ... ok
+test lnurl_pay::tests::pay_request_refuses_non_json_and_non_object_bodies ... ok
+test lnurl_pay::tests::pay_request_refuses_zero_or_inverted_bounds_and_out_of_range_amounts ... ok
+test lnurl_pay::tests::pay_request_refuses_junk_amount_fields_rather_than_prefix_parsing_them ... ok
+test lnurl_pay::tests::invoice_response_refuses_missing_undecodable_expired_and_mismatched_invoices ... ok
+test log::tests::future_envelope_version_returns_typed_error ... ok
+test job_lifecycle::tests::publish_draft_sync_refuses_inside_runtime ... ok
+test log::tests::durable_after_reopen ... ok
+test log::tests::truncated_final_line_returns_prefix_and_typed_error ... ok
+test oplog::tests::a_composed_line_is_stamped_and_keeps_its_message ... ok
+test log::tests::round_trip_mixed_events_replays_in_sequence ... ok
+test oplog::tests::every_second_of_day_renders_at_fixed_width ... ok
+test oplog::tests::seconds_of_day_render_zero_padded ... ok
+test oplog::tests::stamp_is_a_utc_time_of_day ... ok
+test oplog::tests::verbose_is_off_unless_explicitly_set ... ok
+test log::tests::late_attacher_replays_then_resumes_without_gap_or_duplicate ... ok
+test payment::tests::attempt_id_is_stable_and_unit_is_part_of_the_key ... ok
+test payment::tests::attempt_id_binds_creq_hash_with_none_byte_identical_to_no_creq ... ok
+test payment::tests::complete_locked_refuses_a_locked_journal_whose_attempt_id_mismatches_the_key ... ok
+test payment::tests::blind_remint_negative_control_violates_the_pay_once_counter ... ok
+test payment::tests::auto_advance_refuses_recovered_locked_but_operator_completion_drives_it ... ok
+test payment::tests::content_hash_field_name_refuses_to_deserialize ... ok
+test payment::tests::completion_with_no_relay_stays_locked ... ok
+test payment::tests::delivery_refusal_leaves_no_intent_and_fires_no_wallet_effect ... ok
+test payment::tests::complete_locked_refuses_every_non_locked_state ... ok
+test payment::tests::empty_relay_success_stays_locked_and_never_auto_resends ... ok
+test payment::tests::crash_after_lock_effect_reconciles_without_reminting ... ok
+test payment::tests::forged_receipt_author_or_missing_signature_is_rejected ... ok
+test payment::tests::every_effect_observes_its_write_ahead_sync ... ok
+test payment::tests::fs_journal_rejects_complete_json_without_newline ... ok
+test payment::tests::fs_journal_syncs_parent_before_the_first_effect ... ok
+test payment::tests::machine_rejects_skipped_and_repeated_states ... ok
+test payment::tests::mismatched_locked_token_refuses_before_verify_or_send ... ok
+test payment::tests::missing_recovered_locked_token_refuses_and_never_remints ... ok
+test payment::tests::fs_journal_rejects_foreign_payment_key_record ... ok
+test payment::tests::payment_key_delivery_integrity_hash_round_trips ... ok
+test payment::tests::payment_key_must_bind_the_verified_commit_before_intent ... ok
+test payment::tests::fs_journal_rejects_torn_tail ... ok
+test payment::tests::prepay_seam_accepts_valid_receipt_and_authorship_tuple ... ok
+test payment::tests::prepay_seam_refuses_tampered_tuple_field ... ok
+test payment::tests::prepay_seam_refuses_tuple_signed_by_a_non_seller_key ... ok
+test payment::tests::receipt_authority_fails_closed_on_empty_relay_before_returning_evidence ... ok
+test payment::tests::prepay_seam_refuses_tuple_signed_over_a_different_commit_oid ... ok
+test payment::tests::receipt_authority_accepts_real_cosigned_receipt_and_stamps_kind ... ok
+test payment::tests::receipt_authority_rejects_forged_seller_signature ... ok
+test payment::tests::receipt_authority_refuses_receipt_bound_to_other_payment_terms ... ok
+test payment::tests::receipt_authority_rejects_tampered_delivery_binding ... ok
+test payment::tests::receipt_authority_rejects_wrong_external_anchor ... ok
+test payment::tests::receipt_record_journal_without_kind_defaults_to_zero ... ok
+test payment::tests::receipt_published_recovery_closes_without_any_effect ... ok
+test payment::tests::recovery_refuses_to_close_on_non_receipt_kind ... ok
+test payment::tests::receipt_backcompat_empty_exec_metadata_commitment_still_verifies ... ok
+test payment::tests::replay_is_synced_before_the_first_effect ... ok
+test payment::tests::service_mints_at_most_once_across_retry_and_concurrency ... ok
+test payment::tests::spent_recovered_locked_refuses_and_leaves_the_journal_unchanged ... ok
+test payment::tests::sent_recovery_retries_receipt_only ... ok
+test payment_send::tests::corrupt_wire_payload_fails_closed ... ok
+test payment::tests::verified_delivery_commit_reaches_the_existing_payment_spine ... ok
+test payment_send::tests::gift_wrap_timestamp_tweak_stays_inside_relay_freshness_window ... ok
+test payment::tests::unspent_recovered_locked_completes_to_closed_reusing_the_token ... ok
+test payment_send::tests::memory_payment_records_metadata_only ... ok
+test payment_send::tests::nut18_wire_json_is_the_payment_request_payload ... ok
+test payment_send::tests::payment_payload_debug_redacts_proof_secret ... ok
+test payment_send::tests::payment_send_fails_closed_when_no_relay_accepts ... ok
+test payment_send::tests::payment_send_preserves_partial_relay_outcome ... ok
+test payment_send::tests::payment_payload_round_trips_through_the_nut18_wire ... ok
+test payment_send::tests::gift_wrap_never_leaks_proof_secret_or_payload_plaintext ... ok
+test fee_remit::tests::two_racing_attempts_against_the_same_balance_record_exactly_one_remittance ... ok
+test payment_wallet::tests::a_mapped_send_still_holding_reserved_proofs_refuses_rather_than_stranding_them ... ok
+test payment_wallet::tests::amount_covers_fee_refuses_dust_and_accepts_fee_plus_one ... ok
+test payment_wallet::tests::a_mapped_token_created_saga_is_retired_not_merely_counted ... ok
+test payment_wallet::tests::a_recorded_refusal_still_blocks_the_pay_path ... ok
+test payment_wallet::tests::build_nut18_payload_recovers_when_the_mint_rotated_its_keyset ... ok
+test job_lifecycle::tests::config_default_flip_after_accept_does_not_shift_attempt_id ... ok
+test payment_wallet::tests::a_mapped_retire_refuses_every_near_miss_and_leaves_the_saga_in_place ... ok
+test lnurl_pay::tests::shipped_fetcher_refuses_http_without_a_network ... ok
+test payment_wallet::tests::empty_reserved_with_bound_proofs_refuses_retire ... ok
+test payment_wallet::tests::empty_swap_orphan_is_not_kept_by_a_transaction_for_a_different_saga ... ok
+test payment_wallet::tests::confirmed_attempt_reconciles_the_exact_token_without_a_second_send ... ok
+test job_lifecycle::tests::the_wake_returns_on_a_match_on_lag_and_on_expiry_but_not_on_an_unrelated_event ... ok
+test payment_wallet::tests::empty_swap_saga_with_a_referencing_transaction_still_refuses ... ok
+test payment_wallet::tests::expansion_does_not_touch_the_mint_when_the_cache_already_serves_the_token ... ok
+test payment_wallet::tests::expansion_recovers_when_the_mint_rotated_its_keyset ... ok
+test payment_wallet::tests::expansion_retries_exactly_once_when_the_mint_still_lacks_the_keyset ... ok
+test payment_wallet::tests::live_gate_all_unspent_returns_the_reused_token ... ok
+test payment_wallet::tests::confirmed_attempt_with_empty_reserved_orphan_refuses_reconcile ... ok
+test payment_wallet::tests::live_gate_incomplete_answer_fails_closed_as_effect ... ok
+test payment_wallet::tests::live_gate_pending_proof_stops_with_spent ... ok
+test payment_wallet::tests::live_gate_spent_proof_stops_with_spent ... ok
+test payment_wallet::tests::nut07_empty_states_refuses_retire ... ok
+test payment_wallet::tests::nut07_partial_states_refuses_retire ... ok
+test payment_wallet::tests::nut07_wrong_y_states_refuses_retire ... ok
+test payment_wallet::tests::only_the_unknown_short_keyset_id_variant_triggers_a_refresh ... ok
+test payment_wallet::tests::confirmed_attempt_without_its_exact_proof_refuses ... ok
+test payment_wallet::tests::pay_matches_creq ... ok
+test payment_wallet::tests::one_unresolvable_saga_does_not_veto_a_resolvable_one_in_the_same_pass ... ok
+test payment_wallet::tests::policy_maps_the_offer_once_into_typed_terms_at_the_realized_mint ... ok
+test payment_wallet::tests::policy_rejects_a_realized_mint_outside_the_allowlist ... ok
+test payment_wallet::tests::policy_rejects_an_unknown_unit_without_defaulting_to_sat ... ok
+test payment_wallet::tests::bridge_recv_fails_closed_when_the_worker_never_answers ... ok
+test payment_wallet::tests::empty_reserved_proofs_reserved_refuses_retire_migration_safe ... ok
+test payment_wallet::tests::proofs_reserved_all_unspent_retires_and_returns_spendable ... ok
+test payment_wallet::tests::proofs_reserved_with_pending_mint_state_refuses_retire_sticky ... ok
+test payment_wallet::tests::proofs_reserved_with_spent_mint_state_refuses_retire ... ok
+test payment_wallet::tests::redeem_guard ... ok
+test payment_wallet::tests::pay_path_timeout_refuses_bounded_without_charging_the_budget ... ok
+test payment_wallet::tests::seller_receive_detailed_returns_face_and_the_mint_fee_beside_it ... ok
+test payment_wallet::tests::empty_swap_orphan_with_no_transaction_is_dropped_and_pay_resumes ... ok
+test payment_wallet::tests::seller_receive_completes_a_real_swap_at_non_default_realized_mint_via_signing_mock ... ok
+test payment_wallet::tests::seller_receive_recovers_when_the_mint_rotated_its_keyset ... ok
+test payment_wallet::tests::seller_receive_refuses_when_wallet_mint_differs_from_realized_terms ... ok
+test payment_wallet::tests::seller_receive_rejects_an_authentic_underpay_before_the_mint_swap ... ok
+test payment_wallet::tests::seller_receive_rejects_dust_as_uneconomical_before_swap ... ok
+test payment_wallet::tests::seller_receive_rejects_when_wallet_returns_a_mismatched_amount ... ok
+test payment_wallet::tests::seller_receive_rejects_an_inflated_proof_at_the_mint_swap ... ok
+test payment_wallet::tests::seller_receive_returns_face_when_net_plus_fee_matches ... ok
+test payment_wallet::tests::seller_receive_succeeds_when_wallet_opened_at_non_default_realized_mint ... ok
+test payment_wallet::tests::seller_receive_surfaces_fee_mismatch_without_treating_as_underpay ... ok
+test payment_wallet::tests::send_saga_all_inputs_spent_completes_without_reclaiming_the_token ... ok
+test payment_wallet::tests::send_saga_all_inputs_unspent_refuses_rather_than_revoking_an_unclaimed_token ... ok
+test payment_wallet::tests::send_saga_binding_no_proofs_refuses_rather_than_destroying_its_token_record ... ok
+test payment_wallet::tests::swap_saga_all_inputs_unspent_rolls_back ... ok
+test payment_wallet::tests::swap_saga_mixed_input_states_refuses ... ok
+test payment_wallet::tests::signing_swap_transport_refuses_replayed_receive_token ... ok
+test payment_wallet::tests::token_proof_ys_recovers_when_the_mint_rotated_its_keyset ... ok
+test payment_wallet::tests::pay_dust_guard_fails_fast_with_mint_unreachable_pay_when_mint_down ... ok
+test platform_fee::tests::a_large_amount_that_would_overflow_u64_arithmetic_is_computed_exactly ... ok
+test platform_fee::tests::a_one_sat_payment_at_two_percent_owes_a_fee_of_zero_and_is_not_an_error ... ok
+test platform_fee::tests::a_rate_above_the_whole_is_clamped_to_the_whole_amount ... ok
+test platform_fee::tests::bps_render_as_the_percentage_a_seller_reads ... ok
+test platform_fee::tests::fractional_rates_round_down_per_payment ... ok
+test platform_fee::tests::kept_is_face_minus_mint_fee_minus_platform_fee_and_never_negative ... ok
+test platform_fee::tests::one_hundred_percent_takes_the_whole_amount ... ok
+test platform_fee::tests::the_shipped_destination_is_the_ordered_lightning_address ... ok
+test platform_fee::tests::the_shipped_rate_is_ten_percent_and_within_the_whole ... ok
+test platform_fee::tests::two_percent_of_one_hundred_sats_is_two_sats ... ok
+test platform_fee::tests::zero_basis_points_takes_nothing ... ok
+test profile::tests::announce_delivery_repo_refuses_bad_locators_without_leaking_url ... ok
+test profile::tests::default_about_mint_label_comes_from_config_not_testnut ... ok
+test profile::tests::default_about_names_every_accepted_mint_in_order ... ok
+test profile::tests::fetch_names_sync_refuses_inside_runtime ... ok
+test profile::tests::generated_about_is_noop_when_unchanged ... ok
+test profile::tests::generated_about_noop_is_wired_into_the_publish_path ... ok
+test profile::tests::generated_about_regenerates_when_live_config_changes ... ok
+test profile::tests::mint_host_label_reduces_a_url_to_its_host ... ok
+test payment_wallet::tests::post_dust_guard_fails_fast_with_mint_unreachable_when_mint_down ... ok
+test profile::tests::operator_about_update_marks_protected_and_is_preserved ... ok
+test profile::tests::parse_kind0_name_reads_name_field ... ok
+test profile::tests::parse_kind0_name_survives_multibyte_char_on_byte_cap ... ok
+test profile::tests::pre_upgrade_about_with_unknown_provenance_is_preserved ... ok
+test profile::tests::resolve_display_names_skips_invalid_hex_without_relay ... ok
+test receipt::tests::exec_metadata_commitment_empty_marker_and_stability ... ok
+test receipt::tests::preimage_canonical_json_is_domain_prefixed ... ok
+test receipt::tests::preimage_digest_binds_the_delivered_object_and_kind ... ok
+test receipt::tests::receipt_preimage_binds_creq_hash_additively ... ok
+test receipt::tests::result_content_hash_is_sha256_hex_of_result_content ... ok
+test runtime_guard::tests::refuse_err_inside_runtime ... ok
+test runtime_guard::tests::refuse_ok_outside_runtime ... ok
+test sandbox_net::tests::a_policy_with_no_pinhole_refuses_any_accept ... ok
+test sandbox_net::tests::a_single_port_pinhole_is_accepted_in_either_spelling ... ok
+test sandbox_net::tests::an_exact_comparison_would_have_refused_this_contained_namespace ... ok
+test sandbox_net::tests::each_family_is_installed_by_its_own_binary ... ok
+test sandbox_net::tests::each_way_containment_can_be_absent_is_refused ... ok
+test sandbox_net::tests::every_denied_destination_is_dropped ... ok
+test sandbox_net::tests::loopback_is_never_denied ... ok
+test sandbox_net::tests::metadata_is_dropped_and_never_accepted ... ok
+test sandbox_net::tests::no_configured_range_opens_no_pinhole ... ok
+test sandbox_net::tests::no_rendered_argument_contains_whitespace ... ok
+test sandbox_net::tests::no_rule_names_an_interface ... ok
+test sandbox_net::tests::port_range_parses_and_refuses_the_sentinel_and_the_inverted ... ok
+test sandbox_net::tests::the_chain_policy_line_is_not_counted_as_a_rule ... ok
+test sandbox_net::tests::the_deny_list_names_every_lan_shaped_range_independently ... ok
+test sandbox_net::tests::the_host_gateway_is_covered_by_a_range_deny ... ok
+test profile::tests::set_profile_writes_config_without_inventing_on_bootstrap ... ok
+test sandbox_net::tests::the_measured_readback_of_a_contained_namespace_verifies ... ok
+test sandbox_net::tests::the_pinhole_accept_precedes_the_range_denies ... ok
+test sandbox_net::tests::the_whitespace_guard_can_detect_a_bad_prefix ... ok
+test sandbox_netns::tests::a_missing_seat_label_parses_as_no_owner_not_as_an_empty_owner ... ok
+test sandbox_netns::tests::a_seats_own_holder_with_a_job_attached_survives ... ok
+test sandbox_netns::tests::an_attachment_to_another_holder_does_not_protect_this_one ... ok
+test sandbox_netns::tests::an_unlabelled_holder_belongs_to_nobody_and_is_never_reaped ... ok
+test sandbox_netns::tests::both_families_reach_the_sidecar_in_one_plan ... ok
+test sandbox_netns::tests::every_rendered_rule_becomes_exactly_one_stdin_line ... ok
+test sandbox_netns::tests::holders_are_reaped_when_nothing_is_attached ... ok
+test sandbox_netns::tests::only_holders_with_no_job_attached_are_reapable ... ok
+test sandbox_netns::tests::seat_b_does_not_select_seat_as_live_but_unattached_holder ... ok
+test sandbox_netns::tests::seat_b_does_select_its_own_stale_holder ... ok
+test sandbox_netns::tests::the_gateway_is_asked_of_docker_never_computed ... ok
+test sandbox_netns::tests::the_holder_carries_the_seat_that_created_it ... ok
+test sandbox_netns::tests::the_holder_is_locked_down_and_labelled_for_reaping ... ok
+test sandbox_netns::tests::the_holder_listing_asks_for_untruncated_ids ... ok
+test sandbox_netns::tests::the_holder_listing_narrows_to_the_seat_and_prints_it_back ... ok
+test sandbox_netns::tests::the_holder_runs_sleep_in_exec_form_with_no_shell ... ok
+test payment_wallet::tests::post_dust_guard_falls_back_to_cached_keyset_when_mint_unreachable ... ok
+test sandbox_netns::tests::the_measured_address_is_what_the_pinhole_names ... ok
+test sandbox_netns::tests::the_mode_query_names_every_container_it_was_given ... ok
+test sandbox_netns::tests::the_probe_output_yields_the_address ... ok
+test sandbox_netns::tests::the_job_joins_the_holders_namespace_and_never_names_a_network ... ok
+test sandbox_netns::tests::the_sidecar_takes_the_plan_on_stdin_and_is_told_nothing_else ... ok
+test sandbox_netns::tests::only_the_sidecar_is_granted_net_admin ... ok
+test seller::free_lane_tests::a_free_offer_is_admitted_only_by_a_seat_that_opted_in_never_by_a_zero_rate_one ... ok
+test seller::free_lane_tests::a_free_offer_still_passes_through_the_targeting_gate_first ... ok
+test seller::tests::agent_command_argv_array_parses ... ok
+test seller::tests::a_pre_378_config_migrates_agent_label_into_the_agents_list ... ok
+test seller::tests::agent_command_string_refused_at_config_parse ... ok
+test seller::tests::cashu_secret_from_nostr_hex_leaves_even_y_unchanged ... ok
+test seller::tests::cashu_secret_from_nostr_hex_normalizes_odd_y_to_even ... ok
+test seller::tests::delivered_unpaid_is_recoverable_and_not_orphaned ... ok
+test seller::tests::journal_pay_once_and_bind_refuse_wrong_job ... ok
+test seller::free_lane_tests::takes_no_payment_requires_rate_zero ... ok
+test seller::tests::offer_backfill_secs_parses_custom_and_zero ... ok
+test seller::tests::journal_reads_fail_closed_on_corruption_and_treat_missing_as_empty ... ok
+test seller::tests::last_receipt_ts_none_then_some_after_receipt ... ok
+test seller::tests::oldest_unsettled_delivery_ts_survives_newer_receipt ... ok
+test seller::tests::pending_receive_breadcrumb_found_then_superseded_by_receipt ... ok
+test seller::tests::rate_gate_floor_allows_above_rate_refuses_below_and_untargeted ... ok
+test payment_wallet::tests::token_created_without_confirmed_tx_is_not_retired ... ok
+test seller::tests::the_agents_list_is_bare_names_and_migrates_table_entries ... ok
+test seller_agents::tests::a_duplicate_listing_keeps_one_entry_so_advertisement_matches_dispatch ... ok
+test seller_agents::tests::a_named_request_dispatches_to_that_harness_and_nothing_else ... ok
+test seller_agents::tests::a_single_agents_entry_resolves_the_preset_and_advertises_its_name ... ok
+test seller_agents::tests::advertised_is_exactly_what_dispatch_serves ... ok
+test seller_agents::tests::cursor_offers_both_measured_session_directories ... ok
+test seller::tests::plan_orphaned_claims_from_real_journal_marks_past_deadline_expired ... ok
+test seller_agents::tests::every_builtin_preset_maps_to_a_credential_directory_under_user_home ... ok
+test seller_agents::tests::every_preset_failing_refuses_rather_than_serving_nothing ... ok
+test seller_agents::tests::harness_credential_dirs_never_guesses_from_an_unlabelled_hatch ... ok
+test seller::tests::plan_orphaned_claims_live_before_deadline_and_backcompat_old_line ... ok
+test seller_agents::tests::no_harness_at_all_refuses ... ok
+test seller_agents::tests::no_request_takes_the_preferred_entry_and_any_is_the_same_case ... ok
+test seller_agents::tests::unlabelled_argv_hatch_advertises_nothing_but_still_runs_untargeted_jobs ... ok
+test seller_agents::tests::partial_failure_degrades_loud_and_serves_with_the_remainder ... ok
+test seller::tests::receipt_amount_must_equal_offer_amount_not_rate ... ok
+test seller_exec::tests::a_capture_failure_is_reported_and_never_a_silent_orphan ... ok
+test seller_exec::tests::a_broken_probe_workdir_is_unmeasured_rather_than_absent ... ok
+test seller_exec::tests::a_code_constructed_endpoint_flag_with_whitespace_is_refused ... ok
+test seller_exec::tests::a_configured_sandbox_network_reaches_the_argv_and_an_unset_one_emits_no_flag ... ok
+test seller_exec::tests::a_docker_launch_refuses_a_placeholder_name_the_job_env_already_sets ... ok
+test seller_exec::tests::a_docker_policy_yields_no_host_argv_but_does_yield_a_probe_launch ... ok
+test seller_exec::tests::a_file_credential_path_must_be_absolute ... ok
+test seller_exec::tests::a_file_credential_refuses_blank_fields_and_a_malformed_upstream ... ok
+test seller_exec::tests::a_file_credential_variable_may_not_also_be_forwarded ... ok
+test seller_exec::tests::a_host_executor_forwards_nothing_because_it_inherits_everything ... ok
+test seller_exec::tests::a_probe_is_removed_without_capture_and_writes_nothing ... ok
+test seller_exec::tests::a_probe_runs_in_the_supplied_workdir_not_the_daemon_cwd ... ok
+test seller_exec::tests::a_probe_whose_container_survives_is_not_reported_as_proven ... ok
+test seller_exec::tests::a_probe_workdir_that_does_not_exist_is_refused_and_a_real_one_renders ... ok
+test payment_wallet::tests::worker_rejects_a_wrong_seller_lock_through_the_real_verify_adapter ... ok
+test seller_exec::tests::a_signal_killed_probe_is_unmeasured_under_every_executor ... ok
+test seller_exec::tests::agent_run_fail_closed_without_acp_feature ... ok
+test seller_exec::tests::an_already_gone_container_is_never_reported_as_a_clean_capture ... ok
+test seller_exec::tests::an_awarded_job_captures_on_both_a_successful_and_a_failed_exit ... ok
+test seller_exec::tests::an_empty_launcher_argv_is_pass_through_not_a_launcher ... ok
+test seller_exec::tests::an_unmeasured_spawn_failure_is_never_reported_as_absent ... ok
+test seller_exec::tests::capture_is_written_before_the_container_is_removed ... ok
+test seller_exec::tests::capture_retains_no_credential_header_or_token ... ok
+test seller_exec::tests::claude_preset_resolves_harness_family_claude_despite_npx_argv0 ... ok
+test seller_exec::tests::codex_chatgpt_auth_path_must_be_absolute ... ok
+test seller_exec::tests::composed_prompt_carries_task_and_owned_delivery_instructions ... ok
+test seller_exec::tests::custom_preset_label_is_the_reported_harness_identity ... ok
+test seller_exec::tests::delivery_message_caps_a_multibyte_summary_by_bytes_not_chars ... ok
+test seller_exec::tests::delivery_message_cuts_a_long_summary_at_a_word_boundary ... ok
+test seller_exec::tests::delivery_message_leaves_an_under_budget_summary_byte_identical ... ok
+test seller_exec::tests::delivery_message_summarizes_the_task ... ok
+test seller_exec::tests::diagnostics_land_outside_the_bind_mounted_workdir ... ok
+test seller_exec::tests::docker_policy_hardens_against_the_strangers_code_it_runs ... ok
+test seller_exec::tests::docker_policy_keeps_the_container_alive_for_its_own_diagnostics ... ok
+test seller_exec::tests::docker_policy_mounts_only_the_job_workdir ... ok
+test seller_exec::tests::docker_run_hides_maxplayer_home_and_persists_workdir_output ... ok
+test seller_exec::tests::docker_runtime_is_named_only_when_configured_and_precedes_the_image ... ok
+test seller_exec::tests::drop_fallback_is_remove_only_and_settling_disarms_it ... ok
+test seller_exec::tests::empty_agent_command_fails_closed ... ok
+test seller_exec::tests::forwarded_env_reaches_the_container_argv ... ok
+test seller_exec::tests::from_config_defaults_docker_image_when_unset ... ok
+test seller_exec::tests::from_config_resolves_and_trims_the_runtime ... ok
+test seller_exec::tests::from_config_resolves_the_network_and_the_proxy_port_range ... ok
+test seller_exec::tests::job_and_holder_are_distinct_objects_removed_by_exact_name ... ok
+test seller_exec::tests::job_container_carries_a_deterministic_name_and_label ... ok
+test seller_exec::tests::launcher_policy_makes_the_launcher_argv0 ... ok
+test seller_exec::tests::only_allowlisted_agent_auth_env_crosses_into_the_container ... ok
+test seller_exec::tests::only_docker_reads_125_as_a_runtime_failure ... ok
+test seller_exec::tests::operator_named_env_extends_the_allowlist_without_duplicating_it ... ok
+test seller_exec::tests::passthrough_policy_launches_the_configured_command_byte_identical ... ok
+test seller_exec::tests::preamble_carries_this_jobs_own_values_and_never_invites_refusal ... ok
+test seller_exec::tests::preamble_warns_off_self_matching_process_waiters ... ok
+test seller_exec::tests::repeated_probes_do_not_grow_the_diagnostics_tree ... ok
+test seller_exec::tests::retry_exhausts_bounded_attempts_then_surfaces_the_error ... ok
+test seller_exec::tests::retry_past_deadline_makes_one_attempt_then_surfaces_the_error ... ok
+test seller_exec::tests::retry_recovers_from_a_transient_error_within_the_deadline ... ok
+test seller_exec::tests::seller_delivery_kind_derives_fork_from_typed_delivery ... ok
+test seller_exec::tests::seller_exec_metadata_emits_captured_usage_into_result_tags ... ok
+test seller_exec::tests::seller_exec_metadata_is_harness_generic_public_and_absent_stays_absent ... ok
+test seller_exec::tests::the_dashboard_family_vocabulary_is_not_the_wire_family_vocabulary ... ok
+test seller_exec::tests::the_declared_output_type_reaches_the_prompt_and_absence_states_nothing ... ok
+test seller_exec::tests::the_probe_answers_from_inside_the_container_not_from_the_host ... ignored, runs a real container; needs a docker daemon and MAXPLAYER_PROBE_IMAGE
+test seller_exec::tests::the_probe_argv_and_a_job_argv_differ_only_in_the_trailing_command ... ok
+test seller_exec::tests::the_probe_runs_as_the_identity_an_awarded_job_gets ... ok
+test seller_exec::tests::the_probe_workdir_is_unique_under_seller_jobs_and_removed_on_drop ... ok
+test seller_exec::tests::the_probes_own_failure_outranks_the_cleanup_it_caused ... ok
+test seller_exec::tests::the_uncontained_audit_counts_both_registries_not_just_the_table ... ok
+test seller_exec::tests::two_file_credentials_may_not_claim_the_same_variable ... ok
+test seller_exec::tests::uncontained_forwarded_credentials_flags_only_unrecognized_operator_vars ... ok
+test seller_exec::tests::unified_job_timeout_is_the_remaining_deadline_not_a_hardcoded_constant ... ok
+test seller_exec::tests::a_bounded_probe_separates_success_absence_and_unmeasurable ... ok
+test seller_git::snapshot_tests::delivery_excludes_seller_run_transcript_and_sentinel_counts_only_the_deliverable ... ok
+test seller_git::snapshot_tests::delivery_tree_carries_this_jobs_execution_sentinel ... ok
+test seller_exec::tests::a_capability_probe_that_never_returns_is_bounded_and_killed ... ok
+test payment_wallet::tests::swap_saga_all_inputs_spent_recovers_via_restore ... ok
+test seller_git::snapshot_tests::nothing_to_deliver_from_scratch_refuses ... ok
+test seller_git::snapshot_tests::deliver_after_snapshot_pushes_branch ... ok
+test payment_wallet::tests::is_mint_unreachable_classifies_502_through_fee_and_preflight_bridge ... ok
+test seller_git::snapshot_tests::nothing_to_deliver_contribution_refuses ... ok
+test seller_git::snapshot_tests::ignores_agent_scratch_commits_delivers_single_commit_on_base ... ok
+test seller_git::snapshot_tests::snapshot_bypasses_base_repo_hooks ... ok
+test seller_exec::tests::a_runtime_failure_survives_the_whole_probe_path ... ok
+test seller_git::snapshot_tests::snapshot_without_system_git ... ok
+test seller_git::snapshot_tests::snapshots_from_scratch_as_root_commit ... ok
+test seller_git::snapshot_tests::snapshot_commit_is_never_signed ... ok
+test seller_git::snapshot_tests::snapshot_excludes_gitignored_files ... ok
+test seller_git::tests::allowlist_https_accepted_by_locator_gate ... ok
+test seller_git::snapshot_tests::snapshot_never_includes_git_internals ... ok
+test seller_git::tests::init_contribution_workdir_refuses_ext_base ... ok
+test seller_git::snapshot_tests::snapshot_preserves_executable_bit ... ok
+test seller_git::tests::preflight_push_probe_refuses_non_allowlisted_remote ... ok
+Initialized empty Git repository in /private/var/folders/mc/_gm6z2qx19qfdb0wl005gvnr0000gp/T/maxplayer-seller-git-checkout-base-54560-0/.git/
+test seller_git::snapshot_tests::snapshot_reflects_deletions ... ok
+Initialized empty Git repository in /private/var/folders/mc/_gm6z2qx19qfdb0wl005gvnr0000gp/T/maxplayer-seller-git-refuse-54560-2/.git/
+Initialized empty Git repository in /private/var/folders/mc/_gm6z2qx19qfdb0wl005gvnr0000gp/T/maxplayer-seller-git-file-refuse-54560-3/.git/
+test seller_git::snapshot_tests::snapshots_uncommitted_workdir_onto_base ... ok
+test seller_memory::tests::ensure_memory_dir_is_idempotent_and_never_clobbers ... ok
+test seller_memory::tests::ensure_memory_dir_seeds_operator_notes_and_nonempty_index ... ok
+test seller_memory::tests::frontmatter_author_parses_operator_agent_and_none ... ok
+test seller_memory::tests::is_operator_owned_by_frontmatter_and_by_notes_convention ... ok
+test seller_memory::tests::read_on_start_accepts_index_at_exact_bound ... ok
+test seller_memory::tests::read_on_start_none_when_no_index ... ok
+test seller_memory::tests::read_on_start_refuses_index_over_size_bound ... ok
+test seller_memory::tests::read_on_start_template_seam_overrides_default ... ok
+test seller_memory::tests::read_on_start_uses_default_template_with_index_and_absolute_dir ... ok
+test seller_memory::tests::retro_prompt_default_and_seam ... ok
+test seller_memory::tests::snapshot_restore_reverts_operator_files_and_leaves_agent_files ... ok
+test seller_node::ingester::tests::an_award_after_a_claim_creates_the_job ... ok
+test seller_node::ingester::tests::ingests_offers_idempotently ... ok
+test seller_node::lock::tests::second_acquire_fails_closed_while_first_is_held ... ok
+[main (root-commit) c0d2faa] seller delivery
+ 1 file changed, 1 insertion(+)
+ create mode 100644 out.txt
+test seller_node::outbox::tests::drain_confirms_pending_and_is_a_noop_second_time ... ok
+test seller_node::outbox::tests::expired_rows_are_not_published ... ok
+test seller_git::snapshot_tests::tooth_delivery_snapshot_uses_journaled_date_and_is_deterministic ... ok
+test seller_node::run::resume_action_tests::already_delivered_or_receipted_never_reruns ... ok
+test seller_node::run::resume_action_tests::genuine_mid_flight_runs_the_agent ... ok
+test seller_node::run::resume_action_tests::lapsed_deadline_fails_the_stale_award ... ok
+test seller_node::run::resume_action_tests::pushed_but_not_enqueued_finalizes_without_rerun ... ok
+test seller_node::run::resume_action_tests::settled_elsewhere_skips_the_live_residual_in_both_directions ... ok
+test seller_node::run::resume_action_tests::terminal_states_never_rerun_regardless_of_markers ... ok
+test seller_node::outbox::tests::failed_publish_stays_pending_and_bumps_attempts ... ok
+[main (root-commit) c0d2faa] seller delivery
+ 1 file changed, 1 insertion(+)
+ create mode 100644 out.txt
+test seller_git::tests::push_refuses_ssh_and_local_paths ... ok
+test seller_node::run::slot_gate_tests::a_fresh_award_takes_its_park_synchronously_out_of_the_sweeps_reach ... ok
+[main (root-commit) c0d2faa] seller delivery
+ 1 file changed, 1 insertion(+)
+ create mode 100644 out.txt
+test seller_git::tests::push_to_local_https_style_bare_via_file_is_refused ... ok
+test seller_git::tests::checkout_base_branch_from_oid_creates_fork_tip ... ok
+test seller_node::run::serialized_bounded_push_tests::a_hung_push_times_out_and_frees_the_lock ... ok
+test seller_node::run::slot_gate_tests::a_resumed_permit_is_not_parked_so_the_lapse_sweep_cannot_reclaim_it ... ok
+test seller_node::run::serialized_bounded_push_tests::concurrent_pushes_serialize_to_one_at_a_time ... ok
+test seller_node::run::slot_gate_tests::awarded_job_is_out_of_lapse_sweep_reach ... ok
+test seller_node::run::slot_gate_tests::double_release_cannot_exceed_capacity ... ok
+test seller_node::run::slot_gate_tests::every_release_path_returns_capacity ... ok
+test seller_node::run::slot_gate_tests::lapse_sweep_reclaims_expired_and_leaves_fresh ... ok
+test seller_node::run::slot_gate_tests::one_slot_is_serial_admits_one_then_blocks ... ok
+test seller_node::run::slot_gate_tests::re_seen_offer_does_not_double_reserve ... ok
+test seller_node::run::slot_gate_tests::release_is_idempotent ... ok
+test seller_node::run::slot_gate_tests::release_returns_the_slot ... ok
+test seller_node::run::slot_gate_tests::take_for_execution_is_none_whenever_nothing_is_parked_not_only_on_restart ... ok
+test seller_node::run::slot_gate_tests::taken_permit_holds_capacity_until_dropped ... ok
+test seller_node::run::slot_gate_tests::two_slots_admit_two_then_block_the_third ... ok
+test seller_node::run::slot_gate_tests::zero_config_clamps_to_serial ... ok
+test seller_node::run::supervised_probe_tests::a_hung_probe_hits_the_wall_clock_ceiling_and_the_harness_is_re_probed ... ok
+test seller_node::run::slot_gate_tests::a_queued_resume_waiter_is_not_starved_by_a_barging_claim ... ok
+test seller_node::run::supervised_probe_tests::a_panicking_probe_releases_the_in_flight_mark_so_the_harness_is_re_probed ... ok
+test seller_node::run::supervised_probe_tests::a_restored_harness_advertises_the_model_its_probe_observed ... ok
+test seller_node::run::tests::a_dropped_harness_stops_the_node_claiming_for_it ... ok
+test seller_node::run::tests::a_failed_remittance_leaves_the_receipt_journaled_the_job_paid_and_the_balance_intact ... ok
+test seller_node::run::slot_gate_tests::a_redundant_second_award_queues_for_a_real_slot_instead_of_bypassing_the_ceiling ... ok
+test seller_node::run::tests::a_flaky_harness_that_recovers_on_a_later_turn_is_proven ... ok
+test seller_node::run::tests::a_collected_job_records_the_platform_fee_constant_and_the_sats_it_implies ... ok
+test seller_node::run::tests::a_free_offer_does_not_bypass_the_admission_gates ... ok
+test seller_node::run::tests::a_free_offer_is_claimed_only_by_a_seat_that_opted_in ... ok
+test seller_node::run::tests::a_free_seat_still_judges_a_priced_offer_by_the_price_floor ... ok
+test seller_node::run::tests::a_first_failure_logs_exactly_one_line_with_its_detail_folded_in ... ok
+test seller_node::run::slot_gate_tests::a_restart_resumes_more_jobs_than_slots_without_exceeding_capacity ... ok
+test seller_node::run::tests::a_harness_cannot_pass_its_probe_by_echoing_its_own_workdir_path ... ok
+test seller_node::run::slot_gate_tests::an_award_after_its_park_lapsed_waits_for_a_real_slot_never_runs_permitless ... ok
+test seller_node::run::tests::a_long_agent_message_is_truncated_on_a_char_boundary ... ok
+test seller_node::run::tests::a_fresh_award_id_for_a_delivered_job_is_recorded_but_never_re_executed ... ok
+test seller_node::run::tests::a_named_buyer_reaches_a_seat_with_the_targeted_surface_closed ... ok
+test seller_node::run::tests::a_node_without_the_requested_harness_never_claims ... ok
+test seller_node::run::tests::a_probe_sentinel_is_minted_from_one_definition_and_is_not_ecash ... ok
+test seller_node::run::tests::a_rearm_attempt_with_no_verdict_is_treated_as_a_refusal ... ok
+test seller_node::run::tests::a_genuine_wrong_p_restricted_stays_removed ... ok
+test seller_git::tests::preflight_push_probe_fails_closed_on_unreachable_https_remote ... ok
+test seller_exec::tests::a_cleanup_failure_travels_out_of_the_probe_runner ... ok
+test seller_node::run::tests::a_resumed_job_still_dispatches_to_the_harness_it_requested ... ok
+test credential_proxy::tests::a_large_body_relays_in_full ... ok
+test seller_node::run::tests::a_seat_whose_harness_fails_its_probe_advertises_nothing ... ok
+test seller_node::run::tests::a_seat_leaving_the_selling_role_retracts_its_announcement ... ok
+test seller_node::run::tests::a_seller_that_loses_the_home_lock_reaches_no_wire ... ok
+test seller_node::run::tests::a_shared_outcome_re_arms_the_live_retry_timer ... ok
+test seller_node::run::tests::a_shutdown_drain_gives_up_waiting_at_its_bound_but_never_cancels_the_attempt ... ok
+test seller_node::run::tests::allowlist_fences_out_an_unlisted_buyer ... ok
+test seller_node::run::tests::a_requested_shutdown_drains_a_pending_remittance_before_the_loop_returns ... ok
+test seller_node::run::tests::an_auth_class_unrunnable_turn_gets_a_sign_in_remedy_not_a_sandbox_one ... ok
+test seller_node::run::tests::a_requested_shutdown_ends_the_platform_fee_retries ... ok
+test credential_proxy::tests::the_streamed_body_redirect_matrix_is_pinned_per_status ... ok
+test seller_node::run::tests::an_offer_targeted_at_another_seat_is_refused_under_every_control_setting ... ok
+test credential_proxy::tests::an_undeclared_over_cap_body_is_cut_off_mid_stream ... ok
+test seller_node::run::tests::an_unrunnable_turn_stops_the_loop_even_after_a_flaky_retry ... ok
+test seller_node::run::tests::award_binds_our_claim_and_releases_on_a_different_one ... ok
+test seller_node::run::tests::award_filter_is_pubkey_scoped_for_targeted ... ok
+test seller_node::run::tests::award_filter_is_unscoped_for_open_pool_so_losers_see_the_award ... ok
+test seller_node::run::tests::award_from_non_buyer_is_ignored_even_when_claim_matches ... ok
+test buyer::relay::tests::an_auth_required_refusal_is_resent_after_auth_and_only_when_auto_auth_is_on ... ok
+test credential_proxy::tests::an_upstream_that_dies_mid_relay_releases_both_the_client_and_its_permit ... ok
+test collect::tests::collect_without_bind_refuses_fail_closed_when_nothing_delivered ... ok
+test buyer::relay::tests::the_sdk_recovers_our_job_subscription_across_a_relay_restart ... ok
+test seller_node::run::tests::boot_resume_re_drives_awarded_undelivered_job_delivery_lands_once ... ok
+test seller_node::run::tests::both_unreachable_branches_share_one_remedy_text ... ok
+test seller_node::run::tests::characterization_a_lapsed_awarded_row_lapses_and_stops_counting_once_failed ... ok
+test seller_node::run::tests::claims_fresh_targeted_offer_at_rate ... ok
+test seller_node::run::tests::clone_at_base_oid_not_empty_workdir ... ok
+test seller_node::run::tests::closing_both_open_routes_restores_allowlist_only_admission_with_the_list_intact ... ok
+test seller_node::run::tests::combine_upgrades_to_settled_and_never_weakens_back ... ok
+test seller_node::run::tests::contribution_deliver_emits_result_envelope_pin_only ... ok
+test seller_node::run::tests::default_seat_refuses_a_targeted_offer_from_an_unnamed_buyer ... ok
+test seller_node::run::tests::delivered_or_paid_job_is_not_re_executed ... ok
+test seller_node::run::tests::delivery_hash_binds_stored_creq_not_drifted_config ... ok
+test seller_node::run::tests::delivery_preimage_binds_stored_creq_not_drifted_config ... ok
+test seller_node::run::tests::a_forged_or_misbound_decision_never_suppresses ... ok
+test seller_node::run::tests::execution_failure_feedback_is_a_buyer_addressed_error ... ok
+test seller_node::run::tests::fed_under_rate_offers_fifo_bounds_the_set ... ok
+test seller_node::run::tests::fed_under_rate_offers_record_is_idempotent ... ok
+test seller_node::run::tests::feedback_rides_the_authoritative_reason_code_tag ... ok
+test seller_node::run::tests::free_not_offered_is_not_folded_into_the_rate_gate ... ok
+test seller_node::run::tests::heartbeat_publish_is_confirmed_only_on_a_relay_ok ... ok
+test seller_node::run::tests::is_auth_class_matches_only_the_acp_auth_message ... ok
+test seller_node::run::tests::lapsed_is_refused_before_the_allowlist_fence ... ok
+test seller_node::run::tests::a_job_we_hold_a_claim_for_is_never_suppressed ... ok
+test seller_node::run::tests::a_receipt_stays_terminal_against_an_award_in_either_order ... ok
+test seller_node::run::tests::mid_flight_second_award_is_admitted_for_execution_no_per_job_in_flight_lock ... ok
+test seller_node::run::tests::long_lived_subs_resubscribe_on_auth_after_a_challenge_roll ... ok
+test seller_node::run::tests::a_settled_offer_won_by_another_seat_is_not_claimed ... ok
+test seller_node::run::tests::offer_backfill_since_is_a_bounded_lookback_widened_to_the_configured_window ... ok
+test seller_node::run::tests::only_harness_attributable_failures_narrow_the_roster ... ok
+test seller_node::run::tests::open_pool_filter_rides_the_offer_req_iff_opted_in ... ok
+test seller_node::run::tests::open_pool_rearm_backoff_doubles_and_stays_capped ... ok
+test seller_node::run::tests::liveness_probe_answers_only_on_an_authenticated_session ... ok
+test seller_node::run::tests::open_targeted_is_off_by_default_on_the_wire ... ok
+test seller_node::run::tests::plan_delivery_workdir_maps_pin_to_clone_and_none_to_empty ... ok
+test seller_node::run::tests::platform_fee_is_charged_on_the_offer_face_not_the_wallet_net ... ok
+test seller_node::run::tests::probe_step_never_retries_the_unrunnable_shape ... ok
+test seller_node::run::tests::probe_step_retries_the_flaky_shape_up_to_the_cap_then_fails_closed ... ok
+test seller_node::run::tests::probe_step_stops_on_a_proven_turn ... ok
+test seller_node::run::tests::realized_mint_must_be_in_the_stored_creq ... ok
+test seller_node::run::tests::receipt_collect_dedups_a_replayed_payment ... ok
+test seller_node::run::tests::an_authentic_acceptance_is_the_backup_suppression ... ok
+test seller_node::run::tests::open_pool_rearms_on_an_owned_tick_without_any_reconnect ... ok
+test seller_node::run::tests::an_authentic_award_to_another_seller_is_not_claimed_when_capacity_frees ... ok
+test seller_node::run::tests::recovery_backoff_grows_and_stays_capped ... ok
+test seller_node::run::tests::an_unknown_id_closed_costs_no_reconnect_and_no_resubscribe ... ok
+test seller_node::run::tests::redeem_classification_finalizes_and_never_forges_from_a_breadcrumb ... ok
+test seller_node::run::tests::refuses_an_offer_authored_before_the_admit_horizon ... ok
+test seller_node::run::tests::refuses_below_rate ... ok
+test seller_node::run::tests::refuses_lapsed_offer_before_rate ... ok
+test seller_node::run::tests::reject_reader_gate_refuses_non_awarding_author_and_live_filter_includes_3407 ... ok
+test seller_node::run::tests::remittance_follows_only_a_new_receipt_never_a_duplicate_or_an_error ... ok
+test seller_node::run::tests::backfill_refuses_aged_historical_but_still_admits_a_fresh_offer ... ok
+test seller_node::run::tests::restart_resume_selection_over_persisted_rows ... ok
+test seller_node::run::tests::resubscribe_on_auth_restores_an_auth_required_closed_leg ... ok
+test seller_node::run::tests::resume_redelivery_is_deterministic_and_never_double_publishes ... ok
+test seller_node::run::tests::resume_selects_awarded_or_executing_not_delivered_or_terminal ... ok
+test seller_node::run::tests::seal_sender_must_be_the_bound_offer_buyer ... ok
+test seller_node::run::tests::belt_runs_the_agent_when_the_relay_holds_no_settlement_the_foil ... ok
+test seller_node::run::tests::skip_reason_names_taken_elsewhere_apart_from_settled ... ok
+test seller_node::run::tests::taken_elsewhere_expires_at_the_offer_deadline_and_settled_never_does ... ok
+test seller_node::run::tests::taken_elsewhere_is_buyer_bound_and_fails_open_once_expired ... ok
+test seller_node::run::tests::terminal_offers_buyer_binds_the_settlement ... ok
+test seller_node::run::tests::terminal_offers_drop_newest_protects_an_established_buyer ... ok
+test seller_node::run::tests::terminal_offers_fifo_bounds_the_offer_map ... ok
+test seller_node::run::tests::terminal_offers_record_is_idempotent ... ok
+test seller_node::run::tests::the_advertised_admission_matches_what_classify_offer_decides ... ok
+test seller_node::run::tests::the_allowlist_and_the_targeted_opt_in_admit_additively ... ok
+test seller_node::run::tests::the_already_handled_skip_names_itself_on_finished_jobs_only ... ok
+test seller_node::run::tests::the_closed_targeted_refusal_names_its_own_knob_not_the_allowlist ... ok
+test seller_node::run::tests::the_completed_turn_reason_carries_the_agents_own_words ... ok
+test seller_node::run::tests::the_completed_turn_reason_never_rules_containment_out ... ok
+test seller_node::run::tests::the_declared_output_type_survives_wire_to_row_to_prompt_across_a_restart ... ok
+test seller_node::run::tests::the_empty_list_warning_offers_all_three_routes_back_in ... ok
+test seller_node::run::tests::seller_start_publishes_kind0_and_zero_kind_31990 ... ok
+test seller_node::run::tests::the_first_retry_never_fires_before_thirty_seconds_after_boot_even_after_a_collect_success ... ok
+test seller_node::run::tests::the_harness_request_survives_the_wire_to_row_mapping ... ok
+test seller_node::run::tests::the_junk_list_warning_offers_all_three_routes_back_in ... ok
+test seller_node::run::tests::the_operators_declared_colour_reaches_the_beat_and_never_the_claim ... ok
+test seller_node::run::tests::the_pre_advertise_probe_names_every_failure_when_nothing_proved ... ok
+test seller_node::run::tests::the_pre_advertise_probe_names_every_failure_when_some_still_prove ... ok
+test seller_node::run::tests::the_pre_advertise_probe_renders_a_nameless_verdict_as_unlabelled ... ok
+test seller_node::run::tests::the_pre_advertise_probe_reports_full_service_when_every_harness_proved ... ok
+test seller_node::run::tests::belt_skips_a_live_residual_when_a_buyer_receipt_settled_elsewhere ... ok
+test seller_node::run::tests::the_first_advertisement_carries_the_measured_capability_set ... ok
+test seller_node::run::tests::the_self_probe_is_decided_by_the_sentinel_not_by_a_completed_turn ... ok
+test seller_node::run::tests::the_siren_fires_for_an_allowlist_that_can_never_match ... ok
+test seller_node::run::tests::the_siren_stays_silent_when_one_allowlist_entry_is_usable ... ok
+test seller_node::run::tests::the_proving_turns_model_reaches_both_wire_surfaces_before_serving ... ok
+test seller_node::run::tests::the_three_admission_controls_are_additive_and_independent ... ok
+test seller_node::run::tests::the_two_open_surfaces_are_independent ... ok
+test seller_node::run::tests::the_unknown_close_diagnostic_carries_both_ages_and_the_auth_state ... ok
+test seller_node::run::tests::the_unreachable_seat_warning_fires_on_exactly_the_closed_config ... ok
+test seller_node::run::tests::the_unusable_list_explanation_names_the_curve_not_only_the_shape ... ok
+test seller_node::run::tests::belt_skips_a_live_residual_when_our_result_is_on_the_relay ... ok
+test seller_node::run::tests::under_rate_feedback_only_for_targeted_under_rate_rate_gate ... ok
+test seller_node::run::tests::unsettled_delivery_pins_the_cursor_until_its_receipt_lands ... ok
+test seller_node::run::tests::unsupported_version_offer_is_a_distinct_parse_refusal ... ok
+test seller_node::run::tests::untargeted_needs_open_pool_opt_in ... ok
+test seller_node::run::tests::watchdog_clock_refreshes_only_when_both_legs_confirm ... ok
+test seller_node::run::tests::watchdog_stall_math_clamps_and_trips_only_at_threshold ... ok
+test seller_node::run::tests::wrap_backfill_cursor_clamps_to_the_oldest_unsettled_delivery_and_fails_closed ... ok
+test seller_node::run::tests::recovery_puts_no_p_gated_req_on_the_wire_before_nip42_completes ... ok
+test seller_node::run::tests::reconnect_reauthenticates_and_delivery_resumes_in_process ... ok
+test seller_node::shutdown::tests::a_repeated_request_is_redundant_not_an_error ... ok
+test seller_node::shutdown::tests::a_request_reaches_the_loop_with_its_reason ... ok
+test seller_node::shutdown::tests::dropping_every_handle_is_not_a_shutdown ... ok
+test seller_node::shutdown::tests::the_receiver_is_taken_once ... ok
+test seller_node::signer::tests::a_stalled_signer_round_trip_is_bounded_and_leaves_the_caller_usable ... ok
+test seller_node::signer::tests::actor_serves_pubkey_and_never_the_secret ... ok
+test seller_node::signer::tests::builds_nip98_push_header_through_the_actor_never_leaking_the_secret ... ok
+test seller_node::signer::tests::signed_event_carries_the_protocol_tags ... ok
+test seller_node::signer::tests::signing_is_deterministic_for_a_fixed_created_at ... ok
+test seller_node::signer::tests::signs_receipt_hash_through_the_actor_never_leaking_the_secret ... ok
+test seller_node::store::free_lane_tests::a_free_delivery_records_payment_none_and_a_priced_one_records_sat ... ok
+test seller_node::store::free_lane_tests::a_v6_store_migrates_to_v7_additively_and_re_entrantly ... ok
+test seller_node::store::free_lane_tests::the_offers_payment_mode_survives_a_restart ... ok
+test seller_node::store::tests::a_plan_whose_net_exceeds_its_gross_is_refused ... ok
+test seller_node::store::tests::a_second_plan_while_one_is_in_flight_is_refused_by_api_and_by_index ... ok
+test seller_node::store::tests::a_store_from_before_the_column_migrates_and_reads_no_preference ... ok
+test seller_node::store::tests::a_store_from_before_the_fee_columns_migrates_and_reads_zero ... ok
+test seller_node::store::tests::a_store_from_before_the_settled_elsewhere_column_migrates_and_reads_false ... ok
+test seller_node::store::tests::a_store_holding_only_terminal_jobs_reports_none_in_flight ... ok
+test seller_node::store::tests::a_v10_store_migrates_to_v11_additively_and_its_rows_read_as_unowned ... ok
+test seller_node::store::tests::a_v11_store_migrates_to_v12_additively_and_its_planned_row_reads_as_not_spending ... ok
+test seller_node::store::tests::a_v12_store_migrates_to_v13_additively_and_its_spending_row_reads_as_unbound ... ok
+test seller_node::store::tests::a_v4_store_opens_clean_under_v5_and_gains_contribution_pins ... ok
+test seller_node::store::tests::a_v8_store_migrates_to_v9_and_reads_no_mint_fee_rather_than_zero ... ok
+test seller_node::store::tests::a_v9_store_migrates_to_v10_and_reads_its_receipts_as_unremitted ... ok
+test seller_node::store::tests::award_dedup_creates_one_job_and_ignores_replays ... ok
+test seller_node::store::tests::claim_and_enqueue_is_idempotent_no_double_enqueue ... ok
+test seller_node::store::tests::collect_receipt_dedups_and_pays_once ... ok
+test seller_node::store::tests::collect_receipt_journals_the_fee_in_the_same_row_and_accrued_fees_sums_it ... ok
+test seller_node::store::tests::contribution_pin_round_trips_and_absent_for_from_scratch ... ok
+test seller_node::store::tests::deliver_is_idempotent_and_enqueues_result_once ... ok
+test seller_node::store::tests::expire_outbox_stops_the_publisher_from_sending ... ok
+test seller_node::store::tests::fail_releases_the_receipts_and_the_invoice_stays_used ... ok
+test seller_node::store::tests::job_award_time_is_deterministic_when_a_job_holds_two_awards ... ok
+test seller_node::store::tests::job_checks_round_trip_and_absent_row_is_none ... ok
+test seller_node::store::tests::job_state_spellings_are_the_literals_the_schema_stores ... ok
+test seller_node::store::tests::jobs_in_flight_counts_exactly_the_occupying_states ... ok
+test seller_node::store::tests::jobs_in_flight_is_a_count_not_a_flag ... ok
+test seller_node::store::tests::offers_awarded_elsewhere_selects_only_live_unclaimed_awarded_offers ... ok
+test seller_node::store::tests::only_awarded_and_executing_occupy_an_execution_slot ... ok
+test seller_node::store::tests::open_is_wal_and_carries_schema_and_start ... ok
+test seller_node::store::tests::plan_then_settle_discharges_the_receipts_and_a_second_plan_finds_nothing ... ok
+test seller_node::store::tests::record_offer_is_idempotent ... ok
+test seller_node::store::tests::replan_remittance_updates_only_our_own_planned_unbound_row_and_keeps_receipts_pinned ... ok
+test seller_node::store::tests::requested_agent_survives_a_reopen ... ok
+test seller_node::store::tests::settled_elsewhere_marker_round_trips_and_defaults_false ... ok
+test seller_node::store::tests::the_declared_output_type_survives_a_reopen ... ok
+test seller_node::store::tests::the_narrowing_mutators_report_when_they_move_nothing ... ok
+test seller_node::store::tests::the_spend_fence_admits_only_the_owner_of_a_planned_row_with_lease_to_spare_and_only_once ... ok
+test seller_node::store::tests::tooth_outbox_write_lands_atomically_with_the_claim ... ok
+test seller_node::tests::restart_resumes_job_state_and_never_double_publishes ... ok
+test seller_node::tests::restart_then_award_rebinds_the_parked_claim ... ok
+test seller_node::tests::second_node_on_same_home_fails_closed ... ok
+test seller_node::tests::status_snapshot_never_leaks_the_secret ... ok
+test seller_node::wallet_actor::tests::concurrent_callers_are_serialized_through_one_slot ... ok
+test seller_roster::tests::a_claimed_probe_is_not_handed_out_again_until_its_verdict_lands ... ok
+test seller_roster::tests::a_deadline_expiry_neither_drops_the_harness_nor_consumes_a_strike ... ok
+test seller_roster::tests::a_dropped_harness_leaves_the_advertisement_and_the_dispatch_table_together ... ok
+test seller_roster::tests::a_dropped_harness_takes_its_model_off_the_wire_with_its_name ... ok
+test seller_roster::tests::a_fresh_observation_of_no_model_clears_a_stale_one ... ok
+test seller_roster::tests::a_fully_dropped_named_roster_reports_dark_alongside_an_empty_advertisement ... ok
+test seller_roster::tests::a_later_observation_replaces_an_earlier_one ... ok
+test seller_roster::tests::a_named_request_for_a_serving_harness_is_unaffected_by_another_ones_drop ... ok
+test seller_roster::tests::a_recorded_model_is_advertised_against_its_own_harness ... ok
+test seller_roster::tests::a_seat_that_has_probed_nothing_advertises_no_capabilities ... ok
+test seller_roster::tests::a_serving_harness_reports_no_unavailability_and_keeps_its_argv_reachable ... ok
+test seller_roster::tests::abandoning_a_claimed_probe_releases_the_mark_and_re_arms_it_without_restoring ... ok
+test seller_roster::tests::abandoning_after_a_verdict_landed_is_an_idempotent_no_op ... ok
+test seller_roster::tests::abandoning_an_incapable_probe_leaves_the_capability_untouched ... ok
+test seller_roster::tests::an_undeclared_seat_states_no_colour_at_all ... ok
+test seller_roster::tests::dropping_the_preferred_harness_falls_through_to_the_next_serving_one ... ok
+test seller_roster::tests::every_harness_dropped_serves_nothing_rather_than_falling_back ... ok
+test seller_roster::tests::incapable_names_the_capability_schedules_no_probe_and_derives_its_own_remedy ... ok
+test seller_roster::tests::probed_capabilities_ride_the_same_snapshot_as_the_harnesses ... ok
+test seller_roster::tests::recording_a_model_never_changes_availability ... ok
+test seller_roster::tests::repeated_failures_escalate_the_probe_delay_and_saturate ... ok
+test seller_roster::tests::strike_history_survives_a_restore_so_a_flapping_harness_backs_off_further ... ok
+test seller_roster::tests::the_advertisement_separates_having_no_name_from_having_nothing_to_serve ... ok
+test seller_roster::tests::the_capability_a_snapshot_implies_reaches_the_filterable_tags ... ok
+test seller_roster::tests::the_probe_window_elapsing_does_not_restore_anything ... ok
+test seller_roster::tests::the_unlabelled_hatch_is_droppable_even_though_it_has_no_name ... ok
+test seller_roster::tests::the_unlabelled_hatch_serves_with_a_model_but_advertises_neither ... ok
+test store_maint::tests::an_unfinished_compaction_is_recovered_not_discarded ... ok
+test store_maint::tests::compaction_preserves_every_object_including_unreachable_ones ... ok
+test store_maint::tests::kept_packs_are_never_counted_or_moved ... ok
+test store_maint::tests::under_threshold_leaves_the_store_untouched ... ok
+test telemetry::tests::disabled_channel_emits_nothing ... ok
+test telemetry::tests::envelope_wraps_the_episode_with_type_and_routing_fields ... ok
+test telemetry::tests::mirror_only_works_without_a_sink_command ... ok
+test telemetry::tests::never_echoes_secret_key_in_rendered_event ... ok
+test telemetry::tests::sink_failure_does_not_block_or_lose_episodes_jsonl_append ... ok
+test telemetry::tests::sink_receives_episode_envelope ... ok
+test wallet::tests::amount_overflow_is_rejected_by_native_checked_sum ... ok
+test wallet::tests::connector_check_computes_ys_without_keyset_fetch ... ok
+test wallet::tests::duplicate_secret_and_y_are_rejected_by_native_token_value ... ok
+test wallet::tests::unsigned_prepay_token_uses_spending_conditions_not_witness_signatures ... ok
+test wallet::tests::verify_rejects_conditions_seller_cannot_satisfy ... ok
+test wallet::tests::verify_rejects_equal_numeric_amount_in_wrong_currency_unit ... ok
+test wallet::tests::verify_rejects_mixed_seller_and_other_primary_locks ... ok
+test wallet::tests::verify_rejects_non_nut10_sibling_proof ... ok
+test wallet::tests::verify_rejects_wrong_mint_amount_lock_and_spent_state ... ok
+test wallet_ops::tests::a_melt_ceiling_admits_a_prepared_melt_by_what_confirm_will_actually_debit ... ok
+test wallet_ops::tests::a_melt_ceiling_admits_only_the_planned_invoice_within_the_gross_debit ... ok
+test wallet_ops::tests::a_prepared_payment_relays_confirm_and_cancel_verdicts ... ok
+test wallet_ops::tests::a_total_ceiling_refusal_names_the_parts_the_total_and_the_ceiling ... ok
+test wallet_ops::tests::balances_include_unconfigured_proofs_from_the_shared_database ... ok
+test wallet_ops::tests::blocking_complete_mint_by_id_refuses_inside_runtime ... ok
+test wallet_ops::tests::blocking_mint_refuses_inside_runtime ... ok
+test wallet_ops::tests::complete_mint_by_id_empty_quote_id_refuses ... ok
+test wallet_ops::tests::complete_mint_by_id_unknown_quote_without_amount_refuses ... ok
+test wallet_ops::tests::dropping_an_undecided_prepared_payment_cancels_it_and_joins_its_thread ... ok
+test wallet_ops::tests::extra_mint_add_remove_keeps_default_pinned ... ok
+test wallet_ops::tests::funding_op_never_writes_back_the_env_widened_real_mint_fence ... ok
+test seller_node::run::tests::repeated_open_pool_rejection_backs_off_and_never_hot_loops ... ok
+test wallet_ops::tests::mint_not_allowed_names_home_default_not_testnut_constant ... ok
+test wallet_ops::tests::mint_pinned_default_error_names_the_real_default_not_testnut ... ok
+test wallet_ops::tests::normalize_mint_url_trims_and_strips_trailing_slash ... ok
+test wallet_ops::tests::of_mint_classifies_testnut_play_and_others_real ... ok
+test wallet_ops::tests::post_confirm_balance_read_failure_preserves_outcome ... ok
+test wallet_ops::tests::post_receive_balance_read_failure_preserves_outcome ... ok
+test wallet_ops::tests::receive_refuses_real_mint_when_disallowed ... ok
+test wallet_ops::tests::redact_secret_empty_marks_empty ... ok
+test wallet_ops::tests::send_outcome_debug_redacts_bearer_token ... ok
+test wallet_ops::tests::the_confirmability_bound_selects_the_verdicts_invoices_when_searched_downward ... ok
+test wallet_ops::tests::unknown_mint_refused_without_inventing_credit ... ok
+test wallet_ops::tests::lookup_pending_quote_unknown_id_is_none ... ok
+test seller_node::run::tests::distinct_under_rate_offers_each_get_their_own_feedback ... ok
+test seller_node::run::tests::a_losing_open_pool_claimant_releases_its_slot_when_it_sees_the_award ... ok
+test seller_node::run::tests::offer_backfill_fetches_even_with_nothing_pending ... ok
+test seller_node::run::tests::offer_backfill_recovers_an_offer_the_deaf_live_sub_never_delivered ... ok
+test seller_node::run::tests::an_accept_naming_another_seats_claim_never_binds_the_loser ... ok
+test seller_node::run::tests::reconsider_backfills_a_capacity_skipped_open_pool_offer_when_a_slot_frees ... ok
+test seller_node::run::tests::reconsider_backfills_a_capacity_skipped_targeted_offer_when_a_slot_frees ... ok
+test seller_node::run::tests::the_receipt_sub_backfills_the_terminal_cache_on_boot ... ok
+test seller_node::run::tests::wrap_backfill_fetches_even_with_nothing_pending ... ok
+test seller_node::run::tests::under_rate_feedback_emitted_once_across_backfill_re_ingest ... ok
+test seller_node::run::tests::the_suppression_survives_a_restart_off_the_store_alone ... ok
+test seller_node::run::tests::wraps_subscription_survives_ten_consecutive_reconnects has been running for over 60 seconds
+test seller_node::run::tests::wraps_subscription_survives_ten_consecutive_reconnects ... ok
+
+failures:
+
+---- credential_proxy::tests::a_declared_over_cap_body_is_refused_before_the_upstream_sees_it stdout ----
+
+thread 'credential_proxy::tests::a_declared_over_cap_body_is_refused_before_the_upstream_sees_it' (78641002) panicked at crates/maxplayer-core/src/credential_proxy.rs:3520:14:
+called `Result::unwrap()` on an `Err` value: reqwest::Error { kind: Request, url: "http://127.0.0.1:49410/v1/messages", source: hyper_util::client::legacy::Error(SendRequest, hyper::Error(BodyWrite, Os { code: 54, kind: ConnectionReset, message: "Connection reset by peer" })) }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    credential_proxy::tests::a_declared_over_cap_body_is_refused_before_the_upstream_sees_it
+
+test result: FAILED. 1426 passed; 1 failed; 2 ignored; 0 measured; 0 filtered out; finished in 158.49s
+
+error: test failed, to rerun pass `-p maxplayer-core --lib`
+     Running tests/acp_concurrency.rs (target/debug/deps/acp_concurrency-0a254720b15e90f1)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/collect_integrity.rs (target/debug/deps/collect_integrity-d228ebaddcf1465b)
+
+running 8 tests
+Initialized empty Git repository in /private/var/folders/mc/_gm6z2qx19qfdb0wl005gvnr0000gp/T/maxplayer-collect-itest-free-wrongtip-upstream-57474-2/.git/
+Initialized empty Git repository in /private/var/folders/mc/_gm6z2qx19qfdb0wl005gvnr0000gp/T/maxplayer-collect-itest-replay-57474-7/.git/
+Initialized empty Git repository in /private/var/folders/mc/_gm6z2qx19qfdb0wl005gvnr0000gp/T/maxplayer-collect-itest-valid-57474-5/.git/
+Initialized empty Git repository in /private/var/folders/mc/_gm6z2qx19qfdb0wl005gvnr0000gp/T/maxplayer-collect-itest-deadmint-57474-4/.git/
+Initialized empty Git repository in /private/var/folders/mc/_gm6z2qx19qfdb0wl005gvnr0000gp/T/maxplayer-collect-itest-upstream-57474-3/.git/
+Initialized empty Git repository in /private/var/folders/mc/_gm6z2qx19qfdb0wl005gvnr0000gp/T/maxplayer-collect-itest-free-nosentinel-57474-1/.git/
+Initialized empty Git repository in /private/var/folders/mc/_gm6z2qx19qfdb0wl005gvnr0000gp/T/maxplayer-collect-itest-free-ok-57474-6/.git/
+Initialized empty Git repository in /private/var/folders/mc/_gm6z2qx19qfdb0wl005gvnr0000gp/T/maxplayer-collect-itest-nosentinel-57474-0/.git/
+[main (root-commit) a62cbc5] base commit
+ 1 file changed, 1 insertion(+)
+ create mode 100644 README.md
+[main (root-commit) a62cbc5] base commit
+ 1 file changed, 1 insertion(+)
+ create mode 100644 README.md
+[main (root-commit) 23e8cc1] delivery
+ 1 file changed, 1 insertion(+)
+ create mode 100644 README.md
+[main (root-commit) a8ac08f] delivery
+ 2 files changed, 5 insertions(+)
+ create mode 100644 MAXPLAYER_EXECUTION_SENTINEL
+ create mode 100644 README.md
+[main (root-commit) a8ac08f] delivery
+ 2 files changed, 5 insertions(+)
+ create mode 100644 MAXPLAYER_EXECUTION_SENTINEL
+ create mode 100644 README.md
+[main (root-commit) 715c870] delivery
+ 2 files changed, 5 insertions(+)
+ create mode 100644 MAXPLAYER_EXECUTION_SENTINEL
+ create mode 100644 README.md
+[main (root-commit) 23e8cc1] delivery
+ 1 file changed, 1 insertion(+)
+ create mode 100644 README.md
+[main (root-commit) df13723] delivery
+ 2 files changed, 5 insertions(+)
+ create mode 100644 MAXPLAYER_EXECUTION_SENTINEL
+ create mode 100644 README.md
+[main b6c2d9e] tip commit
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+[main b6c2d9e] tip commit
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+test collect_refuses_no_sentinel_on_a_replayed_sentinel_from_another_job ... ok
+test a_free_collect_refuses_a_wrong_tip_and_materializes_nothing ... ok
+test collect_refuses_no_sentinel_when_delivery_carries_none ... ok
+test a_free_collect_refuses_a_delivery_with_no_execution_sentinel ... ok
+test collect_refuses_pay_when_delivered_tip_differs_from_bound_oid ... ok
+test collect_refuses_dead_mint_at_preflight_before_the_budget_reserve ... ok
+test a_free_collect_settles_without_authorize_pay_and_a_paid_one_still_enters_it ... ok
+test collect_passes_the_sentinel_gate_for_a_valid_delivery ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.77s
+
+     Running tests/free_post_no_wallet.rs (target/debug/deps/free_post_no_wallet-7cfcd4fd97607e17)
+
+running 1 test
+test a_free_post_succeeds_with_no_wallet_and_a_priced_one_on_the_same_home_refuses ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+
+     Running tests/git_config_isolation.rs (target/debug/deps/git_config_isolation-82705a4f3e3809c4)
+
+running 1 test
+test ambient_insteadof_cannot_rewrite_allowlisted_https ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+     Running tests/hostile_local_git_config.rs (target/debug/deps/hostile_local_git_config-745a67540209ad05)
+
+running 1 test
+test config_rewrite_defeats_a_local_insteadof_redirect ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/no_system_git.rs (target/debug/deps/no_system_git-f7b151b0f5a85765)
+
+running 1 test
+test production_git_legs_never_shell_out_to_system_git ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+
+     Running tests/relay_git_http_auth.rs (target/debug/deps/relay_git_http_auth-c3553482e103af38)
+
+running 2 tests
+Initialized empty Git repository in /private/var/folders/mc/_gm6z2qx19qfdb0wl005gvnr0000gp/T/maxplayer-relay-git-auth-authed-upstream-57822-2/.git/
+Initialized empty Git repository in /private/var/folders/mc/_gm6z2qx19qfdb0wl005gvnr0000gp/T/maxplayer-relay-git-auth-unauth-upstream-57822-1/.git/
+[main (root-commit) a59e0ff] base commit
+ 1 file changed, 1 insertion(+)
+ create mode 100644 README.md
+[main (root-commit) a59e0ff] base commit
+ 1 file changed, 1 insertion(+)
+ create mode 100644 README.md
+test unauthenticated_fetch_of_protected_repo_fails_closed ... ok
+test authenticated_fetch_base_succeeds_via_fork_path ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s
+
+     Running tests/sandbox_netns_live.rs (target/debug/deps/sandbox_netns_live-fc7ede556c8c95fd)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests maxplayer_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: 1 target failed:
+    `-p maxplayer-core --lib`
+exit=101
