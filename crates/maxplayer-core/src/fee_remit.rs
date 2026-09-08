@@ -1228,7 +1228,9 @@ fn remit_inner(
     // 3/0/1000/[32] ⇒ probe expects 2 ≥ 3 − 0 … refused; invoice 1 pays with a 3-sat debit). Fees
     // are checked by the exact search over candidate invoices (`plan_confirmable_invoice`), then
     // re-checked on the quote actually raised; `FeesDoNotFit` is returned only when NO candidate
-    // fits. The probe's figure is kept for the printed lines only.
+    // fits. So a payment that can fit within the gross IS planned (the largest such invoice), and
+    // one that never can is refused here at planning, not at payment. The probe's figure is kept
+    // for the printed lines only.
     let expected = probe_estimate.expected_fees_sats;
     let expected_clause = |expected: u64| {
         if expected > 0 {
@@ -4575,8 +4577,14 @@ mod tests {
 
     // Addendum gate 2c: two attempts race against the same balance — two threads, two connections
     // to the same store, released together — and EXACTLY ONE remittance is recorded and exactly one
-    // melt happens. The loser is refused by the store's plan (a row already in flight, or nothing
-    // left once the winner settled), never paid a second time.
+    // melt happens. The loser is refused, never paid a second time, by whichever boundary it
+    // reaches first (addendum 11 §2, verdict 1ee5cb2 §5.2): the store's plan (both saw no row —
+    // `PlanRefused` in flight / total moved), reconciliation of the winner's PLANNED row (another
+    // live owner's lease stands — `HeldByOwner`), reconciliation of the winner's SPENDING row bound
+    // to its quote (`SpendingHeld` — the product's REQUIRED result after the fence, which round 9's
+    // oracle panicked on), or the winner already settled (`NothingUnremitted`). Every arm asserts
+    // the row, owner, quote and pinned-receipt figures it names; the two ordered tests below pin
+    // the after-fence and after-settled orderings deterministically.
     #[test]
     fn two_racing_attempts_against_the_same_balance_record_exactly_one_remittance() {
         for round in 0..8 {
@@ -4593,6 +4601,11 @@ mod tests {
                     // A connection of its own, as two collect handlers on two threads would have.
                     let store = SellerStore::open(&db).expect("open");
                     let mut fake = Fake::new(|_| 2);
+                    // Two processes are two owners (`process_owner` is per process). With ONE shared
+                    // owner string a loser that met the winner's PLANNED row would release it as
+                    // "its own earlier attempt" (`ReleaseOn::OwnPlanned`) — a shape no deployment
+                    // has (addendum 11 §2).
+                    fake.owner = format!("proc-t{thread}");
                     // Two real LNURL calls never hand out the same invoice: distinct hashes, so
                     // the loser cannot be masked by a DuplicateInvoice on the winner's hash.
                     fake.invoice_tag = format!("-t{thread}");
@@ -4608,7 +4621,12 @@ mod tests {
                         100 + thread,
                         &mut out,
                     );
-                    (outcome, String::from_utf8_lossy(&out).into_owned())
+                    (
+                        outcome,
+                        String::from_utf8_lossy(&out).into_owned(),
+                        fake.invoices.clone(),
+                        fake.melts.len(),
+                    )
                 }));
             }
             let results: Vec<_> = handles
@@ -4621,28 +4639,108 @@ mod tests {
                 1,
                 "exactly one melt: {results:?}"
             );
-            let paid = results
+            let winners: Vec<usize> = results
                 .iter()
-                .filter(|(outcome, _)| matches!(outcome, Ok(RemitOutcome::Paid { .. })))
-                .count();
-            assert_eq!(paid, 1, "exactly one attempt paid: {results:?}");
-            for (outcome, out) in &results {
+                .enumerate()
+                .filter(|(_, (outcome, ..))| matches!(outcome, Ok(RemitOutcome::Paid { .. })))
+                .map(|(thread, _)| thread)
+                .collect();
+            assert_eq!(winners.len(), 1, "exactly one attempt paid: {results:?}");
+            let winner_thread = winners[0];
+            let winner_owner = format!("proc-t{winner_thread}");
+            let winner_row_id = format!("hash-13-2-t{winner_thread}");
+            let winner_quote = format!("paid-quote-lnbc-fake-13-2-t{winner_thread}");
+            let rows = store.remittances().expect("rows");
+            assert_eq!(rows.len(), 1, "exactly one remittance row: {rows:?}");
+            let winner = &rows[0];
+            assert_eq!(winner.state, RemittanceState::Settled);
+            assert_eq!(winner.remittance_id, winner_row_id);
+            assert_eq!(winner.owner.as_deref(), Some(winner_owner.as_str()));
+            assert_eq!(
+                winner.spending_quote_id.as_deref(),
+                Some(winner_quote.as_str())
+            );
+            assert_eq!((winner.gross_sats, winner.net_sats), (15, 13));
+            assert_eq!(winner.receipts, 2);
+            for (thread, (outcome, out, invoices, own_melts)) in results.iter().enumerate() {
                 match outcome {
-                    Ok(RemitOutcome::Paid { .. }) => {}
-                    Ok(RemitOutcome::Refused(Refusal::PlanRefused(reason))) => assert!(
-                        reason.contains("still in flight")
-                            || reason.contains("nothing to remit")
-                            || reason.contains("unremitted total moved"),
-                        "the loser is refused by the store's plan: {reason}\n{out}"
-                    ),
-                    Ok(RemitOutcome::Refused(Refusal::NothingUnremitted)) => {}
+                    Ok(RemitOutcome::Paid {
+                        remittance_id,
+                        net_sats,
+                        melt_fee_sats,
+                    }) => {
+                        assert_eq!(remittance_id, &winner_row_id);
+                        assert_eq!((*net_sats, *melt_fee_sats), (13, 1));
+                        assert_eq!(*own_melts, 1);
+                    }
+                    Ok(RemitOutcome::Refused(Refusal::PlanRefused(reason))) => {
+                        assert!(
+                            reason.contains("still in flight")
+                                || reason.contains("nothing to remit")
+                                || reason.contains("unremitted total moved"),
+                            "the loser is refused by the store's plan: {reason}\n{out}"
+                        );
+                        assert_eq!(*own_melts, 0, "{out}");
+                    }
+                    Ok(RemitOutcome::Refused(Refusal::NothingUnremitted)) => {
+                        assert!(invoices.is_empty(), "nothing to plan on: {out}");
+                        assert_eq!(*own_melts, 0, "{out}");
+                    }
+                    Ok(RemitOutcome::Refused(Refusal::HeldByOwner {
+                        remittance_id,
+                        owner,
+                        lease_until_unix,
+                    })) => {
+                        // The loser met the winner's row PLANNED (journaled, not yet fenced): the
+                        // winner is another live owner whose lease stands, so the loser holds.
+                        assert_ne!(thread, winner_thread);
+                        assert_eq!(remittance_id, &winner_row_id, "{out}");
+                        assert_eq!(owner, &winner_owner, "{out}");
+                        assert_eq!(*lease_until_unix, 400 + winner_thread as i64, "{out}");
+                        assert!(
+                            out.contains(&format!(
+                                "remittance {winner_row_id} is planned by another live process ({winner_owner}, lease until unix {lease_until_unix}) and its quote is not terminal; not releasing a live payer's intent"
+                            )),
+                            "{out}"
+                        );
+                        assert!(invoices.is_empty(), "held before planning: {out}");
+                        assert_eq!(*own_melts, 0, "{out}");
+                    }
+                    Ok(RemitOutcome::Refused(Refusal::SpendingHeld {
+                        remittance_id,
+                        owner,
+                        spending_since_unix,
+                        quote_id,
+                        observed,
+                        held_sats,
+                    })) => {
+                        // The loser started reconciliation after the winner's fence: the winner's
+                        // row is SPENDING, bound to the winner's payment quote — which the LOSER's
+                        // wallet never raised — and the whole gross stays pinned to it.
+                        assert_ne!(thread, winner_thread);
+                        assert_eq!(remittance_id, &winner_row_id, "{out}");
+                        assert_eq!(owner, &winner_owner, "{out}");
+                        assert_eq!(
+                            Some(*spending_since_unix),
+                            winner.spending_since_unix,
+                            "{out}"
+                        );
+                        assert_eq!(*spending_since_unix, 100 + winner_thread as i64);
+                        assert_eq!(quote_id.as_deref(), Some(winner_quote.as_str()), "{out}");
+                        assert_eq!(observed, "this wallet holds no such melt quote", "{out}");
+                        assert_eq!(*held_sats, 15, "the winner's gross, pinned: {out}");
+                        assert!(
+                            out.contains(&format!(
+                                "HELD: remittance {winner_row_id} is SPENDING (admitted by {winner_owner} at unix {spending_since_unix}), bound to melt quote {winner_quote}; this wallet holds no such melt quote; 15 sats of receipts stay pinned to it — a spending row is released by nobody and on no clock; it settles only when the mint reports that quote PAID; an operator decision, not a timeout, resolves it. REFUSED — nothing moved by this run"
+                            )),
+                            "{out}"
+                        );
+                        assert!(invoices.is_empty(), "held before planning: {out}");
+                        assert_eq!(*own_melts, 0, "{out}");
+                    }
                     other => panic!("unexpected outcome {other:?}\n{out}"),
                 }
             }
-            let rows = store.remittances().expect("rows");
-            assert_eq!(rows.len(), 1, "exactly one remittance row: {rows:?}");
-            assert_eq!(rows[0].state, RemittanceState::Settled);
-            assert_eq!((rows[0].gross_sats, rows[0].net_sats), (15, 13));
             let accrued = store.accrued_fees().expect("read");
             assert_eq!(
                 (
@@ -4654,6 +4752,185 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(&root);
         }
+    }
+
+    // Addendum 11 §2, ordered (i): the racing test's after-fence ordering, deterministic. A (proc-a)
+    // pauses right after its fence admitted the melt and bound its quote — its row is SPENDING —
+    // and B (proc-b, its own wallet, which never raised A's quote) runs `--confirm`: B reconciles
+    // A's bound spending row, its wallet holds no such quote ⇒ `SpendingHeld` naming A's row, A's
+    // owner, A's bound quote and the 15 pinned sats, one HELD line; B plans nothing (no invoice),
+    // pays nothing, changes nothing. A resumes and pays once. One melt, one Paid, one Settled row,
+    // accounting (15, 0, 0); B's refused confirm journaled against A's row.
+    #[test]
+    fn a_racer_that_starts_after_the_winners_fence_is_held_on_the_winners_bound_quote_and_the_winner_pays_once()
+     {
+        let (store, root) = store_with_fees("race-after-fence", &[10, 5]);
+        drop(store);
+        let db = root.join(STATE_DB_FILE);
+        let melts = Arc::new(AtomicUsize::new(0));
+        let mut a = Fake::new(|_| 2);
+        a.owner = "proc-a".to_owned();
+        a.invoice_tag = "-a".to_owned();
+        a.melt_results = vec![Ok((13, 1))];
+        let (a_result, b_results) = run_paused(
+            &db,
+            a,
+            100,
+            PauseAt::Admit,
+            super::test_support::Gate::new(),
+            Arc::clone(&melts),
+            |store_b| {
+                let x = store_b
+                    .in_flight_remittance()
+                    .expect("query")
+                    .expect("A's row");
+                assert_eq!(x.state, RemittanceState::Spending);
+                assert_eq!(x.remittance_id, "hash-13-2-a");
+                assert_eq!(x.spending_quote_id.as_deref(), Some(X_PAYMENT_QUOTE));
+                let mut b = Fake::new(|_| 2);
+                b.owner = "proc-b".to_owned();
+                b.invoice_tag = "-b".to_owned();
+                b.melt_results = vec![Ok((13, 1))];
+                b.melt_counter = Some(Arc::clone(&melts));
+                let (outcome, out) = run_remit(store_b, &mut b, RemitTrigger::Command, 101);
+                assert_eq!(
+                    outcome,
+                    RemitOutcome::Refused(Refusal::SpendingHeld {
+                        remittance_id: "hash-13-2-a".to_owned(),
+                        owner: "proc-a".to_owned(),
+                        spending_since_unix: 100,
+                        quote_id: Some(X_PAYMENT_QUOTE.to_owned()),
+                        observed: "this wallet holds no such melt quote".to_owned(),
+                        held_sats: 15,
+                    }),
+                    "{out}"
+                );
+                assert!(
+                    out.contains("HELD: remittance hash-13-2-a is SPENDING (admitted by proc-a at unix 100), bound to melt quote paid-quote-lnbc-fake-13-2-a; this wallet holds no such melt quote; 15 sats of receipts stay pinned to it — a spending row is released by nobody and on no clock; it settles only when the mint reports that quote PAID; an operator decision, not a timeout, resolves it. REFUSED — nothing moved by this run"),
+                    "{out}"
+                );
+                assert_eq!(
+                    b.quote_status_calls,
+                    vec![X_PAYMENT_QUOTE.to_owned()],
+                    "B asked its wallet about A's bound quote, once"
+                );
+                assert!(b.invoices.is_empty(), "B planned nothing: {out}");
+                assert!(
+                    b.quotes.is_empty() && b.melts.is_empty(),
+                    "B paid nothing: {out}"
+                );
+                assert_eq!(
+                    store_b
+                        .in_flight_remittance()
+                        .expect("query")
+                        .expect("still A's row")
+                        .state,
+                    RemittanceState::Spending,
+                    "B changed nothing"
+                );
+                vec![(outcome, out)]
+            },
+        );
+        let (a_outcome, a_out) = a_result;
+        assert_eq!(
+            a_outcome,
+            Ok(RemitOutcome::Paid {
+                remittance_id: "hash-13-2-a".to_owned(),
+                net_sats: 13,
+                melt_fee_sats: 1,
+            }),
+            "A pays X once it resumes:\n{a_out}"
+        );
+        assert_eq!(melts.load(Ordering::SeqCst), 1, "exactly one actual debit");
+        assert_eq!(b_results.len(), 1);
+        let store = SellerStore::open(&db).expect("open");
+        let rows = store.remittances().expect("rows");
+        assert_eq!(rows.len(), 1, "one row, A's: {rows:?}");
+        assert_eq!(rows[0].remittance_id, "hash-13-2-a");
+        assert_eq!(rows[0].state, RemittanceState::Settled);
+        assert_eq!((rows[0].gross_sats, rows[0].net_sats), (15, 13));
+        assert_eq!(rows[0].receipts, 2);
+        let accrued = store.accrued_fees().expect("read");
+        assert_eq!(
+            (
+                accrued.remitted_fee_sats,
+                accrued.in_flight_fee_sats,
+                accrued.unremitted_fee_sats
+            ),
+            (15, 0, 0)
+        );
+        let attempts = store.recent_remit_attempts(10).expect("attempts");
+        assert_eq!(
+            attempts.len(),
+            2,
+            "A's payment and B's refused --confirm: {attempts:?}"
+        );
+        assert_eq!(attempts[0].outcome, RemitAttemptOutcome::Paid);
+        assert_eq!(attempts[1].trigger, RemitAttemptTrigger::Command);
+        assert_eq!(attempts[1].outcome, RemitAttemptOutcome::Refused);
+        assert_eq!(attempts[1].remittance_id.as_deref(), Some("hash-13-2-a"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Addendum 11 §2, ordered (ii): the racing test's after-settled ordering. A pays and settles
+    // in full; then B (another owner, its own wallet) runs `--confirm`: no row is in flight, the
+    // unremitted balance is 0 ⇒ `NothingUnremitted` — B raises no invoice, no quote, no melt;
+    // still one melt, one Settled row, accounting (15, 0, 0).
+    #[test]
+    fn a_racer_that_starts_after_the_winner_settled_finds_nothing_unremitted_and_pays_nothing() {
+        let (store, root) = store_with_fees("race-after-settled", &[10, 5]);
+        let mut a = Fake::new(|_| 2);
+        a.owner = "proc-a".to_owned();
+        a.invoice_tag = "-a".to_owned();
+        a.melt_results = vec![Ok((13, 1))];
+        let (a_outcome, a_out) = run_remit(&store, &mut a, RemitTrigger::Collect, 100);
+        assert_eq!(
+            a_outcome,
+            RemitOutcome::Paid {
+                remittance_id: "hash-13-2-a".to_owned(),
+                net_sats: 13,
+                melt_fee_sats: 1,
+            },
+            "{a_out}"
+        );
+        assert_eq!(a.melts.len(), 1);
+        let mut b = Fake::new(|_| 2);
+        b.owner = "proc-b".to_owned();
+        b.invoice_tag = "-b".to_owned();
+        b.melt_results = vec![Ok((13, 1))];
+        let (b_outcome, b_out) = run_remit(&store, &mut b, RemitTrigger::Command, 101);
+        assert_eq!(
+            b_outcome,
+            RemitOutcome::Refused(Refusal::NothingUnremitted),
+            "{b_out}"
+        );
+        assert!(
+            b_out.contains("Nothing to remit. REFUSED — nothing moved."),
+            "{b_out}"
+        );
+        assert!(
+            b.quote_status_calls.is_empty() && b.status_calls.is_empty(),
+            "no row in flight, nothing to reconcile: {b_out}"
+        );
+        assert!(
+            b.invoices.is_empty() && b.quotes.is_empty() && b.melts.is_empty(),
+            "{b_out}"
+        );
+        let rows = store.remittances().expect("rows");
+        assert_eq!(rows.len(), 1, "one row, A's: {rows:?}");
+        assert_eq!(rows[0].remittance_id, "hash-13-2-a");
+        assert_eq!(rows[0].state, RemittanceState::Settled);
+        assert_eq!((rows[0].gross_sats, rows[0].net_sats), (15, 13));
+        let accrued = store.accrued_fees().expect("read");
+        assert_eq!(
+            (
+                accrued.remitted_fee_sats,
+                accrued.in_flight_fee_sats,
+                accrued.unremitted_fee_sats
+            ),
+            (15, 0, 0)
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // ---- addendum 8 §1: the ceiling bounds the ENTIRE wallet debit (verdict B4) ----------------
