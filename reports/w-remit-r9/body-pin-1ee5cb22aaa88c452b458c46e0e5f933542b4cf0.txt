@@ -1,0 +1,32 @@
+PR #979 body pin — round 9 (ruling 2026-09-08T18:32Z item 2)
+=============================================================
+Pinned at:            2026-09-08T18:54:03Z (UTC), by `gh pr edit 979 --repo MakePrisms/maxplayerai --body-file reports/w-remit-r9/body-r9-pin.md`
+Final head (B):       1ee5cb22aaa88c452b458c46e0e5f933542b4cf0  (reports/w-remit-r9/body-r9-pin.md added; nothing else)
+Moved-out commit (A): 293e0e6a258f61cd1c79e0c2fb82e5afbfaaf26d  (permalink target for the four moved-out files)
+Executable head:      240240c3f26bd35c3a8c5a3d70229f9730a0a221  (last commit touching any .rs; unchanged)
+Body source:          reports/w-remit-r9/body-r9-pin.md, built by build-body-pin-r9.py 293e0e6a258f61cd1c79e0c2fb82e5afbfaaf26d
+
+Sizes
+  body-r9-pin.md            62,505 characters / 63,299 bytes   (GitHub cap 65,536 chars: OK, margin 3,031; self-target 62,000: OVER by 505 — cap is the binding constraint, accepted)
+  body-readback-1ee5cb22aaa88c452b458c46e0e5f933542b4cf0.md       62,506 characters                  (+1 trailing LF added by `gh api --jq .body`; content otherwise identical, verified a.rstrip('\n')==b.rstrip('\n') True)
+  placeholders left:        grep -c '@@A@@' body-r9-pin.md = 0
+  permalinks at 293e0e6:    5 blob URLs (rounds-5-8-sections.md, commit-history-a6217328-240240c.md, exact-records.txt, evidence-table.txt)
+
+sha256
+  body-r9-pin.md            043220644375e54971fc294a2f30086ddc6e626d86d307b58d44c7bdd66105a9
+  body-readback-1ee5cb22aaa88c452b458c46e0e5f933542b4cf0.md       db7aa9c59aa87c625224e2c607b59d3637c15e3cce7fb568eb0898fe383510e3   (differs only by the trailing LF)
+
+Tree
+  git diff --stat 240240c..1ee5cb22aaa88c452b458c46e0e5f933542b4cf0 -- . ':(exclude)reports'   → empty (0 lines)
+  git diff --stat 240240c..1ee5cb22aaa88c452b458c46e0e5f933542b4cf0 | tail -1                 → 75 files changed, 45501 insertions(+)   (reports/w-remit-r9/ only)
+  git rev-list --count a6217328..1ee5cb22aaa88c452b458c46e0e5f933542b4cf0                     → 110
+  PR head on GitHub after push: 1ee5cb22aaa88c452b458c46e0e5f933542b4cf0 (fork maxy-player/maxplayerai, branch feat/seller-fee-remit)
+
+CI (read 2026-09-08T18:55Z via gh run list --repo MakePrisms/maxplayerai --commit <sha>)
+  293e0e6 (A): CI in_progress   https://github.com/MakePrisms/maxplayerai/actions/runs/34265599825
+  1ee5cb2 (B): CI in_progress   https://github.com/MakePrisms/maxplayerai/actions/runs/34265766747
+     jobs at read time: Build (no default features) pass 27s · JS test suites pass 11s · Release workflow gates pass 10s ·
+                        Build & test (acp) pending · Money-path tests pending · Test the full shipped feature combo pending · Build & test (default features) pending
+     Vercel: "Authorization required to deploy" — repo-level, unrelated to this PR (same on every head since round 1)
+  Both reports-only commits: no .rs change, so the compile/test jobs exercise the same code as 240240c.
+  Follow-up read appended below when the runs complete.
