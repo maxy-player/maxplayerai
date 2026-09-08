@@ -345,9 +345,12 @@ impl FeeRemittance {
 /// state transition that changes zero rows if the row is no longer as the reason found it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReleaseOn {
-    /// A SPENDING row whose BOUND quote (`spending_quote_id`) the mint reports terminal — FAILED,
-    /// or UNPAID and expired past the spending margin. Names the quote observed, so the release
-    /// lands only if that is still the row's bound quote.
+    /// A SPENDING row whose BOUND quote (`spending_quote_id`) is named. Names the quote, so the
+    /// release lands only if that is still the row's bound quote. **Not emitted by reconciliation
+    /// since addendum 6** (`fee_remit::reconcile_decision` holds a bound spending row on
+    /// everything but PAID: the mint pays an UNPAID or FAILED quote regardless of expiry, so no
+    /// observation proves the bound quote cannot still debit); kept as the store's conditional
+    /// transition with its tests, with no automatic caller.
     TerminalBoundQuote { quote_id: String },
     /// A SPENDING row admitted by a v12 binary — before admissions bound a quote — whose invoice's
     /// quote(s) the mint reports terminal: the release v12 had, kept only for rows v12 wrote
