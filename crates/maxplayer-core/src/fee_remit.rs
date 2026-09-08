@@ -1550,7 +1550,10 @@ fn remit_inner(
                 let _ = writeln!(
                     out,
                     "WARNING: the wallet lost {debit} sats ({} net + {} melt fee + {} proof input fee + {} swap fee) against {gross} sats accrued — above the ceiling the melt was admitted under. Recorded as settled; report this.",
-                    outcome.paid_sats, outcome.fee_sats, outcome.input_fee_sats, outcome.swap_fee_sats
+                    outcome.paid_sats,
+                    outcome.fee_sats,
+                    outcome.input_fee_sats,
+                    outcome.swap_fee_sats
                 );
             }
             Ok(RemitOutcome::Paid {
