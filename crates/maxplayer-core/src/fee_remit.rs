@@ -5638,9 +5638,8 @@ mod tests {
         );
         let delta = before - after;
         assert_eq!(
-            delta,
-            1 + 0 + 1 + 1,
-            "invoice + Lightning + ACTUAL input + swap"
+            delta, 3,
+            "invoice 1 + Lightning 0 + ACTUAL input 1 + swap 1 = 3"
         );
         assert!(delta <= 3, "the wallet lost {delta} sats against 3 accrued");
         assert_eq!(
