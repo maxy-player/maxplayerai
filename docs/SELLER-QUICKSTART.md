@@ -1285,14 +1285,19 @@ its own:
   quote and holds off unless it is PAID, and every release is written as a condition on the row, so
   a release decided on a stale reading changes nothing. A held attempt is visible, not silent:
   `maxplayer seller fees remit` prints one `HELD:` line naming the row, the quote, what the mint said
+  (unpaid, failed, pending, unknown, or a quote the wallet does not know — the same one line for each)
   and how many sats are pinned, and exits 3 — on the dry run too. Clearing it is an operator's
   decision, and there is no command for it yet; until then the node's later attempts are refused and
   the balance accumulates unremitted behind the held row. This is what the module's two-process tests
-  prove, and its bound: two processes on one host clock, one store, one fake mint that accepts unpaid
-  or failed quotes regardless of expiry as the real one does (pauses after the plan, after the quote,
-  after the gate, inside the payment after the wallet's last local check, and between a release
-  decision and its write; the lease and the quote expiring while paused; distinct invoices; funds for
-  a second payment present; actual melts counted). They do not run a real mint or a real wallet.
+  prove, and its bound: two processes, each on its own connection to one store, against one fake mint
+  that accepts unpaid or failed quotes regardless of expiry as the inspected CDK 0.17.2 mint
+  implementation does (pauses after the plan, after the quote, after the gate, inside the payment
+  after the wallet's last local check, and between a release decision and its write; the lease and
+  the quote expiring while paused; distinct invoices; funds for a second payment present; actual
+  melts counted). Only the delayed-payment case also shares one clock and one wallet's proofs between
+  the two; the others build each process's clock on its own. They do not run a real mint or a real
+  wallet, and no deployed mint's behaviour was measured — the mint behaviour they model is read from
+  the pinned CDK 0.17.2 source.
 - **The log stays readable while it retries.** Every attempt gets at most one line. The first
   failure's line carries its detail — the destination, the balance it saw, the error — and the
   backoff it starts; later attempts in the same streak get one line each (how many have failed,
@@ -1327,9 +1332,9 @@ The dry run prints whether the automatic remittance is on, the recent attempts w
 melt fee reserve, the invoice amount the platform receives, and the most that can leave your wallet —
 and moves nothing. `--confirm` forces one attempt now, under exactly the same rules as the automatic
 path. It refuses, moving nothing (exit 3), when nothing is unremitted; when the balance is below the
-destination's minimum (the command prints how far short you are); or when an earlier attempt is still
-settling at the mint. **Running it again after a payment pays nothing** — the receipts it discharged
-are recorded.
+destination's minimum (the command prints how far short you are); when an earlier attempt is still
+settling at the mint; or when an admitted attempt is held on its bound quote (the `HELD:` line above).
+**Running it again after a payment pays nothing** — the receipts it discharged are recorded.
 
 ---
 

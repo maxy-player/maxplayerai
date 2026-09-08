@@ -892,10 +892,11 @@ pub async fn melt_within_async(
 /// `prepare_melt(quote_id)` / `confirm` — after re-checking the ceiling against the quote's STORED
 /// amount and fee reserve immediately before `prepare_melt`. An unknown quote id is refused before
 /// the wallet touches a proof. `prepare_melt` refuses a quote whose expiry has passed on THIS
-/// wallet's clock; past that check nothing here re-checks expiry or state, and the mint (CDK
-/// 0.17.2) pays an UNPAID or FAILED quote regardless of its expiry — which is why the caller never
-/// treats "expired" or "FAILED" as proof that a prepared payment cannot still land, never
-/// re-quotes, and holds its row until the mint reports PAID (addendum 6 §1.2).
+/// wallet's clock; past that check nothing here re-checks expiry or state, and the inspected CDK
+/// 0.17.2 mint implementation (checksum-pinned source; no deployed mint was measured) pays an
+/// UNPAID or FAILED quote regardless of its expiry — which is why the caller never treats
+/// "expired" or "FAILED" as proof that a prepared payment cannot still land, never re-quotes, and
+/// holds its row until the mint reports PAID (addendum 6 §1.2).
 /// Same mint resolution and `allow_real_mints` gate as every melt here.
 pub async fn pay_melt_quote_async(
     home: &MaxplayerHome,

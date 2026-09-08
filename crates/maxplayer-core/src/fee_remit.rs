@@ -81,9 +81,11 @@
 //! anything else — UNPAID however long past its expiry, FAILED, PENDING, UNKNOWN, a quote the wallet
 //! does not know — it is HELD, and its receipts with it, until the mint says PAID or an operator
 //! decides (no override exists in this round). **We do not infer terminality from a clock**, and
-//! not from the mint's FAILED either, because the mint this wallet talks to (CDK 0.17.2, read from
-//! the checksum-pinned source in the round-4 verdict) pays an UNPAID *or FAILED* quote with no
-//! expiry check, and the wallet's own request, once past `prepare_melt`, re-checks nothing: a
+//! not from the mint's FAILED either, because the inspected CDK 0.17.2 mint implementation
+//! (checksum-pinned source, read in the round-4 and round-5 verdicts — the implementation this
+//! wallet is built on, not a measurement of whichever server a configured mint URL reaches) pays an
+//! UNPAID *or FAILED* quote with no expiry check, and the wallet's own request, once past
+//! `prepare_melt`, re-checks nothing: a
 //! payment prepared before the quote expired can land after any observation a second process makes.
 //! A release on "expired" or "FAILED" would therefore make the same gross payable twice
 //! (`a_payment_prepared_before_expiry_cannot_be_doubled_by_a_release_after_it` schedules exactly
@@ -96,7 +98,15 @@
 //! mint pay the FAILED quote — and the table
 //! `a_spending_row_is_never_released_by_reconciliation_only_settled`). What "at most one debit"
 //! rests on is the exclusion: a second attempt is never admitted while a bound spending row
-//! exists. It does not rest on when a quote dies. The cost is named, not hidden: a melt the mint
+//! exists — at two boundaries. The ordinary one is RECONCILIATION: every `remit` run first finds the
+//! in-flight row and, on anything but PAID, returns [`Refusal::SpendingHeld`] before it plans
+//! anything (the two-process tests' B runs all stop here). Behind it is the STORE:
+//! [`SellerStore::plan_remittance`] refuses a second plan with `PlanRefused::InFlight` inside its own
+//! `IMMEDIATE` transaction while any planned-or-spending row exists — the race-closing layer, reached
+//! when two runs both saw no row (`two_racing_attempts_against_the_same_balance_record_exactly_one_remittance`)
+//! and exercised directly, on B's own connection while A is paused inside its payment, in
+//! `a_payment_prepared_before_expiry_cannot_be_doubled_by_a_release_after_it`. It does not rest on
+//! when a quote dies. The cost is named, not hidden: a melt the mint
 //! genuinely failed leaves the row held and every later remittance refused until an operator acts
 //! (owed as later work; the CLI exits 3 and prints one `HELD:` line naming the row, the quote, the
 //! mint's answer and the pinned sats). The owner's own reconciliation of its own `planned` row may
@@ -104,15 +114,21 @@
 //! shot for the command), so its earlier attempt is over and, the fence never having been passed,
 //! spent nothing. Its own `spending` row gets no such exception.
 //!
-//! **What the two-process tests prove, and their bound:** two processes on one host clock, sharing
-//! one store, one fake mint and one fake wallet, debit an accrued balance at most once under every
-//! interleaving they schedule — pauses after the plan, after the quote, after the fence, inside the
-//! payment after the wallet's last local check, and between a release decision and its write; the
-//! lease and the quote expiring while paused; distinct invoices; actual melts counted; the fake
-//! mint accepting UNPAID or FAILED quotes regardless of expiry, as the real one does. They do not
-//! run a real mint or a real wallet, and `a_release_decided_on_a_stale_planned_snapshot…` moves
-//! its command clock (401) independently of its effects clock (100) to force the SQL ordering — a
-//! synthetic time model, not a claim about how a mint's clock behaves.
+//! **What the two-process tests prove, and their bound:** two processes, each on its own store
+//! connection, debit an accrued balance at most once under every interleaving they schedule —
+//! pauses after the plan, after the quote, after the fence, inside the payment after the wallet's
+//! last local check, and between a release decision and its write; the lease and the quote expiring
+//! while paused; distinct invoices; actual melts counted; the fake mint accepting UNPAID or FAILED
+//! quotes regardless of expiry, as the inspected CDK 0.17.2 implementation does. What each shares
+//! is stated per test, not assumed: (a), (b1), (b2), (c), (B2) and (d) share one fake mint (the quote
+//! registry) and build their two processes' clocks independently unless the test reassigns them
+//! ((b2) and the delayed-confirm test hand B the clock A reads); only the delayed-confirm test
+//! also shares one fake wallet — one proof pool both processes select from; the older (b)/(c) cases
+//! and the node's 2b test script the mint's answer on one process instead of reading a shared
+//! registry. They do not run a real mint or a real wallet, and
+//! `a_release_decided_on_a_stale_planned_snapshot…` moves its command clock (401) independently of
+//! its effects clock (100) to force the SQL ordering — a synthetic time model, not a claim about
+//! how a mint's clock behaves.
 //!
 //! Every effect on the world goes through [`RemitEffects`], so the decision logic is tested against
 //! scripted effects without a network or a mint. Exactly one method of that trait spends:
