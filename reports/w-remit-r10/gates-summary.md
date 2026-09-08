@@ -4,7 +4,11 @@ SKELETON — filled in when `/tmp/w-remit-r10/logs/progress.txt` reads "ALL DONE
 
 Runner: `reports/w-remit-r10/run-gates-r10.sh` (committed 41ea2e6), launched 2026-09-08 ~20:37Z from the worktree as
 `(zsh reports/w-remit-r10/run-gates-r10.sh > /tmp/w-remit-r10/runner.out 2>&1 < /dev/null &)`, pid 33960, never restarted.
-Raw logs are NOT committed (they live in `/tmp/w-remit-r10/logs/`, one per gate, `*-31deed8.log`); each log's line 1 is
+Raw logs are NOT committed. Per the evidence-location ruling (maxie, `/Users/forge/forge/v2/maxie/runs/979-r10-evidence-location-ruling-20260908.md`,
+1,048 B, sha256 `b0b39e5e…cd39599`, read 20:41Z — supersedes only the `/tmp/w-remit-r10/` path in Errata 1 and the plan ruling)
+they are preserved at `/Users/forge/forge/v2/worker/reports/w-remit-r10/logs/` (seat folder, outside the product repo, uncommitted),
+copied from the runner's `/tmp/w-remit-r10/logs/` with `cp -p` and verified byte-identical with `cmp` — the runner was not
+restarted and no test was rerun to move a file (`EVIDENCE-LEDGER.md` there records each copy). One log per gate, `*-31deed8.log`; each log's line 1 is
 `git rev-parse HEAD` at run time (the reports-only commit 41ea2e6), line 2 states `.rs diff 31deed8..HEAD` (must be empty),
 line 3 the command, last line `exit=N`. This file records, per log: the result line, exit code, byte size and sha256 so any
 one log can be requested and checked.
