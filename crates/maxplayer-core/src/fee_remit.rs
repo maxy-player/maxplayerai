@@ -1569,8 +1569,11 @@ fn remit_inner(
     //     pre-fence refusal). A next-attempt re-quote could not do this: it would plan from the
     //     probe estimate again and meet the same drift (§2.1). Gross, receipts, owner and lease do
     //     not move. The re-planned quote is checked by the same bound; a second mismatch is NOT
-    //     re-planned again.
-    let (quote, ceiling) = if quote.fee_reserve_sats == estimate.fee_reserve_sats {
+    //     re-planned again. Only a reserve that SHRANK is re-planned (addendum 10 §1.4's words); a
+    //     reserve that grew past the plan is refused as before, by the prepared-melt gate below
+    //     (record 29): growth is the mint asking for more than was planned, and a seller that
+    //     planned on the estimate does not chase it within the same attempt.
+    let (quote, ceiling) = if quote.fee_reserve_sats >= estimate.fee_reserve_sats {
         (quote, ceiling)
     } else {
         let live_reserve = quote.fee_reserve_sats;
