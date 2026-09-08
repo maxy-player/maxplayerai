@@ -1697,14 +1697,22 @@ fn remit_inner(
                         outcome.paid_sats, outcome.fee_sats, outcome.quote_id, planned.remittance_id
                     )
                 })?;
+            // Actual debit (addendum 9 §2.1): invoice + the SDK's `fee_paid` (the mint's Lightning
+            // fee PLUS the actual proof input fee on the melt's proofs, inclusive — pinned CDK
+            // `melt/saga/mod.rs:139–148`) + the swap fee charged at the swap. The PREPARED input
+            // fee is an estimate the SDK replaced inside `fee_paid`; it is printed, not added.
             let debit = outcome
                 .paid_sats
                 .saturating_add(outcome.fee_sats)
-                .saturating_add(outcome.input_fee_sats)
                 .saturating_add(outcome.swap_fee_sats);
+            let balance_now = match outcome.balance_after_sats {
+                Some(balance) => format!("{balance} sats"),
+                None => "unknown (the balance read after the payment failed; the payment stands)"
+                    .to_owned(),
+            };
             let _ = writeln!(
                 out,
-                "PAID — remittance {} settled\n  gross discharged: {} sats\n  melt fee taken by the mint: {} sats (quote {} reserved {} sats; ceiling {gross} sats held at the moment of spending)\n  proof input fee: {} sats; swap fee: {} sats (the SDK's prepared figures, bounded together with the invoice and the reserve under that ceiling before the fence)\n  net paid to {}: {} sats\n  stays in your wallet (unused reserve): {} sats\n  wallet balance now: {} sats at {}\n  receipts discharged: {}",
+                "PAID — remittance {} settled\n  gross discharged: {} sats\n  melt fee taken by the mint: {} sats (quote {} reserved {} sats; ceiling {gross} sats held at the moment of spending; this is the SDK's fee_paid = Lightning fee + actual proof input fee)\n  estimated proof input fee (prepared): {} sats — replaced by the actual fee inside the melt fee above, not added again; swap fee (charged at swap): {} sats\n  actual debit: {debit} sats = net + melt fee + swap fee\n  net paid to {}: {} sats\n  stays in your wallet (unused reserve): {} sats\n  wallet balance now: {} at {}\n  receipts discharged: {}",
                 settled.remittance_id,
                 settled.gross_sats,
                 outcome.fee_sats,
@@ -1715,21 +1723,21 @@ fn remit_inner(
                 settled.destination,
                 outcome.paid_sats,
                 gross.saturating_sub(debit),
-                outcome.balance_sats,
+                balance_now,
                 outcome.mint_url,
                 settled.receipts
             );
             if debit > gross {
-                // Belt behind the braces: the prepared melt's total (invoice + reserve + input fee
-                // + swap fee) was bounded by the ceiling before the fence, and the mint's fee is at
-                // most its reserve, so this line should never print. If it does, the SDK's actual
-                // input fee on the swapped proofs exceeded its prepared estimate.
+                // Belt behind the braces: the prepared melt's total was bounded by the ceiling
+                // before the fence, the confirmability check bounded invoice + reserve + ACTUAL
+                // input fee + swap fee under it too, and the mint's Lightning fee is at most its
+                // reserve, so this line should never print under fixed fee metadata. If it does,
+                // the mint's fee metadata changed between prepare and confirm (§1.5 bound).
                 let _ = writeln!(
                     out,
-                    "WARNING: the wallet lost {debit} sats ({} net + {} melt fee + {} proof input fee + {} swap fee) against {gross} sats accrued — above the ceiling the melt was admitted under. Recorded as settled; report this.",
+                    "WARNING: the wallet lost {debit} sats ({} net + {} melt fee incl. actual proof input fee + {} swap fee) against {gross} sats accrued — above the ceiling the melt was admitted under. Recorded as settled; report this.",
                     outcome.paid_sats,
                     outcome.fee_sats,
-                    outcome.input_fee_sats,
                     outcome.swap_fee_sats
                 );
             }
@@ -2581,6 +2589,9 @@ pub(crate) mod test_support {
         pub(crate) input_fee_ppk: u64,
         /// The exact proofs each debit spent, in order (empty inner vec when `proofs` is `None`).
         pub(crate) proofs_spent: Vec<Vec<u64>>,
+        /// When set, the observational balance read after a confirmed melt fails (addendum 9 §2.3):
+        /// `MeltOutcome::balance_after_sats` is `None`; the payment itself is unaffected.
+        pub(crate) balance_read_fails: bool,
         /// Every pre-melt swap performed inside `confirm_melt`, in order — a swap is a mint effect
         /// that charges its fee whether or not the melt after it succeeds (addendum 9 §1.3).
         pub(crate) swaps: Vec<FakeSwap>,
@@ -2648,6 +2659,7 @@ pub(crate) mod test_support {
                 proofs: None,
                 input_fee_ppk: 0,
                 proofs_spent: Vec::new(),
+                balance_read_fails: false,
                 swaps: Vec::new(),
                 prepared: BTreeMap::new(),
                 next_token: 1,
@@ -3250,6 +3262,11 @@ pub(crate) mod test_support {
                 paid_sats: paid,
                 fee_sats: fee_paid_sats,
                 balance_sats: 1_000,
+                balance_after_sats: if self.balance_read_fails {
+                    None
+                } else {
+                    Some(1_000)
+                },
                 quote_id: quote_id.to_owned(),
                 fee_reserve_sats: quote.fee_reserve_sats,
                 input_fee_sats,
@@ -4575,6 +4592,21 @@ mod tests {
             out.contains("Prepared melt of quote paid-quote-lnbc-fake-12-2: proof input fee 4 sats (estimate; actual on the swapped proofs 3 sats), swap fee 1 sats (the wallet's proofs do not fit: a pre-melt swap will be performed); total debit 20 sats (12 invoice + 3 reserve + fees) fits the ceiling of 20 sats; proofs reserved in this wallet only, nothing posted yet"),
             "{out}"
         );
+        // §2 G/F2: the SDK's inclusive `fee_paid` (4 = Lightning 1 + actual input 3) is counted
+        // ONCE; the prepared estimate (4) is printed, not added — debit 12 + 4 + 1 = 17, not 21.
+        for needle in [
+            "melt fee taken by the mint: 4 sats (quote paid-quote-lnbc-fake-12-2 reserved 3 sats; ceiling 20 sats held at the moment of spending; this is the SDK's fee_paid = Lightning fee + actual proof input fee)",
+            "estimated proof input fee (prepared): 4 sats — replaced by the actual fee inside the melt fee above, not added again; swap fee (charged at swap): 1 sats",
+            "actual debit: 17 sats = net + melt fee + swap fee",
+            "stays in your wallet (unused reserve): 3 sats",
+            "wallet balance now: 1000 sats at https://mint.example",
+        ] {
+            assert!(out.contains(needle), "missing {needle:?} in:\n{out}");
+        }
+        assert!(
+            !out.contains("WARNING"),
+            "no false overspend warning from double-counting the input fee:\n{out}"
+        );
         let after = fake.pool_value().expect("pool");
         assert_eq!((before, after), (32, 15), "measured: change [8, 4] from the swap + [2, 1] from the melt");
         let delta = before - after;
@@ -4607,6 +4639,44 @@ mod tests {
             ),
             (20, 0, 0)
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Addendum 9 §2.4: the same fee-bearing success (prepared input 4 ≠ actual 3) when the
+    // observational balance read after the payment FAILS: no false overspend warning, the residual
+    // balance printed as "unknown" — never a computed figure — and the settlement unaffected.
+    #[test]
+    fn a_failed_balance_read_after_a_fee_bearing_payment_prints_unknown_and_no_false_warning() {
+        let (store, root) = store_with_fees("fee-bearing-balance-unknown", &[10, 10]);
+        let mut fake = Fake::new(|_| 3);
+        fake.input_fee_ppk = 1000;
+        fake.proofs = Some(fake_proofs(&[32]));
+        fake.registry = Some(quote_registry());
+        fake.melt_results = vec![Ok((12, 1))];
+        fake.balance_read_fails = true;
+        let (outcome, out) = run_remit(&store, &mut fake, RemitTrigger::Command, 100);
+        assert!(is_paid(&outcome), "{out}");
+        assert_eq!(fake.melts.len(), 1);
+        assert_eq!(fake.swaps.len(), 1);
+        assert!(
+            out.contains("wallet balance now: unknown (the balance read after the payment failed; the payment stands) at https://mint.example"),
+            "{out}"
+        );
+        assert!(
+            out.contains("actual debit: 17 sats = net + melt fee + swap fee")
+                && out.contains("stays in your wallet (unused reserve): 3 sats"),
+            "{out}"
+        );
+        assert!(!out.contains("WARNING"), "{out}");
+        assert!(
+            !out.contains("wallet balance now: 9 sats") && !out.contains("wallet balance now: 15 sats"),
+            "no computed residual is printed:\n{out}"
+        );
+        assert_eq!(fake.pool_value(), Some(15), "the payment itself is unaffected");
+        let rows = store.remittances().expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, RemittanceState::Settled);
+        assert_eq!(rows[0].melt_fee_sats, Some(4));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4873,6 +4943,12 @@ mod tests {
             Some(13),
             "32 − 1 swap fee − 13 − 2 Lightning fee − 3 ACTUAL input fee"
         );
+        assert!(
+            out.contains("actual debit: 19 sats = net + melt fee + swap fee")
+                && out.contains("stays in your wallet (unused reserve): 1 sats"),
+            "{out}"
+        );
+        assert!(!out.contains("WARNING"), "{out}");
         let lost = 32 - fake.pool_value().expect("pool");
         assert_eq!(lost, 13 + 2 + 3 + 1);
         assert!(lost <= 20, "the wallet lost {lost} sats against 20 accrued");
@@ -5026,7 +5102,7 @@ mod tests {
         assert!(is_paid(&outcome), "{out}");
         assert_eq!(fake.melts.len(), 1, "exactly one debit, ever");
         assert!(
-            out.contains("melt fee taken by the mint: 1 sats (quote paid-quote-lnbc-fake-13-4 reserved 2 sats; ceiling 15 sats held at the moment of spending)"),
+            out.contains("melt fee taken by the mint: 1 sats (quote paid-quote-lnbc-fake-13-4 reserved 2 sats; ceiling 15 sats held at the moment of spending; this is the SDK's fee_paid = Lightning fee + actual proof input fee)"),
             "{out}"
         );
         let rows = store.remittances().expect("rows");

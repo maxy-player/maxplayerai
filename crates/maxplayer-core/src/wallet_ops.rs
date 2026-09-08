@@ -224,20 +224,33 @@ pub struct ReceiveOutcome {
 pub struct MeltOutcome {
     pub mint_url: String,
     pub paid_sats: u64,
+    /// CDK `FinalizedMelt::fee_paid` (pinned `melt/saga/mod.rs:139–148`): proofs sent − invoice −
+    /// change returned = the Lightning fee the mint took PLUS the ACTUAL proof input fee on the
+    /// proofs the melt sent. Inclusive; it does not contain the pre-melt swap's fee. Never add
+    /// `input_fee_sats` to it — that fee is already in here, at its actual value.
     pub fee_sats: u64,
+    /// Best-effort balance after the payment: the observational read when it succeeded, else
+    /// `before − actual debit`. Legacy field kept for the operator paths; the seller fee remittance
+    /// prints [`Self::balance_after_sats`] instead and says "unknown" rather than a computed number.
     pub balance_sats: u64,
+    /// The observational post-payment balance read: `None` when the read failed (the payment still
+    /// happened; the caller prints "unknown", never a computed figure).
+    pub balance_after_sats: Option<u64>,
     /// The mint's melt quote id the payment settled under — journaled by the seller fee remittance
     /// so a settled row names the quote the mint can be asked about.
     pub quote_id: String,
     /// The fee RESERVE the paying quote carried — the ceiling on `fee_sats`, checked against the
     /// caller's [`MeltCeiling`] before anything was spent. Journaled beside the actual fee.
     pub fee_reserve_sats: u64,
-    /// The proof-input fee the SDK's prepared melt carried (CDK `PreparedMelt::input_fee`): what the
-    /// mint charges on the proofs sent with the melt request, on top of the invoice and the fee
-    /// reserve. `0` where the path did not prepare through [`prepare_melt_payment_blocking`].
+    /// The proof-input fee the SDK's prepared melt carried (CDK `PreparedMelt::input_fee`): an
+    /// ESTIMATE on the split of invoice + reserve (`melt/saga/mod.rs:383–387`), bounded under the
+    /// ceiling before the fence. Informational after payment: `confirm` recomputes the actual fee on
+    /// the swapped proofs and that actual fee is inside `fee_sats`. `0` where the path did not
+    /// prepare through [`prepare_melt_payment_blocking`].
     pub input_fee_sats: u64,
     /// The fee of the pre-melt swap the wallet performed inside `confirm` because its proofs did not
-    /// fit the amount (CDK `PreparedMelt::swap_fee`); `0` when no swap was needed.
+    /// fit the amount (CDK `PreparedMelt::swap_fee`), charged at the swap; `0` when no swap was
+    /// needed. Not part of `fee_sats`. Actual debit = `paid_sats` + `fee_sats` + `swap_fee_sats`.
     pub swap_fee_sats: u64,
 }
 
@@ -1216,12 +1229,14 @@ async fn pay_quote_on_wallet(
         .await
         .map(|balance| balance.to_u64())
         .map_err(|error| error.to_string());
+    let balance_after_sats = read.as_ref().ok().copied();
     let balance_sats = post_confirm_balance(read, before, paid_sats.saturating_add(fee_sats), "melt");
     Ok(MeltOutcome {
         mint_url,
         paid_sats,
         fee_sats,
         balance_sats,
+        balance_after_sats,
         quote_id: quote.id.clone(),
         fee_reserve_sats,
         input_fee_sats,
@@ -1550,16 +1565,20 @@ fn prepared_melt_thread(
                 .await
                 .map(|balance| balance.to_u64())
                 .map_err(|error| error.to_string());
+            // Actual debit (addendum 9 §2.1): invoice + `fee_paid` (Lightning fee + ACTUAL proof
+            // input fee, inclusive) + the swap fee charged at the swap. The PREPARED input fee is
+            // an estimate the SDK replaced inside `fee_paid`; adding it again double-counts.
             let spent = paid_sats
                 .saturating_add(fee_sats)
-                .saturating_add(preparation.input_fee_sats)
                 .saturating_add(preparation.swap_fee_sats);
+            let balance_after_sats = read.as_ref().ok().copied();
             let balance_sats = post_confirm_balance(read, before, spent, "melt");
             Ok(Some(MeltOutcome {
                 mint_url: preparation.mint_url.clone(),
                 paid_sats,
                 fee_sats,
                 balance_sats,
+                balance_after_sats,
                 quote_id: preparation.quote_id.clone(),
                 fee_reserve_sats: preparation.fee_reserve_sats,
                 input_fee_sats: preparation.input_fee_sats,
@@ -2173,6 +2192,7 @@ mod tests {
             paid_sats: 13,
             fee_sats: 1,
             balance_sats: 100,
+            balance_after_sats: Some(100),
             quote_id: "q-pay".to_owned(),
             fee_reserve_sats: 2,
             input_fee_sats: 1,
