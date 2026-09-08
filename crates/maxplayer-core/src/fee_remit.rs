@@ -188,10 +188,7 @@ pub trait RemitEffects {
     fn melt_status(&mut self, bolt11: &str) -> Result<Option<MeltQuoteStatus>, String>;
     /// What the mint says about ONE quote, by id — the quote a SPENDING row's admission bound
     /// (addendum 5 §1, rule 2). `None` when this wallet never raised it.
-    fn melt_status_for_quote(
-        &mut self,
-        quote_id: &str,
-    ) -> Result<Option<MeltQuoteStatus>, String>;
+    fn melt_status_for_quote(&mut self, quote_id: &str) -> Result<Option<MeltQuoteStatus>, String>;
     /// Observation point: called once the plan is journaled, before the payment quote is raised.
     /// The live effects do nothing here; tests pause here to interleave a second process against
     /// the planned row (addendum 3 §2.2).
@@ -299,10 +296,7 @@ impl RemitEffects for LiveEffects {
             .map_err(|error| error.to_string())
     }
 
-    fn melt_status_for_quote(
-        &mut self,
-        quote_id: &str,
-    ) -> Result<Option<MeltQuoteStatus>, String> {
+    fn melt_status_for_quote(&mut self, quote_id: &str) -> Result<Option<MeltQuoteStatus>, String> {
         wallet_ops::melt_status_for_quote_blocking(&self.home, quote_id, None)
             .map_err(|error| error.to_string())
     }
@@ -1195,7 +1189,11 @@ fn remit_inner(
     let _ = writeln!(
         out,
         "Payment quote {} raised at mint {} for {} sats (fee reserve {} sats, expires unix {}); fits the ceiling of {gross} sats",
-        quote.quote_id, quote.mint_url, quote.amount_sats, quote.fee_reserve_sats, quote.expiry_unix
+        quote.quote_id,
+        quote.mint_url,
+        quote.amount_sats,
+        quote.fee_reserve_sats,
+        quote.expiry_unix
     );
     effects.after_quote(&planned, &quote);
 
@@ -3667,7 +3665,12 @@ mod tests {
             Some(ReleaseOn::TerminalUnboundSpending)
         );
         assert_eq!(
-            release_on(&reconcile_decision(&unbound, Some(&unpaid_expired), "proc-a", 901)),
+            release_on(&reconcile_decision(
+                &unbound,
+                Some(&unpaid_expired),
+                "proc-a",
+                901
+            )),
             Some(ReleaseOn::TerminalUnboundSpending)
         );
         assert_eq!(
@@ -4281,7 +4284,10 @@ mod tests {
                 "the expired estimate was never paid"
             );
             assert_eq!(
-                quotes.values().filter(|q| q.state == MeltQuoteState::Paid).count(),
+                quotes
+                    .values()
+                    .filter(|q| q.state == MeltQuoteState::Paid)
+                    .count(),
                 1
             );
         }
@@ -4380,7 +4386,9 @@ mod tests {
                     "bound melt quote paid-quote-lnbc-fake-13-2-a expires at unix 130, within 60 s of now (unix 201); not paid"
                 );
             }
-            other => panic!("A must refuse its bound quote and pay nothing, got {other:?}\n{a_out}"),
+            other => {
+                panic!("A must refuse its bound quote and pay nothing, got {other:?}\n{a_out}")
+            }
         }
         assert!(
             a_out.contains("this process raises no other quote for it"),
@@ -4485,7 +4493,11 @@ mod tests {
                     .in_flight_remittance()
                     .expect("query")
                     .expect("A's row");
-                assert_eq!(x.state, RemittanceState::Planned, "A is paused BEFORE its fence");
+                assert_eq!(
+                    x.state,
+                    RemittanceState::Planned,
+                    "A is paused BEFORE its fence"
+                );
                 assert_eq!(x.spending_since_unix, None);
                 assert_eq!(x.spending_quote_id, None);
                 {
@@ -4560,7 +4572,10 @@ mod tests {
                 "Q was raised and never paid"
             );
             assert_eq!(
-                quotes.values().filter(|q| q.state == MeltQuoteState::Paid).count(),
+                quotes
+                    .values()
+                    .filter(|q| q.state == MeltQuoteState::Paid)
+                    .count(),
                 1
             );
         }
@@ -4829,7 +4844,8 @@ mod tests {
                         .expect("Q")
                         .state = arm.state;
                     let mut results = Vec::new();
-                    for (trigger, now) in [(RemitTrigger::DryRun, 450), (RemitTrigger::Command, 451)]
+                    for (trigger, now) in
+                        [(RemitTrigger::DryRun, 450), (RemitTrigger::Command, 451)]
                     {
                         let mut b = second_process(&registry, &melts);
                         let (outcome, out) = run_remit(store_b, &mut b, trigger, now);
@@ -4929,7 +4945,10 @@ mod tests {
                             arm.label
                         );
                     }
-                    other => panic!("[{}] A must be refused by the mint, got {other:?}\n{a_out}", arm.label),
+                    other => panic!(
+                        "[{}] A must be refused by the mint, got {other:?}\n{a_out}",
+                        arm.label
+                    ),
                 }
                 assert!(
                     a_out.contains("This process raises no other quote for the row"),

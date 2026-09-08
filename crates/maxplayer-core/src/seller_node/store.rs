@@ -4093,7 +4093,13 @@ mod tests {
         );
         assert_eq!(
             store
-                .release_remittance("h1", &ReleaseOn::OwnPlanned { owner: OWNER.to_owned() }, 13)
+                .release_remittance(
+                    "h1",
+                    &ReleaseOn::OwnPlanned {
+                        owner: OWNER.to_owned()
+                    },
+                    13
+                )
                 .expect("query"),
             None,
             "a settled row is not released: zero rows, hold"
@@ -4194,7 +4200,12 @@ mod tests {
         // stands, and it is OWNER's) changes zero rows and touches nothing.
         assert_eq!(
             store
-                .release_remittance("h1", &ReleaseOn::TerminalBoundQuote { quote_id: "q-any".to_owned() }, 3
+                .release_remittance(
+                    "h1",
+                    &ReleaseOn::TerminalBoundQuote {
+                        quote_id: "q-any".to_owned()
+                    },
+                    3
                 )
                 .expect("query"),
             None,
@@ -4202,14 +4213,26 @@ mod tests {
         );
         assert_eq!(
             store
-                .release_remittance("h1", &ReleaseOn::LeaseExpired { now_unix: LEASE - 1 }, 3)
+                .release_remittance(
+                    "h1",
+                    &ReleaseOn::LeaseExpired {
+                        now_unix: LEASE - 1
+                    },
+                    3
+                )
                 .expect("query"),
             None,
             "the lease stands: zero rows"
         );
         assert_eq!(
             store
-                .release_remittance("h1", &ReleaseOn::OwnPlanned { owner: "someone-else".to_owned() }, 3)
+                .release_remittance(
+                    "h1",
+                    &ReleaseOn::OwnPlanned {
+                        owner: "someone-else".to_owned()
+                    },
+                    3
+                )
                 .expect("query"),
             None,
             "not that process's row: zero rows"
@@ -4220,7 +4243,13 @@ mod tests {
             "three held releases touched nothing"
         );
         let failed = store
-            .release_remittance("h1", &ReleaseOn::OwnPlanned { owner: OWNER.to_owned() }, 3)
+            .release_remittance(
+                "h1",
+                &ReleaseOn::OwnPlanned {
+                    owner: OWNER.to_owned(),
+                },
+                3,
+            )
             .expect("query")
             .expect("released");
         assert_eq!(failed.state, RemittanceState::Failed);
@@ -4239,7 +4268,13 @@ mod tests {
         );
         assert_eq!(
             store
-                .release_remittance("h1", &ReleaseOn::OwnPlanned { owner: OWNER.to_owned() }, 4)
+                .release_remittance(
+                    "h1",
+                    &ReleaseOn::OwnPlanned {
+                        owner: OWNER.to_owned()
+                    },
+                    4
+                )
                 .expect("query"),
             None
         );
@@ -4516,7 +4551,10 @@ mod tests {
             })
             .expect("query")
             .expect("admitted");
-        assert_eq!(clock_reads, 1, "the clock is read exactly once, inside the fence");
+        assert_eq!(
+            clock_reads, 1,
+            "the clock is read exactly once, inside the fence"
+        );
         assert_eq!(admitted.state, RemittanceState::Spending);
         assert_eq!(admitted.spending_since_unix, Some(439));
         assert_eq!(admitted.spending_quote_id.as_deref(), Some("q-a"));
@@ -4565,11 +4603,15 @@ mod tests {
                 "the planned-row release requires no admission mark",
             ),
             (
-                ReleaseOn::OwnPlanned { owner: "proc-a".to_owned() },
+                ReleaseOn::OwnPlanned {
+                    owner: "proc-a".to_owned(),
+                },
                 "even the owner's own planned-row release: the row is spending",
             ),
             (
-                ReleaseOn::TerminalBoundQuote { quote_id: "q-a2".to_owned() },
+                ReleaseOn::TerminalBoundQuote {
+                    quote_id: "q-a2".to_owned(),
+                },
                 "a terminal verdict on a quote that is not the bound one",
             ),
         ] {
@@ -4585,11 +4627,21 @@ mod tests {
             "four held releases touched nothing"
         );
         let released = store
-            .release_remittance("h1", &ReleaseOn::TerminalBoundQuote { quote_id: "q-a".to_owned() }, 10)
+            .release_remittance(
+                "h1",
+                &ReleaseOn::TerminalBoundQuote {
+                    quote_id: "q-a".to_owned(),
+                },
+                10,
+            )
             .expect("query")
             .expect("released on the bound quote");
         assert_eq!(released.state, RemittanceState::Failed);
-        assert_eq!(released.spending_quote_id.as_deref(), Some("q-a"), "history kept");
+        assert_eq!(
+            released.spending_quote_id.as_deref(),
+            Some("q-a"),
+            "history kept"
+        );
         // A row that is no longer in flight: zero rows, whoever asks; a missing row says so.
         assert_eq!(
             store
@@ -4783,7 +4835,10 @@ mod tests {
             .expect("the v12 spending row is the row in flight");
         assert_eq!(spending.state, RemittanceState::Spending);
         assert_eq!(spending.spending_since_unix, Some(150));
-        assert_eq!(spending.spending_quote_id, None, "admitted before quotes were bound");
+        assert_eq!(
+            spending.spending_quote_id, None,
+            "admitted before quotes were bound"
+        );
         assert_eq!(spending.owner.as_deref(), Some("proc-v12"));
         assert_eq!(spending.lease_until_unix, Some(400));
         assert_eq!(spending.melt_quote_id.as_deref(), Some("q-est"));
@@ -4798,16 +4853,22 @@ mod tests {
                 "lease expiry never touches a spending row, migrated or not",
             ),
             (
-                ReleaseOn::TerminalBoundQuote { quote_id: "q-est".to_owned() },
+                ReleaseOn::TerminalBoundQuote {
+                    quote_id: "q-est".to_owned(),
+                },
                 "the estimate quote was never BOUND: the bound-quote release changes zero rows",
             ),
             (
-                ReleaseOn::OwnPlanned { owner: "proc-v12".to_owned() },
+                ReleaseOn::OwnPlanned {
+                    owner: "proc-v12".to_owned(),
+                },
                 "not a planned row",
             ),
         ] {
             assert_eq!(
-                store.release_remittance("v12-spending", &wrong, 500).expect("query"),
+                store
+                    .release_remittance("v12-spending", &wrong, 500)
+                    .expect("query"),
                 None,
                 "{why}"
             );
@@ -4863,7 +4924,11 @@ mod tests {
         );
         let rows = store.remittances().expect("rows");
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[1].spending_quote_id.as_deref(), Some("q-bound"), "the binding survives a reopen");
+        assert_eq!(
+            rows[1].spending_quote_id.as_deref(),
+            Some("q-bound"),
+            "the binding survives a reopen"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

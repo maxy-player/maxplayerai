@@ -301,9 +301,7 @@ pub(crate) fn render(
             (None, _, _) => "not observed".to_owned(),
         };
         let state = match row.state {
-            RemittanceState::Planned => {
-                "PLANNED (settling — re-run remit to reconcile)".to_owned()
-            }
+            RemittanceState::Planned => "PLANNED (settling — re-run remit to reconcile)".to_owned(),
             // Addendum 4 §1 / addendum 5 §1: the owner's compare-and-set admitted the melt and bound
             // the quote it pays. Never released on time; reconciliation asks the mint about THAT
             // quote — settles on PAID, releases on FAILED or UNPAID past expiry + margin, else holds.
