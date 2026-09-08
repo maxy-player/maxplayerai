@@ -66,7 +66,7 @@
 //! selects and reserves proofs in the wallet's own store and exposes `input_fee`, `swap_fee` and
 //! `requires_swap` (`melt/mod.rs:428–450`) while posting no proof-bearing or fee-bearing request
 //! (it may fetch mint metadata/keysets, a GET; the swap `melt/saga/mod.rs:687–697` and the melt
-//! request `:907–911` both live inside `confirm`) — and [`MeltCeiling::admits_total`] is taken on
+//! request `:907–911` both live inside `confirm`) — and [`MeltCeiling::admits_confirmable`] is taken on
 //! those four figures; over ⇒ `PreparedMelt::cancel` (`:817–831`, best-effort local compensation:
 //! proofs back to Unspent, quote released) and the ordinary before-fence refusal (planned row
 //! released, one `REFUSED before spending` line naming the total, its parts and the ceiling,
@@ -2226,39 +2226,10 @@ impl Drop for RemitPermit {
     }
 }
 
-/// NUT-02 (pinned `cdk/src/fees.rs:35–48`, reached from `wallet/mod.rs:319–352` and `:356`):
-/// fee = ceil(ppk × count / 1000).
-pub(crate) fn fee_for(input_fee_ppk: u64, count: usize) -> u64 {
-    (input_fee_ppk * count as u64).div_ceil(1000)
-}
-
-/// The denominations a power-of-two keyset hands back for `amount` under `SplitTarget::None`
-/// (CDK `Amount::split`, the split the swap uses for the melt's proofs at `swap/saga/mod.rs:
-/// 285–301` and for the change) — one proof per set bit, largest first.
-pub(crate) fn binary_split(amount: u64) -> Vec<u64> {
-    (0..64)
-        .rev()
-        .map(|bit| 1u64 << bit)
-        .filter(|denomination| amount & denomination != 0)
-        .collect()
-}
-
-/// CDK's post-swap figures for a melt of `need` = invoice + reserve on a swap layout: the target the
-/// wallet swaps to (`need` + the PREPARED input fee, `melt/saga/mod.rs:678`) and the ACTUAL input
-/// fee the SDK recomputes on that target's binary split (`:704`). `prepared_input_fee_sats` is what
-/// `prepare_melt` estimated (the fee on the split of `need`, `:383–387`); when `None` it is computed
-/// the same way here (planning, before any quote's figures exist).
-pub(crate) fn post_swap_figures(
-    need_sats: u64,
-    prepared_input_fee_sats: Option<u64>,
-    input_fee_ppk: u64,
-) -> (u64, u64) {
-    let prepared = prepared_input_fee_sats
-        .unwrap_or_else(|| fee_for(input_fee_ppk, binary_split(need_sats).len()));
-    let target_sats = need_sats.saturating_add(prepared);
-    let actual = fee_for(input_fee_ppk, binary_split(target_sats).len());
-    (target_sats, actual)
-}
+// The SDK fee arithmetic (`fee_for`, `binary_split`, `post_swap_figures`, `confirm_bound`) lives in
+// `wallet_ops` since addendum 10 §1.1, so the wallet's prepared-melt gate, this module's planner and
+// its pre-fence check are one function; re-exported here for this module and its tests.
+pub(crate) use crate::wallet_ops::{binary_split, fee_for, post_swap_figures};
 
 /// **Fee-aware planning (addendum 9 §1.2): the largest invoice `confirm` can actually pay within
 /// `gross`.** Searches DOWN from `gross − reserve` for the first invoice `n` for which, with
@@ -2358,7 +2329,8 @@ pub(crate) mod test_support {
     use crate::lnurl_pay::{LightningAddress, PayRequest, ResolvedInvoice, Url};
     use crate::seller_node::store::FeeRemittance;
     use crate::wallet_ops::{
-        MeltCeiling, MeltEstimate, MeltOutcome, MeltPreparation, MeltQuoteState, MeltQuoteStatus,
+        ConfirmShortfall, MeltCeiling, MeltEstimate, MeltOutcome, MeltPreparation, MeltQuoteState,
+        MeltQuoteStatus, WalletOpsError,
     };
 
     /// A rendezvous a test uses to PAUSE one attempt at a chosen point (after the plan is journaled,
@@ -3086,27 +3058,63 @@ pub(crate) mod test_support {
                 self.pay_refusals.push(reason.clone());
                 return Err(MeltFailure::Failed(reason));
             }
-            // The total bound on the prepared figures — the SDK's, as the shipped path takes it.
-            let total_debit_sats = MeltCeiling::total_debit(
+            // The one gate on the prepared figures (addendum 10 §1.1) — the SDK's figures through
+            // the same `confirm_bound` the shipped path takes, same refusal wording.
+            let total_debit_sats = match ceiling.admits_confirmable(
                 quote.amount_sats,
                 quote.fee_reserve_sats,
-                input_fee_sats,
+                Some(input_fee_sats),
                 swap_fee_sats,
-            );
-            if !ceiling.admits_total(
-                quote.amount_sats,
-                quote.fee_reserve_sats,
-                input_fee_sats,
-                swap_fee_sats,
+                self.input_fee_ppk,
+                requires_swap,
             ) {
-                self.return_proofs(&selected);
-                let reason = format!(
-                    "melt refused before spending: mint https://mint.example quote {quote_id} would debit {total_debit_sats} sats in total ({} sats invoice + {} sats fee reserve + {input_fee_sats} sats proof input fee + {swap_fee_sats} sats swap fee) against a ceiling of {} sats; the prepared melt was cancelled and its proofs released; nothing was posted to the mint",
-                    quote.amount_sats, quote.fee_reserve_sats, ceiling.max_debit_sats
-                );
-                self.ceiling_refusals.push(reason.clone());
-                return Err(MeltFailure::RefusedBeforeSpending(reason));
-            }
+                Ok(bound) => bound.worst_debit_sats,
+                Err(shortfall) => {
+                    self.return_proofs(&selected);
+                    let refusal = match shortfall {
+                        ConfirmShortfall::DifferentInvoice {
+                            invoice_sats,
+                            planned_invoice_sats,
+                        } => WalletOpsError::MeltExceedsCeiling {
+                            mint_url: "https://mint.example".to_owned(),
+                            quote_id: quote_id.to_owned(),
+                            invoice_sats,
+                            fee_reserve_sats: quote.fee_reserve_sats,
+                            planned_invoice_sats,
+                            max_debit_sats: ceiling.max_debit_sats,
+                        },
+                        ConfirmShortfall::TargetShort { bound, .. } => {
+                            WalletOpsError::MeltWouldNotConfirm {
+                                mint_url: "https://mint.example".to_owned(),
+                                quote_id: quote_id.to_owned(),
+                                invoice_sats: quote.amount_sats,
+                                fee_reserve_sats: quote.fee_reserve_sats,
+                                input_fee_sats,
+                                actual_input_fee_sats: bound.actual_input_fee_sats,
+                                target_sats: bound.target_sats,
+                                swap_fee_sats,
+                                input_fee_ppk: self.input_fee_ppk,
+                            }
+                        }
+                        ConfirmShortfall::OverCeiling {
+                            bound,
+                            max_debit_sats,
+                        } => WalletOpsError::MeltTotalExceedsCeiling {
+                            mint_url: "https://mint.example".to_owned(),
+                            quote_id: quote_id.to_owned(),
+                            invoice_sats: quote.amount_sats,
+                            fee_reserve_sats: quote.fee_reserve_sats,
+                            input_fee_sats: bound.actual_input_fee_sats,
+                            swap_fee_sats,
+                            total_sats: bound.worst_debit_sats,
+                            max_debit_sats,
+                        },
+                    };
+                    let reason = refusal.to_string();
+                    self.ceiling_refusals.push(reason.clone());
+                    return Err(MeltFailure::RefusedBeforeSpending(reason));
+                }
+            };
             let token = self.next_token;
             self.next_token += 1;
             let preparation = MeltPreparation {

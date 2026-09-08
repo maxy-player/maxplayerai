@@ -14,15 +14,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cashu::{MintUrl, Token};
-use sha2::{Digest, Sha256};
+use cdk::Amount;
 use cdk::cdk_database::WalletDatabase;
 use cdk::nuts::{CurrencyUnit, MintQuoteState, PaymentMethod, ProofsMethods};
 use cdk::wallet::{KeysetFilter, ReceiveOptions, SendOptions, Wallet};
-use cdk::Amount;
 use cdk_sqlite::wallet::WalletSqliteDatabase;
+use sha2::{Digest, Sha256};
 
 use crate::buyer_fund::seed_from_secret_hex;
-use crate::home::{self, HomeError, MaxplayerHome, DEFAULT_MINT_URL};
+use crate::home::{self, DEFAULT_MINT_URL, HomeError, MaxplayerHome};
 
 #[derive(Debug)]
 pub enum WalletOpsError {
@@ -31,16 +31,23 @@ pub enum WalletOpsError {
     /// MEMBERSHIP miss, cleared by `maxplayer wallet mints add`. `default_mint` carries the home's
     /// ACTUAL default (`config.default_mint()`) so the Display names it rather than the pinned
     /// testnut constant — on a real-minibits home the latter is a money-relevant lie (#506).
-    MintNotAllowed { mint_url: String, default_mint: String },
+    MintNotAllowed {
+        mint_url: String,
+        default_mint: String,
+    },
     /// The mint IS configured but is a real mint refused by the real-mint fence (issue #49):
     /// `allow_real_mints` is off. A POLICY block — `mints add` cannot clear it, so it must NOT
     /// borrow [`Self::MintNotAllowed`]'s remedy; the control is `MAXPLAYER_ALLOW_REAL_MINTS` (#465).
-    RealMintDisallowed { mint_url: String },
+    RealMintDisallowed {
+        mint_url: String,
+    },
     /// `remove_mint` refuses to remove the home's pinned default mint. `mint_url` carries that
     /// actual default (`config.default_mint()`) so the message names the real pinned mint rather
     /// than a hardcoded constant — on a real-minibits home the constant would be a false-default
     /// lie (#579).
-    MintPinnedDefault { mint_url: String },
+    MintPinnedDefault {
+        mint_url: String,
+    },
     /// A melt run under a [`MeltCeiling`] was REFUSED before any proof was selected, prepared or
     /// spent: the quote the mint raised at payment time would take more out of the wallet than the
     /// caller's hard maximum, or quoted a different invoice amount than the caller planned. The
@@ -73,6 +80,23 @@ pub enum WalletOpsError {
         total_sats: u64,
         max_debit_sats: u64,
     },
+    /// A melt under a [`MeltCeiling`] was REFUSED after `prepare_melt` and before `confirm` because
+    /// `confirm` would NOT succeed (addendum 10 §1.1, [`ConfirmShortfall::TargetShort`]): the swap
+    /// would yield `target_sats`, the SDK recomputes the input fee on those proofs as
+    /// `actual_input_fee_sats` (its prepared estimate was `input_fee_sats`), and target < invoice +
+    /// reserve + actual — pinned CDK refuses AFTER paying the swap fee (`melt/saga/mod.rs:704–712`).
+    /// Caught here instead: the prepared melt was CANCELLED, no fee-bearing request was posted.
+    MeltWouldNotConfirm {
+        mint_url: String,
+        quote_id: String,
+        invoice_sats: u64,
+        fee_reserve_sats: u64,
+        input_fee_sats: u64,
+        actual_input_fee_sats: u64,
+        target_sats: u64,
+        swap_fee_sats: u64,
+        input_fee_ppk: u64,
+    },
     Wallet(String),
 }
 
@@ -80,7 +104,10 @@ impl std::fmt::Display for WalletOpsError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Home(error) => write!(formatter, "{error}"),
-            Self::MintNotAllowed { mint_url, default_mint } => write!(
+            Self::MintNotAllowed {
+                mint_url,
+                default_mint,
+            } => write!(
                 formatter,
                 "mint {mint_url} is not configured; add it with `maxplayer wallet mints add` (default stays {default_mint})"
             ),
@@ -123,6 +150,29 @@ impl std::fmt::Display for WalletOpsError {
                  ({invoice_sats} sats invoice + {fee_reserve_sats} sats fee reserve + {input_fee_sats} sats proof input fee \
                  + {swap_fee_sats} sats swap fee) against a ceiling of {max_debit_sats} sats; the prepared melt was \
                  cancelled and its proofs released; nothing was posted to the mint"
+            ),
+            Self::MeltWouldNotConfirm {
+                mint_url,
+                quote_id,
+                invoice_sats,
+                fee_reserve_sats,
+                input_fee_sats,
+                actual_input_fee_sats,
+                target_sats,
+                swap_fee_sats,
+                input_fee_ppk,
+            } => write!(
+                formatter,
+                "melt refused before spending: the wallet would swap to {target_sats} sats ({:?}) for mint {mint_url} \
+                 quote {quote_id} and the mint's actual proof input fee on those proofs is {actual_input_fee_sats} sats \
+                 (prepared estimate {input_fee_sats} sats at {input_fee_ppk} ppk), so {invoice_sats} sats invoice + \
+                 {fee_reserve_sats} sats fee reserve + {actual_input_fee_sats} sats would need {} sats and the SDK would \
+                 refuse AFTER paying the {swap_fee_sats} sats swap fee; the prepared melt was cancelled before any \
+                 fee-bearing request",
+                binary_split(*target_sats),
+                invoice_sats
+                    .saturating_add(*fee_reserve_sats)
+                    .saturating_add(*actual_input_fee_sats)
             ),
             Self::Wallet(message) => write!(formatter, "wallet error: {message}"),
         }
@@ -254,18 +304,150 @@ pub struct MeltOutcome {
     pub swap_fee_sats: u64,
 }
 
+/// NUT-02 (pinned `cdk/src/fees.rs:35–48`, reached from `wallet/mod.rs:319–352` and `:356`):
+/// fee = ceil(ppk × count / 1000).
+pub(crate) fn fee_for(input_fee_ppk: u64, count: usize) -> u64 {
+    (input_fee_ppk * count as u64).div_ceil(1000)
+}
+
+/// The denominations a power-of-two keyset hands back for `amount` under `SplitTarget::None`
+/// (CDK `Amount::split`, the split the swap uses for the melt's proofs at `swap/saga/mod.rs:
+/// 285–301` and for the change) — one proof per set bit, largest first.
+pub(crate) fn binary_split(amount: u64) -> Vec<u64> {
+    (0..64)
+        .rev()
+        .map(|bit| 1u64 << bit)
+        .filter(|denomination| amount & denomination != 0)
+        .collect()
+}
+
+/// CDK's post-swap figures for a melt of `need` = invoice + reserve on a swap layout: the target the
+/// wallet swaps to (`need` + the PREPARED input fee, `melt/saga/mod.rs:678`) and the ACTUAL input
+/// fee the SDK recomputes on that target's binary split (`:704`). `prepared_input_fee_sats` is what
+/// `prepare_melt` estimated (the fee on the split of `need`, `:383–387`); when `None` it is computed
+/// the same way here (planning, before any quote's figures exist).
+pub(crate) fn post_swap_figures(
+    need_sats: u64,
+    prepared_input_fee_sats: Option<u64>,
+    input_fee_ppk: u64,
+) -> (u64, u64) {
+    let prepared = prepared_input_fee_sats
+        .unwrap_or_else(|| fee_for(input_fee_ppk, binary_split(need_sats).len()));
+    let target_sats = need_sats.saturating_add(prepared);
+    let actual = fee_for(input_fee_ppk, binary_split(target_sats).len());
+    (target_sats, actual)
+}
+
+/// What pinned CDK 0.17.2's `confirm` will act on for a melt of `invoice + reserve`, and the most it
+/// can debit — the ONE arithmetic the seller fee remittance's planner, the wallet's prepared-melt
+/// gate ([`MeltCeiling::admits_confirmable`]) and its pre-fence check all decide on (addendum 10
+/// §1.1). Computed by [`confirm_bound`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmBound {
+    /// invoice + fee reserve.
+    pub need_sats: u64,
+    /// The SDK's PREPARED input fee: the fee on the binary split of `need` (`melt/saga/mod.rs:
+    /// 383–387`) — an estimate on a swap layout; the fee on the selected proofs on an exact fit.
+    pub prepared_input_fee_sats: u64,
+    /// The amount the pre-melt swap yields (`need` + prepared input fee, `:678`); `need` itself when
+    /// no swap is needed.
+    pub target_sats: u64,
+    /// The input fee `confirm` RECOMPUTES on the proofs the melt sends (`:704`): on the target's
+    /// binary split after a swap, the prepared figure on an exact fit.
+    pub actual_input_fee_sats: u64,
+    /// The fee of the pre-melt swap, charged at the swap; `0` without one.
+    pub swap_fee_sats: u64,
+    /// The most that can leave the wallet: invoice + reserve + ACTUAL input fee + swap fee. The
+    /// Lightning fee the mint keeps is at most the reserve, so the debit is at most this.
+    pub worst_debit_sats: u64,
+}
+
+/// Why [`confirm_bound`] refused — each names the figures a refusal line prints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfirmShortfall {
+    /// The paying quote is not for the invoice the caller planned.
+    DifferentInvoice {
+        invoice_sats: u64,
+        planned_invoice_sats: u64,
+    },
+    /// After the swap the target would not cover invoice + reserve + the recomputed input fee: the
+    /// SDK would refuse AFTER paying the swap fee (`melt/saga/mod.rs:704–712`).
+    TargetShort {
+        bound: ConfirmBound,
+        needed_after_swap_sats: u64,
+    },
+    /// `confirm` would succeed but the worst-case debit exceeds the ceiling.
+    OverCeiling {
+        bound: ConfirmBound,
+        max_debit_sats: u64,
+    },
+}
+
+/// **Addendum 10 §1.1, the actual-confirmability bound:** for `invoice + reserve` under the given
+/// fee metadata, `confirm` succeeds iff on a swap layout `target ≥ need + actual_input_fee(target
+/// split)`, and the payment fits iff `need + actual_input_fee + swap_fee ≤ max_debit_sats`. On an
+/// exact-fit layout (`requires_swap == false`) the selected proofs already cover the prepared fee, so
+/// only the debit bound applies with `actual = prepared`. `prepared_input_fee_sats` is the SDK's
+/// figure when a preparation exists, `None` when planning (computed the same way, on the split of
+/// `need`). Pure; the same function answers the planner (`Ok` ⇒ this invoice is confirmable), the
+/// wallet's gate and the pre-fence check, so they cannot disagree on fixed metadata.
+pub fn confirm_bound(
+    invoice_sats: u64,
+    fee_reserve_sats: u64,
+    prepared_input_fee_sats: Option<u64>,
+    swap_fee_sats: u64,
+    input_fee_ppk: u64,
+    requires_swap: bool,
+    max_debit_sats: u64,
+) -> Result<ConfirmBound, ConfirmShortfall> {
+    let need_sats = invoice_sats.saturating_add(fee_reserve_sats);
+    let (prepared_input_fee_sats, target_sats, actual_input_fee_sats) = if requires_swap {
+        let (target_sats, actual) =
+            post_swap_figures(need_sats, prepared_input_fee_sats, input_fee_ppk);
+        (target_sats.saturating_sub(need_sats), target_sats, actual)
+    } else {
+        let prepared = prepared_input_fee_sats.unwrap_or(0);
+        (prepared, need_sats, prepared)
+    };
+    let worst_debit_sats = need_sats
+        .saturating_add(actual_input_fee_sats)
+        .saturating_add(swap_fee_sats);
+    let bound = ConfirmBound {
+        need_sats,
+        prepared_input_fee_sats,
+        target_sats,
+        actual_input_fee_sats,
+        swap_fee_sats,
+        worst_debit_sats,
+    };
+    let needed_after_swap_sats = need_sats.saturating_add(actual_input_fee_sats);
+    if requires_swap && target_sats < needed_after_swap_sats {
+        return Err(ConfirmShortfall::TargetShort {
+            bound,
+            needed_after_swap_sats,
+        });
+    }
+    if worst_debit_sats > max_debit_sats {
+        return Err(ConfirmShortfall::OverCeiling {
+            bound,
+            max_debit_sats,
+        });
+    }
+    Ok(bound)
+}
+
 /// A hard bound a caller places on a melt. Two checks share it: [`Self::admits`] bounds the two
 /// figures a QUOTE carries (invoice + fee reserve) and is taken before any proof is selected — the
 /// operator's [`melt_within_async`] takes only this one (its reserve-only ceiling is kept as is,
-/// addendum 8 §6); [`Self::admits_total`] bounds the four figures a PREPARED melt carries (invoice +
-/// fee reserve + the SDK's proof-input fee + its pre-melt swap fee) and is taken between
-/// `prepare_melt` and `confirm` by [`prepare_melt_payment_blocking`] — the seller fee remittance's
-/// path, whose ceiling therefore bounds the ENTIRE wallet debit (addendum 8 §1, verdict B4). The
-/// remittance's money hold (stage 2a, addendum 3 §1): the plan's estimate is not the quote the spend
-/// runs under — the mint quotes again when the payment is made, and its fee reserve can differ — so
-/// the ceiling is enforced at the moment of spending, not estimated beforehand or regretted
-/// afterwards. A quote that does not fit is refused as [`WalletOpsError::MeltExceedsCeiling`], a
-/// clean failure with nothing moved.
+/// addendum 8 §6); [`Self::admits_confirmable`] is the actual-confirmability bound on a PREPARED
+/// melt (invoice + fee reserve + the input fee the SDK will RECOMPUTE on the proofs it sends + its
+/// pre-melt swap fee, addendum 10 §1.1) and is taken between `prepare_melt` and `confirm` by
+/// [`prepare_melt_payment_blocking`] — the seller fee remittance's path, whose ceiling therefore
+/// bounds the ENTIRE wallet debit (addendum 8 §1, verdict B4). The remittance's money hold (stage
+/// 2a, addendum 3 §1): the plan's estimate is not the quote the spend runs under — the mint quotes
+/// again when the payment is made, and its fee reserve can differ — so the ceiling is enforced at
+/// the moment of spending, not estimated beforehand or regretted afterwards. A quote that does not
+/// fit is refused as [`WalletOpsError::MeltExceedsCeiling`], a clean failure with nothing moved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeltCeiling {
     /// The most that may leave the wallet for this melt — invoice amount and fee reserve together.
@@ -286,28 +468,40 @@ impl MeltCeiling {
             && invoice_sats.saturating_add(fee_reserve_sats) <= self.max_debit_sats
     }
 
-    /// Whether the WHOLE debit of a prepared melt fits under this ceiling: invoice + fee reserve +
-    /// the proof-input fee on the selected proofs + the pre-melt swap fee (both as the SDK's
-    /// prepared melt states them). [`Self::admits`] is the same bound on the two figures a quote
-    /// carries; this is the bound on the four a prepared melt carries (addendum 8 §1, verdict B4).
-    /// Pure, so the arithmetic is unit-tested without a mint.
-    pub fn admits_total(
+    /// **The one gate on a PREPARED melt (addendum 10 §1.1).** The paying quote must be for the
+    /// planned invoice, and [`confirm_bound`] must hold for the SDK's prepared figures under
+    /// `max_debit_sats`: `confirm` will succeed and its worst-case debit (invoice + reserve + the
+    /// input fee it RECOMPUTES on the proofs it sends + swap fee) fits. Replaces round 8's bound on
+    /// the PREPARED total — an estimate that can exceed the final debit and refused fitting
+    /// remittances (verdict 4714623 §3.2). Pure, so unit-tested without a mint.
+    pub fn admits_confirmable(
         &self,
         invoice_sats: u64,
         fee_reserve_sats: u64,
-        input_fee_sats: u64,
+        prepared_input_fee_sats: Option<u64>,
         swap_fee_sats: u64,
-    ) -> bool {
-        invoice_sats == self.invoice_sats
-            && Self::total_debit(
+        input_fee_ppk: u64,
+        requires_swap: bool,
+    ) -> Result<ConfirmBound, ConfirmShortfall> {
+        if invoice_sats != self.invoice_sats {
+            return Err(ConfirmShortfall::DifferentInvoice {
                 invoice_sats,
-                fee_reserve_sats,
-                input_fee_sats,
-                swap_fee_sats,
-            ) <= self.max_debit_sats
+                planned_invoice_sats: self.invoice_sats,
+            });
+        }
+        confirm_bound(
+            invoice_sats,
+            fee_reserve_sats,
+            prepared_input_fee_sats,
+            swap_fee_sats,
+            input_fee_ppk,
+            requires_swap,
+            self.max_debit_sats,
+        )
     }
 
-    /// The four parts summed, saturating — the figure the bound compares and the refusal names.
+    /// The four parts summed, saturating — the figure a refusal names, with the input fee at the
+    /// value the caller has (the ACTUAL one where [`confirm_bound`] computed it).
     pub fn total_debit(
         invoice_sats: u64,
         fee_reserve_sats: u64,
@@ -363,7 +557,7 @@ pub struct MeltEstimate {
 
 /// The SDK's figures for ONE prepared melt — read off CDK 0.17.2's `PreparedMelt` after
 /// `prepare_melt` selected and reserved proofs in the LOCAL store and before `confirm` performs any
-/// swap or posts the melt request. The bound in [`MeltCeiling::admits_total`] is taken on these.
+/// swap or posts the melt request. The bound in [`MeltCeiling::admits_confirmable`] is taken on these.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeltPreparation {
     pub mint_url: String,
@@ -382,7 +576,7 @@ pub struct MeltPreparation {
     /// proof when it RECOMPUTES the input fee on the swapped proofs (pinned `melt/saga/mod.rs:704`);
     /// read as the fee on 1000 proofs, which is exactly ppk (`fees.rs:35–48`).
     pub input_fee_ppk: u64,
-    /// The four parts summed (saturating) — what `admits_total` compared against the ceiling.
+    /// The four parts summed (saturating) — what `admits_confirmable` compared against the ceiling: invoice + reserve + ACTUAL input fee + swap fee.
     pub total_debit_sats: u64,
     pub expiry_unix: u64,
 }
@@ -531,10 +725,7 @@ pub fn normalize_mint_url(raw: &str) -> Result<String, WalletOpsError> {
 }
 
 fn is_autopay_mint(mint_url: &str) -> bool {
-    normalize_mint_url(mint_url)
-        .ok()
-        .as_deref()
-        == Some(DEFAULT_MINT_URL)
+    normalize_mint_url(mint_url).ok().as_deref() == Some(DEFAULT_MINT_URL)
 }
 
 /// Money class a mint moves, derived purely from the mint URL. The pinned testnut host
@@ -643,7 +834,10 @@ fn post_receive_balance(read: Result<u64, String>, before: u64, received_sats: u
     }
 }
 
-fn resolve_mint(home: &MaxplayerHome, mint_override: Option<&str>) -> Result<String, WalletOpsError> {
+fn resolve_mint(
+    home: &MaxplayerHome,
+    mint_override: Option<&str>,
+) -> Result<String, WalletOpsError> {
     match mint_override {
         Some(url) => mint_is_allowed(home, url),
         None => normalize_mint_url(home.config.default_mint()),
@@ -657,7 +851,8 @@ pub async fn open_wallet_async(
 ) -> Result<Wallet, WalletOpsError> {
     let mint_url = mint_is_allowed(home, mint_url)?;
     let secret = home::read_secret_key_hex(home)?;
-    let seed = seed_from_secret_hex(&secret).map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+    let seed =
+        seed_from_secret_hex(&secret).map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
     let path = sqlite_path(&home.wallet_dir);
     let store = WalletSqliteDatabase::new(path)
         .await
@@ -1239,7 +1434,8 @@ async fn pay_quote_on_wallet(
         .map(|balance| balance.to_u64())
         .map_err(|error| error.to_string());
     let balance_after_sats = read.as_ref().ok().copied();
-    let balance_sats = post_confirm_balance(read, before, paid_sats.saturating_add(fee_sats), "melt");
+    let balance_sats =
+        post_confirm_balance(read, before, paid_sats.saturating_add(fee_sats), "melt");
     Ok(MeltOutcome {
         mint_url,
         paid_sats,
@@ -1355,7 +1551,7 @@ async fn active_keyset_input_fee_ppk(wallet: &Wallet) -> Result<u64, String> {
 ///    (pinned `melt/saga/mod.rs:286–460`; writes only the wallet's own database; it may FETCH mint
 ///    metadata/keysets — `:303` → keysets → `metadata_cache.load` — a GET, never a proof-bearing or
 ///    fee-bearing request);
-/// 3. takes the bound on the SDK's four figures — [`MeltCeiling::admits_total`]. Over the ceiling
+/// 3. takes the actual-confirmability bound on the SDK's figures — [`MeltCeiling::admits_confirmable`]. Refused
 ///    ⇒ `PreparedMelt::cancel` (best-effort local compensation: proofs back to Unspent, quote
 ///    released; `:817–831` logs its own DB errors and still returns Ok) and
 ///    [`WalletOpsError::MeltTotalExceedsCeiling`]: no fee-bearing request was posted, nothing left
@@ -1502,35 +1698,10 @@ fn prepared_melt_thread(
             .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
         let input_fee_sats = prepared.input_fee().to_u64();
         let swap_fee_sats = prepared.swap_fee().to_u64();
-        let total_debit_sats =
-            MeltCeiling::total_debit(invoice_sats, fee_reserve_sats, input_fee_sats, swap_fee_sats);
-        if !ceiling.admits_total(invoice_sats, fee_reserve_sats, input_fee_sats, swap_fee_sats) {
-            // The bound. Cancel FIRST — the SDK's compensations: proofs back to Unspent, quote
-            // released, saga deleted, all local — then refuse, typed. Cancel is best-effort (CDK
-            // logs a compensation's own DB error and still returns Ok); an Err here is reported
-            // for what it is: no fee-bearing request was posted, but a local proof reservation may
-            // remain — `open_wallet_async` only constructs the wallet and does not run CDK
-            // `recover_incomplete_sagas` on this path (only `crossmint_hop` calls it); a supported
-            // recovery path is owed, not wired here.
-            let refusal = WalletOpsError::MeltTotalExceedsCeiling {
-                mint_url: mint_url.clone(),
-                quote_id: quote.id.clone(),
-                invoice_sats,
-                fee_reserve_sats,
-                input_fee_sats,
-                swap_fee_sats,
-                total_sats: total_debit_sats,
-                max_debit_sats: ceiling.max_debit_sats,
-            };
-            return match prepared.cancel().await {
-                Ok(()) => Err(refusal),
-                Err(error) => Err(WalletOpsError::Wallet(format!(
-                    "{refusal}; AND cancelling the prepared melt failed: {error} (no fee-bearing request was posted; a local proof reservation may remain until a supported recovery path — owed — releases it)"
-                ))),
-            };
-        }
-        // The keyset's ppk, for the caller's confirmability arithmetic (addendum 9 §1.1): the fee
-        // on 1000 proofs is exactly `input_fee_ppk`. A failed read cancels the preparation.
+        let requires_swap = prepared.requires_swap();
+        // The keyset's ppk, for the confirmability arithmetic (addendum 9 §1.1 / addendum 10 §1.1):
+        // the fee on 1000 proofs is exactly `input_fee_ppk`. Read BEFORE the gate, which needs it;
+        // a failed read cancels the preparation.
         let input_fee_ppk = match active_keyset_input_fee_ppk(&wallet).await {
             Ok(ppk) => ppk,
             Err(error) => {
@@ -1546,6 +1717,73 @@ fn prepared_melt_thread(
                 };
             }
         };
+        // The one gate (addendum 10 §1.1): will `confirm` succeed, and does its worst-case debit —
+        // invoice + reserve + the input fee the SDK RECOMPUTES on the proofs it sends + swap fee —
+        // fit the ceiling? On a refusal, cancel FIRST — the SDK's compensations: proofs back to
+        // Unspent, quote released, saga deleted, all local — then refuse, typed. Cancel is
+        // best-effort (CDK logs a compensation's own DB error and still returns Ok); an Err here is
+        // reported for what it is: no fee-bearing request was posted, but a local proof reservation
+        // may remain — `open_wallet_async` only constructs the wallet and does not run CDK
+        // `recover_incomplete_sagas` on this path (only `crossmint_hop` calls it); a supported
+        // recovery path is owed, not wired here.
+        let bound = match ceiling.admits_confirmable(
+            invoice_sats,
+            fee_reserve_sats,
+            Some(input_fee_sats),
+            swap_fee_sats,
+            input_fee_ppk,
+            requires_swap,
+        ) {
+            Ok(bound) => bound,
+            Err(shortfall) => {
+                let refusal = match shortfall {
+                    ConfirmShortfall::DifferentInvoice {
+                        invoice_sats,
+                        planned_invoice_sats,
+                    } => WalletOpsError::MeltExceedsCeiling {
+                        mint_url: mint_url.clone(),
+                        quote_id: quote.id.clone(),
+                        invoice_sats,
+                        fee_reserve_sats,
+                        planned_invoice_sats,
+                        max_debit_sats: ceiling.max_debit_sats,
+                    },
+                    ConfirmShortfall::TargetShort { bound, .. } => {
+                        WalletOpsError::MeltWouldNotConfirm {
+                            mint_url: mint_url.clone(),
+                            quote_id: quote.id.clone(),
+                            invoice_sats,
+                            fee_reserve_sats,
+                            input_fee_sats,
+                            actual_input_fee_sats: bound.actual_input_fee_sats,
+                            target_sats: bound.target_sats,
+                            swap_fee_sats,
+                            input_fee_ppk,
+                        }
+                    }
+                    ConfirmShortfall::OverCeiling {
+                        bound,
+                        max_debit_sats,
+                    } => WalletOpsError::MeltTotalExceedsCeiling {
+                        mint_url: mint_url.clone(),
+                        quote_id: quote.id.clone(),
+                        invoice_sats,
+                        fee_reserve_sats,
+                        input_fee_sats: bound.actual_input_fee_sats,
+                        swap_fee_sats,
+                        total_sats: bound.worst_debit_sats,
+                        max_debit_sats,
+                    },
+                };
+                return match prepared.cancel().await {
+                    Ok(()) => Err(refusal),
+                    Err(error) => Err(WalletOpsError::Wallet(format!(
+                        "{refusal}; AND cancelling the prepared melt failed: {error} (no fee-bearing request was posted; a local proof reservation may remain until a supported recovery path — owed — releases it)"
+                    ))),
+                };
+            }
+        };
+        let total_debit_sats = bound.worst_debit_sats;
         let preparation = MeltPreparation {
             mint_url: mint_url.clone(),
             quote_id: quote.id.clone(),
@@ -1553,7 +1791,7 @@ fn prepared_melt_thread(
             fee_reserve_sats,
             input_fee_sats,
             swap_fee_sats,
-            requires_swap: prepared.requires_swap(),
+            requires_swap,
             input_fee_ppk,
             total_debit_sats,
             expiry_unix: quote.expiry,
@@ -1828,9 +2066,11 @@ pub fn remove_mint(home: &mut MaxplayerHome, mint_url: &str) -> Result<(), Walle
     if normalized == default {
         return Err(WalletOpsError::MintPinnedDefault { mint_url: default });
     }
-    let present = home.config.extra_mints.iter().any(|entry| {
-        normalize_mint_url(entry).ok().as_deref() == Some(normalized.as_str())
-    });
+    let present = home
+        .config
+        .extra_mints
+        .iter()
+        .any(|entry| normalize_mint_url(entry).ok().as_deref() == Some(normalized.as_str()));
     if !present {
         return Err(WalletOpsError::MintNotAllowed {
             mint_url: normalized,
@@ -1861,7 +2101,8 @@ pub fn mint_blocking(
     amount_sats: u64,
     mint_override: Option<&str>,
 ) -> Result<MintFlow, WalletOpsError> {
-    crate::runtime_guard::refuse_nested_block_on("mint_blocking").map_err(WalletOpsError::Wallet)?;
+    crate::runtime_guard::refuse_nested_block_on("mint_blocking")
+        .map_err(WalletOpsError::Wallet)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1907,7 +2148,8 @@ pub fn send_blocking(
     amount_sats: u64,
     mint_override: Option<&str>,
 ) -> Result<SendOutcome, WalletOpsError> {
-    crate::runtime_guard::refuse_nested_block_on("send_blocking").map_err(WalletOpsError::Wallet)?;
+    crate::runtime_guard::refuse_nested_block_on("send_blocking")
+        .map_err(WalletOpsError::Wallet)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1933,7 +2175,8 @@ pub fn melt_blocking(
     bolt11: &str,
     mint_override: Option<&str>,
 ) -> Result<MeltOutcome, WalletOpsError> {
-    crate::runtime_guard::refuse_nested_block_on("melt_blocking").map_err(WalletOpsError::Wallet)?;
+    crate::runtime_guard::refuse_nested_block_on("melt_blocking")
+        .map_err(WalletOpsError::Wallet)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -2071,51 +2314,119 @@ mod tests {
         );
     }
 
-    /// Addendum 8 §1 / verdict B4: the bound on a PREPARED melt is on all four of the SDK's figures.
-    /// The verdict's own arithmetic — invoice 13, reserve 2, proof-input fee 4 (four proofs at
-    /// 1000 ppk for 15 = 8+4+2+1), swap fee 1 (one 32-sat proof swapped) — passes the two-figure
-    /// check at exactly 15 and must FAIL the four-figure one at 20.
+    /// Addendum 10 §1.1: the bound on a PREPARED melt is the ACTUAL-confirmability bound, one
+    /// arithmetic for the planner, the gate and the pre-fence check. Verdict 4714623 §3.2's witness —
+    /// gross 19, reserve 2, 1000 ppk, one 32-sat proof: invoice 13 prepares input 4 (15 = 8+4+2+1)
+    /// and swap 1; the PREPARED total 20 > 19, but confirm swaps to 19 = [16, 2, 1], recomputes 3,
+    /// 19 ≥ 18, and debits at most 13 + 2 + 3 + 1 = 19 ≤ 19 — ADMITTED. Round 8 refused it.
     #[test]
-    fn a_melt_ceiling_bounds_the_total_debit_including_proof_input_and_swap_fees() {
+    fn a_melt_ceiling_admits_a_prepared_melt_by_what_confirm_will_actually_debit() {
         let ceiling = MeltCeiling {
-            max_debit_sats: 15,
+            max_debit_sats: 19,
             invoice_sats: 13,
             planned_quote_id: Some("q-estimate".to_owned()),
         };
-        assert!(
-            ceiling.admits(13, 2),
-            "the two-figure check admits 13 + 2 = 15"
+        let bound = ceiling
+            .admits_confirmable(13, 2, Some(4), 1, 1000, true)
+            .expect("13 + 2 + actual 3 + swap 1 = 19 fits 19");
+        assert_eq!(
+            bound,
+            ConfirmBound {
+                need_sats: 15,
+                prepared_input_fee_sats: 4,
+                target_sats: 19,
+                actual_input_fee_sats: 3,
+                swap_fee_sats: 1,
+                worst_debit_sats: 19,
+            }
         );
-        assert!(
-            !ceiling.admits_total(13, 2, 4, 1),
-            "13 + 2 + 4 + 1 = 20 exceeds the 15-sat gross once the SDK's fees are counted"
+        assert_eq!(
+            MeltCeiling::total_debit(13, 2, 4, 1),
+            20,
+            "the PREPARED total is 20 — an estimate above the actual debit, no longer the gate"
         );
-        assert_eq!(MeltCeiling::total_debit(13, 2, 4, 1), 20);
-        assert!(
-            ceiling.admits_total(13, 2, 0, 0),
-            "zero fees: same as the two-figure bound"
+        // One sat less of gross and the same melt is over the ceiling, by the ACTUAL figures.
+        let tighter = MeltCeiling {
+            max_debit_sats: 18,
+            ..ceiling.clone()
+        };
+        assert_eq!(
+            tighter.admits_confirmable(13, 2, Some(4), 1, 1000, true),
+            Err(ConfirmShortfall::OverCeiling {
+                bound: bound.clone(),
+                max_debit_sats: 18,
+            })
         );
-        assert!(
-            !ceiling.admits_total(13, 2, 1, 0),
-            "one sat of proof fee over the gross is refused"
+        // Record 37's schedule: invoice 12, reserve 0, prepared 2 (12 = 8+4) ⇒ target 14 = [8,4,2]
+        // ⇒ actual 3 ⇒ 14 < 15: the SDK would refuse AFTER the swap — refused here, before it.
+        let planned_12 = MeltCeiling {
+            max_debit_sats: 20,
+            invoice_sats: 12,
+            planned_quote_id: None,
+        };
+        assert!(matches!(
+            planned_12.admits_confirmable(12, 0, Some(2), 1, 1000, true),
+            Err(ConfirmShortfall::TargetShort {
+                needed_after_swap_sats: 15,
+                bound: ConfirmBound {
+                    target_sats: 14,
+                    actual_input_fee_sats: 3,
+                    ..
+                },
+            })
+        ));
+        // Exact fit (no swap): the selected proofs already carry the prepared fee; only the debit
+        // bound applies, with actual = prepared.
+        assert_eq!(
+            ceiling
+                .admits_confirmable(13, 2, Some(4), 0, 1000, false)
+                .map(|bound| bound.worst_debit_sats),
+            Ok(19)
         );
-        assert!(
-            !ceiling.admits_total(13, 2, 0, 1),
-            "so is one sat of swap fee"
+        assert!(matches!(
+            ceiling.admits_confirmable(13, 2, Some(5), 0, 1000, false),
+            Err(ConfirmShortfall::OverCeiling { .. })
+        ));
+        // A different invoice than the one planned is refused even when it fits.
+        assert_eq!(
+            ceiling.admits_confirmable(12, 0, Some(0), 0, 0, false),
+            Err(ConfirmShortfall::DifferentInvoice {
+                invoice_sats: 12,
+                planned_invoice_sats: 13,
+            })
         );
-        assert!(
-            ceiling.admits_total(13, 0, 1, 1),
-            "fees fit when the reserve leaves room: 13 + 0 + 1 + 1 = 15"
-        );
-        assert!(
-            !ceiling.admits_total(12, 0, 0, 0),
-            "a different invoice amount than the one planned is refused even when it fits"
-        );
-        assert!(
-            !ceiling.admits_total(13, u64::MAX, u64::MAX, u64::MAX),
-            "the sum saturates rather than wrapping under the ceiling"
-        );
+        // Saturating, never wrapping.
+        assert!(matches!(
+            ceiling.admits_confirmable(13, u64::MAX, Some(u64::MAX), u64::MAX, 1000, true),
+            Err(ConfirmShortfall::OverCeiling { .. })
+        ));
         assert_eq!(MeltCeiling::total_debit(u64::MAX, 1, 1, 1), u64::MAX);
+    }
+
+    /// The planner's question, through the same function: the largest invoice for which
+    /// `confirm_bound` holds with the prepared fee computed on the split of `need`. Addendum 10 §1.2:
+    /// 19/2/1000/[32] ⇒ 13; a consistently reserve-0 schedule at gross 20 ⇒ 15 (not 12); 20/2 ⇒ 13;
+    /// 3/1 ⇒ none.
+    #[test]
+    fn the_confirmability_bound_selects_the_verdicts_invoices_when_searched_downward() {
+        let largest = |gross: u64, reserve: u64| {
+            (1..=gross.saturating_sub(reserve)).rev().find(|&invoice| {
+                confirm_bound(invoice, reserve, None, 1, 1000, true, gross).is_ok()
+            })
+        };
+        assert_eq!(largest(19, 2), Some(13));
+        assert_eq!(largest(20, 0), Some(15));
+        assert_eq!(largest(20, 2), Some(13));
+        assert_eq!(largest(3, 1), None);
+        let fifteen = confirm_bound(15, 0, None, 1, 1000, true, 20).expect("15/0 fits 20");
+        assert_eq!(
+            (
+                fifteen.target_sats,
+                fifteen.actual_input_fee_sats,
+                fifteen.worst_debit_sats
+            ),
+            (19, 3, 19)
+        );
     }
 
     /// The typed refusal names every part, the total and the ceiling, and says what happened to the
@@ -2276,8 +2587,7 @@ mod tests {
         );
         // No substring of the token beyond a trivial prefix leaks (guard against partial exposure).
         assert!(
-            !rendered.contains("spendable-bearer-ecash-secret")
-                && !rendered.contains(&token[6..]),
+            !rendered.contains("spendable-bearer-ecash-secret") && !rendered.contains(&token[6..]),
             "SendOutcome Debug must not leak token material: {rendered}"
         );
         assert!(
@@ -2310,7 +2620,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let mut home = bootstrap(&root).expect("bootstrap");
         // Issue #378: the shipped default mint is the real minibits mint (not testnut).
-        assert_eq!(home.config.default_mint(), crate::home::DEFAULT_MINIBITS_MINT_URL);
+        assert_eq!(
+            home.config.default_mint(),
+            crate::home::DEFAULT_MINIBITS_MINT_URL
+        );
         let listed = list_mints(&home).expect("list");
         assert_eq!(listed.len(), 1);
         assert!(listed[0].is_default);
@@ -2420,7 +2733,10 @@ mod tests {
         let err = mint_blocking(&home, 1, Some("https://evil.example")).expect_err("deny");
         assert!(matches!(&err, WalletOpsError::MintNotAllowed { .. }));
         // #465: a genuine membership miss KEEPS the `mints add` remedy — the distinction the fix draws.
-        assert!(err.to_string().contains("mints add"), "membership miss keeps the `mints add` remedy: {err}");
+        assert!(
+            err.to_string().contains("mints add"),
+            "membership miss keeps the `mints add` remedy: {err}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2521,7 +2837,10 @@ mod tests {
     #[test]
     fn post_confirm_balance_read_failure_preserves_outcome() {
         // Read failed: best-effort `before - spent`, never an error → the token is still returned.
-        assert_eq!(post_confirm_balance(Err("boom".into()), 100, 30, "send"), 70);
+        assert_eq!(
+            post_confirm_balance(Err("boom".into()), 100, 30, "send"),
+            70
+        );
         // Underflow-safe when the estimate would go negative.
         assert_eq!(post_confirm_balance(Err("boom".into()), 10, 30, "send"), 0);
         // Read ok and balance decreased → report the read value.
@@ -2592,8 +2911,7 @@ mod tests {
         let root = temp_home("complete-nested");
         let _ = std::fs::remove_dir_all(&root);
         let home = bootstrap(&root).expect("bootstrap");
-        let err = complete_mint_by_id_blocking(&home, "quote", Some(21), None)
-            .expect_err("nested");
+        let err = complete_mint_by_id_blocking(&home, "quote", Some(21), None).expect_err("nested");
         assert!(err.to_string().contains("nested block_on refused"));
         let _ = std::fs::remove_dir_all(&root);
     }
