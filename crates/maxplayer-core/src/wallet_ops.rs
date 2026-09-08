@@ -16,8 +16,8 @@ use std::time::Duration;
 use cashu::{MintUrl, Token};
 use sha2::{Digest, Sha256};
 use cdk::cdk_database::WalletDatabase;
-use cdk::nuts::{CurrencyUnit, MintQuoteState, PaymentMethod};
-use cdk::wallet::{ReceiveOptions, SendOptions, Wallet};
+use cdk::nuts::{CurrencyUnit, MintQuoteState, PaymentMethod, ProofsMethods};
+use cdk::wallet::{KeysetFilter, ReceiveOptions, SendOptions, Wallet};
 use cdk::Amount;
 use cdk_sqlite::wallet::WalletSqliteDatabase;
 
@@ -54,6 +54,25 @@ pub enum WalletOpsError {
         planned_invoice_sats: u64,
         max_debit_sats: u64,
     },
+    /// A melt under a [`MeltCeiling`] was REFUSED after `prepare_melt` and before `confirm`: the
+    /// TOTAL the wallet would lose — invoice + fee reserve + the proof-input fee the mint charges on
+    /// the selected proofs + the fee of the pre-melt swap the wallet would perform when its proofs do
+    /// not fit — exceeds the caller's hard maximum (addendum 8 §1, verdict B4). The four figures are
+    /// the SDK's own, read off the prepared melt (CDK 0.17.2 `PreparedMelt::input_fee` /
+    /// `swap_fee`), not an estimate. The prepared melt was CANCELLED: its proofs are released in the
+    /// local store and nothing was ever posted to the mint — `prepare_melt` only reads the mint's
+    /// keysets and writes the wallet's own database (pinned `melt/saga/mod.rs:286–460`); the swap and
+    /// the melt request both live inside `confirm` (`:687–697`, `:907–911`). Nothing left the wallet.
+    MeltTotalExceedsCeiling {
+        mint_url: String,
+        quote_id: String,
+        invoice_sats: u64,
+        fee_reserve_sats: u64,
+        input_fee_sats: u64,
+        swap_fee_sats: u64,
+        total_sats: u64,
+        max_debit_sats: u64,
+    },
     Wallet(String),
 }
 
@@ -88,6 +107,22 @@ impl std::fmt::Display for WalletOpsError {
                  ({invoice_sats} sats invoice + {fee_reserve_sats} sats fee reserve; planned invoice \
                  {planned_invoice_sats} sats) against a ceiling of {max_debit_sats} sats; nothing left the wallet",
                 invoice_sats.saturating_add(*fee_reserve_sats)
+            ),
+            Self::MeltTotalExceedsCeiling {
+                mint_url,
+                quote_id,
+                invoice_sats,
+                fee_reserve_sats,
+                input_fee_sats,
+                swap_fee_sats,
+                total_sats,
+                max_debit_sats,
+            } => write!(
+                formatter,
+                "melt refused before spending: mint {mint_url} quote {quote_id} would debit {total_sats} sats in total \
+                 ({invoice_sats} sats invoice + {fee_reserve_sats} sats fee reserve + {input_fee_sats} sats proof input fee \
+                 + {swap_fee_sats} sats swap fee) against a ceiling of {max_debit_sats} sats; the prepared melt was \
+                 cancelled and its proofs released; nothing was posted to the mint"
             ),
             Self::Wallet(message) => write!(formatter, "wallet error: {message}"),
         }
@@ -197,6 +232,13 @@ pub struct MeltOutcome {
     /// The fee RESERVE the paying quote carried — the ceiling on `fee_sats`, checked against the
     /// caller's [`MeltCeiling`] before anything was spent. Journaled beside the actual fee.
     pub fee_reserve_sats: u64,
+    /// The proof-input fee the SDK's prepared melt carried (CDK `PreparedMelt::input_fee`): what the
+    /// mint charges on the proofs sent with the melt request, on top of the invoice and the fee
+    /// reserve. `0` where the path did not prepare through [`prepare_melt_payment_blocking`].
+    pub input_fee_sats: u64,
+    /// The fee of the pre-melt swap the wallet performed inside `confirm` because its proofs did not
+    /// fit the amount (CDK `PreparedMelt::swap_fee`); `0` when no swap was needed.
+    pub swap_fee_sats: u64,
 }
 
 /// A hard bound a caller places on a melt, checked against the quote the mint raises AT PAYMENT
@@ -225,6 +267,36 @@ impl MeltCeiling {
         invoice_sats == self.invoice_sats
             && invoice_sats.saturating_add(fee_reserve_sats) <= self.max_debit_sats
     }
+
+    /// Whether the WHOLE debit of a prepared melt fits under this ceiling: invoice + fee reserve +
+    /// the proof-input fee on the selected proofs + the pre-melt swap fee (both as the SDK's
+    /// prepared melt states them). [`Self::admits`] is the same bound on the two figures a quote
+    /// carries; this is the bound on the four a prepared melt carries (addendum 8 §1, verdict B4).
+    /// Pure, so the arithmetic is unit-tested without a mint.
+    pub fn admits_total(
+        &self,
+        invoice_sats: u64,
+        fee_reserve_sats: u64,
+        input_fee_sats: u64,
+        swap_fee_sats: u64,
+    ) -> bool {
+        invoice_sats == self.invoice_sats
+            && Self::total_debit(invoice_sats, fee_reserve_sats, input_fee_sats, swap_fee_sats)
+                <= self.max_debit_sats
+    }
+
+    /// The four parts summed, saturating — the figure the bound compares and the refusal names.
+    pub fn total_debit(
+        invoice_sats: u64,
+        fee_reserve_sats: u64,
+        input_fee_sats: u64,
+        swap_fee_sats: u64,
+    ) -> u64 {
+        invoice_sats
+            .saturating_add(fee_reserve_sats)
+            .saturating_add(input_fee_sats)
+            .saturating_add(swap_fee_sats)
+    }
 }
 
 /// A melt quote and nothing more: what the mint would charge to pay `bolt11`, read without paying
@@ -243,6 +315,140 @@ pub struct MeltEstimate {
     /// admission to this quote and refuses to pay it inside its spending margin of expiry
     /// (addendum 5 §1, rule 1).
     pub expiry_unix: u64,
+    /// The proof fees the SDK would charge on top of amount + reserve if THIS wallet paid this quote
+    /// now, computed from the wallet's own unspent proofs and the mint's keyset `input_fee_ppk` the
+    /// way `prepare_melt` computes them (addendum 8 §1.3) — the proof-input fee on an exact-fit
+    /// selection, or the estimated input fee plus the swap fee on a layout that needs a pre-melt
+    /// swap — WITHOUT reserving anything. Sizes the plan so a payment that can fit is planned and one
+    /// that never can is refused at planning; the hard bound is still taken on the prepared melt's
+    /// own figures at payment ([`prepare_melt_payment_blocking`]). `0` when the estimate could not
+    /// be made (e.g. the wallet cannot cover amount + reserve at estimate time); the reason is in
+    /// [`Self::expected_fees_note`].
+    pub expected_fees_sats: u64,
+    /// Why `expected_fees_sats` is `0` by default rather than measured, when it is; `None` when the
+    /// estimate was made.
+    pub expected_fees_note: Option<String>,
+}
+
+/// The SDK's figures for ONE prepared melt — read off CDK 0.17.2's `PreparedMelt` after
+/// `prepare_melt` selected and reserved proofs in the LOCAL store and before `confirm` performs any
+/// swap or posts the melt request. The bound in [`MeltCeiling::admits_total`] is taken on these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeltPreparation {
+    pub mint_url: String,
+    pub quote_id: String,
+    pub invoice_sats: u64,
+    pub fee_reserve_sats: u64,
+    /// `PreparedMelt::input_fee` — on the swap layout this is the SDK's estimate for the proofs the
+    /// swap will yield (pinned `melt/saga/mod.rs:384–399`); on the exact-fit layout it is the fee on
+    /// the selected proofs (`:359`).
+    pub input_fee_sats: u64,
+    /// `PreparedMelt::swap_fee` — the fee on the proofs the pre-melt swap consumes; `0` when no swap.
+    pub swap_fee_sats: u64,
+    /// `PreparedMelt::requires_swap` — whether `confirm` will perform a pre-melt swap first.
+    pub requires_swap: bool,
+    /// The four parts summed (saturating) — what `admits_total` compared against the ceiling.
+    pub total_debit_sats: u64,
+    pub expiry_unix: u64,
+}
+
+enum PreparedCommand {
+    Confirm,
+    Cancel,
+}
+
+/// A melt that is PREPARED — proofs selected and reserved in the wallet's own database, fees known,
+/// nothing posted to the mint — and waits for the caller to [`Self::confirm`] or [`Self::cancel`].
+/// Returned by [`prepare_melt_payment_blocking`] after the caller's ceiling admitted the total. The
+/// seller fee remittance holds one across its store fence (addendum 8 §1.2: bound → fence →
+/// confirm), so that a fee refusal happens before the row is ever bound and a fence refusal cancels
+/// a melt that has cost nothing.
+///
+/// Lives on a thread of its own: CDK's `PreparedMelt<'a>` borrows the `Wallet`, and every wallet
+/// call here runs on a fresh current-thread Tokio runtime, so a dedicated OS thread owns the
+/// runtime, the wallet and the prepared melt together and waits on a channel for the verdict.
+/// Dropping this without a verdict CANCELS (the thread sees the channel close and runs
+/// `PreparedMelt::cancel`, which reverts the reservation and releases the quote locally — pinned
+/// `melt/saga/mod.rs:817–831`).
+pub struct PreparedMeltPayment {
+    pub preparation: MeltPreparation,
+    command: Option<std::sync::mpsc::Sender<PreparedCommand>>,
+    reply: std::sync::mpsc::Receiver<Result<Option<MeltOutcome>, WalletOpsError>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl std::fmt::Debug for PreparedMeltPayment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedMeltPayment")
+            .field("preparation", &self.preparation)
+            .field("decided", &self.command.is_none())
+            .finish()
+    }
+}
+
+impl PreparedMeltPayment {
+    /// **The payment.** `PreparedMelt::confirm` on the thread that holds it: the pre-melt swap if
+    /// one is required, then the melt request; funds leave the wallet here and nowhere else on this
+    /// path. An `Err` is opaque as to how far it got — the SDK runs its saga recovery on a failed
+    /// confirm (pinned `melt/mod.rs:860–868`) and the caller reconciles by quote id.
+    pub fn confirm(mut self) -> Result<MeltOutcome, WalletOpsError> {
+        self.decide(PreparedCommand::Confirm)?.ok_or_else(|| {
+            WalletOpsError::Wallet(
+                "the prepared melt's thread reported no outcome for a confirm; reconcile the quote by id"
+                    .to_owned(),
+            )
+        })
+    }
+
+    /// Release the prepared melt: proofs back to Unspent, quote released, saga row deleted — all in
+    /// the wallet's own database; nothing was ever posted, so there is nothing to undo at the mint.
+    pub fn cancel(mut self) -> Result<(), WalletOpsError> {
+        self.decide(PreparedCommand::Cancel).map(|_| ())
+    }
+
+    fn decide(
+        &mut self,
+        command: PreparedCommand,
+    ) -> Result<Option<MeltOutcome>, WalletOpsError> {
+        let Some(sender) = self.command.take() else {
+            return Err(WalletOpsError::Wallet(
+                "the prepared melt was already decided".to_owned(),
+            ));
+        };
+        let what = match command {
+            PreparedCommand::Confirm => "confirm",
+            PreparedCommand::Cancel => "cancel",
+        };
+        sender.send(command).map_err(|_| {
+            WalletOpsError::Wallet(format!(
+                "the prepared melt's thread is gone before the {what}; the wallet's saga recovery releases its proofs on the next open"
+            ))
+        })?;
+        let reply = self.reply.recv().map_err(|_| {
+            WalletOpsError::Wallet(format!(
+                "the prepared melt's thread ended without reporting the {what}; reconcile the quote by id"
+            ))
+        });
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        reply?
+    }
+}
+
+impl Drop for PreparedMeltPayment {
+    fn drop(&mut self) {
+        if let Some(sender) = self.command.take() {
+            // Undecided: cancel. A send failure means the thread is already gone (it cancels on a
+            // closed channel too); either way nothing was posted.
+            let _ = sender.send(PreparedCommand::Cancel);
+            let _ = self.reply.recv();
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
 }
 
 /// The mint's melt-quote lifecycle, re-exported so a CLI caller can match on it without depending
@@ -968,6 +1174,10 @@ async fn pay_quote_on_wallet(
         .prepare_melt(&quote.id, HashMap::new())
         .await
         .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+    // Reported, not bounded: this operator path keeps its reserve-only ceiling (addendum 8 §6); the
+    // seller fee remittance pays through [`prepare_melt_payment_blocking`], which bounds the total.
+    let input_fee_sats = prepared.input_fee().to_u64();
+    let swap_fee_sats = prepared.swap_fee().to_u64();
     let confirmed = prepared
         .confirm()
         .await
@@ -990,7 +1200,315 @@ async fn pay_quote_on_wallet(
         balance_sats,
         quote_id: quote.id.clone(),
         fee_reserve_sats,
+        input_fee_sats,
+        swap_fee_sats,
     })
+}
+
+/// The proof fees THIS wallet would pay on top of `inputs_needed` (amount + fee reserve) for a melt
+/// prepared now, computed exactly as pinned CDK 0.17.2 `MeltSaga::prepare` computes them
+/// (`melt/saga/mod.rs:301–318` exact fit, `:377–403` swap layout) but WITHOUT reserving a proof or
+/// writing a saga: keysets and unspent proofs are read, `Wallet::select_proofs` is a pure function,
+/// and the fee lookups read the mint's keyset metadata (cached; a GET at most). Returns the
+/// proof-input fee on an exact-fit selection, or estimated input fee + swap fee on a swap layout.
+async fn expected_melt_fees(wallet: &Wallet, inputs_needed: Amount) -> Result<u64, String> {
+    let active_keyset_ids: Vec<_> = wallet
+        .get_mint_keysets(KeysetFilter::Active)
+        .await
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|keyset| keyset.id)
+        .collect();
+    let keyset_fees_and_amounts = wallet
+        .get_keyset_fees_and_amounts()
+        .await
+        .map_err(|error| error.to_string())?;
+    let available = wallet
+        .get_unspent_proofs()
+        .await
+        .map_err(|error| error.to_string())?;
+    let exact = Wallet::select_proofs(
+        inputs_needed,
+        available.clone(),
+        &active_keyset_ids,
+        &keyset_fees_and_amounts,
+        true,
+    )
+    .map_err(|error| error.to_string())?;
+    if exact.total_amount().map_err(|error| error.to_string())? == inputs_needed {
+        return Ok(wallet
+            .get_proofs_fee(&exact)
+            .await
+            .map_err(|error| error.to_string())?
+            .total
+            .to_u64());
+    }
+    let active_keyset_id = wallet
+        .get_active_keyset()
+        .await
+        .map_err(|error| error.to_string())?
+        .id;
+    let fee_and_amounts = wallet
+        .get_keyset_fees_and_amounts_by_id(active_keyset_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let estimated_output_count = inputs_needed
+        .split(&fee_and_amounts)
+        .map_err(|error| error.to_string())?
+        .len();
+    let input_fee = wallet
+        .get_keyset_count_fee(&active_keyset_id, estimated_output_count as u64)
+        .await
+        .map_err(|error| error.to_string())?;
+    let to_swap = Wallet::select_proofs(
+        inputs_needed + input_fee,
+        available,
+        &active_keyset_ids,
+        &keyset_fees_and_amounts,
+        true,
+    )
+    .map_err(|error| error.to_string())?;
+    let swap_fee = wallet
+        .get_proofs_fee(&to_swap)
+        .await
+        .map_err(|error| error.to_string())?
+        .total;
+    Ok((input_fee + swap_fee).to_u64())
+}
+
+/// **Prepare a melt quote this wallet already holds, by id, bound on its TOTAL cost, and hand it
+/// back undecided.** The seller fee remittance's spending call since addendum 8 (§1.1–1.2): the
+/// quote was raised by [`melt_quote_async`] and its id is about to be bound to the row by the store
+/// fence; this
+/// 1. refuses an unknown quote id before the wallet touches a proof, re-checks the ceiling against
+///    the quote's STORED amount and reserve, and checks the balance covers them — as
+///    [`pay_melt_quote_async`] does;
+/// 2. `prepare_melt(quote_id)`: the SDK selects and RESERVES proofs in the wallet's own database and
+///    computes the proof-input fee and, when the proofs do not fit, the pre-melt swap and its fee
+///    (pinned `melt/saga/mod.rs:286–460`; local writes only — the mint learns nothing);
+/// 3. takes the bound on the SDK's four figures — [`MeltCeiling::admits_total`]. Over the ceiling
+///    ⇒ `PreparedMelt::cancel` (proofs back to Unspent, quote released; `:817–831`) and
+///    [`WalletOpsError::MeltTotalExceedsCeiling`]: nothing was posted, nothing left the wallet;
+/// 4. under it ⇒ returns a [`PreparedMeltPayment`] whose [`PreparedMeltPayment::confirm`] performs
+///    the swap (if any) and the melt request — the only spend on this path — and whose
+///    [`PreparedMeltPayment::cancel`] (or drop) releases it.
+/// Same mint resolution and `allow_real_mints` gate as every melt here. The operator's
+/// `melt_within_*` path does NOT use this: it keeps its reserve-only ceiling (addendum 8 §6).
+pub fn prepare_melt_payment_blocking(
+    home: &MaxplayerHome,
+    quote_id: &str,
+    mint_override: Option<&str>,
+    ceiling: &MeltCeiling,
+) -> Result<PreparedMeltPayment, WalletOpsError> {
+    crate::runtime_guard::refuse_nested_block_on("prepare_melt_payment_blocking")
+        .map_err(WalletOpsError::Wallet)?;
+    let quote_id = quote_id.trim().to_owned();
+    if quote_id.is_empty() {
+        return Err(WalletOpsError::Wallet("melt quote id is empty".into()));
+    }
+    let mint_url = resolve_mint(home, mint_override)?;
+    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+        return Err(WalletOpsError::RealMintDisallowed { mint_url });
+    }
+    let home = home.clone();
+    let ceiling = ceiling.clone();
+    let (prepared_tx, prepared_rx) =
+        std::sync::mpsc::channel::<Result<MeltPreparation, WalletOpsError>>();
+    let (command_tx, command_rx) = std::sync::mpsc::channel::<PreparedCommand>();
+    let (reply_tx, reply_rx) =
+        std::sync::mpsc::channel::<Result<Option<MeltOutcome>, WalletOpsError>>();
+    let thread = std::thread::Builder::new()
+        .name("melt-prepared".to_owned())
+        .spawn(move || {
+            prepared_melt_thread(
+                home,
+                mint_url,
+                quote_id,
+                ceiling,
+                prepared_tx,
+                command_rx,
+                reply_tx,
+            );
+        })
+        .map_err(|error| WalletOpsError::Wallet(format!("spawn melt thread: {error}")))?;
+    match prepared_rx.recv() {
+        Ok(Ok(preparation)) => Ok(PreparedMeltPayment {
+            preparation,
+            command: Some(command_tx),
+            reply: reply_rx,
+            thread: Some(thread),
+        }),
+        Ok(Err(error)) => {
+            let _ = thread.join();
+            Err(error)
+        }
+        Err(_) => {
+            let _ = thread.join();
+            Err(WalletOpsError::Wallet(
+                "the melt thread ended before reporting its preparation; nothing was posted".to_owned(),
+            ))
+        }
+    }
+}
+
+/// The body of the thread that owns a prepared melt: runtime, wallet and `PreparedMelt` live here
+/// together; the caller's verdict arrives on `command`.
+fn prepared_melt_thread(
+    home: MaxplayerHome,
+    mint_url: String,
+    quote_id: String,
+    ceiling: MeltCeiling,
+    prepared_tx: std::sync::mpsc::Sender<Result<MeltPreparation, WalletOpsError>>,
+    command: std::sync::mpsc::Receiver<PreparedCommand>,
+    reply: std::sync::mpsc::Sender<Result<Option<MeltOutcome>, WalletOpsError>>,
+) {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = prepared_tx.send(Err(WalletOpsError::Wallet(error.to_string())));
+            return;
+        }
+    };
+    let wallet = match runtime.block_on(open_wallet_async(&home, &mint_url)) {
+        Ok(wallet) => wallet,
+        Err(error) => {
+            let _ = prepared_tx.send(Err(error));
+            return;
+        }
+    };
+    // Steps 1–3 as one future so an early refusal is one `Err` and the prepared melt (which borrows
+    // the wallet) stays on this thread's stack for the verdict.
+    let staged = runtime.block_on(async {
+        let quote = wallet
+            .localstore
+            .get_melt_quote(&quote_id)
+            .await
+            .map_err(|error| WalletOpsError::Wallet(error.to_string()))?
+            .ok_or_else(|| {
+                WalletOpsError::Wallet(format!(
+                    "melt quote {quote_id} is not in this wallet; refusing to pay a quote this wallet did not raise"
+                ))
+            })?;
+        let invoice_sats = quote.amount.to_u64();
+        let fee_reserve_sats = quote.fee_reserve.to_u64();
+        if !ceiling.admits(invoice_sats, fee_reserve_sats) {
+            return Err(WalletOpsError::MeltExceedsCeiling {
+                mint_url: mint_url.clone(),
+                quote_id: quote.id.clone(),
+                invoice_sats,
+                fee_reserve_sats,
+                planned_invoice_sats: ceiling.invoice_sats,
+                max_debit_sats: ceiling.max_debit_sats,
+            });
+        }
+        let need = invoice_sats.saturating_add(fee_reserve_sats);
+        let before = wallet
+            .total_balance()
+            .await
+            .map_err(|error| WalletOpsError::Wallet(error.to_string()))?
+            .to_u64();
+        if before < need {
+            return Err(WalletOpsError::Wallet(format!(
+                "insufficient funds for melt: balance={before} need={need} (amount+fee_reserve)"
+            )));
+        }
+        let prepared = wallet
+            .prepare_melt(&quote.id, HashMap::new())
+            .await
+            .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+        let input_fee_sats = prepared.input_fee().to_u64();
+        let swap_fee_sats = prepared.swap_fee().to_u64();
+        let total_debit_sats =
+            MeltCeiling::total_debit(invoice_sats, fee_reserve_sats, input_fee_sats, swap_fee_sats);
+        if !ceiling.admits_total(invoice_sats, fee_reserve_sats, input_fee_sats, swap_fee_sats) {
+            // The bound. Cancel FIRST — proofs back to Unspent, quote released, saga deleted, all
+            // local — then refuse, typed. A cancel that itself fails is reported as such: the SDK's
+            // saga recovery releases a stale reservation on the next wallet open, and still nothing
+            // was posted.
+            let refusal = WalletOpsError::MeltTotalExceedsCeiling {
+                mint_url: mint_url.clone(),
+                quote_id: quote.id.clone(),
+                invoice_sats,
+                fee_reserve_sats,
+                input_fee_sats,
+                swap_fee_sats,
+                total_sats: total_debit_sats,
+                max_debit_sats: ceiling.max_debit_sats,
+            };
+            return match prepared.cancel().await {
+                Ok(()) => Err(refusal),
+                Err(error) => Err(WalletOpsError::Wallet(format!(
+                    "{refusal}; AND cancelling the prepared melt failed: {error} (its proofs are released by the wallet's saga recovery on the next open; nothing was posted)"
+                ))),
+            };
+        }
+        let preparation = MeltPreparation {
+            mint_url: mint_url.clone(),
+            quote_id: quote.id.clone(),
+            invoice_sats,
+            fee_reserve_sats,
+            input_fee_sats,
+            swap_fee_sats,
+            requires_swap: prepared.requires_swap(),
+            total_debit_sats,
+            expiry_unix: quote.expiry,
+        };
+        Ok((prepared, preparation, before))
+    });
+    let (prepared, preparation, before) = match staged {
+        Ok(staged) => staged,
+        Err(error) => {
+            let _ = prepared_tx.send(Err(error));
+            return;
+        }
+    };
+    if prepared_tx.send(Ok(preparation.clone())).is_err() {
+        // Nobody is listening: release and leave.
+        let _ = runtime.block_on(prepared.cancel());
+        return;
+    }
+    // Plain blocking wait, on a thread with no runtime driving anything else.
+    let verdict = command.recv();
+    let outcome = match verdict {
+        Ok(PreparedCommand::Confirm) => runtime.block_on(async {
+            let confirmed = prepared
+                .confirm()
+                .await
+                .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+            // `confirm` is the effect boundary — funds have left the wallet, so the outcome MUST be
+            // returned; the post-confirm balance read is observational (finding U).
+            let paid_sats = confirmed.amount().to_u64();
+            let fee_sats = confirmed.fee_paid().to_u64();
+            let read = wallet
+                .total_balance()
+                .await
+                .map(|balance| balance.to_u64())
+                .map_err(|error| error.to_string());
+            let spent = paid_sats
+                .saturating_add(fee_sats)
+                .saturating_add(preparation.input_fee_sats)
+                .saturating_add(preparation.swap_fee_sats);
+            let balance_sats = post_confirm_balance(read, before, spent, "melt");
+            Ok(Some(MeltOutcome {
+                mint_url: preparation.mint_url.clone(),
+                paid_sats,
+                fee_sats,
+                balance_sats,
+                quote_id: preparation.quote_id.clone(),
+                fee_reserve_sats: preparation.fee_reserve_sats,
+                input_fee_sats: preparation.input_fee_sats,
+                swap_fee_sats: preparation.swap_fee_sats,
+            }))
+        }),
+        Ok(PreparedCommand::Cancel) | Err(_) => runtime
+            .block_on(prepared.cancel())
+            .map(|()| None)
+            .map_err(|error| WalletOpsError::Wallet(format!("cancel prepared melt: {error}"))),
+    };
+    let _ = reply.send(outcome);
 }
 
 /// Raise a melt quote for `bolt11` and return it WITHOUT paying. Same mint resolution and real-mint
@@ -1014,12 +1532,21 @@ pub async fn melt_quote_async(
         .melt_quote(PaymentMethod::BOLT11, bolt11, None, None)
         .await
         .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+    // Fee-aware estimate (addendum 8 §1.3): the proof fees this wallet would pay on top of
+    // amount + reserve, the SDK's way, reserving nothing. Not estimable ⇒ 0 and the reason.
+    let (expected_fees_sats, expected_fees_note) =
+        match expected_melt_fees(&wallet, quote.amount + quote.fee_reserve).await {
+            Ok(fees) => (fees, None),
+            Err(reason) => (0, Some(reason)),
+        };
     Ok(MeltEstimate {
         mint_url,
         quote_id: quote.id,
         amount_sats: quote.amount.to_u64(),
         fee_reserve_sats: quote.fee_reserve.to_u64(),
         expiry_unix: quote.expiry,
+        expected_fees_sats,
+        expected_fees_note,
     })
 }
 
@@ -1418,6 +1945,167 @@ mod tests {
             !ceiling.admits(u64::MAX, u64::MAX),
             "the sum saturates rather than wrapping under the ceiling"
         );
+    }
+
+    /// Addendum 8 §1 / verdict B4: the bound on a PREPARED melt is on all four of the SDK's figures.
+    /// The verdict's own arithmetic — invoice 13, reserve 2, proof-input fee 4 (four proofs at
+    /// 1000 ppk for 15 = 8+4+2+1), swap fee 1 (one 32-sat proof swapped) — passes the two-figure
+    /// check at exactly 15 and must FAIL the four-figure one at 20.
+    #[test]
+    fn a_melt_ceiling_bounds_the_total_debit_including_proof_input_and_swap_fees() {
+        let ceiling = MeltCeiling {
+            max_debit_sats: 15,
+            invoice_sats: 13,
+            planned_quote_id: Some("q-estimate".to_owned()),
+        };
+        assert!(ceiling.admits(13, 2), "the two-figure check admits 13 + 2 = 15");
+        assert!(
+            !ceiling.admits_total(13, 2, 4, 1),
+            "13 + 2 + 4 + 1 = 20 exceeds the 15-sat gross once the SDK's fees are counted"
+        );
+        assert_eq!(MeltCeiling::total_debit(13, 2, 4, 1), 20);
+        assert!(ceiling.admits_total(13, 2, 0, 0), "zero fees: same as the two-figure bound");
+        assert!(!ceiling.admits_total(13, 2, 1, 0), "one sat of proof fee over the gross is refused");
+        assert!(!ceiling.admits_total(13, 2, 0, 1), "so is one sat of swap fee");
+        assert!(ceiling.admits_total(13, 0, 1, 1), "fees fit when the reserve leaves room: 13 + 0 + 1 + 1 = 15");
+        assert!(
+            !ceiling.admits_total(12, 0, 0, 0),
+            "a different invoice amount than the one planned is refused even when it fits"
+        );
+        assert!(
+            !ceiling.admits_total(13, u64::MAX, u64::MAX, u64::MAX),
+            "the sum saturates rather than wrapping under the ceiling"
+        );
+        assert_eq!(MeltCeiling::total_debit(u64::MAX, 1, 1, 1), u64::MAX);
+    }
+
+    /// The typed refusal names every part, the total and the ceiling, and says what happened to the
+    /// prepared melt — the line the remittance prints.
+    #[test]
+    fn a_total_ceiling_refusal_names_the_parts_the_total_and_the_ceiling() {
+        let refusal = WalletOpsError::MeltTotalExceedsCeiling {
+            mint_url: "https://mint.example".to_owned(),
+            quote_id: "q-pay".to_owned(),
+            invoice_sats: 13,
+            fee_reserve_sats: 2,
+            input_fee_sats: 4,
+            swap_fee_sats: 1,
+            total_sats: 20,
+            max_debit_sats: 15,
+        };
+        assert_eq!(
+            refusal.to_string(),
+            "melt refused before spending: mint https://mint.example quote q-pay would debit 20 sats in total \
+             (13 sats invoice + 2 sats fee reserve + 4 sats proof input fee + 1 sats swap fee) against a ceiling \
+             of 15 sats; the prepared melt was cancelled and its proofs released; nothing was posted to the mint"
+        );
+    }
+
+    /// A prepared payment whose verdict never comes is cancelled on drop: the thread must have
+    /// replied and exited, not hung. Exercised with a thread that models the protocol (the real
+    /// body needs a wallet with a stored quote — the full path is the remittance's regression).
+    #[test]
+    fn dropping_an_undecided_prepared_payment_cancels_it_and_joins_its_thread() {
+        let (command_tx, command_rx) = std::sync::mpsc::channel::<PreparedCommand>();
+        let (reply_tx, reply_rx) =
+            std::sync::mpsc::channel::<Result<Option<MeltOutcome>, WalletOpsError>>();
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = Arc::clone(&cancelled);
+        let thread = std::thread::spawn(move || {
+            let verdict = command_rx.recv();
+            if matches!(verdict, Ok(PreparedCommand::Cancel) | Err(_)) {
+                seen.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            let _ = reply_tx.send(Ok(None));
+        });
+        let payment = PreparedMeltPayment {
+            preparation: MeltPreparation {
+                mint_url: "https://mint.example".to_owned(),
+                quote_id: "q-pay".to_owned(),
+                invoice_sats: 13,
+                fee_reserve_sats: 2,
+                input_fee_sats: 0,
+                swap_fee_sats: 0,
+                requires_swap: false,
+                total_debit_sats: 15,
+                expiry_unix: u64::MAX,
+            },
+            command: Some(command_tx),
+            reply: reply_rx,
+            thread: Some(thread),
+        };
+        assert!(format!("{payment:?}").contains("decided: false"));
+        drop(payment);
+        assert!(
+            cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            "drop without a verdict must send Cancel and wait for the thread"
+        );
+    }
+
+    /// `confirm` and `cancel` each consume the payment and relay the thread's reply.
+    #[test]
+    fn a_prepared_payment_relays_confirm_and_cancel_verdicts() {
+        fn fixture(
+            script: impl FnOnce(PreparedCommand) -> Result<Option<MeltOutcome>, WalletOpsError>
+            + Send
+            + 'static,
+        ) -> PreparedMeltPayment {
+            let (command_tx, command_rx) = std::sync::mpsc::channel::<PreparedCommand>();
+            let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                let verdict = command_rx.recv().expect("a verdict");
+                let _ = reply_tx.send(script(verdict));
+            });
+            PreparedMeltPayment {
+                preparation: MeltPreparation {
+                    mint_url: "https://mint.example".to_owned(),
+                    quote_id: "q-pay".to_owned(),
+                    invoice_sats: 13,
+                    fee_reserve_sats: 2,
+                    input_fee_sats: 1,
+                    swap_fee_sats: 0,
+                    requires_swap: false,
+                    total_debit_sats: 16,
+                    expiry_unix: u64::MAX,
+                },
+                command: Some(command_tx),
+                reply: reply_rx,
+                thread: Some(thread),
+            }
+        }
+        let outcome = MeltOutcome {
+            mint_url: "https://mint.example".to_owned(),
+            paid_sats: 13,
+            fee_sats: 1,
+            balance_sats: 100,
+            quote_id: "q-pay".to_owned(),
+            fee_reserve_sats: 2,
+            input_fee_sats: 1,
+            swap_fee_sats: 0,
+        };
+        let expected = outcome.clone();
+        let confirmed = fixture(move |verdict| {
+            assert!(matches!(verdict, PreparedCommand::Confirm));
+            Ok(Some(outcome))
+        })
+        .confirm()
+        .expect("confirm relays the outcome");
+        assert_eq!(confirmed, expected);
+
+        fixture(|verdict| {
+            assert!(matches!(verdict, PreparedCommand::Cancel));
+            Ok(None)
+        })
+        .cancel()
+        .expect("cancel relays Ok");
+
+        let none_for_confirm = fixture(|_| Ok(None)).confirm().expect_err("no outcome is an error");
+        assert!(none_for_confirm.to_string().contains("reported no outcome for a confirm"));
+
+        let failed = fixture(|_| Err(WalletOpsError::Wallet("mint said no".to_owned())))
+            .confirm()
+            .expect_err("a failed confirm is relayed");
+        assert_eq!(failed.to_string(), "wallet error: mint said no");
     }
 
     // Finding DD: `SendOutcome.token` is a BEARER cashu token (spendable ecash). Its `Debug` MUST

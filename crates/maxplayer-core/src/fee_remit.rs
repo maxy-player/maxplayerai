@@ -2283,6 +2283,8 @@ pub(crate) mod test_support {
                 amount_sats,
                 fee_reserve_sats,
                 expiry_unix: self.quote_expiry_unix,
+                expected_fees_sats: 0,
+                expected_fees_note: None,
             })
         }
 
@@ -2309,6 +2311,8 @@ pub(crate) mod test_support {
                 amount_sats,
                 fee_reserve_sats,
                 expiry_unix: self.quote_expiry_unix,
+                expected_fees_sats: 0,
+                expected_fees_note: None,
             })
         }
 
@@ -2438,6 +2442,8 @@ pub(crate) mod test_support {
                 balance_sats: 1_000,
                 quote_id: quote_id.to_owned(),
                 fee_reserve_sats: quote.fee_reserve_sats,
+                input_fee_sats: 0,
+                swap_fee_sats: 0,
             })
         }
 
