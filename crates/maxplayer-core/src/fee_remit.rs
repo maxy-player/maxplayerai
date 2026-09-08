@@ -1570,8 +1570,8 @@ fn remit_inner(
     //     probe estimate again and meet the same drift (§2.1). Gross, receipts, owner and lease do
     //     not move. The re-planned quote is checked by the same bound; a second mismatch is NOT
     //     re-planned again.
-    let (invoice, net, quote, ceiling) = if quote.fee_reserve_sats == estimate.fee_reserve_sats {
-        (invoice, net, quote, ceiling)
+    let (quote, ceiling) = if quote.fee_reserve_sats == estimate.fee_reserve_sats {
+        (quote, ceiling)
     } else {
         let live_reserve = quote.fee_reserve_sats;
         let requires_swap = estimate.input_fee_ppk > 0;
@@ -1584,7 +1584,7 @@ fn remit_inner(
             requires_swap,
             gross,
         ) {
-            Ok(_) => (invoice, net, quote, ceiling),
+            Ok(_) => (quote, ceiling),
             Err(shortfall) => {
                 let why_not = match &shortfall {
                     ConfirmShortfall::TargetShort {
@@ -1716,12 +1716,13 @@ fn remit_inner(
                     invoice_sats: net2,
                     planned_quote_id: Some(quote2.quote_id.clone()),
                 };
-                (invoice2, net2, quote2, ceiling2)
+                (quote2, ceiling2)
             }
         }
     };
-    // From here `net`, `quote` and `ceiling` are the (possibly re-planned) figures; `planned` keeps
-    // the row as first journaled — only its unchanged fields (id, gross, receipts) are read below.
+    // From here `quote` and `ceiling` are the (possibly re-planned) figures — the invoice paid is
+    // `ceiling.invoice_sats`, the quote's; `planned` keeps the row as first journaled and only its
+    // unchanged fields (id, gross, receipts) are read below.
     let margin_secs = lease_secs(SPEND_MARGIN);
     let quote_inside_margin = |now_unix: i64| {
         u64::try_from(now_unix.saturating_add(margin_secs))
@@ -2407,9 +2408,7 @@ impl Drop for RemitPermit {
 // The SDK fee arithmetic (`fee_for`, `binary_split`, `post_swap_figures`, `confirm_bound`) lives in
 // `wallet_ops` since addendum 10 §1.1, so the wallet's prepared-melt gate, this module's planner and
 // its pre-fence check are one function; re-exported here for this module and its tests.
-pub(crate) use crate::wallet_ops::{
-    ConfirmShortfall, binary_split, confirm_bound, fee_for, post_swap_figures,
-};
+pub(crate) use crate::wallet_ops::{ConfirmShortfall, binary_split, confirm_bound};
 
 /// **Fee-aware planning (addendum 9 §1.2): the largest invoice `confirm` can actually pay within
 /// `gross`.** Searches DOWN from `gross − reserve` for the first invoice `n` for which, with
@@ -3566,6 +3565,7 @@ mod tests {
     use super::*;
     use crate::seller_node::STATE_DB_FILE;
     use crate::seller_node::store::{ReceiptFees, RemittanceState};
+    use crate::wallet_ops::post_swap_figures;
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
