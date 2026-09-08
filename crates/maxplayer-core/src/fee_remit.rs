@@ -5288,17 +5288,30 @@ mod tests {
     //   `prepare_melt`'s expiry check on the wallet's clock — and PAUSES there, its request built
     //   but not yet at the mint.
     //   The shared clock moves to 261: Q is past expiry and past the old margin.
-    //   B — another owner, disjoint proofs left in the same wallet — runs `--dry-run` then
-    //   `--confirm`: it asks the mint about Q by id, gets UNPAID (expired), and HOLDS: X stays
-    //   spending, its receipts stay pinned (real SQL), B plans no Y, raises nothing, pays nothing —
-    //   with 15 sats of exact proofs still in the wallet, so B was refused by the STORE, not for
-    //   want of funds.
-    //   A resumes: the mint (as CDK 0.17.2 does) accepts the expired UNPAID Q and pays X.
+    //   B — another owner, disjoint proofs left in the same wallet — is refused at TWO named
+    //   boundaries, exercised separately (addendum 7 §1; verdict at 6fd13df §5 D1):
+    //     (i) RECONCILIATION: B runs `--dry-run` then `--confirm` through the real `remit`. Step 1
+    //         of `remit_inner` finds X in flight, asks the mint about Q BY ID, gets UNPAID (expired),
+    //         and `reconcile_decision` HOLDS — `Refusal::SpendingHeld`, returned before any plan.
+    //         While X is bound and spending, EVERY `remit` on this store stops here by design; it
+    //         never reaches `plan_remittance`, so these two runs do not exercise the store's own
+    //         predicate — the next boundary does.
+    //     (ii) STORE: between those two runs B makes a concrete planning attempt for a distinct
+    //         invoice Y, on B's own connection, through the store's admission entry
+    //         `plan_remittance` — the call `remit_inner` step 6 makes. Its in-flight predicate
+    //         (`in_flight_remittance_in`, inside the `IMMEDIATE` transaction) refuses with
+    //         `PlanRefused::InFlight` naming X: no Y row, receipts still pinned to X, no quote
+    //         raised, no debit. This is the race-closing layer the ordinary held-row path never
+    //         reaches while X is spending; it is reached here directly, not by hand-written SQL.
+    //   At both boundaries 15 sats of exact proofs are still in the wallet, so neither refusal is
+    //   for want of funds.
+    //   A resumes: the mint (as the inspected CDK 0.17.2 implementation does) accepts the expired
+    //   UNPAID Q and pays X.
     // Exactly ONE debit, never two — and it is one because B was never admitted while X was bound
     // and spending, NOT because Q expired: at 6fc77e1 the same ordering released X on the expired
     // Q, B paid Y, and A's late request paid Q — two payments against one accrued balance. The
-    // receipt invariant is asserted through the ordering (pinned to X at both of B's observations,
-    // discharged once by A's debit), not only in the final row count.
+    // receipt invariant is asserted through the ordering (pinned to X at each of B's three
+    // observations, discharged once by A's debit), not only in the final row count.
     #[test]
     fn a_payment_prepared_before_expiry_cannot_be_doubled_by_a_release_after_it() {
         let (store, root) = store_with_fees("delayed-confirm", &[10, 5]);
@@ -5375,7 +5388,7 @@ mod tests {
                     assert!(b.status_calls.is_empty(), "{out}");
                     assert!(
                         b.invoices.is_empty() && b.quotes.is_empty() && b.melts.is_empty(),
-                        "B was refused admission: no plan, no quote, no payment: {out}"
+                        "B was held at RECONCILIATION, before any plan: no invoice, no quote, no payment: {out}"
                     );
                     assert!(!out.contains("released 15 sats"), "at {now}: {out}");
                     assert_eq!(
@@ -5402,9 +5415,124 @@ mod tests {
                     assert_eq!(
                         remaining(&proofs),
                         vec![1, 2, 4, 8],
-                        "at {now}: B had exact proofs for a 15-sat payment and did not use them — the store, not the wallet, refused it"
+                        "at {now}: B had exact proofs for a 15-sat payment and did not use them — reconciliation held it before the wallet was asked; the store's own refusal is exercised below, not inferred from this"
                     );
                     results.push((outcome, out));
+
+                    if trigger == RemitTrigger::DryRun {
+                        // Boundary (ii), the STORE — between B's dry-run and its confirm, with A
+                        // still parked inside its payment and X spending/bound to Q. B builds a
+                        // concrete plan for a DISTINCT invoice Y exactly as `remit_inner` would
+                        // (its LNURL pay request, its own `-b`-tagged invoice for the 13-sat net,
+                        // the same 15-sat gross and 2-sat reserve its dry-run would print) and
+                        // takes it to the store's admission entry — the call at step 6 — on B's
+                        // own connection. Y's melt quote is None on purpose: raising an estimate
+                        // for Y at the mint IS a quote raised, which this observation asserts did
+                        // not happen, and the store's in-flight predicate runs before any use of
+                        // the plan's quote id.
+                        let mut b_plan = second_process(&registry, &melts);
+                        b_plan.clock = Arc::clone(&clock);
+                        b_plan.proofs = Some(Arc::clone(&proofs));
+                        let address = LightningAddress::parse(PLATFORM_FEE_ADDRESS)
+                            .expect("platform address");
+                        let pay = b_plan.pay_request(&address).expect("LNURL pay request");
+                        let y = b_plan.invoice(&pay, 13).expect("Y invoice");
+                        assert!(
+                            y.payment_hash.ends_with("-b") && y.payment_hash != X_ID,
+                            "Y is B's own invoice, distinct from X: {}",
+                            y.payment_hash
+                        );
+                        let plan_y = RemittancePlan {
+                            payment_hash: y.payment_hash.clone(),
+                            gross_sats: 15,
+                            net_sats: 13,
+                            melt_fee_reserve_sats: 2,
+                            destination: address.to_string(),
+                            bolt11: y.bolt11.clone(),
+                            melt_quote_id: None,
+                        };
+                        let refused = store_b
+                            .plan_remittance(
+                                &plan_y,
+                                b_plan.owner(),
+                                now.saturating_add(lease_secs(REMIT_LEASE)),
+                                now,
+                            )
+                            .expect_err("the STORE refuses B's plan while X is in flight");
+                        match &refused {
+                            PlanRefused::InFlight(active) => {
+                                assert_eq!(
+                                    (
+                                        active.remittance_id.as_str(),
+                                        active.state,
+                                        active.spending_quote_id.as_deref(),
+                                        active.owner.as_deref(),
+                                        active.spending_since_unix,
+                                    ),
+                                    (
+                                        X_ID,
+                                        RemittanceState::Spending,
+                                        Some(X_PAYMENT_QUOTE),
+                                        Some("proc-a"),
+                                        Some(100),
+                                    ),
+                                    "the STORE refused B's plan naming X, spending and bound to Q: {active:?}"
+                                );
+                            }
+                            other => panic!(
+                                "expected the STORE's PlanRefused::InFlight naming X, got {other:?}"
+                            ),
+                        }
+                        let printed = refused.to_string();
+                        assert!(
+                            printed.contains("remittance hash-13-2-a")
+                                && printed.contains("still in flight"),
+                            "what `remit_inner` would print as REFUSED — ...: {printed}"
+                        );
+                        // Nothing moved by that attempt: no Y row, receipts still pinned to X, no
+                        // quote raised at the mint, no proof selected, no debit.
+                        assert_eq!(
+                            store_b
+                                .remittances()
+                                .expect("rows")
+                                .iter()
+                                .map(|row| (row.remittance_id.as_str(), row.state))
+                                .collect::<Vec<_>>(),
+                            vec![(X_ID, RemittanceState::Spending)],
+                            "the STORE wrote no Y row"
+                        );
+                        assert_eq!(
+                            ledger(store_b),
+                            (0, 15, 0),
+                            "the STORE's refusal left every receipt pinned to X; none became payable"
+                        );
+                        {
+                            let quotes = registry.lock().unwrap_or_else(|e| e.into_inner());
+                            assert!(
+                                quotes.keys().all(|id| id.ends_with("-a")),
+                                "B's planning attempt raised no quote at the mint: {:?}",
+                                quotes.keys().collect::<Vec<_>>()
+                            );
+                            assert_eq!(quotes[X_PAYMENT_QUOTE].state, MeltQuoteState::Unpaid);
+                        }
+                        assert_eq!(b_plan.invoices, vec![13], "Y's LNURL invoice is the only effect");
+                        assert!(
+                            b_plan.estimates.is_empty()
+                                && b_plan.quotes.is_empty()
+                                && b_plan.melts.is_empty(),
+                            "no estimate, no payment quote, no melt for Y"
+                        );
+                        assert_eq!(
+                            melts.load(Ordering::SeqCst),
+                            0,
+                            "no debit while A is still parked and B is refused by the STORE"
+                        );
+                        assert_eq!(
+                            remaining(&proofs),
+                            vec![1, 2, 4, 8],
+                            "B had exact proofs for Y and the STORE, not the wallet, refused it"
+                        );
+                    }
                 }
                 results
             },
@@ -5468,6 +5596,9 @@ mod tests {
             (15, 0, 0),
             "the 15 sats accrued were discharged exactly once"
         );
+        // Two attempts journaled: A's paid collect and B's refused confirm (dry-runs journal
+        // nothing). B's direct planning attempt at the store journals nothing either — attempts are
+        // written by `remit`'s wrapper, and `plan_remittance` refused inside its own transaction.
         let attempts = store.recent_remit_attempts(10).expect("attempts");
         assert_eq!(attempts.len(), 2, "{attempts:?}");
         assert_eq!(
@@ -5493,7 +5624,7 @@ mod tests {
                 RemitAttemptOutcome::Refused,
                 Some(X_ID)
             ),
-            "B's --confirm hold is journaled naming X"
+            "B's --confirm hold at RECONCILIATION is journaled naming X"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
