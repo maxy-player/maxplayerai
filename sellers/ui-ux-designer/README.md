@@ -1,17 +1,23 @@
 # UI/UX designer seller
 
-A **runnable** maxplayer seller package for UI/UX design review and token-driven redesign
-verification. It is not a persona file: it ships a working ACP agent, a pinned browser harness,
-accessibility checks, visual comparison, image handling, a sample redesign, and one smoke gate that
-proves the whole path works — or fails.
+A **runnable** maxplayer seller package for UI/UX design work. It is not a persona file: a real
+model harness, driven through maxplayer's own local driver, is given a natural-language brief and
+**authors the design itself** — then renders it, inspects its own screenshots, and audits its own
+accessibility. Around that sit a pinned browser harness, accessibility checks, visual comparison,
+image handling, and one smoke gate that proves the whole path works — or fails.
 
 ## Read this first: what this does NOT do
 
 - **It has never been run against a live maxplayer relay.** No wallet, no sats, no seat, no mint.
   The seller *registration* path — publishing a profile, claiming a job, delivering, getting paid —
   is entirely unexercised here. Everything below concerns the agent and its tools.
-- **It calls no language model.** The agent performs a deterministic review pipeline against a JSON
-  brief. It does not write creative copy or invent layouts on request.
+- **The generative path costs real model tokens** on this host's own account, takes minutes, and
+  produces **different output every run**. The gate is deliberately not deterministic.
+- **It rests on one model harness.** `codex-acp` is what answers here; `claude-agent-acp` is
+  installed but refused by a standing org spend limit. If the working account hits its limit the
+  generative check fails loudly — it never falls back to faking the designer.
+- **No human designer has judged the output.** Zero automated accessibility violations is a floor,
+  not taste.
 - **It has not been run inside the docker sandbox** (`[sandbox] mode = "docker"`).
 - Automated accessibility checking finds roughly a third of real problems. See
   [`design-identity/IDENTITY.md`](design-identity/IDENTITY.md) §6 rule 12.
@@ -20,6 +26,15 @@ proves the whole path works — or fails.
 ## Prerequisites
 
 - **Node ≥ 20** (developed and verified on v26.5.0).
+- **A `maxplayer` binary built with the `acp` feature**, for the generative check:
+  ```bash
+  cargo build -p maxplayer --features acp --release
+  ```
+  A stock release build refuses the path with `maxplayer run requires rebuilding with the acp
+  feature`. The gate locates `target/release/maxplayer` (or `target/debug`), verifies it really has
+  the feature, and fails with that message rather than substituting anything.
+- **An authorized ACP harness on PATH** — `codex-acp` is what this was verified against. Override
+  with `--agent-command <path>`.
 - A Playwright-managed Chromium. The lockfile pins `playwright@1.62.0`, whose Chromium is
   **revision 1234 / Google Chrome for Testing 151.0.7922.34**. If that revision is already in your
   `~/Library/Caches/ms-playwright` (or `PLAYWRIGHT_BROWSERS_PATH`), nothing downloads. Otherwise:
@@ -34,12 +49,26 @@ npm ci
 bash scripts/smoke.sh          # the gate — exit 0 means everything below is true
 ```
 
-The gate is the documentation that cannot go stale. It launches Chromium and prints its version
-(rather than checking a binary exists), regenerates the contrast ledger, checks libvips, **spawns
-the agent and drives it over ACP stdio**, re-verifies every produced artifact from outside the
-agent, and then runs three negative controls that must each fail. Any failure exits nonzero.
+**Expect this to take several minutes**: the gate spends a real model turn letting the agent design
+something. Last verified run: **9 checks run, 0 failed**.
 
-Run one job directly:
+The gate is the documentation that cannot go stale. It launches Chromium and prints its version
+(rather than checking a binary exists), regenerates the contrast ledger, checks libvips, **hands a
+natural-language brief with no candidate supplied to a real model through the maxplayer local
+driver and requires it to author, render and audit its own design**, then drives the deterministic
+review pipeline as tooling, re-verifies every produced artifact from outside the agent, and finally
+runs four negative controls that must each fail. Any failure exits nonzero.
+
+Run the generative path directly:
+
+```bash
+node agent/design-run.mjs --brief briefs/nova-status-brief.md --out runs/mine
+node agent/design-run.mjs --brief briefs/nova-status-brief.md --out runs/mine --verify-only
+```
+
+`--verify-only` re-checks a finished run's evidence without spending another model turn.
+
+Run the review tooling directly:
 
 ```bash
 node tools/drive-agent.mjs --brief jobs/sample-review.json

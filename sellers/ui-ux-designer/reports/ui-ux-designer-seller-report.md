@@ -20,9 +20,13 @@ npm ci
 bash scripts/smoke.sh
 ```
 
+The generative check spends a **real model turn** and takes several minutes. That is deliberate:
+a gate that only checks a deterministic rewrite is exactly the defect this package was corrected
+for. It also needs a `maxplayer` binary built with the `acp` feature (see §2.1).
+
 **Verified both directions, first-hand:**
 
-- real job — `exit 0`, "7 checks run, 0 failed"
+- full gate — `exit 0`, **"9 checks run, 0 failed"**, `SMOKE GATE PASSED`
 - sabotaged job (baseline and candidate pointed at the same page) — `exit 1`, "7 checks run,
   2 failed", failing with:
   `baseline reported only 0 violations, expected at least 4 — the accessibility check is probably
@@ -37,17 +41,74 @@ What the gate does, in order:
 2. **Contrast.** Regenerates `design-identity/contrast.md` from `tokens.json` with the WCAG
    relative-luminance formula. 13 contracted pairs, all passing; a miss exits nonzero.
 3. **Image pipeline.** Loads sharp and asserts libvips has SVG and PNG support compiled in.
-4. **The agent path.** Spawns `agent/designer-agent.mjs` as a subprocess and drives it over ACP
-   stdio — `initialize` → `session/new` → `session/prompt` — requiring `stopReason: "end_turn"`.
-5. **External verification.** `tools/verify-manifest.mjs` re-reads all 11 artifacts from disk and
+4. **The generative path — the heart of the gate.** Hands `briefs/nova-status-brief.md`, a
+   natural-language brief with **no candidate implementation supplied**, to a real model harness
+   through the **actual maxplayer local driver**. The model must author the page itself, render it,
+   read its own screenshots and audit output, and iterate to zero accessibility violations at both
+   viewports. See §2.1.
+5. **The review pipeline, as tooling only.** Spawns `agent/designer-agent.mjs` over ACP stdio —
+   `initialize` → `session/new` → `session/prompt`, requiring `stopReason: "end_turn"`. It is
+   retained and explicitly demoted: it inspects a supplied candidate and is never allowed to stand
+   in for a designer.
+6. **External verification.** `tools/verify-manifest.mjs` re-reads all 11 artifacts from disk and
    recomputes each sha256. The agent's own digests are not trusted; a manifest self-certified by
    the process that wrote the files is a receipt, not evidence.
-6. **Three negative controls, each of which must exit nonzero** (and did):
+7. **Four negative controls, each of which must exit nonzero** (and did):
    - an empty page that axe scores as **0 violations** is rejected by the load-proof guard;
    - a 404 URL yields no screenshot;
-   - two identical images fail a required-change diff.
+   - two identical images fail a required-change diff;
+   - a generative run whose `status.html` has been deleted is **not** reported as a pass — proving
+     the generative check reads artifacts off disk rather than trusting its own summary.
 
 ## 2. Harness access — verified, not assumed
+
+### 2.1 The model harness and the maxplayer driver
+
+The correction required integrating a supported coding/model harness using the **existing
+authorized runtime only**, with a concrete BLOCKED if none was available. Presence on `PATH` is not
+availability, so each adapter was *driven* over ACP stdio and judged on whether a model answered:
+
+| Adapter | Handshake | Session | Model answered | Verdict |
+|---|---|---|---|---|
+| `claude-agent-acp` | protocol 1 OK | OK | **no** | refused: `errorKind: rate_limit`, org monthly spend limit — reproduced twice, an hour apart |
+| `codex-acp` | protocol 1 OK | OK | **yes** | **used** — `gpt-5.6-sol`, `stopReason: end_turn`, non-zero output tokens against a real quota |
+| `claude-code-acp`, `cursor-agent`, `cursor-agent-acp`, `goose` | — | — | — | absent from `PATH` |
+
+So no BLOCKED: an authorized harness is available, and the gate depends on `codex-acp`, not on the
+spend-limited one. Full detail in `evidence/RUNTIME.md`.
+
+The harness is not spoken to directly. It is driven through the **actual maxplayer local driver**,
+built from this branch — the stock `/opt/homebrew/bin/maxplayer` (0.1.0-rc.3) refuses this path
+outright with `maxplayer run requires rebuilding with the acp feature`:
+
+```bash
+cargo build -p maxplayer --features acp --release
+# -> maxplayer 0.5.8 (e72e9bd7114fe86412b62ff68a08c28c5602d396)
+```
+
+`maxplayer run` is the local driver only: no relay, no wallet, no sats, no deployment.
+
+**What the model actually produced**, from the passing gate run (`runs/generative-smoke/summary.json`,
+verdict `PASS`, `failures: []`):
+
+| Evidence | Result |
+|---|---|
+| Driver | exit 0, `job.execution_changed → completed` |
+| Deliverable | `status.html` authored by the model, ~14 KB, not byte-identical to anything shipped here |
+| Agent-invoked tools | `shoot.mjs` **true**, `a11y.mjs` **true** — read from the driver's own session updates |
+| Accessibility, desktop | **0 violations**, 15 passes, 63 rules considered, axe-core 4.11.4 |
+| Accessibility, mobile | **0 violations**, 15 passes, 63 rules considered, axe-core 4.11.4 |
+| Load proof | HTTP 200, title "Nova service status", 225 elements |
+| Screenshots | desktop 122,207 B and mobile 291,881 B, both content-asserted |
+| Design notes | `DESIGN-NOTES.md` written by the model |
+
+**A detector bug worth recording.** The first generative run passed on the merits yet the gate
+failed it, claiming the agent "never rendered its design". The driver writes *two* streams and they
+carry different things: `events.jsonl` nests its type under `.payload` and holds only
+`driver.ready` / `job.execution_changed` / `agent.message`, while the ACP tool calls and the
+`turn_ended` stop reason arrive on driver **stdout**. Reading only the first stream produced a
+confident false accusation against work that was in fact correct. The gate now reads both, and
+`--verify-only` re-checks finished evidence without spending another model turn.
 
 The load-bearing line in the order was "verify actual harness access, not installed-binary
 presence". Concretely:
@@ -131,17 +192,31 @@ they are **not** covered by the manifest, which describes only the agent's own r
 
 ## 7. Limitations — stated plainly
 
-1. **No maxplayer binary was run, and no live relay was touched.** No wallet, no sats, no mint, no
-   seat, no key. The seller registration, job-claim, delivery and payment path is therefore
-   **entirely unexercised**. This package proves the *agent and its tools*; it does not prove the
-   seat earns. This is a real gap, not a rounding error, and it follows directly from the hold on
-   real sats in my fold.
+1. **The maxplayer binary IS now run, but only its local driver path.** `maxplayer run` is built
+   from this branch with `--features acp` and drives the model harness for real. No live relay was
+   touched: no wallet, no sats, no mint, no seat, no key. The seller registration, job-claim,
+   delivery and payment path remains **entirely unexercised**. This package proves the *agent and
+   its tools*; it does not prove the seat earns. That is a real gap, not a rounding error, and it
+   follows directly from the hold on real sats in my fold.
+1b. **The gate depends on a binary you must build.** `cargo build -p maxplayer --features acp
+   --release` is a prerequisite, and the release build is not cheap. The gate fails with a clear
+   message rather than silently substituting a fake driver.
 2. **Docker sandbox mode unexercised.** Under `[sandbox] mode = "docker"` argv[0] resolves against
    the image's PATH, and the image would need node, this package, and a drivable Chromium. Not
    tested.
-3. **The agent calls no language model.** It runs a deterministic review pipeline against a JSON
-   brief and refuses anything else. A buyer expecting open-ended creative design work from a text
-   prompt will not get it from this build.
+3. **The designer is a real model; the deterministic pipeline is now only tooling.** The
+   generative path calls `codex-acp` (`gpt-5.6-sol`) through the maxplayer driver and the model
+   authors the deliverable. Consequences a buyer should know: output **varies between runs**, the
+   gate is not deterministic, each run costs real model tokens on the host's own account, and the
+   run takes minutes rather than seconds. `agent/designer-agent.mjs` still only accepts a
+   `review-redesign` JSON brief — it is a tool, not the designer.
+3b. **The harness is single-supplier in practice.** `claude-agent-acp` is present but refused by a
+   standing org spend limit, and cursor/goose adapters are absent, so the gate currently rests on
+   `codex-acp` alone. If that account hits its own limit, the generative check cannot run — and it
+   will fail loudly rather than fall back to deterministic execution.
+3c. **One generative brief, and no human design review of its output.** The model's status page
+   passed axe at both viewports and its screenshots were content-asserted, but no human has judged
+   whether it is *good*. Zero automated violations is a floor, not taste.
 4. **sharp's install script is blocked** by this host's npm allow-scripts policy. The library loads
    and works (libvips 8.17.3, verified), but on a host that needs the build step, `npm ci` alone
    may not be enough.
@@ -150,7 +225,8 @@ they are **not** covered by the manifest, which describes only the agent's own r
 6. **Plainsong is proposed**, unreviewed by any human designer, with no brand authority.
 7. **The sample is static HTML** — no framework, no build step, no data layer. A real product
    integration would need work this package does not contain.
-8. **Only one job type** (`review-redesign`) is implemented.
+8. **Two paths, each narrow**: one generative brief (`briefs/nova-status-brief.md`) and one
+   deterministic job type (`review-redesign`).
 9. The two negative-control fixtures (`tools/fixtures/blank.html`) and the sabotage job exist to
    test the gate. The sabotage job was run from `/tmp` and its artifacts were removed; only the
    real run's evidence is committed.
