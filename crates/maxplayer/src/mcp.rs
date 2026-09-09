@@ -396,7 +396,9 @@ async fn call_tool_async(state: &McpState, params: &Value) -> Result<Value, Stri
         "award_claim" => route_tool(state, "award_claim", "award", arguments).await,
         // A READ, routed over the same socket for one reason only: the daemon holds the home's
         // identity, and the relay read is authenticated as the buyer. It reaches no money.
-        "discover_sellers" => route_tool(state, "discover_sellers", "discover_sellers", arguments).await,
+        "discover_sellers" => {
+            route_tool(state, "discover_sellers", "discover_sellers", arguments).await
+        }
         moved => Err(moved_tool_error(moved)),
     }
 }
