@@ -858,7 +858,10 @@ mod tests {
             .expect("read")
             .expect("injects");
         let truncation = read.truncation.expect("truncated");
-        assert!(read.section.len() <= MAX_MEMORY_INDEX_BYTES, "within budget");
+        assert!(
+            read.section.len() <= MAX_MEMORY_INDEX_BYTES,
+            "within budget"
+        );
         let (head, marker) = split_head_and_marker(&read.section);
         assert_eq!(
             marker,
@@ -907,7 +910,10 @@ mod tests {
             truncation.shown_bytes, 0,
             "no non-empty head exists within the budget, and none is manufactured"
         );
-        assert!(read.section.len() <= MAX_MEMORY_INDEX_BYTES, "within budget");
+        assert!(
+            read.section.len() <= MAX_MEMORY_INDEX_BYTES,
+            "within budget"
+        );
         assert!(std::str::from_utf8(read.section.as_bytes()).is_ok());
         let (head, marker) = split_head_and_marker(&read.section);
         assert!(head.is_empty(), "the head is empty: {head:?}");
