@@ -11,13 +11,22 @@ behaves as specified, not that any third-party tool has been accepted.
 ## Why there are two bundles from 2026-09-09
 
 `20260909T220053Z` and `20260909T220105Z` are two runs started twelve seconds apart. That
-overlap was not intentional. The turn that produced them was one of several killed mid-flight
-by provider errors, and two overlapping executions resulted; both completed, and `git add -A`
-committed both.
+overlap was not intentional.
+
+An earlier version of this file blamed a turn killed mid-flight by a provider error. That was a
+guess presented as fact, and it was probably wrong: two sessions were writing this worktree and
+branch at the time, and on 2026-09-09 15:06 PDT the second was ordered to stop and this author
+was made sole writer. The second run is most likely the other session's.
+
+**What the artifacts actually support:** two executions started twelve seconds apart, on
+separate networks, volumes and container names, on the same Docker daemon, both completing
+27/27. **What they do not support:** attribution. Both sessions committed under the worktree
+identity `w-seller-tool-onboarding-r2`, and no artifact records the launching process, so which
+session produced which bundle cannot be established from what is here. Stating it either way
+would be invention.
 
 They are kept rather than pruned, because deleting an inconvenient artifact is a worse habit
-than explaining it, and because the accident is mildly informative: the two runs are
-independent, use different ephemeral ports and container names, and agree exactly.
+than explaining it, and because two runs that agree are mildly better than one.
 
 | | `20260909T220053Z` | `20260909T220105Z` |
 | --- | --- | --- |
