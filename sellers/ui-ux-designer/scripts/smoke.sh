@@ -20,6 +20,7 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 PKG="$PWD"
 JOB="${1:-jobs/sample-review.json}"
+BRIEF="${BRIEF:-briefs/nova-status-brief.md}"
 FAILURES=0
 STEP=0
 
@@ -76,8 +77,24 @@ say "2. Image pipeline"
 must "sharp/libvips loaded with svg+png support" \
   node tools/svg.mjs --check
 
-say "3. THE AGENT PATH — spawn agent/designer-agent.mjs and drive it over ACP stdio"
-must "agent completes a review-redesign turn with stopReason=end_turn" \
+say "3. THE GENERATIVE PATH — a natural-language brief, NO candidate supplied"
+# This is the heart of the gate. A real model harness is driven through the ACTUAL maxplayer
+# local driver and must AUTHOR the page, render it, read its own screenshots and audit output,
+# and iterate to zero accessibility violations at both viewports. Nothing here supplies a
+# candidate to edit; if the model produces nothing, this check fails.
+#
+# It costs a real model turn and takes several minutes. That is the price of proving a
+# designer can design, and it is not skippable: a gate that only checks a deterministic
+# rewrite is exactly the failure this package was corrected for.
+GEN_OUT="runs/generative-smoke"
+rm -rf "$GEN_OUT"
+must "the model authors, renders and audits its own design (several minutes)" \
+  node agent/design-run.mjs --brief "$BRIEF" --out "$GEN_OUT"
+
+say "3b. THE REVIEW PIPELINE AS TOOLING — deterministic, and only ever a tool"
+# Retained from the reviewed package, but demoted: it inspects a supplied candidate. It is
+# not the designer and is never allowed to stand in for one.
+must "review tooling completes a review-redesign turn with stopReason=end_turn" \
   node tools/drive-agent.mjs --brief "$JOB"
 
 RESULT_JSON="$(node -e '
@@ -118,6 +135,20 @@ CAND="evidence/screenshots/$(node -e '
 ' "$JOB")"
 must_fail "two identical images do not pass a required-change diff" \
   node tools/vdiff.mjs --a "$CAND" --b "$CAND" --out /tmp/ui-ux-smoke-diff.$$.png --min-ratio 0.02
+
+# A generative run whose deliverable has been removed must NOT be reported as a pass. This
+# proves the generative check is reading real artifacts rather than trusting its own summary.
+SABOTAGE="runs/generative-sabotage.$$"
+rm -rf "$SABOTAGE"
+if [[ -d "$GEN_OUT" ]]; then
+  cp -R "$GEN_OUT" "$SABOTAGE"
+  rm -f "$SABOTAGE/workspace/status.html"
+  must_fail "a generative run with its deliverable deleted is not reported as a pass" \
+    node agent/design-run.mjs --brief "$BRIEF" --out "$SABOTAGE" --verify-only
+  rm -rf "$SABOTAGE"
+else
+  fail "no generative run directory to sabotage — the generative check did not produce evidence"
+fi
 
 say "Summary"
 printf '   %d checks run, %d failed\n' "$STEP" "$FAILURES"
