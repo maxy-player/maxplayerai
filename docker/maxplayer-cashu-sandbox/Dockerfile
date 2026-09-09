@@ -38,6 +38,15 @@ ARG NUTS_COMMIT=49a909ce4d0739824b3859d4b3da21e6c1abdaeb
 FROM rust:1-bookworm AS mint-builder
 ARG CDK_VERSION
 
+# protoc is a BUILD-TIME requirement even with --no-default-features: cdk-mintd depends on
+# cdk-signatory unconditionally (the local in-process signatory), and cdk-signatory 0.17.2's
+# build.rs compiles src/proto/signatory.proto whether or not the `grpc` feature is on — it panics
+# with "Could not find `protoc`" otherwise. Measured, not assumed: the first build of this image
+# failed exactly there. protoc lives in this builder stage only; it is not in the final image.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
 # --no-default-features drops cln, lnd, lnbits, bdk, ldk-node, grpc-processor and the management
 # RPC. What is left is exactly the isolated testing mode: `fakewallet` (= dep:cdk-fake-wallet) and
 # the sqlite store. cdk-mintd's own config comment is explicit that fakewallet "is isolated testing
