@@ -88,6 +88,16 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     CARGO_TARGET_DIR=/tmp/target cargo install --path /seedgen --root /out; \
     strip /out/bin/test-mint-seed
 
+# The acceptance harness. It is baked rather than compiled at run time so the gate maxie runs is a
+# single command with no build step and no network fetch, and so the binary is pinned to the same
+# CDK as the mint and the seller.
+COPY docker/maxplayer-cashu-sandbox/acceptance /acceptance
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=cashu-mint-target,target=/tmp/target \
+    set -eux; \
+    CARGO_TARGET_DIR=/tmp/target cargo install --path /acceptance --root /out; \
+    strip /out/bin/mint-acceptance
+
 # ---------------------------------------------------------------------------------------------
 # knowledge corpus, at pinned commits
 # ---------------------------------------------------------------------------------------------
@@ -123,6 +133,7 @@ ARG NUTS_COMMIT
 
 COPY --from=mint-builder /out/bin/cdk-mintd /usr/local/bin/cdk-mintd
 COPY --from=mint-builder /out/bin/test-mint-seed /usr/local/bin/test-mint-seed
+COPY --from=mint-builder /out/bin/mint-acceptance /usr/local/bin/mint-acceptance
 COPY --from=corpus /corpus /opt/cashu/corpus
 COPY docker/maxplayer-cashu-sandbox/test-mint.config.toml /opt/cashu/test-mint.config.toml
 COPY docker/maxplayer-cashu-sandbox/bin/test-mint /usr/local/bin/test-mint
@@ -131,7 +142,8 @@ COPY docker/maxplayer-cashu-sandbox/bin/test-mint /usr/local/bin/test-mint
 # world-readable and everything it must run world-executable (same rule as the base image's
 # `install -m 0755`).
 RUN set -eux; \
-    chmod 0755 /usr/local/bin/cdk-mintd /usr/local/bin/test-mint-seed /usr/local/bin/test-mint; \
+    chmod 0755 /usr/local/bin/cdk-mintd /usr/local/bin/test-mint-seed /usr/local/bin/test-mint \
+        /usr/local/bin/mint-acceptance; \
     chmod -R a+rX /opt/cashu; \
     cdk-mintd --version; \
     test-mint --help >/dev/null
