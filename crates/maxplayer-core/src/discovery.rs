@@ -78,6 +78,19 @@ pub const DEFAULT_DIRECTORY_LIMIT: usize = 500;
 /// the relay leg so a build with no relay features can still state the tool's contract.
 pub const DEFAULT_DISCOVERY_TIMEOUT_SECS: u64 = 8;
 
+/// The largest directory-read budget a caller may ask for, in seconds.
+///
+/// ⚠ THE CEILING EXISTS BECAUSE THE CALLER THAT MATTERS HAS ITS OWN DEADLINE. `maxplayer mcp`
+/// caps a `tools/call` at 15 s (`mcp::TOOL_DEADLINE_SECS`) and reports a cap-hit as a tool error
+/// with no directory in it, so a budget at or above that ceiling converts every slow relay into
+/// "the tool broke" instead of the honest "the relay did not answer" this module goes to some
+/// trouble to be able to say. 10 s leaves the daemon room to reply inside the client's window.
+///
+/// It is REFUSED at the RPC boundary rather than silently clamped, the same choice
+/// [`crate::job_lifecycle::WAIT_FOR_CAP_SECS`] makes for the long poll: a caller that asked for
+/// 60 s and got 10 would read the empty answer as sixty seconds of evidence.
+pub const MAX_DISCOVERY_TIMEOUT_SECS: u64 = 10;
+
 /// One seat as the public directory describes it, at the moment of the read.
 ///
 /// Every field comes off ONE announcement — the latest live beat for this seat's `(pubkey, d)`
@@ -399,12 +412,18 @@ mod transport {
     };
     use crate::gateway::{EventDraft, TagSpec};
     use crate::home::MaxplayerHome;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    /// How long to wait for the socket before reading. `connect()` only SPAWNS the connection, so a
-    /// fetch racing the handshake burns its whole window and comes back empty — which this module
-    /// would then have to report as an unconfirmed read of an apparently dead market.
+    /// Ceiling on the connect leg alone. `connect()` only SPAWNS the connection, so a fetch racing
+    /// the handshake burns its whole window and comes back empty — which this module would then
+    /// have to report as an unconfirmed read of an apparently dead market. It is a CEILING, not a
+    /// floor: the wait is whatever is left of the caller's budget, capped here.
     const RELAY_CONNECT_WAIT: Duration = Duration::from_secs(20);
+
+    /// What is left of the caller's budget. Zero once it is spent — never a negative wrap.
+    fn remaining(deadline: Instant) -> Duration {
+        deadline.saturating_duration_since(Instant::now())
+    }
 
     /// Read the live seat directory off the home's relay. **Read-only**: it subscribes and fetches,
     /// and publishes no event of any kind.
@@ -414,15 +433,22 @@ mod transport {
     /// once the relay proves it is serving THIS session's REQs, and the proof must precede the read
     /// it vouches for — the first fetch may have spent its window on connect/auth, so absence is
     /// concluded from a SECOND read taken after the probe's `EOSE`.
+    ///
+    /// `budget` bounds the WHOLE read, not each leg. Connect, fetch, liveness probe and recheck
+    /// draw down one deadline, because a caller (an MCP tool with a client read-timeout) can only
+    /// honour a promise about the total: four legs of eight seconds is a thirty-two-second tool.
+    /// Running out mid-read yields [`SellerDirectory::unverified`] — an unanswered read, which is
+    /// what it is — never an empty market and never an error.
     pub async fn fetch_directory_async(
         home: &MaxplayerHome,
         policy: DirectoryPolicy,
         limit: usize,
-        timeout: Duration,
+        budget: Duration,
     ) -> Result<SellerDirectory, DiscoveryError> {
         use nostr_sdk::pool::relay::ReqExitPolicy;
         use nostr_sdk::prelude::{Client, Filter, Kind};
 
+        let deadline = Instant::now() + budget;
         let secret = crate::home::read_secret_key_hex(home)
             .map_err(|error| DiscoveryError::Identity(error.to_string()))?;
         let keys = nostr_sdk::Keys::parse(&secret)
@@ -440,7 +466,9 @@ mod transport {
             .relay(&home.config.relay_url)
             .await
             .map_err(|error| DiscoveryError::Relay(format!("relay handle: {error}")))?;
-        relay.wait_for_connection(RELAY_CONNECT_WAIT).await;
+        relay
+            .wait_for_connection(remaining(deadline).min(RELAY_CONNECT_WAIT))
+            .await;
 
         // Scoped to the seat address: the kind, the `#t=maxplayer` namespace guard so a foreign
         // event squatting the kind is never delivered, and the `d` identifier so only seat
@@ -459,23 +487,36 @@ mod transport {
         // `Ok(empty)`, so a relay REFUSING this REQ (a CLOSED with a reason, an auth failure) would
         // read as an empty market. Here a refusal surfaces as `Err` and becomes `DiscoveryError`.
         let mut events = relay
-            .fetch_events(filter.clone(), timeout, ReqExitPolicy::ExitOnEOSE)
+            .fetch_events(filter.clone(), remaining(deadline), ReqExitPolicy::ExitOnEOSE)
             .await
             .map_err(|error| DiscoveryError::Relay(format!("fetch seat directory: {error}")))?;
 
         if events.is_empty() {
+            // Out of budget: we hold an empty list we cannot vouch for. Report it as the
+            // unanswered read it is rather than probing on a deadline that has already passed.
+            if remaining(deadline).is_zero() {
+                client.disconnect().await;
+                return Ok(SellerDirectory::unverified());
+            }
             let served = crate::buyer::relay::probe_relay_serves_our_reqs(
                 &client,
                 keys.public_key(),
-                timeout,
+                remaining(deadline),
             )
             .await;
             if !served {
                 client.disconnect().await;
                 return Ok(SellerDirectory::unverified());
             }
+            // The probe vouches only for a read that FOLLOWS it, so a spent budget here cannot be
+            // reported as a confirmed empty market either.
+            let recheck = remaining(deadline);
+            if recheck.is_zero() {
+                client.disconnect().await;
+                return Ok(SellerDirectory::unverified());
+            }
             events = relay
-                .fetch_events(filter, timeout, ReqExitPolicy::ExitOnEOSE)
+                .fetch_events(filter, recheck, ReqExitPolicy::ExitOnEOSE)
                 .await
                 .map_err(|error| {
                     DiscoveryError::Relay(format!("fetch seat directory (recheck): {error}"))
@@ -503,12 +544,13 @@ mod transport {
         Ok(reduce_directory(announcements, policy))
     }
 
-    /// Sync entry point for callers not already on a runtime.
+    /// Sync entry point for callers not already on a runtime. `budget` bounds the whole read, as in
+    /// [`fetch_directory_async`].
     pub fn fetch_directory(
         home: &MaxplayerHome,
         policy: DirectoryPolicy,
         limit: usize,
-        timeout: Duration,
+        budget: Duration,
     ) -> Result<SellerDirectory, DiscoveryError> {
         crate::runtime_guard::refuse_nested_block_on("discovery::fetch_directory")
             .map_err(DiscoveryError::Runtime)?;
@@ -516,7 +558,7 @@ mod transport {
             .enable_all()
             .build()
             .map_err(|error| DiscoveryError::Runtime(error.to_string()))?;
-        runtime.block_on(fetch_directory_async(home, policy, limit, timeout))
+        runtime.block_on(fetch_directory_async(home, policy, limit, budget))
     }
 }
 
