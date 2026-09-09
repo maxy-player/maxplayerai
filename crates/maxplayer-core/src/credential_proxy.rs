@@ -3495,8 +3495,16 @@ mod tests {
     // reproduce.
     #[tokio::test]
     async fn a_declared_over_cap_body_is_refused_before_the_upstream_sees_it() {
-        let (stub_addr, stub) = spawn_stub("UPSTREAM_OK").await;
-        let upstream = format!("http://{stub_addr}");
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // The upstream here is a listener nothing ever accepts from, which witnesses "never dialled"
+        // more strictly than a stub that reports what it served: a connection that IS dialled completes
+        // in the kernel's backlog whether or not anything accepts it, so an accept that finds nothing
+        // waiting is proof no connection was opened at all — not merely proof none was answered.
+        let upstream_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let upstream = format!("http://{}", upstream_listener.local_addr().unwrap());
         let engine = Arc::new(ProxyEngine::new([authority_of(&upstream).unwrap()]));
         let placeholder = mint_anthropic_placeholder();
         engine
@@ -3509,27 +3517,59 @@ mod tests {
         let proxy = start(Arc::clone(&engine), None).await.unwrap();
         let port = proxy.local_addr().port();
 
-        // One byte over the cap, declared up front: `reqwest` sets `content-length` for a sized body.
-        let over = vec![b'z'; MAX_REQUEST_BODY_BYTES + 1];
-        let response = reqwest::Client::new()
-            .post(format!("http://127.0.0.1:{port}/v1/messages"))
-            .header("x-api-key", &placeholder)
-            .body(over)
-            .send()
+        // The HEADERS ALONE, on a socket this test drives itself. Handing `reqwest` a sized 32 MiB + 1
+        // body made the client race its own upload against the answer: the proxy refuses from the
+        // header and closes, so the write failed before the response was read and the test saw a
+        // transport error instead of the `413`. Declaring the over-cap length and sending no body byte
+        // asks exactly the question the cap answers, with nothing to race.
+        let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .unwrap();
-        assert_eq!(
-            response.status(),
-            413,
-            "a declared over-cap body keeps the buffered path's refusal"
+        let declared = MAX_REQUEST_BODY_BYTES + 1;
+        sock.write_all(
+            format!(
+                "POST /v1/messages HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\n\
+                 x-api-key: {placeholder}\r\ncontent-length: {declared}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        sock.flush().await.unwrap();
+
+        // Bounded: on a proxy that waited for the declared body before deciding, this test must fail
+        // on the deadline rather than hang forever.
+        let mut head = Vec::new();
+        let mut tmp = [0u8; 1024];
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                head.extend_from_slice(&tmp[..n]);
+                if find_subslice(&head, b"\r\n\r\n").is_some() {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the proxy must refuse a declared over-cap length from the headers alone");
+
+        let text = String::from_utf8_lossy(&head).to_string();
+        let status_line = text.lines().next().unwrap_or_default().to_owned();
+        assert!(
+            status_line.starts_with("HTTP/1.1 413"),
+            "a declared over-cap body keeps the buffered path's refusal; got {status_line:?}"
         );
 
         // The upstream must never have been dialled: the refusal is decided from the header alone, so
-        // the real credential was never put on the wire for this request. Checked WITHOUT a timer —
-        // the stub completes only once it has served a connection, and the `413` above is already in
-        // hand, so "still running" is a settled fact here rather than a race against a deadline.
+        // the real credential was never put on the wire for this request. The `413` is already in hand
+        // above, so a connection, had one been made, would be sitting in this listener's backlog now.
         assert!(
-            !stub.is_finished(),
+            tokio::time::timeout(Duration::from_millis(500), upstream_listener.accept())
+                .await
+                .is_err(),
             "an over-cap request must not reach the upstream at all"
         );
     }

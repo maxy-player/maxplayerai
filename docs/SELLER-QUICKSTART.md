@@ -1200,13 +1200,14 @@ On a typical keyset the fee is **1 sat** for small amounts:
 - **The setup default is `100`, and that is the number to start from.** Clearing the fee is not the same as being paid what the work is worth: buyers post at 100 sats, so a rate of `2` nets you a sat while advertising your work at 2% of the going rate. Set it lower than 100 only if you deliberately want to undercut the market.
 - The **receipt / journal records the FACE (offer) amount**, not your wallet net. The face is the accounting figure; the **sats you receive are `face − fee`**. Do not read the receipt's face number as "sats pocketed."
 
-### Platform fee (stage 1: recorded, not paid)
+### Platform fee (recorded at collect; paid automatically by your node)
 
 The product charges a platform fee on each payment you collect. **The rate is set by the product,
 in the binary, and you cannot change it** — there is no config key, no environment variable and no
-flag for it. **The rate is 10%.** This stage only records what that comes to: **there is no way to
-pay it yet**, because no payout destination exists in the product, so the figure in your journal is
-not a bill that is due.
+flag for it. **The rate is 10%.** Collection records what that comes to, and **your node then pays it
+automatically**: once a payment has landed and its receipt is journaled, the node makes a best-effort
+attempt to remit the whole unremitted balance to the platform's Lightning address. You do not have to
+remember to pay; there is nothing to run.
 
 **The fee is 10% of the offer amount — the price the buyer paid — not of what lands in your
 wallet.** The mint's own input fee (described above) is a separate deduction and does not shrink the
@@ -1222,17 +1223,150 @@ maxplayer seller fees [--home <dir>]
 ```
 
 and each collected job prints four figures with plain labels: **what the buyer paid** (the offer
-amount), **mint fee**, **platform fee (10%)**, and **you keep** (`paid − mint fee − platform fee`),
-plus the totals. The `seller node collect ok` log line carries the same figures
-(`amount_received=` is what the buyer paid, then `mint_fee=`, `fee_sats=`, `fee_bps=`, `kept=`).
-Jobs collected before the mint fee was recorded print `mint fee: not recorded` and no "you keep"
-figure, rather than a made-up zero.
+amount), **mint fee**, **platform fee (10%)** with whether it is unremitted or which remittance paid
+it, and **you keep** (`paid − mint fee − platform fee`), plus the totals — the platform fee split
+into remitted and unremitted — and every remittance so far. The `seller node collect ok` log line
+carries the same figures (`amount_received=` is what the buyer paid, then `mint_fee=`, `fee_sats=`,
+`fee_bps=`, `kept=`). Jobs collected before the mint fee was recorded print `mint fee: not recorded`
+and no "you keep" figure, rather than a made-up zero.
 
-**This stage records the fee and pays nobody.** No sats leave your wallet on account of it: there is
-no fee recipient in this version, and no payout, transfer or remittance of the recorded amount exists
-anywhere in the binary. A 100-sat offer with a 1-sat mint fee, for example, records
-`amount_sats = 100, mint_fee_sats = 1, fee_bps = 1000, fee_sats = 10`, prints `you keep: 89 sats`,
-and moves nothing.
+**How the automatic remittance behaves.** A 100-sat offer with a 1-sat mint fee, for example, records
+`amount_sats = 100, mint_fee_sats = 1, fee_bps = 1000, fee_sats = 10`, prints `you keep: 89 sats`, and
+the 10 sats are now **unremitted** platform fee. Right after that receipt is written — and only after
+a *new* receipt, never on a replayed payment — the node starts one remittance attempt on a thread of
+its own:
+
+- It resolves the platform's Lightning address over LNURL-pay (the address is fixed in the binary,
+  not configurable — a seller-editable address would let a seller pay the fee to itself), reads the
+  destination's minimum, and **if the unremitted balance is below that minimum it does nothing**: a
+  10% fee on payments under 10 sats owes under 1 sat, and small balances simply accumulate until they
+  clear the minimum. That is the expected steady state for small jobs, not an error.
+- Otherwise it takes a melt quote from your default mint and invoices **the largest amount the
+  wallet can actually pay for at most the accrued fee**: the mint's melt fee reserve and the proof
+  fees come out of it (a mint that charges per input proof, or one whose proofs do not fit the
+  amount and need a swap first). The wallet SDK (CDK) *estimates* the proof fee before paying and
+  *recomputes* it on the proofs its swap hands back, refusing after the swap if they fall short — so
+  the planner runs that recomputation itself and picks an amount that survives it (the plan prints
+  both figures: `expected proof fees (SDK estimate, bounded exactly at payment): N sats; actual
+  proof input fee the SDK recomputes on the swapped proofs: M sats ⇒ worst case W sats leaves the
+  wallet (≤ G)`). **You never pay more than the fee you accrued; every fee comes out of that amount,
+  not on top of it.** It then journals
+  the attempt in `seller.sqlite` (`fee_remittances`: gross, melt fee, net, the address literal,
+  melt quote id, payment hash, state, which process owns the attempt, and when it was admitted to
+  spend), pays the invoice from your ecash through the wallet's gated melt (the same
+  `allow_real_mints` gate `maxplayer wallet melt` honours), and marks the receipts it covered as
+  discharged. **The accrued fee is a hard ceiling on everything that leaves the wallet, enforced
+  before any ecash is spent**, in one sequence: first the payment quote's **invoice plus the mint's
+  fee reserve alone** is checked against the gross (a reserve that grew past it is refused here); if
+  the live reserve differs from the estimate and the planned amount would no longer confirm, the
+  attempt re-plans once onto a new invoice; then the wallet prepares the payment locally — reserving
+  proofs; it may fetch the mint's fee table, but sends no proofs and pays no fee yet — and the node
+  re-runs the SDK's post-swap arithmetic on the prepared figures: the bound is the **actual** proof
+  input fee the SDK recomputes on the proofs its swap hands back, so **the invoice plus the reserve
+  plus that actual input fee plus any pre-melt swap fee** must fit the gross, and the payment is
+  refused if the SDK would fail after its swap. The SDK's *prepared* fee display is not the bound: a
+  prepared total over the gross whose actual debit fits is paid. On any of these refusals the
+  prepared payment (if any) is cancelled — the proofs go back to unspent — before any ecash is
+  consumed; the journaled row is left as it was, still planned with its receipts pinned, the refusal
+  is journaled, and the next attempt's reconciliation releases that row (it was this process's own
+  earlier attempt) and re-quotes. After a payment the report counts the SDK's fee once — `melt fee taken by
+  the mint` already includes the actual proof input fee — and prints `actual debit: D sats = net +
+  melt fee + swap fee`; if the wallet cannot read its balance afterwards it prints `wallet balance
+  now: unknown (…)` rather than a guessed number. **Known bound:** the mint can change its fee
+  table between the preparation and the payment and the SDK accepts no caller maximum; if that
+  happens the payment can fail after its swap (the swap fee is lost and the row stays held until
+  the mint says PAID or an operator decides) or cost more than predicted (a `WARNING` line). Not
+  observed on any mint; disclosed, not solved. Also owed: if cancelling a prepared payment itself
+  fails, a local proof reservation can remain — reopening the wallet does not clear it — until a
+  supported recovery path exists. (The operator's plain `maxplayer wallet melt` keeps its older
+  check — invoice plus reserve only — and is not changed by this.)
+- **It cannot affect the payment it followed.** Your receipt is written and the job is marked paid
+  before the attempt starts. If the attempt fails — the mint is down, the payout host is unreachable,
+  the wallet is short, no route — the failure is written to the node log and journaled
+  (`fee_remit_attempts`), and the balance stays unremitted. **The node then retries on its own clock,
+  for as long as it runs**: after a failure the next attempt comes within a minute, and the ceiling
+  on the wait then doubles — 2, 4, 8, 16 minutes — up to once every 30 minutes, each delay
+  randomised between zero and that ceiling so a fleet of sellers does not hit a recovering host in
+  the same second. A success resets the clock to its 30-second base; a balance under the
+  destination's minimum is not a failure and does not lengthen it. Nothing runs at startup: the
+  first check comes between 30 and 60 seconds after boot, and a payment collected in those first
+  seconds cannot pull it earlier — the 30-second floor holds. The retries live inside the node's
+  main loop, so stopping the node stops them from being scheduled — and a payment already in flight
+  when you stop the node is **drained, not cut off**: once serving has ended the node waits up to 60
+  seconds for the attempt to finish (ecash that may already be with the mint is never abandoned
+  mid-payment), and if that wait runs out it logs one incident line and exits while the attempt
+  finishes on its own. The next collected payment also tries again with the whole accumulated
+  balance. An attempt interrupted mid-payment is reconciled with the mint on the next attempt:
+  settled if the mint reports the payment landed. An attempt that never reached the point of
+  spending is released if its quote failed or expired, or if the process that owned it is provably
+  gone. An attempt that DID reach the point of spending — the store admitted it and bound the one
+  mint quote it may pay — is **held**, however long, on anything but the mint saying PAID: not
+  released on "expired", not on "failed", not on any clock. We do not infer that a payment is dead
+  from a clock, because the mint pays a quote it calls unpaid or failed regardless of its expiry,
+  and a payment prepared before the expiry can land after it; releasing on either would let the
+  same balance be paid twice. Two processes sharing one store — the node and a hand-run
+  `maxplayer seller fees remit --confirm`, say — pay an accrued balance once, not twice: at most one
+  remittance can be in flight (a second cannot even be planned while one exists), the receipts it
+  covers are pinned to it, only the process that planned it may pay it, it passes a single
+  compare-and-set in the store immediately before spending which also fixes the one mint quote it
+  may pay, and it never pays under any other quote; a second process asks the mint about that exact
+  quote and holds off unless it is PAID, and every release is written as a condition on the row, so
+  a release decided on a stale reading changes nothing. A held attempt is visible, not silent:
+  `maxplayer seller fees remit` prints one `HELD:` line naming the row, the quote, what the mint said
+  (unpaid, failed, pending, unknown, or a quote the wallet does not know — the same one line for each)
+  and how many sats are pinned, and exits 3 — on the dry run too. Clearing it is an operator's
+  decision, and there is no command for it yet; until then the node's later attempts are refused and
+  the balance accumulates unremitted behind the held row. This is what the module's two-process tests
+  prove, and its bound: two processes, each on its own connection to one store, against one fake mint
+  that accepts unpaid or failed quotes regardless of expiry as the inspected CDK 0.17.2 mint
+  implementation does (pauses after the plan, after the quote, after the gate, inside the payment
+  after the wallet's last local check, and between a release decision and its write; the lease and
+  the quote expiring while paused; distinct invoices; funds for a second payment present; actual
+  melts counted). What the two processes share is stated per test in the module's documentation,
+  not assumed: all of them share the one store; the fake mint's quote registry is shared in seven
+  (the live-owner, expired-estimate, expired-quote-held, paused-owner, stale-snapshot, full-path and
+  delayed-payment cases); one clock is handed from the first process to the second in four of those
+  (expired-quote-held, paused-owner, stale-snapshot, delayed-payment) while the other three leave
+  each process its own clock; and only the delayed-payment case also shares one wallet's proofs
+  between the two. They do not run a real mint or a real wallet, and no deployed mint's behaviour
+  was measured — the mint behaviour they model is read from the pinned CDK 0.17.2 source.
+- **The log stays readable while it retries.** Every attempt gets at most one line. The first
+  failure's line carries its detail — the destination, the balance it saw, the error — and the
+  backoff it starts; later attempts in the same streak get one line each (how many have failed,
+  when the next is; the moment the delay reaches its 30-minute cap is said on that same line); and
+  the success that ends a streak says how many attempts failed and for how long the fee sat owed —
+  the line to look for when you ask "did it ever go out?".
+
+**The off switch.** If you need to stop the automatic payout — a misbehaving mint, an incident — set
+
+```toml
+[platform_fee]
+auto_remit = false      # or MAXPLAYER_PLATFORM_FEE__AUTO_REMIT=false
+```
+
+and restart the node. One flag covers both automatic paths — the attempt after each payment and the
+retry clock. This is an **operational valve, not a waiver**: the fee keeps accruing on every payment,
+stays owed, and stays visible in `maxplayer seller fees`; when you turn the switch back on the next
+attempt (a collect, or the retry clock's first check) remits the whole accumulated balance. The switch
+cannot change the rate or the address — the `[platform_fee]` table has no key for either.
+`maxplayer seller fees remit --confirm` still pays by hand while it is off.
+
+**Inspecting and forcing a remittance by hand.** `maxplayer seller fees remit` is the operator's
+window onto the automatic path, and its recovery lever:
+
+```
+maxplayer seller fees remit [--home <dir>]              # dry run: recent attempts, resolve, quote, print the plan, move nothing
+maxplayer seller fees remit --confirm [--home <dir>]    # pay the unremitted balance NOW (also with auto_remit = false)
+```
+
+The dry run prints whether the automatic remittance is on, the recent attempts with their outcomes
+(paid / refused / failed and why), any attempt still in flight, the gross unremitted fee, the mint's
+melt fee reserve, the invoice amount the platform receives, and the most that can leave your wallet —
+and moves nothing. `--confirm` forces one attempt now, under exactly the same rules as the automatic
+path. It refuses, moving nothing (exit 3), when nothing is unremitted; when the balance is below the
+destination's minimum (the command prints how far short you are); when an earlier attempt is still
+settling at the mint; or when an admitted attempt is held on its bound quote (the `HELD:` line above).
+**Running it again after a payment pays nothing** — the receipts it discharged are recorded.
 
 ---
 

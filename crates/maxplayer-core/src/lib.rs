@@ -39,11 +39,21 @@ pub mod engine;
 pub mod env_provision;
 pub mod episode;
 pub mod event;
+/// Paying the accrued platform fee: the ONE remit path in the product, behind an effects trait so
+/// the decision logic is tested without a network or a mint. Three callers — the seller node's
+/// collect path (automatic, best-effort), the seller node's retry tick (automatic, backed off), and
+/// `maxplayer seller fees remit` (inspection and recovery).
+#[cfg(feature = "wallet")]
+pub mod fee_remit;
 pub mod format;
 pub mod gateway;
 pub mod heartbeat;
 pub mod home;
 pub mod kinds;
+/// LNURL-pay (LUD-06/LUD-16) resolution of a Lightning address to a bolt11 invoice, fail-closed.
+/// Used by [`fee_remit`] only; `wallet`-gated because it rides the `reqwest` client.
+#[cfg(feature = "wallet")]
+pub mod lnurl_pay;
 pub mod log;
 // Ungated on purpose: the CLI's MCP tool table reads the long-poll cap from here on a build with
 // no `wallet` feature, where `job_lifecycle` is compiled out.
@@ -64,9 +74,10 @@ pub mod payment;
 pub mod payment_send;
 #[cfg(feature = "wallet")]
 pub mod payment_wallet;
-/// Seller-side platform fee (stage 1): the product-set rate in basis points and the fee arithmetic.
-/// Ungated so the arithmetic builds and tests everywhere; accrued and journaled at collect,
-/// remitted nowhere.
+/// Seller-side platform fee: the product-set rate in basis points, the fee arithmetic, and the
+/// product-set payout address. Ungated so the arithmetic builds and tests everywhere; accrued and
+/// journaled at collect, remitted by [`fee_remit`] — automatically after each collect, or by
+/// `maxplayer seller fees remit --confirm`.
 pub mod platform_fee;
 pub mod receipt;
 /// Shared NIP-42 relay-auth handshake, neutral to any single consumer (seller receive + buyer
