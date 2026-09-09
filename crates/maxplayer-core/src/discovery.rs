@@ -487,7 +487,11 @@ mod transport {
         // `Ok(empty)`, so a relay REFUSING this REQ (a CLOSED with a reason, an auth failure) would
         // read as an empty market. Here a refusal surfaces as `Err` and becomes `DiscoveryError`.
         let mut events = relay
-            .fetch_events(filter.clone(), remaining(deadline), ReqExitPolicy::ExitOnEOSE)
+            .fetch_events(
+                filter.clone(),
+                remaining(deadline),
+                ReqExitPolicy::ExitOnEOSE,
+            )
             .await
             .map_err(|error| DiscoveryError::Relay(format!("fetch seat directory: {error}")))?;
 
@@ -650,6 +654,64 @@ mod tests {
         assert!(directory.read_confirmed);
         assert_eq!(directory.events_read, 1);
         assert_eq!(directory.skipped, DirectorySkips::default());
+    }
+
+    #[test]
+    fn a_discovered_pubkey_is_accepted_by_the_unchanged_targeted_post_path() {
+        // The handoff, end to end and OFFLINE: the pubkey a discovery row carries goes into the
+        // EXISTING targeted-post parameter and comes back out of the parsed offer as the seat the
+        // offer addresses. No relay, no post, no payment — only the two ends of the flow the order
+        // names, joined by nothing but a 64-hex string.
+        //
+        // This test exists to catch a whole class of quiet breakage: a row field that renders fine
+        // and is not a valid target (padded, truncated, npub-encoded, upper-cased). Discovery's
+        // whole purpose is to end at a value `post_job` accepts, so the value is asserted through
+        // the real `OfferDraft` -> `to_event_draft` -> `parse_offer` path rather than eyeballed.
+        use crate::gateway::{OfferDraft, assert_seller_matches, is_targeted, parse_offer};
+
+        let directory = reduce_directory(
+            [announced(
+                SEAT_A,
+                NOW - 30,
+                &beat(Some("Rust async runtimes"), Some(open_policy())),
+            )],
+            DirectoryPolicy::at(NOW),
+        );
+        let discovered = directory.sellers[0].pubkey.clone();
+
+        let draft = OfferDraft::new(
+            "port a crate to tokio",
+            "text/plain",
+            1,
+            NOW + 600,
+            &discovered,
+        )
+        .to_event_draft();
+        let offer =
+            parse_offer(&draft).expect("an offer targeted at a discovered pubkey must parse");
+
+        assert!(
+            is_targeted(&offer),
+            "a discovered pubkey must produce a TARGETED offer, not an open-pool one"
+        );
+        assert!(offer.seller_matches(&discovered));
+        assert_seller_matches(&offer, &discovered)
+            .expect("the discovered seat must be the seat the offer addresses");
+        assert!(
+            !offer.seller_matches(SEAT_B),
+            "targeting one discovered seat must not address another"
+        );
+
+        // And the row's own specialty is nowhere on the offer. Discovery informed the CHOICE; it
+        // did not become a term of the deal.
+        assert!(
+            !draft
+                .tags
+                .iter()
+                .any(|tag| tag.0.iter().any(|value| value.contains("Rust async"))),
+            "specialty text must not ride the offer: {:?}",
+            draft.tags
+        );
     }
 
     #[test]
