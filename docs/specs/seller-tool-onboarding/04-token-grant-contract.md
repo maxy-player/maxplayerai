@@ -1,163 +1,275 @@
 # 04 — Token, grant and custody contract
 
-Paper artifact. **PROPOSED** throughout — gap G-6 in [01](01-integration-survey.md) records
-that no grant, token, budget or holder concept exists in this repository in any form. Anchored
-in plan v3 §4.
+Paper artifact. **PROPOSED** throughout. Anchored in plan v3 §4, and revised against the
+stage-0 verdict findings F1, F2 and F6.
+
+Citation convention as in [01](01-integration-survey.md): unqualified `store.rs` and `run.rs`
+are under `crates/maxplayer-core/src/seller_node/`.
 
 ## Trust boundary
 
 Trusted: the holder supervisor, and the genuine pinned CLI running inside the holder.
-Untrusted: buyer prompts, buyer-supplied inputs, and the job container — always, including
-when the job container is one the seller's own stack launched.
+Untrusted: buyer prompts, buyer-supplied inputs, and the job container — always.
 
-Plan v3 §4 chooses **trusted credential-reading children** over supervisor-only custody,
-because most real tools cannot be driven any other way. That choice imports an obligation,
-stated here so it cannot be quietly dropped:
+Plan v3 §4 chooses **trusted credential-reading children** over supervisor-only custody. That
+choice imports an obligation:
 
 > A container does not prove a CLI will not disclose its credential. The profile's reviewed
 > input semantics, egress policy, output handling and isolation are all load-bearing, and a
 > profile that cannot establish all four is unsupported in the initial release.
 
-## Enrollment
+## Part I — Grant open (F1)
 
-The seller enrolls **interactively, inside the persistent holder**, through a protected local
-terminal or a vendor browser flow. The tool writes its own authentication state into that
-environment.
+### The boundary is owned award, not a store write
 
-- Secrets never enter chat, command arguments, manifests, checker logs or notices.
-- A host login is **not** assumed portable into the holder. Initial login happens in the
-  holder (plan v3 §7), not by copying a host profile. This is the specific point on which the
-  existing `codex_subscription.rs` precedent diverges — it is host-held and injected — so that
-  module may contribute ideas but not its custody model (gap G-7).
-- The seller may be needed for initial enrollment. Jobs do not re-enroll while the session
-  stays valid.
+[01](01-integration-survey.md) §2.1 establishes from source that an award row means only "an
+award for this job exists": `Awarded::NoClaim` records someone else's win, `Awarded::Duplicate`
+returns before the claim is even read, and suppression (`run.rs:6291-6294`) and
+ACCEPT-without-execution (`run.rs:6172-6182`) reach the same method.
 
-## Per-job environment
+**The authorization adapter is therefore called at the authenticated owned-award / eligible
+execution boundary** — inside the `Awarded::New` arm (`run.rs:6428-6459`), after `match_award`
+has returned `AwardMatch::Execute` — and never from the store.
 
-At invocation the supervisor binds:
+### Five positive preconditions
 
-| Element | Binding |
+A grant opens only when **all five** hold. Any one unproven is a refusal, not a narrower grant.
+
+1. **Owned-win proof.** A local accepted-claim row exists whose claim id equals the award's
+   claim id. Presence of an award row is not proof (`store.rs:1584-1589`).
+2. **Authorized awarder.** The award author equals the buyer recorded on *our own* offer
+   (`run.rs:6382-6386`).
+3. **Eligible durable job state.** The job occupies an execution slot and is not terminal, not
+   lapsed, not delivered, not settled elsewhere.
+4. **Seller-approved binding.** The service id, party, resource set and ceilings come from the
+   seller's holder policy, keyed by a durable binding (below) — **never derived from buyer
+   prose, offer text or job content.**
+5. **Readable authority.** Every fact above was read successfully. An unreadable or errored
+   read is a refusal.
+
+### No grant on
+
+`NoClaim` · `Duplicate` · any store or read error · the suppression path · ACCEPT-only binding ·
+any award that failed `match_award` · resume of a lapsed or terminal row.
+
+### Arm-by-arm treatment
+
+| Arm / path | Grant behaviour |
 | --- | --- |
-| `HOME` | a private per-job directory, with a controlled configuration base |
-| cache | private, per-job, writable, discarded at close |
-| credential store | **only** the profile-selected store, exposed to the trusted child |
-| input | the holder-private staging directory ([03](03-command-policy-mapping.md)) |
-| output | the holder-created private slot |
-| egress | reviewed per profile; default deny |
+| `New` + `AwardMatch::Execute` | Open a fresh grant. The only minting path. |
+| `Duplicate` | **Never mint.** May only re-present the *same* committed authorization, after revalidating preconditions 1–5. Must not reset counters, extend deadlines, widen scope, or reopen a tombstone. |
+| `NoClaim` | Refuse. Nothing to authorize. |
+| ACCEPT-only | Refuse. The path explicitly does not execute. |
+| suppression | Refuse. Someone else's win. |
+| resume after restart | Treated as recovery, not as a new open — see Part II. |
 
-Never available: any buyer container's view of the credential mount, unrelated host files,
-other jobs' directories, the Docker socket, host process namespaces.
+### Idempotent open
 
-The existing `SandboxPolicy::forward_env` allowlist (`seller_exec.rs:612`, applied by
-`forwarded_agent_env` `:913`) is the right shape to build on and is deliberately testable
-against an injected lookup. It is an **environment** allowlist only; it is not a credential
-store selector, and it must not be described as one.
+Opening is a two-phase commit against the holder's own durable record, keyed by
+`(job_id, award_id, grant_version)`:
 
-Read-only credential mounts are used **only** for tools that actually tolerate them. Declaring
-read-only for a tool that must refresh is how the next section's bug appears.
+1. **reserve** the authorization row as `opening`;
+2. **commit** it as `admitted` once the token is minted.
 
-### Credential maintenance
+A crash between award and grant persistence leaves an `opening` row. Recovery **revalidates
+preconditions 1–5 and then either commits the same authorization idempotently or abandons it**.
+It never mints a second, differently scoped authorization for the same award, and a replayed
+award for an already-tombstoned job is refused.
 
-Tools that must write refresh tokens or profile state use a **serialized
-credential-maintenance operation outside job control**. Only its designated auth-store writes
-persist. Job-generated cache and config never merge back into the credential base.
+### The durable binding
 
-If a tool cannot separate auth-store writes from job state safely, that profile is marked
-**unsupported in the initial release**. Browser profile mutation and isolation are deferred —
-a lock file does not solve them.
+Because the `jobs` table has no service or grant column ([01](01-integration-survey.md) §2.2),
+the holder owns its own record. Per maxie's ruling: **use a durable holder admission/close
+record; do not add gratuitous marketplace state.**
 
-## Grant issuance
+```
+holder_admission
+  job_id            the marketplace job id (bare String; treated as untrusted until matched)
+  award_id          the award event id that authorized this admission
+  holder_id         which holder
+  party             seller-approved, from holder policy
+  service_id        seller-approved, from holder policy
+  grant_version     monotonic; frozen at admission
+  resources         the enumerated granted set
+  ceilings          calls / items / bytes
+  expiry            absolute
+  state             opening | admitted | closing | closed     (monotonic, never regresses)
+  close_reason      success | failure | cancel | timeout | expiry | reconciled-unknown
+  reservations      durable counters
+```
 
-The seller approves, in holder policy (surfaced through the manifest's `grant_policy`): allowed
-job **opener identities**, **parties**, **service IDs**, **verbs**, **resource sets** and
-**ceilings**.
+The seller-controlled source of `party`, `service_id`, `resources` and `ceilings` is the
+manifest's `grant_policy` ([02](02-manifest-schema.md)), reviewed by a human. The mapping from
+a marketplace job to a holder/service is seller configuration, not inference.
 
-On job creation the holder validates the request against **both** that policy **and the
-authoritative job record**, and rejects excess rather than silently narrowing to the allowed
-subset. Two rules that are easy to lose:
+## Part II — Close, restart and reconciliation (F2)
 
-- **An authenticated opener cannot grant itself more authority.** Being allowed to open jobs is
-  not being allowed to choose their scope.
-- **A policy change cannot broaden an existing job.** Grants are versioned; a running job keeps
-  the grant version it was issued.
+### Why the holder cannot trust the marketplace record
 
-Connection point: immediately after `record_award` (`seller_node/store.rs:1590`) and before
-`mark_executing` (`:1699`) — see [01](01-integration-survey.md) for why award, not offer.
+From source ([01](01-integration-survey.md) §2.3): timeout **does** reach `Failed`, but
+`fail_job` is best-effort — "a fail-mark that itself errors is logged, never propagated — the
+loop keeps serving" — and it logs `Ok(0)` "no job row moved" and `Err` "write error
+(continuing)". Restart re-drives non-terminal rows (`run.rs:4597-4634`), graceful shutdown
+leaves rows for replay (`run.rs:4721-4727`), and resume treats a **missing deadline as live**
+(`run.rs:~1548-1578`).
 
-## Token shape and verification
+Those are correct marketplace choices — never lose a genuine award. They are the **opposite**
+of what credential authority needs. Per maxie's ruling: **fail closed independently rather than
+trusting the record.**
 
-The holder issues a token bound to: **holder, party, service, job ID, grant version, expiry.**
+Three consequences, binding:
 
-Every call verifies, before any child process exists:
+1. The holder's own admission record is authoritative for authority decisions; the marketplace
+   record is corroborating evidence.
+2. The holder enforces its **own** absolute deadline. A missing or unreadable deadline is
+   **expired**, not live.
+3. A marketplace resume never reopens a grant. Only a fresh authorized open does.
 
-1. signature;
-2. audience (this holder);
-3. time, against a controlled clock;
-4. an **active** job record in the authoritative store;
-5. party equality and service equality against that record;
-6. verb membership and resource membership in the grant;
-7. remaining budget.
+### Commit point and ordering
 
-**Claims alone never override the record.** A token whose claims say `job=J, resource=R` while
-the record says `J` is closed is a rejection, not a permitted call. Because the seller-path job
-id is a bare `String` (gap G-5), this record re-check is the *only* thing standing between job
-`K`'s valid token and job `J`'s resources — there is no type-level protection. Test 6 in
-[07](07-test-entrypoints-and-evidence.md) exists specifically to hold that line.
+Close has one commit point: the monotonic transition of `state` to `closing` with a
+`close_reason`, in the holder's durable store.
 
-## Close
+Ordering is fixed, because "deny new calls" and "clean up" cannot share one transaction —
+process termination and filesystem removal are not transactional with SQLite:
 
-Close happens on success, failure, cancellation or timeout, and is **atomic**: it denies new
-calls, revokes mediated tokens, stops owned processes, and removes job data.
+1. **commit** `closing` + `close_reason` durably;
+2. from that instant **deny all new calls and renewals** for this job;
+3. **release or forfeit** outstanding reservations (below);
+4. revoke mediated tokens; stop supervisor-owned processes; remove job data;
+5. **commit** `closed`.
 
-- Closed-job records **persist through token expiry**; a record cannot be forgotten while a
-  token naming it could still be presented.
-- Restart **fails closed** until active records are reconciled.
-- Renewal cannot revive a closed job. Neither can a restart.
-- Process-group kill is **insufficient**: descendants can escape it. Lifecycle control is
-  supervisor-owned container/cgroup or equivalent, and test 9 explicitly starts a descendant.
+Steps 3–5 are **idempotent and repeatable**. A crash anywhere re-runs them from the durable
+`closing` row. Because step 1 precedes every effect, a crash after step 1 still denies calls.
 
-Existing states cover Delivered | Paid | Failed via `is_finished()` (`store.rs:743`).
-Cancellation and timeout have no store state (gap G-2), so the timeout path driven by
-`job_timeout_secs` must be wired to close explicitly. An unwired timeout is a job that stays
-open past its budget — the failure this contract most wants to avoid.
+### Adapter call sites
+
+| Event | Core site | Reason |
+| --- | --- | --- |
+| success | delivery/enqueue path | `success` |
+| failure and timeout | every path through `fail_job` (`run.rs:8377-8393`) | `failure` / `timeout` |
+| cancellation, shutdown | graceful shutdown (`run.rs:4721-4727`) | `cancel` |
+| boot reconciliation | restart sweep (`run.rs:4597-4634`) | see below |
+| holder-local expiry | holder's own timer, independent of core | `expiry` |
+
+The last row is essential: **the holder supervises its own deadlines**, so a marketplace process
+that disappears entirely still results in closure. Holder-side expiry does not depend on any
+core call arriving.
+
+### Boot reconciliation
+
+On start, every `opening`, `admitted` or `closing` row is reconciled **before any call is
+served**:
+
+- `closing` → re-run idempotent steps 3–5.
+- `admitted` past its holder-enforced expiry → close, reason `expiry`.
+- `admitted` within expiry → serve **only** if preconditions 1–5 re-verify against a currently
+  eligible job; otherwise close with `reconciled-unknown`.
+- `opening` → the idempotent-open rule in Part I.
+
+**Fail closed until reconciliation completes.** An unreadable or lost holder record is
+`reconciled-unknown`: deny, do not reconstruct authority from the marketplace record.
+
+### Reservations and uncertain vendor effects
+
+Outstanding reservations at close are **forfeited, not refunded**, unless the holder holds
+positive proof the effect did not occur. "The process died before we saw a response" is not
+proof of non-occurrence.
+
+**No write auto-replays, ever** — not on restart, not on reconciliation, not on resume. Where a
+call's outcome is unknown, the holder records an `uncertain-effect` marker against the closed
+job and surfaces it to the seller. Marketplace resume may legitimately re-run an agent
+(`run.rs:~1548-1578`); that must never re-drive a vendor write through a reopened grant, which
+is exactly why resume cannot reopen a grant.
 
 ### Residual, recorded rather than solved
 
 **Vendor operations already accepted can outlive local cancellation.** Closing a job stops our
-calls; it does not undo a send, a charge or a publish the vendor already accepted. Counters
-bound *admission*, not consequence. This residual is disclosed to the seller and is never
-described as mitigated.
+calls; it does not undo a send, a charge or a publish the vendor accepted. Counters bound
+*admission*, not consequence. Disclosed to the seller; never described as mitigated.
 
-## Budgets
+## Part III — Token verification
 
-Reserve calls, items and bytes **atomically before execution**, using the profile-declared
-**maximum** effects, not the observed ones. Refuse operations whose maximum is unbounded.
+The token binds **holder, party, service, job ID, grant version, expiry**.
 
-- Counters survive restart.
-- Counters do **not** reset on token renewal.
-- Counters reset only for a separately authorized new job.
-- Refund only reservations **proved** unused.
+Every call verifies, before any child process exists:
 
-Concurrency is the interesting case: two calls whose combined declared maxima exceed the limit
-must not both admit. That is why reservation precedes execution, rather than accounting
-following it.
+1. signature; 2. audience; 3. time against the holder's clock; 4. an `admitted` **holder
+admission row** (not merely a marketplace job row); 5. party and service equality; 6. verb and
+resource membership; 7. remaining budget.
 
-## Holder sharing
+**Claims never override the record.** Because the seller-path job id is a bare `String`
+([01](01-integration-survey.md) §2.2), this record re-check is the only barrier between job
+`K`'s token and job `J`'s resources.
 
-Separate holders for different parties and vendors. Where a holder is shared
-(`party_scope: shared-holder`), **sharing a holder never grants one job another job's
-resources** — the grant check above enforces it, and test 8 demonstrates it.
+## Part IV — Custody
 
-Seller hosting is the initial scope. Platform-hosted credential custody is deferred.
+### Enrollment
 
-## Lifecycle failure
+The seller enrolls **interactively, inside the persistent holder**, via a protected local
+terminal or vendor browser flow. Secrets never enter chat, arguments, manifests, logs or
+notices. A host login is not assumed portable (plan v3 §7).
 
-When the vendor expires authentication mid-operation, the holder:
+The existing per-job credential proxy ([01](01-integration-survey.md) §4.1) is prior art for
+mediation and for fail-closed containment — "there is no fallback to putting the real
+credential in the container" (`seller_exec.rs:2575-2620`) — and the kit should adopt both that
+posture and the no-`Debug` secret type from `codex_subscription.rs:14-19`. It is **not** an
+enrolled persistent tool holder, and must not be described as one.
 
-1. returns a credential-expired result for the in-flight call;
-2. marks itself unhealthy;
-3. queues **one** seller notice, containing no secret;
-4. pauses registration and refuses new work.
+### Per-job environment
 
+| Element | Binding |
+| --- | --- |
+| `HOME` | private per-job directory, controlled configuration base |
+| cache | private, per-job, discarded at close |
+| credential store | only the profile-selected store, to the trusted child |
+| input / output | holder-private staging and slot ([03](03-command-policy-mapping.md)) |
+| egress | default deny; reviewed allowlist, ideally one pinned upstream |
+
+Never available: the credential mount from any buyer container, unrelated host files, other
+jobs' directories, the Docker socket, host process namespaces.
+
+The child environment **starts empty** except reviewed tool/runtime variables. This is
+deliberately *not* the existing `FORWARDED_AGENT_ENV` + `forward_env` behaviour
+(`seller_exec.rs:301,908`), which forwards a built-in credential-bearing allowlist plus
+operator additions. Reuse the mechanism; do not inherit the defaults.
+
+### Credential maintenance
+
+Refresh/profile writes use a **serialized credential-maintenance operation outside job
+control**. Only its designated auth-store writes persist; job cache/config never merges back.
+A tool that cannot separate those writes is **unsupported in the initial release**. Browser
+profile mutation and isolation are deferred; a lock file does not solve them.
+
+## Part V — Holder sharing (F6)
+
+Separate holders for different parties and vendors, without exception.
+
+**`party_scope` selects between exactly two shapes, and neither permits cross-party sharing:**
+
+- `per-party` — one holder instance per party. The default.
+- `shared-holder` — **one holder serving concurrent jobs of the same party and the same
+  vendor.** It exists only so several simultaneous jobs from one party can reuse one enrolled
+  login.
+
+**No cross-party authority may be inferred from `shared-holder`.** A manifest listing parties
+`P` and `Q` declares which openers may open jobs; it does **not** authorize one holder to serve
+both. Distinct parties are represented as distinct holders.
+
+Seller hosting is the initial scope; platform-hosted credential custody is deferred.
+
+## Part VI — Budgets
+
+Reserve calls, items and bytes **atomically before execution**, from profile-declared **maxima**.
+Refuse unbounded operations. Counters survive restart, do not reset on renewal, and reset only
+for a separately authorized new job. Refund only reservations **proved** unused.
+
+Concurrency: two calls whose combined declared maxima exceed a ceiling must not both admit —
+reservation precedes execution rather than accounting following it.
+
+## Part VII — Lifecycle failure
+
+On vendor auth expiry mid-operation the holder returns credential-expired, marks itself
+unhealthy, queues **one** secret-free seller notice, pauses registration and refuses new work.
 Recovery is protected re-enrollment plus a successful health check, after which a **newly
-authorized** job may run. The job that failed stays closed. **No write auto-replays.**
+authorized** job may run. The failed job stays closed. **No write auto-replays.**
