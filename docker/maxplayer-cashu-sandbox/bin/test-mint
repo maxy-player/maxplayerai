@@ -1,0 +1,176 @@
+#!/bin/sh
+# test-mint — start/stop/reset the sandbox-local fakewallet test mint.
+#
+# Worthless test ecash, loopback only, state in the job workdir. Reproducible: `reset` returns the
+# mint to a known-empty state, `start` is idempotent, and nothing here touches a seller config or
+# any host path.
+#
+# The seed is a throwaway BIP-39 mnemonic generated at reset into a 0600 file and passed to
+# cdk-mintd with --seed-file. It is never echoed, never an argument, never in this image.
+
+set -eu
+
+WORK="${TEST_MINT_WORK_DIR:-/work/.test-mint}"
+HOST="${TEST_MINT_HOST:-127.0.0.1}"
+PORT="${TEST_MINT_PORT:-8085}"
+URL="http://${HOST}:${PORT}/"
+TEMPLATE="${TEST_MINT_TEMPLATE:-/opt/cashu/test-mint.config.toml}"
+
+CONFIG="${WORK}/config.toml"
+SEED="${WORK}/seed"
+PIDFILE="${WORK}/mintd.pid"
+LOG="${WORK}/mintd.log"
+
+# Containment is the point of this rig, so it is enforced here rather than documented. A mint bound
+# to anything but loopback would be reachable from the seller's LAN through the job's bridge
+# interface; docs/SANDBOXING.md denies the LAN by destination, not the container's own listeners.
+case "${HOST}" in
+    127.0.0.1|::1|localhost) ;;
+    *)
+        echo "test-mint: refusing to bind ${HOST}: loopback only (127.0.0.1, ::1)" >&2
+        exit 2
+        ;;
+esac
+
+is_running() {
+    [ -f "${PIDFILE}" ] || return 1
+    pid=$(cat "${PIDFILE}" 2>/dev/null || echo "")
+    [ -n "${pid}" ] || return 1
+    kill -0 "${pid}" 2>/dev/null
+}
+
+# node is in the base image (node:22-bookworm-slim); curl is not. /v1/info is the NUT-06 mint info
+# endpoint, so a 200 here means the mint is actually serving the protocol, not merely listening.
+probe() {
+    node -e '
+        const url = process.argv[1];
+        fetch(url, { signal: AbortSignal.timeout(2000) })
+            .then(r => r.ok ? r.text().then(t => { process.stdout.write(t); process.exit(0); })
+                            : process.exit(1))
+            .catch(() => process.exit(1));
+    ' "http://${HOST}:${PORT}/v1/info" 2>/dev/null
+}
+
+ensure_state() {
+    mkdir -p "${WORK}"
+    if [ ! -s "${SEED}" ]; then
+        old_umask=$(umask)
+        umask 077
+        test-mint-seed > "${SEED}"
+        umask "${old_umask}"
+        chmod 0600 "${SEED}"
+    fi
+    if [ ! -s "${CONFIG}" ]; then
+        sed -e "s|__MINT_URL__|${URL}|g" \
+            -e "s|__LISTEN_HOST__|${HOST}|g" \
+            -e "s|__LISTEN_PORT__|${PORT}|g" \
+            "${TEMPLATE}" > "${CONFIG}"
+    fi
+}
+
+cmd_start() {
+    if is_running; then
+        echo "test-mint: already running (pid $(cat "${PIDFILE}")) at ${URL}"
+        return 0
+    fi
+    ensure_state
+    cdk-mintd --work-dir "${WORK}" --config "${CONFIG}" --seed-file "${SEED}" \
+        >> "${LOG}" 2>&1 &
+    echo $! > "${PIDFILE}"
+
+    i=0
+    while [ "${i}" -lt 60 ]; do
+        if probe >/dev/null; then
+            echo "test-mint: up at ${URL} (pid $(cat "${PIDFILE}"), work-dir ${WORK})"
+            return 0
+        fi
+        if ! is_running; then
+            echo "test-mint: mintd exited during startup; last log lines:" >&2
+            tail -n 20 "${LOG}" >&2 || true
+            return 1
+        fi
+        i=$((i + 1))
+        sleep 1
+    done
+    echo "test-mint: timed out after 60s waiting for ${URL}v1/info; last log lines:" >&2
+    tail -n 20 "${LOG}" >&2 || true
+    return 1
+}
+
+cmd_stop() {
+    if ! is_running; then
+        rm -f "${PIDFILE}"
+        echo "test-mint: not running"
+        return 0
+    fi
+    pid=$(cat "${PIDFILE}")
+    kill "${pid}" 2>/dev/null || true
+    i=0
+    while [ "${i}" -lt 20 ] && kill -0 "${pid}" 2>/dev/null; do
+        i=$((i + 1))
+        sleep 1
+    done
+    kill -9 "${pid}" 2>/dev/null || true
+    rm -f "${PIDFILE}"
+    echo "test-mint: stopped (pid ${pid})"
+}
+
+# restart keeps the database and the seed: that is the "recovery/restart without lost or duplicate
+# balance" case. reset throws both away and is the between-runs clean slate.
+cmd_restart() {
+    cmd_stop
+    cmd_start
+}
+
+cmd_reset() {
+    cmd_stop >/dev/null 2>&1 || true
+    rm -rf "${WORK}"
+    echo "test-mint: reset (removed ${WORK})"
+}
+
+cmd_status() {
+    if is_running && probe >/dev/null; then
+        echo "test-mint: healthy at ${URL} (pid $(cat "${PIDFILE}"))"
+        return 0
+    fi
+    if is_running; then
+        echo "test-mint: process alive (pid $(cat "${PIDFILE}")) but ${URL}v1/info is not answering"
+        return 1
+    fi
+    echo "test-mint: not running"
+    return 1
+}
+
+case "${1:-help}" in
+    start)   cmd_start ;;
+    stop)    cmd_stop ;;
+    restart) cmd_restart ;;
+    reset)   cmd_reset ;;
+    status)  cmd_status ;;
+    info)    probe || { echo "test-mint: no answer at ${URL}v1/info" >&2; exit 1; } ;;
+    url)     echo "${URL}" ;;
+    logs)    tail -n "${2:-50}" "${LOG}" ;;
+    help|--help|-h)
+        cat <<EOF
+test-mint — sandbox-local fakewallet mint (worthless test ecash, loopback only)
+
+  start     start the mint, wait until /v1/info answers
+  stop      stop the mint, keep the database
+  restart   stop then start, keeping database and seed (restart-recovery case)
+  reset     stop and delete ${WORK} entirely (clean slate)
+  status    exit 0 only if the mint is serving /v1/info
+  info      print the NUT-06 mint info document
+  url       print the mint URL
+  logs [n]  last n lines of the mint log (default 50)
+
+Environment: TEST_MINT_WORK_DIR (default /work/.test-mint), TEST_MINT_HOST (loopback only),
+TEST_MINT_PORT (default 8085).
+
+This mint must never be added to a seller's accepted_mints.
+EOF
+        ;;
+    *)
+        echo "test-mint: unknown command '$1' (try: test-mint help)" >&2
+        exit 64
+        ;;
+esac
