@@ -42,9 +42,18 @@ engine = "sqlite"
 
 # Single fakewallet backend on sat. Repeat as [[ln]] with a different `unit` to exercise
 # multi-unit; duplicate (unit, method) pairs are rejected at startup.
+# min_mint/max_mint/min_melt/max_melt are REQUIRED here, even though cdk-mintd's own
+# example.config.toml shows them commented out: `struct Ln` (src/config.rs:170-179) gives them no
+# #[serde(default)], so omitting any one of them fails the whole file with the unhelpful
+# "data did not match any variant of untagged enum LnOneOrMany for key `ln`". Measured: that is
+# exactly how the first run of this rig failed. Values below mirror `impl Default for Ln`.
 [ln]
 ln_backend = "fakewallet"
 unit = "sat"
+min_mint = 1
+max_mint = 500000
+min_melt = 1
+max_melt = 500000
 
 [fake_wallet]
 # Non-zero so melt fee-reserve behaviour is exercised rather than silently skipped.
