@@ -1,5 +1,29 @@
 # Seller tool onboarding kit — stage 0 contract
 
+> ## ⚠ Read this first: the lifecycle model here is superseded, and code now exists
+>
+> Governing document: `v2/maxie/runs/seller-tool-scope-correction-20260909.md`
+> (sha256 `683da09559bfc12631062c84ecdf4080778c4b31a3e7c16b3a49a7aa89dc64c3`). It overrides
+> plan v3 and every file in this directory wherever they conflict.
+>
+> Petar, 2026-09-09: *"the seller is defined by it's offering, there is no offering per job, it
+> is per seller, tool should at all times be active together with the seller daemon"*.
+>
+> **Withdrawn across this directory:** per-job tool grants, award-eligibility adapters, award
+> replay gates, and proposed marketplace job-state changes. Wherever a file below reasons about
+> issuing or expiring a tool grant per job, that reasoning no longer applies; the affected
+> sections carry their own notes, and [04](04-token-grant-contract.md) Part I is superseded
+> outright.
+>
+> **The model that replaced it:** one enrolment per seller daemon, live for the daemon's
+> lifetime. A job gets an endpoint and a directory, never a grant.
+>
+> **Status has also moved on.** The "paper contract only" line below was true when written and
+> is no longer. `crates/maxplayer-tool-kit` implements this model, with 32 tests and a Linux
+> container demonstration under `docker/demo.sh`. What survives unchanged is the *epistemic*
+> caution: that kit is exercised against a fake vendor and a CLI written for it, so it
+> establishes mechanism, not third-party acceptance and not a security guarantee.
+
 Status: **paper contract only.** No runtime implementation, no shipped support, no security
 guarantee is established by anything in this directory. Every "the holder does X" sentence
 below is a *requirement placed on a future implementation*, never a description of code that

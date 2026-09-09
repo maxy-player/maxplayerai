@@ -1,5 +1,32 @@
 # 04 — Token, grant and custody contract
 
+> ## ⚠ Part I is SUPERSEDED. Parts II onward stand.
+>
+> Governing document: `v2/maxie/runs/seller-tool-scope-correction-20260909.md`
+> (sha256 `683da09559bfc12631062c84ecdf4080778c4b31a3e7c16b3a49a7aa89dc64c3`), which overrides
+> plan v3 and this contract wherever they conflict.
+>
+> Petar, 2026-09-09: *"the seller is defined by it's offering, there is no offering per job, it
+> is per seller, tool should at all times be active together with the seller daemon"*.
+>
+> **Withdrawn:** the per-job grant model in Part I below — award-eligibility adapters, grant
+> issuance at the owned-award boundary, per-job grant expiry, award replay gates, and every
+> proposed marketplace job-state change. The award boundary is not the tool-lifecycle boundary,
+> and the careful reasoning in Part I about *which* award edge to hook is answering a question
+> that should not have been asked.
+>
+> **What replaced it:** the tool enrols once when the seller daemon starts and stays enrolled
+> until that daemon stops. A job is an addressing and isolation concern only — `attach_job`
+> creates a per-job endpoint and directory, `detach_job` removes them and explicitly reports
+> `tool_still_enrolled: true`. Neither issues, meters nor expires anything.
+>
+> **Still live in this document:** the trust boundary immediately below, and the custody,
+> containment, persistence and re-enrolment obligations in Parts II onward. Those were never
+> about awards and are the parts the implementation actually honours.
+>
+> Implemented in `crates/maxplayer-tool-kit`; demonstrated in `docker/demo.sh`, whose evidence
+> shows one login serving two sequential jobs and surviving a daemon restart.
+
 Paper artifact. **PROPOSED** throughout. Anchored in plan v3 §4, and revised against the
 stage-0 verdict findings F1, F2 and F6.
 
