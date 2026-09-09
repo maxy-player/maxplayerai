@@ -35,4 +35,8 @@ COPY fixtures/seller-tool-config.json /etc/maxplayer/seller-tool-config.json
 # per-job sockets live under this directory.
 RUN mkdir -p /run/holder /var/lib/holder /srv/jobs
 
-CMD ["/usr/local/bin/holderctl", "--help"]
+# No binary in this kit has a --help path: both CLIs print a usage line to stderr and exit
+# non-zero when their arguments are wrong. So the default command does not pretend to be a
+# help screen — it names what the image carries and exits 0. Every real use of this image
+# overrides the command anyway (vendor-service, tool-holderd, or a job's own entrypoint).
+CMD ["/bin/sh", "-c", "echo 'maxplayer-tool-kit image. Run one of: vendor-service, vendor-cli, tool-holderd, holderctl, tool-mcp-bridge.'; echo 'CLI usage: vendor-cli <login|health|whoami|transform|logout> | holderctl <status|health|tools|attach|detach|reenroll|shutdown> --socket <path>'"]
