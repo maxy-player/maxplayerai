@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use cdk::nuts::nut00::ProofsMethods;
-use cdk::nuts::{CurrencyUnit, PaymentMethod};
+use cdk::nuts::{CurrencyUnit, MeltQuoteState, PaymentMethod};
 use cdk::wallet::{ReceiveOptions, SendOptions, Wallet};
 use cdk::Amount;
 use cdk_fake_wallet::{create_fake_invoice, FakeInvoiceDescription};
@@ -206,26 +206,48 @@ async fn main() -> Result<()> {
     // `pay_err` by returning UnknownInvoice from make_payment (cdk-fake-wallet 0.17.2
     // src/lib.rs:659-714). That is a genuine failed outgoing payment, not a skipped leg.
     t.leg("failed payment + no balance lost");
+    // check_payment_state MUST be Unpaid as well, not just pay_err. cdk-fake-wallet inserts
+    // check_payment_state into its payment_states map BEFORE it honours pay_err
+    // (src/lib.rs:706-714), so leaving it at the Paid default makes the mint's follow-up status
+    // check report PAID and the melt finalises as Paid even though make_payment errored. Measured:
+    // with the default the harness saw state=Paid, amount=5, fee_paid=0.
     let fail_desc = FakeInvoiceDescription {
+        pay_invoice_state: MeltQuoteState::Unpaid,
+        check_payment_state: MeltQuoteState::Unpaid,
         pay_err: true,
         check_err: false,
-        ..Default::default()
     };
-    let bad_invoice = create_fake_invoice(MELT * 1_000, serde_json::to_string(&fail_desc)?);
+    let fail_json = serde_json::to_string(&fail_desc)?;
+    let bad_invoice = create_fake_invoice(MELT * 1_000, fail_json.clone());
+    // The injection only works if the mint can read back exactly the JSON we put in the BOLT11
+    // description, so prove the round trip rather than assuming it.
+    let round_trip = bad_invoice.description().to_string();
+    println!("  injected description: {fail_json}");
+    println!("  invoice description read back: {round_trip}");
+    let parses: Option<FakeInvoiceDescription> = serde_json::from_str(&round_trip).ok();
+    t.check(
+        "failure payload survives the BOLT11 description round trip",
+        parses.as_ref().map(|d| d.pay_err).unwrap_or(false),
+        format!("parsed={:?}", parses.is_some()),
+    )?;
     let before_fail = balance(&receiver).await?;
     let fail_quote = receiver
         .melt_quote(PaymentMethod::BOLT11, bad_invoice.to_string(), None, None)
         .await?;
     let prepared_fail = receiver.prepare_melt(&fail_quote.id, HashMap::new()).await?;
     let fail_result = prepared_fail.confirm().await;
-    t.check(
-        "melt against a failing payment errors",
-        fail_result.is_err(),
-        match &fail_result {
-            Ok(_) => "SUCCEEDED — the mint paid an invoice it should not have".to_owned(),
-            Err(e) => format!("rejected: {e}"),
-        },
-    )?;
+    // A failed outgoing payment can surface two ways and both are correct: the wallet call errors,
+    // or it returns a FinalizedMelt whose state is not Paid. What is NOT acceptable is a Paid melt
+    // for an invoice the backend refused. Assert on the outcome, not on the shape of the report.
+    let (failed, detail) = match &fail_result {
+        Err(e) => (true, format!("wallet call errored: {e}")),
+        Ok(f) => {
+            let state = format!("{:?}", f.state());
+            let paid = state.eq_ignore_ascii_case("Paid");
+            (!paid, format!("melt returned state={state}, amount={}, fee_paid={}", u64::from(f.amount()), u64::from(f.fee_paid())))
+        }
+    };
+    t.check("mint did NOT pay the failing invoice", failed, detail)?;
     // The wallet must not silently burn the inputs it reserved for a payment that never happened.
     // check_all_pending_proofs asks the MINT the state of every proof the wallet has reserved and
     // returns the ones the mint says are still unspent to the spendable set. That is the recovery
