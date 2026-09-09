@@ -2,27 +2,42 @@
 #
 # The Cashu/CDK specialist job sandbox.
 #
-# It is the ordinary maxplayer sandbox image plus three things a Cashu/CDK job cannot get at run
-# time without paying for them: a `cdk-mintd` built at the SAME CDK version this workspace pins,
-# the Cashu spec + CDK source corpus on disk at pinned commits, and a start/stop/reset rig for a
-# loopback-only fakewallet test mint.
+# It is the ordinary maxplayer sandbox image plus what a Cashu/CDK job cannot get at run time
+# without paying for it:
 #
-# The mint this image carries is a FAKEWALLET mint. It issues worthless test ecash, it binds
-# 127.0.0.1 only, and its database lives in the job workdir and dies with the container. It must
-# never appear in a seller's `accepted_mints` — that set is the seller's real-money surface and is
-# checked twice in crates/maxplayer-core/src/payment_wallet.rs (realized mint, and the NUT-18
-# payload mint). Nothing in this image writes to a seller config.
+#   * a PINNED Rust toolchain and a warm CDK dependency cache, so a job compiles CDK code OFFLINE
+#     (advisor F1 — the first cut shipped only precompiled binaries, and BuildKit cache mounts
+#     never become image layers);
+#   * the Cashu spec and CDK source at pinned commits;
+#   * the curated knowledge topics AT A CONTAINER PATH (advisor F2 — the injected MEMORY.md index
+#     used to link host files that a contained job cannot reach);
+#   * `cdk-mintd` built at the same CDK version this workspace pins, plus a start/stop/reset rig for
+#     a loopback-only fakewallet test mint whose private state stays OUT of the delivered workdir
+#     (advisor F3);
+#   * a baked acceptance harness and a from-source example.
+#
+# The mint here is a FAKEWALLET mint: worthless test ecash, 127.0.0.1 only, state disposable. It
+# must never appear in a seller's `accepted_mints` — checked twice in
+# crates/maxplayer-core/src/payment_wallet.rs (realized mint, and the NUT-18 payload mint). Nothing
+# in this image writes to a seller config.
 #
 # Build from the REPO ROOT, after the base image exists:
 #   docker buildx build -f docker/maxplayer-sandbox/Dockerfile -t maxplayer-sandbox:v0.5.8-local .
 #   docker buildx build -f docker/maxplayer-cashu-sandbox/Dockerfile \
 #       --build-arg BASE_IMAGE=maxplayer-sandbox:v0.5.8-local \
 #       -t maxplayer-cashu-sandbox:v0.5.8-local .
+#
+# Every FROM below is pinned by DIGEST (advisor F6): `rust:1-bookworm` and `debian:bookworm-slim`
+# are moving tags, and a rebuild against a different toolchain is a different artifact. BASE_IMAGE
+# defaults to the digest of the base built from this same commit; pass a tag only deliberately.
 
-ARG BASE_IMAGE=maxplayer-sandbox:v0.5.8-local
+ARG BASE_IMAGE=maxplayer-sandbox@sha256:4b644531ffe3fdc0c4414aa8d6f9027c58a3f18124bb7abe61bb622973731eea
+# rust:1-bookworm as of 2026-09-08 = rustc 1.98.1 (48a229cea 2026-09-01), cargo 1.98.1.
+ARG RUST_IMAGE=rust@sha256:9a73a5088750b4c95158ab26629c854c3d6fc4b173cb7bc8079ad252d8ed7bfa
+ARG DEBIAN_IMAGE=debian@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
 
 # CDK version is pinned to the version THIS workspace depends on
-# (crates/maxplayer-core/Cargo.toml:59,80,81 and crates/maxplayer/Cargo.toml:105-107 — all =0.17.2).
+# (crates/maxplayer-core/Cargo.toml:62,83-84 and crates/maxplayer/Cargo.toml:105-107 — all =0.17.2).
 # A test mint on a different CDK than the wallet under test would make a protocol mismatch look
 # like a bug in our code.
 ARG CDK_VERSION=0.17.2
@@ -32,10 +47,10 @@ ARG CDK_COMMIT=6132607495ae0741e412a63f2acc34e4ccddfc55
 # the seat's MEMORY.md states this pin so the agent never quotes an old NUT as current.
 ARG NUTS_COMMIT=49a909ce4d0739824b3859d4b3da21e6c1abdaeb
 
-# ---------------------------------------------------------------------------------------------
-# mintd + a seed generator
-# ---------------------------------------------------------------------------------------------
-FROM rust:1-bookworm AS mint-builder
+# =============================================================================================
+# builder — mint, seed generator, harness, and the runtime toolchain payload
+# =============================================================================================
+FROM ${RUST_IMAGE} AS mint-builder
 ARG CDK_VERSION
 
 # protoc is a BUILD-TIME requirement even with --no-default-features: cdk-mintd depends on
@@ -61,55 +76,53 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         --root /out; \
     strip /out/bin/cdk-mintd
 
-# cdk-mintd REQUIRES a seed: lib.rs:1238 bails with "No seed nor remote signatory set", and
-# --seed-file is parsed as a BIP-39 mnemonic (lib.rs:276-286). There is no auto-generation. So the
-# rig mints a throwaway mnemonic per reset, into a 0600 file in the job workdir, and passes it by
-# --seed-file — never on a command line, never in a log, never in this image. bip39 2.2.2 is the
-# version cdk-mintd 0.17.2 already resolves, so it comes out of the same warm registry.
+# The seed generator and the harness are real crates with COMMITTED lockfiles, installed --locked
+# (advisor F6 — they were inline heredocs with ranged dependencies and no recorded resolution).
+COPY docker/maxplayer-cashu-sandbox/seedgen /src/seedgen
+COPY docker/maxplayer-cashu-sandbox/acceptance /src/acceptance
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,id=cashu-mint-target,target=/tmp/target \
     set -eux; \
-    mkdir -p /seedgen/src; \
-    printf '%s\n' \
-        '[package]' \
-        'name = "test-mint-seed"' \
-        'version = "0.1.0"' \
-        'edition = "2021"' \
-        '' \
-        '[dependencies]' \
-        'bip39 = { version = "2.2.2", features = ["rand"] }' \
-        > /seedgen/Cargo.toml; \
-    printf '%s\n' \
-        'fn main() {' \
-        '    let m = bip39::Mnemonic::generate(12).expect("generate mnemonic");' \
-        '    println!("{m}");' \
-        '}' \
-        > /seedgen/src/main.rs; \
-    CARGO_TARGET_DIR=/tmp/target cargo install --path /seedgen --root /out; \
-    strip /out/bin/test-mint-seed
+    CARGO_TARGET_DIR=/tmp/target cargo install --path /src/seedgen --locked --root /out; \
+    CARGO_TARGET_DIR=/tmp/target cargo install --path /src/acceptance --locked --root /out; \
+    strip /out/bin/test-mint-seed /out/bin/mint-acceptance /out/bin/test-mint-invoice
 
-# The acceptance harness. It is baked rather than compiled at run time so the gate maxie runs is a
-# single command with no build step and no network fetch, and so the binary is pinned to the same
-# CDK as the mint and the seller.
-COPY docker/maxplayer-cashu-sandbox/acceptance /acceptance
+# The RUNTIME toolchain payload (advisor F1). Assembled in the same RUN as the registry cache mount,
+# because a cache mount is not a layer: it has to be copied into a real directory here or it is gone.
+#
+# What goes in: the single installed toolchain (rustc, cargo, clippy, rustfmt, rust-std, rust-src)
+# and a CARGO_HOME carrying the registry index plus the .crate archives for the whole CDK
+# dependency graph. What stays out: rustup itself (a job pins one toolchain and must not fetch
+# another), docs and man pages.
+#
+# `registry/src` is dropped deliberately: cargo extracts sources from `registry/cache/*.crate` on
+# first use, so offline builds work without carrying both copies.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=cashu-mint-target,target=/tmp/target \
     set -eux; \
-    CARGO_TARGET_DIR=/tmp/target cargo install --path /acceptance --root /out; \
-    strip /out/bin/mint-acceptance
+    toolchain="$(ls -d /usr/local/rustup/toolchains/* | head -n 1)"; \
+    mkdir -p /out/rust; \
+    cp -a "${toolchain}" /out/rust/toolchain; \
+    rm -rf /out/rust/toolchain/share/doc /out/rust/toolchain/share/man; \
+    mkdir -p /out/rust/cargo; \
+    cp -a /usr/local/cargo/registry /out/rust/cargo/registry; \
+    rm -rf /out/rust/cargo/registry/src; \
+    /out/rust/toolchain/bin/rustc --version > /out/rust/TOOLCHAIN.txt; \
+    /out/rust/toolchain/bin/cargo --version >> /out/rust/TOOLCHAIN.txt; \
+    du -sh /out/rust/toolchain /out/rust/cargo/registry >> /out/rust/TOOLCHAIN.txt
 
-# ---------------------------------------------------------------------------------------------
-# knowledge corpus, at pinned commits
-# ---------------------------------------------------------------------------------------------
-FROM debian:bookworm-slim AS corpus
+# =============================================================================================
+# corpus — the spec and CDK source, at pinned commits
+# =============================================================================================
+FROM ${DEBIAN_IMAGE} AS corpus
 ARG CDK_COMMIT
 ARG NUTS_COMMIT
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 # --filter=blob:none keeps the clone small; the checkout still materialises every file at the pin.
-# .git is removed afterwards so the corpus cannot be silently updated inside a job, and so the
-# image does not carry history it will never read.
+# .git is removed afterwards so the corpus is not an ordinary git working copy inside a job. Note
+# this prevents `git pull`, NOT file writes by a root process (advisor N4) — source pinning, not
+# runtime immutability.
 RUN set -eux; \
     mkdir -p /corpus; \
     git clone --filter=blob:none --no-checkout https://github.com/cashubtc/nuts /corpus/nuts; \
@@ -123,9 +136,9 @@ RUN set -eux; \
         "cashubtc/cdk    ${CDK_COMMIT}  (tag v0.17.2)" \
         > /corpus/PINS.txt
 
-# ---------------------------------------------------------------------------------------------
+# =============================================================================================
 # the specialist image
-# ---------------------------------------------------------------------------------------------
+# =============================================================================================
 FROM ${BASE_IMAGE}
 ARG CDK_VERSION
 ARG CDK_COMMIT
@@ -133,23 +146,61 @@ ARG NUTS_COMMIT
 
 COPY --from=mint-builder /out/bin/cdk-mintd /usr/local/bin/cdk-mintd
 COPY --from=mint-builder /out/bin/test-mint-seed /usr/local/bin/test-mint-seed
+COPY --from=mint-builder /out/bin/test-mint-invoice /usr/local/bin/test-mint-invoice
 COPY --from=mint-builder /out/bin/mint-acceptance /usr/local/bin/mint-acceptance
 COPY --from=corpus /corpus /opt/cashu/corpus
+
+# Runtime Rust (advisor F1).
+COPY --from=mint-builder /out/rust /opt/rust
+ENV CARGO_HOME=/opt/rust/cargo \
+    PATH=/opt/rust/toolchain/bin:/opt/rust/cargo/bin:$PATH
+# Offline by default: a specialist job must not silently reach crates.io and call that a warm cache,
+# and a contained job may have no route there at all. `--offline` on the command line is redundant
+# once this is set; `CARGO_NET_OFFLINE=false` in a job's environment is the deliberate opt-out.
+ENV CARGO_NET_OFFLINE=true
+
+# The curated knowledge topics, INSIDE the image (advisor F2). The injected MEMORY.md index names
+# these container paths, so every link in it resolves for a contained job. Non-secret prose only —
+# no seat home, no wallet, no key is mounted or copied here.
+COPY docker/maxplayer-cashu-sandbox/seat/memory/ /opt/cashu/knowledge/
+# The example is shipped as SOURCE, not as a binary, on purpose: compiling it is the toolchain proof.
+COPY docker/maxplayer-cashu-sandbox/examples/ /opt/cashu/examples/
 COPY docker/maxplayer-cashu-sandbox/test-mint.config.toml /opt/cashu/test-mint.config.toml
 COPY docker/maxplayer-cashu-sandbox/bin/test-mint /usr/local/bin/test-mint
+COPY docker/maxplayer-cashu-sandbox/bin/cashu-toolchain-check /usr/local/bin/cashu-toolchain-check
 
 # The job runs as a host uid with no passwd entry, so everything it must read has to be
 # world-readable and everything it must run world-executable (same rule as the base image's
 # `install -m 0755`).
+#
+# CARGO_HOME is world-writable because cargo takes a lock file inside it (`.package-cache`) on every
+# invocation, and the job's uid is not known at build time. This container is a single-principal
+# disposable sandbox, so a shared-writable cache costs nothing here; it would be wrong in a
+# multi-tenant image.
+#
+# TEST_MINT_STATE_ROOT is created world-writable for the same reason: the mint's private state lives
+# there, OUTSIDE the delivered workdir (advisor F3).
 RUN set -eux; \
-    chmod 0755 /usr/local/bin/cdk-mintd /usr/local/bin/test-mint-seed /usr/local/bin/test-mint \
-        /usr/local/bin/mint-acceptance; \
-    chmod -R a+rX /opt/cashu; \
+    chmod 0755 /usr/local/bin/cdk-mintd /usr/local/bin/test-mint-seed \
+        /usr/local/bin/test-mint-invoice /usr/local/bin/mint-acceptance \
+        /usr/local/bin/test-mint /usr/local/bin/cashu-toolchain-check; \
+    chmod -R a+rX /opt/cashu /opt/rust; \
+    chmod -R a+rwX /opt/rust/cargo; \
+    mkdir -p /var/lib/cashu-test-state; \
+    chmod 1777 /var/lib/cashu-test-state; \
     cdk-mintd --version; \
-    test-mint --help >/dev/null
+    rustc --version; \
+    cargo --version; \
+    test-mint --help >/dev/null; \
+    cashu-toolchain-check --help >/dev/null; \
+    test -f /opt/cashu/knowledge/MEMORY.md; \
+    test -f /opt/cashu/examples/wallet-roundtrip/Cargo.lock
 
 LABEL ai.maxplayer.specialist="cashu-cdk" \
       ai.maxplayer.cashu.cdk-version="${CDK_VERSION}" \
       ai.maxplayer.cashu.cdk-commit="${CDK_COMMIT}" \
       ai.maxplayer.cashu.nuts-commit="${NUTS_COMMIT}" \
-      ai.maxplayer.cashu.mint-backend="fakewallet (worthless test ecash, loopback only)"
+      ai.maxplayer.cashu.mint-backend="fakewallet (worthless test ecash, loopback only)" \
+      ai.maxplayer.cashu.knowledge-path="/opt/cashu/knowledge" \
+      ai.maxplayer.cashu.corpus-path="/opt/cashu/corpus" \
+      ai.maxplayer.cashu.test-state-root="/var/lib/cashu-test-state"

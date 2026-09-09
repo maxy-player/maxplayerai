@@ -21,3 +21,8 @@ anyhow = "1"
 [[bin]]
 name = "mint-acceptance"
 path = "src/main.rs"
+
+# Standalone crate root. These image-local crates are deliberately NOT members of the
+# product workspace: adding them there would drag image tooling into every product build, and
+# an empty [workspace] table is the supported way to say "this is its own root".
+[workspace]
