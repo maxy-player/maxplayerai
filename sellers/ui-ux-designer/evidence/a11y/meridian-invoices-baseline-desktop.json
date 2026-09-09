@@ -1,6 +1,6 @@
 {
   "name": "meridian-invoices-baseline",
-  "url": "http://127.0.0.1:50472/samples/redesign/before/",
+  "url": "http://127.0.0.1:50617/samples/redesign/before/",
   "viewport": "desktop",
   "engine": "axe-core 4.11.4",
   "tags": [
@@ -10,13 +10,13 @@
     "wcag21aa",
     "wcag22aa"
   ],
-  "generatedAt": "2026-09-09T04:17:32.159Z",
+  "generatedAt": "2026-09-09T04:20:06.570Z",
   "loadProof": {
     "title": "Meridian",
     "elements": 70,
     "textLength": 698,
     "stylesheets": 2,
-    "url": "http://127.0.0.1:50472/samples/redesign/before/",
+    "url": "http://127.0.0.1:50617/samples/redesign/before/",
     "rulesConsidered": 64,
     "httpStatus": 200
   },

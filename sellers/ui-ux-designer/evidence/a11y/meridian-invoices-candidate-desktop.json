@@ -1,6 +1,6 @@
 {
   "name": "meridian-invoices-candidate",
-  "url": "http://127.0.0.1:50472/samples/redesign/after/",
+  "url": "http://127.0.0.1:50617/samples/redesign/after/",
   "viewport": "desktop",
   "engine": "axe-core 4.11.4",
   "tags": [
@@ -10,13 +10,13 @@
     "wcag21aa",
     "wcag22aa"
   ],
-  "generatedAt": "2026-09-09T04:17:33.648Z",
+  "generatedAt": "2026-09-09T04:20:08.055Z",
   "loadProof": {
     "title": "Invoices — Meridian",
     "elements": 103,
     "textLength": 1045,
     "stylesheets": 3,
-    "url": "http://127.0.0.1:50472/samples/redesign/after/",
+    "url": "http://127.0.0.1:50617/samples/redesign/after/",
     "rulesConsidered": 62,
     "httpStatus": 200
   },
