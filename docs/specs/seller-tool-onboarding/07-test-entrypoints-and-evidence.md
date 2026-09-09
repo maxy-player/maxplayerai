@@ -39,12 +39,31 @@ Location follows the kit crate proposed in [01](01-integration-survey.md):
 | `crates/maxplayer-tool-kit/fixtures/fake-vendor/` | fixture service | records every call; owns the authoritative call counter |
 | `crates/maxplayer-tool-kit/profiles/` | reviewed profiles | content-addressed; drift resets acceptance |
 
-Two entrypoint properties that matter more than their names:
+### Three independent observers (F4)
 
-1. **The call counter belongs to the fake vendor, not the holder.** "Zero child calls" is
-   asserted from the vendor's record. A holder that reports zero while having called is exactly
-   the defect the negative controls hunt.
-2. **The clock is a fixture clock.** Expiry tests set time explicitly; none sleep.
+An earlier version of this contract asserted "zero child calls" from the fake vendor's request
+counter alone. **That oracle was broken**, and the break was success-shaped: a malformed
+manifest could launch a child that reads a local file, writes output, errors or exits *before
+any network activity*, leaving the vendor counter at zero and the check passing. The child ran;
+the oracle said it hadn't.
+
+The harness therefore owns **three separate observers**, and no one of them may stand in for
+another:
+
+| Observer | Owned by | Answers |
+| --- | --- | --- |
+| **child-start counter** | the harness's process-launch instrumentation, wrapping the exec boundary itself | did any child process **start**? |
+| **vendor request counter** | the fake vendor | did any **remote effect** occur? |
+| **forbidden-effect markers** | the fixture filesystem//egress probes | did a forbidden local read, write or egress occur? |
+
+**Every reject-before-invocation check requires all three: a validation error, AND zero child
+starts, AND zero vendor effects.** A check that can only report the vendor counter is not
+implemented.
+
+Two further properties:
+
+- **The clock is a fixture clock.** Expiry tests set time explicitly; none sleep.
+- **The holder never grades itself.** No oracle reads the holder's own report of what it did.
 
 ## Check map
 
@@ -52,12 +71,12 @@ Each row: the plan v3 §5 check, its oracle, and its declared budget.
 
 | # | Check | Oracle | Budget |
 | --- | --- | --- | --- |
-| 1 | Schema/profile: valid manifest loads; embedded hole, unknown profile, unsafe constant, text-to-URL mapping each reject | validation error **and** zero vendor calls | 0 calls for negatives |
+| 1 | Schema/profile: valid manifest loads; embedded hole, unknown profile, unsafe constant, text-to-URL mapping each reject | validation error **and zero child starts and** zero vendor effects | 0 starts, 0 calls for negatives |
 | 2 | Discovery/result: list equals approved verbs; `render(R)` returns known bytes | independent expected file + digest; **not** exit code, **not** server self-report | 1 call |
-| 3 | Operand grammar: `-x`, `@file`, `x;touch y` reject; `hello-world` arrives as exactly one literal operand | zero calls for negatives; expected bytes and no forbidden-effect marker for the positive | 1 positive call |
+| 3 | Operand grammar: `-x`, `@file`, `x;touch y` reject; `hello-world` arrives as exactly one literal operand | **zero child starts** and zero vendor calls for negatives; expected bytes and no forbidden-effect marker for the positive | 1 positive call |
 | 4 | Artifact consumption: forged handles; driver swaps symlinks/renames **during** staging and **after** validation | no outside-file-read marker; consumed bytes match staged digest; valid staged object may succeed only with its original digest | ≤2 calls, 8 KiB |
 | 5 | Authentication: missing/garbage signature, wrong holder/party/service/job, natural expiry, post-expiry, each close outcome | reject with zero calls, against fixture clock and authoritative records; valid `J/H/P` succeeds once; includes same token after restart and after renewal against a closed record | 1 positive call |
-| 6 | Grant authority: unauthorized opener, excessive grant request, forged claim grant version, verb/resource outside `J`, **`K`'s valid token against `J`** | zero unauthorized calls; seller-authorized `J/R` succeeds once | 1 positive call |
+| 6 | Grant authority: unauthorized opener, excessive grant request, forged claim grant version, verb/resource outside `J`, **`K`'s valid token against `J`**, and **`K`'s genuine handle/slot presented with `J`'s genuine token** (F5) | zero unauthorized calls **and zero child starts**; seller-authorized `J/R` succeeds once | 1 positive call |
 | 7 | Leakage: synthetic auth secret may appear **only** in the declared fake-vendor auth channel; a separate non-auth canary appears nowhere outside its forbidden store | every captured channel inspected, success **and** failure paths; failing to authenticate at the permitted sink also fails the positive oracle | 2 calls |
 | 8 | Isolation: concurrent `J`/`K` cannot read each other's HOME/input/output markers; sequential `K` cannot see `J`'s config/cache mutations | instrumented child observes mounts and identities; forbidden-read marker zero; credential lookup still succeeds at its permitted store | 4 calls, 8 KiB |
 | 9 | Cleanup: fixture child **with a descendant**; close/cancel/timeout `J` | no owned process or job filesystem within 5 s; repeated calls refuse; unrelated `K` still usable; repeat with natural expiry during an active child | ≤4 calls |
@@ -81,10 +100,62 @@ Schema-invalid manifests are not sufficient. Each mutant below is a deliberately
 | expose another job's mount | 8 | — |
 | leave descendants alive | 9 | — |
 | skip quota reservation | 10 | — |
-| retain closed tokens | 5, 6 | 9 |
+| retain closed tokens | 5, 6 | — |
+| **launch a child, then reject without contacting the vendor** | **1, 3** — must fail the pre-invocation oracle on the child-start observer alone | — |
+| open a grant on `NoClaim`, `Duplicate`, suppression or ACCEPT-only | 13 | — |
+| trust the marketplace record instead of the holder record | 14 | — |
+| reopen a grant on marketplace resume | 14 | — |
 
 **Do not demand exactly one failing line.** A mutant may legitimately trip several checks; the
 requirement is that the named check fails, not that nothing else does.
+
+**Dependent skips must name a genuine dependency.** The previous version made cleanup (check 9)
+a dependent skip of the retain-closed-tokens mutant. That was wrong: cleanup is independently
+observable — processes, descendants and job filesystem either remain or do not — regardless of
+whether that mutant also fails authentication. It now runs. A skip is justified only when the
+dependency genuinely prevents observation, and the reason is recorded in `skipped.json`.
+
+## Integration checks 13 and 14 (F1, F2)
+
+These are new, and exist because the grant boundary meets real marketplace code whose semantics
+([01](01-integration-survey.md) §2) do not match holder needs.
+
+### 13 · Owned-award admission
+
+Each case asserts **zero child starts and no grant minted** unless stated:
+
+| Case | Required outcome |
+| --- | --- |
+| award for a claim we do not hold (`NoClaim`) | no grant |
+| award we lost — local claim id differs from the award's | no grant |
+| award author is not the buyer on our own recorded offer | no grant |
+| suppression path records another party's win | no grant |
+| ACCEPT binds an award without executing | no grant |
+| `Duplicate` for an already-admitted job | **same** authorization re-presented after revalidation; counters unchanged, deadline unextended, scope unwidened |
+| `Duplicate` for a tombstoned job | refused; tombstone not reopened |
+| crash between award and grant persistence, then restart | at most one authorization exists; recovery commits the same one idempotently or abandons it |
+| replay of a closed job's award | refused |
+| unreadable authority fact | refused (fail closed) |
+| genuine `New` + `AwardMatch::Execute` | exactly one grant, correct scope — the positive control |
+
+### 14 · Durable close and reconciliation
+
+| Case | Required outcome |
+| --- | --- |
+| crash **before** the `closing` commit | boot reconciliation closes or denies; no call served first |
+| crash **after** the `closing` commit, before cleanup | cleanup re-runs idempotently; new calls already denied |
+| repeated cleanup invocation | idempotent; no error, no double refund |
+| marketplace fail-write fails (`Ok(0)` or `Err`) | holder still closes on its own authority |
+| holder record lost or unreadable | `reconciled-unknown`; deny; authority is **not** reconstructed from the marketplace record |
+| restart with active descendants | descendants stopped; no owned process survives |
+| marketplace process disappears entirely | holder-enforced expiry still closes the grant |
+| missing or unreadable deadline | treated as **expired**, not live — opposite of the marketplace resume rule |
+| marketplace resume of a non-terminal row | agent may re-run; **no grant reopens**, no vendor write replays |
+| outstanding reservation at close | forfeited absent positive proof of non-occurrence; `uncertain-effect` recorded |
+| tombstone + counters after close | preserved; renewal and restart cannot reset them |
+
+Actual crash execution is a later-stage gate. What is owed **now** is this coherent protocol and
+its proof obligation.
 
 ## Live checks
 

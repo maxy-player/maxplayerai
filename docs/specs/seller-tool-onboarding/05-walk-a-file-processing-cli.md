@@ -54,7 +54,11 @@ operations:
       target_format: "pdf"          # bounded enum
       quality: 90                   # bounded integer 1..=100
       doc_title: "quarterly-report" # bounded literal text, fixture grammar
-    effects: { max_calls: 1, max_items: 1, max_bytes: 8192 }
+    effects:
+      max_calls: 1
+      max_items: 1              # one input document -> one output document
+      max_input_bytes: 8192     # staging ingest bound, enforced before invocation
+      max_output_bytes: 262144  # slot quota, enforced by the supervisor at the slot
 grant_policy:
   allowed_openers: ["opener:marketplace-core"]
   allowed_parties: ["party:P"]
@@ -104,10 +108,34 @@ Three mapping decisions worth defending:
    bump, which is why the profile digest pins version.
 2. **`--config` is a constant, not a field.** A job-selectable config file is a
    configuration-selector sink, which the constant policy forbids outright.
-3. **There is no resource identifier in this walk.** The input arrives as an uploaded artifact
-   rather than a vendor-side record, so grant-bound resource membership does not appear in
-   argv. `res:R` still bounds *what the job may ask for*; it just has no argv sink here. That
-   asymmetry is normal and must not be papered over by inventing a resource flag.
+3. **There is no vendor-side resource identifier in this walk, so the handle *is* the granted
+   resource.** The input arrives as an uploaded artifact rather than a vendor record, so no
+   `res:` string appears in argv, and none is invented. But an unused `res:R` in the manifest
+   would bound nothing at all — so the grant check must attach to the object that actually
+   carries authority here: the handle.
+
+### Handle and slot ownership
+
+Every uploaded-artifact handle and destination slot is **holder-issued and immutably bound at
+creation** to a triple:
+
+```
+handle H1 -> { holder: H-docconv-1, party: P, job: J }
+```
+
+The binding is recorded in the holder's durable admission record
+([04](04-token-grant-contract.md) Part I), not in the handle string, and the handle is opaque —
+unguessable and carrying no path.
+
+**Admission membership check, run on every call before any child starts:** for each handle and
+slot named in the request, the recorded triple must equal the presenting token's holder, party
+and job. Not merely "a valid handle" and separately "a valid token" — the *same* triple.
+
+This closes a hole that generic forged-handle and filesystem-isolation cases do **not** close.
+Forged handles test unguessability; mount isolation tests the filesystem. Neither prevents a
+**valid handle owned by job `K`, presented through job `J`'s otherwise entirely valid token**.
+Both objects are genuine; only the relation between them is wrong. That case is enumerated as a
+required negative in [07](07-test-entrypoints-and-evidence.md) check 6.
 
 ## Step 4 — Custody (04)
 
@@ -131,9 +159,24 @@ Token binds holder `H-docconv-1`, party `P`, service `doc-convert`, job `J`, gra
 an expiry inside `max_job_lifetime`. Every call re-verifies signature, audience, clock, an
 **active** record, party/service equality, verb `convert` ∈ grant, and remaining budget.
 
-Reservation before execution: 1 call, 1 item, 8192 bytes — the profile-declared maxima, not the
-observed ones. Close on delivered/failed, and on the `job_timeout_secs` timeout path, which
-must be wired explicitly because no store state represents it (gap G-2).
+Reservation before execution uses profile-declared maxima, not observed values, and each
+counter names what it counts and what enforces it:
+
+| Counter | Reserved | Enforced by |
+| --- | --- | --- |
+| calls | 1 | supervisor invokes once; a retry requires a fresh reservation |
+| items | 1 | one input document, one output document |
+| input bytes | 8 KiB | staging ingest bound, rejected **before** invocation |
+| output bytes | 256 KiB | supervisor fails the job at the slot quota |
+| network | 0 beyond the pinned upstream | default-deny egress |
+
+`quality` does **not** bound output size; it only affects encoder quality. An earlier version of
+this walk implied it did. Any counter without an enforceable tool or supervisor control is
+**unbounded, and unbounded rejects before execution**.
+
+Close on delivered and on every failure path. Timeout **does** reach `Failed`, but the write is
+best-effort, so the holder closes on its own enforced expiry rather than waiting for that record
+([04](04-token-grant-contract.md) Part II).
 
 ## Step 6 — Checker applicability (07)
 
@@ -144,13 +187,21 @@ All twelve checks apply. Three carry walk-specific oracles:
 - **5.4 artifact consumption**: the driver swaps a symlink at the upload entry during staging
   and again after validation. The consumption-time digest check must reject the swapped
   content, and no outside-file-read marker may fire.
+- **5.6 grant authority**: includes the valid-cross-job-handle case above — `K`'s genuine handle
+  presented with `J`'s genuine token must reject with zero child starts.
 - **5.7 leakage**: the synthetic session value may appear only in the fake vendor's declared
   auth channel. Not in the output PDF's metadata — a real hazard for a tool that writes
   document metadata, and the reason `doc_title` is reviewed as a sink at all.
 
 ## Verdict
 
-**Supported at rung 4, conditional on A5**, with these profile requirements:
+**Conditionally supported at rung 4 — conditional on A1–A5, not on A5 alone.** Since the subject
+is an archetype, none of its assumed capabilities is verified; each becomes a required,
+inspection-verified assumption before any profile ships. A1/A4 failing removes the route
+entirely; A2 breaks the staging contract; A3 removes bounded-enum mapping; A5 decides custody.
+The classification stays conditional until a real tool is inspected against all five.
+
+Required profile properties:
 
 1. constants must include an interactive-disabling flag, a plugin-disabling flag and a pinned
    config; a tool lacking any of these needs a documented equivalent or is unsupported;

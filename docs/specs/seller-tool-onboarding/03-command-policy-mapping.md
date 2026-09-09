@@ -120,7 +120,7 @@ Invocation the profile authorizes, and nothing else:
 | `--account` value | constant | seller policy | argv[4..5] | account selector | binds billing identity |
 | `--no-plugins` | constant | fixed | argv[6] | disables extension load | closes plugin sink |
 | `format` | bounded enum `{pdf,png}` | membership | argv[7..8] | output codec | none beyond codec |
-| `page_limit` | bounded integer `1..=50` | range | argv[9..10] | page cap | bounds item count |
+| `page_limit` | bounded integer `1..=20` | range | argv[9..10] | page cap, enforced by the tool | items ≤ the bound value |
 | `title` | bounded literal text | fixture grammar (§02) | argv[11..12] | **data**: drawn into the document header | none |
 | `out` | destination slot | holder-created, private | argv[13..14] | output file path | writes one file in-slot |
 | `res:R` | grant-bound resource id | grant membership **and** `res:[A-Za-z0-9_-]{1,32}` encoding | argv[16], after `--` | record selector | reads one record |
@@ -132,9 +132,31 @@ Notes that make this mapping reviewable rather than decorative:
   mapping and would reject. The mapping is per-tool, never inherited.
 - `res:R` carries two independent checks: grant membership, and the `res:` encoding grammar.
   Passing the first without the second is the mistake plan v3 §3 names explicitly.
-- Effects sum to: one vendor read, one in-slot file write, at most 20 items. That declared
-  maximum is what the budget reservation in [04](04-token-grant-contract.md) reserves *before*
-  execution.
+### Deriving the effect maximum
+
+A declared maximum is **derived from the binding, not asserted beside it**. For this profile:
+
+| Counter | Maximum | Derivation | Enforcement |
+| --- | --- | --- | --- |
+| calls | 1 | this verb invokes the tool exactly once; no retry is authorized | supervisor invokes once; a retry needs a fresh reservation |
+| items | value of `page_limit`, ≤ 20 | the page cap is the item cap | tool-enforced page cap, plus supervisor count of exported objects |
+| input bytes | 8 KiB | the staging ingest bound (§ uploads) | rejected at ingest, before invocation |
+| output bytes | 256 KiB | slot quota | supervisor truncates-and-fails at the slot boundary |
+| network | 0 additional | egress default-deny except the one pinned upstream | egress policy |
+
+**Byte counters are separate and named.** "Bytes" alone is ambiguous; input, output and network
+are reserved and accounted independently, and a manifest that declares one does not bound the
+others.
+
+Two rules this table enforces:
+
+- **The profile's `page_limit` upper bound and the item ceiling are the same number.** Where a
+  profile permits `1..=50` pages, its item maximum is 50, not a smaller figure chosen for a
+  worked example. A manifest binding `page_limit: 20` with `max_items: 3` is **internally
+  inconsistent and rejects at validation** — it is not a tighter ceiling, it is a contradiction.
+- **An effect with no enforceable control is unbounded, and unbounded rejects before
+  execution.** A quality or format setting alone supplies no maximum. If neither the tool nor
+  the supervisor can cap a counter, the profile does not ship.
 
 ## Deferred: HTTP profiles
 

@@ -37,7 +37,11 @@ schema_version: 1                 # integer; server rejects unknown majors outri
 offering:
   service_id: "invoice-render"    # stable id; equality-checked against the job record
   display_name: "Invoice rendering"
-  party_scope: "per-party"        # per-party | shared-holder ; see 04 custody rules
+  party_scope: "per-party"        # per-party | shared-holder.
+                                  # shared-holder means ONE holder serving concurrent jobs of
+                                  # the SAME party and SAME vendor. It never authorizes
+                                  # cross-party sharing; distinct parties are distinct
+                                  # holders. See 04 Part V.
 
 holder:
   holder_id: "H-invoice-1"        # names an already-enrolled holder; never creates one
@@ -54,14 +58,20 @@ operations:                       # one entry per advertised verb; the union of 
       format: "pdf"               # must be a member of the profile's enum
       page_limit: 20              # must lie inside the profile's integer bounds
       title: "hello-world"        # must satisfy the profile's literal-text grammar
-    effects:                      # seller's ceiling; may only be <= the profile maximum
-      max_calls: 3
-      max_items: 3
-      max_bytes: 8192
+    effects:                      # seller's ceiling; may only be <= the profile maximum,
+                                  # AND must be consistent with the bindings above:
+                                  # page_limit 20 can emit 20 items, so max_items >= 20 or
+                                  # the manifest rejects as internally inconsistent.
+      max_calls: 1                # one invocation of this verb
+      max_items: 20               # matches page_limit; see 03 for the derivation rule
+      max_bytes: 262144           # OUTPUT bytes; input and network are counted separately
 
 grant_policy:                     # who may open a job against this offering; see 04
   allowed_openers: ["opener:marketplace-core"]
-  allowed_parties: ["party:P", "party:Q"]
+  allowed_parties: ["party:P"]    # which parties may have jobs opened against THIS holder.
+                                  # Listing several parties does NOT let one holder serve
+                                  # them; it constrains admission. A second party needs its
+                                  # own holder entry.
   resources:
     allow: ["res:R"]
     # everything not listed is denied; there is no deny-list and no wildcard
@@ -118,8 +128,15 @@ A manifest is rejected before any child process exists. The server, in this orde
    — an unsafe constant rejects the profile even if every manifest field is clean;
 7. checks `effects` ceilings are `<=` the profile maxima, and `grant_policy` is well-formed.
 
-**Oracle for every rejection: a validation error and zero child calls.** "Zero child calls" is
-measured by the fake vendor's own call counter, not by the server's self-report.
+**Oracle for every rejection: a validation error AND zero child starts AND zero vendor
+effects** — all three, independently observed.
+
+The three are not interchangeable. A vendor-side request counter cannot prove a child never
+ran: a malformed manifest could launch a child that reads a local file, writes output, errors
+or exits before it ever reaches the network, leaving the vendor counter at zero while the
+oracle passes. That is success-shaped emptiness. "Zero child starts" is therefore measured by
+an **independent process-launch observation** owned by the harness, not by the server's
+self-report and not by the vendor. See [07](07-test-entrypoints-and-evidence.md).
 
 ## Explicitly out of scope for a manifest
 
