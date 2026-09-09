@@ -1,0 +1,33 @@
+[package]
+name = "maxplayer-tool-kit"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Seller-level tool holder: keeps a third-party tool logged in for as long as the seller daemon runs, and exposes a seller-configured operation list to that seller's jobs."
+
+# Deliberately depends on nothing in maxplayer-core and nothing outside std except
+# serde/serde_json. The dependency surface is the audit surface; a holder that
+# custodies a credential should be readable end to end in one sitting.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "vendor-service"
+path = "src/bin/vendor_service.rs"
+
+[[bin]]
+name = "vendor-cli"
+path = "src/bin/vendor_cli.rs"
+
+[[bin]]
+name = "tool-holderd"
+path = "src/bin/tool_holderd.rs"
+
+[[bin]]
+name = "holderctl"
+path = "src/bin/holderctl.rs"
+
+[[bin]]
+name = "tool-mcp-bridge"
+path = "src/bin/tool_mcp_bridge.rs"
