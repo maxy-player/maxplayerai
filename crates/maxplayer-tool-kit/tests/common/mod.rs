@@ -154,8 +154,10 @@ impl Fixture {
         self.runtime.join("holder.sock")
     }
 
+    /// One directory per job, holding that job's single socket. The demo mounts exactly this
+    /// directory into the matching job container.
     pub fn job_socket(&self, job_id: &str) -> PathBuf {
-        self.runtime.join("jobs").join(format!("{job_id}.sock"))
+        self.runtime.join("jobs").join(job_id).join("job.sock")
     }
 
     pub fn ctl(&self, method: &str, params: Value) -> Result<Value, String> {

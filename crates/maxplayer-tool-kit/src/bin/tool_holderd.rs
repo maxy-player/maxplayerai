@@ -413,7 +413,14 @@ impl Holder {
             return RpcResponse::err(id, proto::CODE_REJECTED, "job_root may not contain or equal the holder's private state");
         }
 
-        let sock = self.runtime.join("jobs").join(format!("{job_id}.sock"));
+        // Each job's socket gets its own directory, so exactly one endpoint can be handed to a
+        // job container without handing over the directory that holds every other job's. A flat
+        // `jobs/<id>.sock` layout would make per-job isolation unexpressible as a mount.
+        let dir = self.runtime.join("jobs").join(job_id);
+        if let Err(e) = private_dir(&dir) {
+            return RpcResponse::err(id, proto::CODE_INTERNAL, format!("job socket dir: {e}"));
+        }
+        let sock = dir.join("job.sock");
         let listener = match bind_private(&sock) {
             Ok(l) => l,
             Err(e) => return RpcResponse::err(id, proto::CODE_INTERNAL, e),
