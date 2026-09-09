@@ -107,7 +107,7 @@ async fn send_everything(w: &Wallet) -> Result<Option<(String, u64)>> {
         match w.prepare_send(Amount::from(amount), SendOptions::default()).await {
             Ok(prepared) => {
                 let locked = u64::from(prepared.amount());
-                let token = ***;
+                let token = prepared.confirm(None).await?;
                 return Ok(Some((token.to_string(), locked)));
             }
             Err(_) => continue,
@@ -210,7 +210,7 @@ async fn main() -> Result<()> {
     const SEND: u64 = 21;
     let prepared = wallet.prepare_send(Amount::from(SEND), SendOptions::default()).await?;
     let send_fee = u64::from(prepared.fee());
-    let token_str = ***.to_string();
+    let token_str = prepared.confirm(None).await?.to_string();
     t.check(
         "token is a cashu token",
         token_str.starts_with("cashu"),
@@ -342,7 +342,7 @@ async fn main() -> Result<()> {
         let prep = w.prepare_send(Amount::from(RECOVER_SEND), SendOptions::default()).await?;
         stranded_amount = u64::from(prep.amount());
         // Token created and deliberately NEVER redeemed: this is the unresolved state.
-        let _token = ***;
+        let _token = prep.confirm(None).await?;
         let pending_sends = w.get_pending_sends().await?;
         t.check(
             "an unresolved send exists before restart",

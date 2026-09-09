@@ -42,7 +42,7 @@ async fn main() -> Result<()> {
 
     // 3. Send. prepare_send reserves proofs; the debit is final only at confirm.
     let prepared = alice.prepare_send(Amount::from(8), SendOptions::default()).await?;
-    let token = ***;
+    let token = prepared.confirm(None).await?;
     println!("alice after send: {} sats", u64::from(alice.total_balance().await?));
 
     // 4. Receive into a different wallet.
