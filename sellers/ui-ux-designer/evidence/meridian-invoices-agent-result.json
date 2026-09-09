@@ -3,8 +3,8 @@
   "identity": "Plainsong (PROPOSED — not adopted. See design-identity/IDENTITY.md §0.)",
   "job": "review-redesign",
   "name": "meridian-invoices",
-  "startedAt": "2026-09-09T04:13:58.791Z",
-  "finishedAt": "2026-09-09T04:14:04.820Z",
+  "startedAt": "2026-09-09T04:17:28.582Z",
+  "finishedAt": "2026-09-09T04:17:34.673Z",
   "environment": {
     "node": "v26.5.0",
     "chromium": "151.0.7922.34",
@@ -43,7 +43,7 @@
     },
     {
       "step": "preview",
-      "origin": "http://127.0.0.1:50098",
+      "origin": "http://127.0.0.1:50472",
       "root": "/Users/forge/forge/v2/wt/w-ui-ux-designer-seller/sellers/ui-ux-designer"
     },
     {
@@ -173,22 +173,22 @@
     {
       "file": "/Users/forge/forge/v2/wt/w-ui-ux-designer-seller/sellers/ui-ux-designer/evidence/a11y/meridian-invoices-baseline-desktop.json",
       "bytes": 2239,
-      "sha256": "493a7905c21f6c92a246438a5b5d8749451efc87e42cfb17048d4bb62780d0b3"
+      "sha256": "f4111e381a4dd145a2239ce911557d6448257b834bf0207703688c6091522766"
     },
     {
       "file": "/Users/forge/forge/v2/wt/w-ui-ux-designer-seller/sellers/ui-ux-designer/evidence/a11y/meridian-invoices-baseline-mobile.json",
       "bytes": 2238,
-      "sha256": "1847ede0b4ad9f50e20be43d9d31af97d1f1e6c1ba5ada34d23d76615711ee5a"
+      "sha256": "6e69047b0f76b08e9c2f58248a946993eae19af4144f088cd346f620b7fbc861"
     },
     {
       "file": "/Users/forge/forge/v2/wt/w-ui-ux-designer-seller/sellers/ui-ux-designer/evidence/a11y/meridian-invoices-candidate-desktop.json",
       "bytes": 728,
-      "sha256": "23f0b36554ee0a988a47cdf7fba87892a39b5a2b9a76d20f59529f2bc6042f40"
+      "sha256": "c93d84a927078b13592054b94b9086b0a2c17edfb2018ff11517f217d534346f"
     },
     {
       "file": "/Users/forge/forge/v2/wt/w-ui-ux-designer-seller/sellers/ui-ux-designer/evidence/a11y/meridian-invoices-candidate-mobile.json",
       "bytes": 751,
-      "sha256": "b9e796fc4e0af8a2c50ea01d69e4f8028dd9dba16c7cefbcbbfbaaf1125f4575"
+      "sha256": "b82b3e215cc866477c4a06571dd53a0ef23aa46d236fbe690fd478474484683a"
     },
     {
       "file": "/Users/forge/forge/v2/wt/w-ui-ux-designer-seller/sellers/ui-ux-designer/evidence/diff/meridian-invoices-desktop.png",
