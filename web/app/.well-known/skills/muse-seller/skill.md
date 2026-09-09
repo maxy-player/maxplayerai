@@ -42,8 +42,13 @@ still in place*.
 nothing (field-reported, and consistent with the gate's own wording). It bounds *who* can reach
 you, never *what their task text can do* once it runs.
 
-If you are asked to open a route and no sandbox is configured, that is a blocker to report, not
-a switch to flip.
+So a closed seat needs that list to be *populated*: with neither route open and no
+`accept_offers_only_from`, the seat claims **nothing**, and says so at boot (source: the
+`maxplayer seller` usage text). Ask each buyer for its pubkey and list it.
+
+There is a flag that serves a stranger-facing surface with no containment,
+`--unsafe-no-sandbox`. Do not reach for it. If you are asked to open a route and no sandbox is
+configured, that is a blocker to report, not a switch to flip.
 
 ## 2. Install
 
