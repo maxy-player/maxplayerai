@@ -248,8 +248,39 @@ pub struct AnnouncedSeat {
     pub author_pubkey: String,
     /// The event's `created_at`, unix seconds.
     pub created_at: u64,
+    /// The event's SIGNED id, 64-hex lowercase — the NIP-01 tie-breaker, carried across the
+    /// transport-to-reducer seam because `(author, created_at)` is NOT a total order. Two signed
+    /// beats for one address CAN share a timestamp, and if they disagree about `accepting` then
+    /// whichever the reducer keeps decides whether the seat is live or retracted. Without the id
+    /// that decision falls to iteration luck.
+    pub event_id: String,
     /// The event's kind/tags/content.
     pub event: EventDraft,
+}
+
+/// Whether the relay actually FINISHED answering the directory request.
+///
+/// This is the whole of [`SellerDirectory::read_confirmed`], and it is a transport fact the reducer
+/// cannot derive: rows alone cannot tell a completed answer from a stream that stopped early.
+/// `fetch_events`-style helpers end on either an `EOSE` or a spent deadline WITHOUT distinguishing
+/// them, so a caller that infers completion from "we got here with some events" certifies a partial
+/// read. Only the directory REQ's own `EOSE` may set [`Self::ConfirmedByEose`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadCompletion {
+    /// The directory subscription's own `EOSE` arrived: the relay served everything it holds for
+    /// this filter, so an empty row set is a genuinely empty market.
+    ConfirmedByEose,
+    /// The read ended without its `EOSE` — deadline spent, socket dropped, or stream closed. Rows
+    /// already received are kept and reported HONESTLY as unconfirmed; absence proves nothing.
+    Unconfirmed,
+}
+
+impl ReadCompletion {
+    /// `true` only for [`Self::ConfirmedByEose`]. Written once, here, so no call site can decide
+    /// what "confirmed" means for itself.
+    pub fn is_confirmed(self) -> bool {
+        matches!(self, Self::ConfirmedByEose)
+    }
 }
 
 /// Reduce raw announcements to the live seat directory — **every discovery rule, and no I/O**.
@@ -260,8 +291,10 @@ pub struct AnnouncedSeat {
 ///    the kind must not become a row a buyer might target.
 /// 2. **Resolve the address.** Rows are keyed by `(pubkey, d)` via [`ParsedHeartbeat::key`], NEVER
 ///    by event id: kind-30340 is addressable and superseded IN PLACE, so an id-keyed reduce would
-///    keep a seat's dead announcements alongside its live one. Newest `created_at` wins, with the
-///    author-pubkey-plus-timestamp compare made total by taking the later event on a tie.
+///    keep a seat's dead announcements alongside its live one. Newest `created_at` wins; an exact
+///    timestamp tie is broken by the LOWEST lexical event id, per NIP-01's retention rule for
+///    addressable events. Both together are a total order over signed input, so the result does not
+///    depend on the order the relay handed the events over.
 /// 3. **Discard a future-dated beat**, past the skew tolerance — it would outrank every genuine
 ///    later beat for this address.
 /// 4. **Discard a stale beat**, past the recency window.
@@ -274,11 +307,13 @@ pub struct AnnouncedSeat {
 pub fn reduce_directory(
     announcements: impl IntoIterator<Item = AnnouncedSeat>,
     policy: DirectoryPolicy,
+    completion: ReadCompletion,
 ) -> SellerDirectory {
     let mut skipped = DirectorySkips::default();
     let mut events_read: u32 = 0;
-    // (pubkey, d) -> the newest beat seen for that address so far.
-    let mut newest: HashMap<HeartbeatKey, (u64, ParsedHeartbeat)> = HashMap::new();
+    // (pubkey, d) -> the winning beat for that address so far: its timestamp, its signed id (the
+    // tie-breaker), and the parse.
+    let mut newest: HashMap<HeartbeatKey, (u64, String, ParsedHeartbeat)> = HashMap::new();
 
     for announcement in announcements {
         events_read = events_read.saturating_add(1);
@@ -289,21 +324,27 @@ pub fn reduce_directory(
         let pubkey = announcement.author_pubkey.to_ascii_lowercase();
         let key = parsed.key(&pubkey);
         let created = announcement.created_at;
-        // `>=` keeps the LAST event the relay handed us on an exact timestamp tie. The relay holds
-        // one event per address, so a tie means we were served duplicates and either is the same
-        // seat; what matters is that the choice is total and does not depend on iteration luck for
-        // its *fields*.
-        let supersedes = newest
-            .get(&key)
-            .map(|(previous, _)| created >= *previous)
-            .unwrap_or(true);
+        let id = announcement.event_id.to_ascii_lowercase();
+        // NEWER WINS, and on an exact tie the LOWER id wins — NIP-01's own rule for retaining an
+        // addressable event. A conforming relay may never serve the conflicting pair, but this
+        // reducer is reusable and is handed whatever arrives: two same-address beats sharing a
+        // timestamp and disagreeing about `accepting` must resolve the SAME way whichever order
+        // they come in, or a seat is live or retracted by luck.
+        let supersedes = match newest.get(&key) {
+            None => true,
+            Some((previous_created, previous_id, _)) => match created.cmp(previous_created) {
+                std::cmp::Ordering::Greater => true,
+                std::cmp::Ordering::Less => false,
+                std::cmp::Ordering::Equal => id < *previous_id,
+            },
+        };
         if supersedes {
-            newest.insert(key, (created, parsed));
+            newest.insert(key, (created, id, parsed));
         }
     }
 
     let mut sellers: Vec<DiscoveredSeller> = Vec::with_capacity(newest.len());
-    for (key, (created_at, parsed)) in newest {
+    for (key, (created_at, _id, parsed)) in newest {
         if created_at > policy.now_unix.saturating_add(policy.max_clock_skew_secs) {
             skipped.future_dated = skipped.future_dated.saturating_add(1);
             continue;
@@ -325,7 +366,9 @@ pub fn reduce_directory(
 
     SellerDirectory {
         sellers,
-        read_confirmed: true,
+        // The TRANSPORT's word, never this function's guess. A reducer handed a partial stream
+        // sees perfectly well-formed rows and has no way to know the relay stopped early.
+        read_confirmed: completion.is_confirmed(),
         skipped,
         events_read,
     }
@@ -407,12 +450,17 @@ pub use transport::{fetch_directory, fetch_directory_async};
 #[cfg(all(feature = "wallet", feature = "gateway"))]
 mod transport {
     use super::{
-        AnnouncedSeat, DEFAULT_DIRECTORY_LIMIT, DirectoryPolicy, DiscoveryError, SellerDirectory,
-        reduce_directory,
+        AnnouncedSeat, DEFAULT_DIRECTORY_LIMIT, DirectoryPolicy, DiscoveryError, ReadCompletion,
+        SellerDirectory, reduce_directory,
     };
     use crate::gateway::{EventDraft, TagSpec};
     use crate::home::MaxplayerHome;
     use std::time::{Duration, Instant};
+
+    /// Our own REQ's subscription id. The completion evidence is scoped to THIS id: an `EOSE` for
+    /// anything else — a liveness probe, the buyer's job subscription, another read sharing the
+    /// socket — says nothing about whether the directory request finished.
+    const DIRECTORY_SUB_ID: &str = "maxplayer-discovery-directory";
 
     /// Ceiling on the connect leg alone. `connect()` only SPAWNS the connection, so a fetch racing
     /// the handshake burns its whole window and comes back empty — which this module would then
@@ -425,14 +473,22 @@ mod transport {
         deadline.saturating_duration_since(Instant::now())
     }
 
-    /// Read the live seat directory off the home's relay. **Read-only**: it subscribes and fetches,
+    /// Read the live seat directory off the home's relay. **Read-only**: it subscribes and reads,
     /// and publishes no event of any kind.
     ///
-    /// Emptiness is disambiguated before it is reported, exactly as
-    /// [`crate::job_lifecycle::award_presence_async`] does it: an empty fetch is answered-empty only
-    /// once the relay proves it is serving THIS session's REQs, and the proof must precede the read
-    /// it vouches for — the first fetch may have spent its window on connect/auth, so absence is
-    /// concluded from a SECOND read taken after the probe's `EOSE`.
+    /// Completion is read off OUR OWN REQ and nothing else. The subscription is opened with a known
+    /// id, the notification receiver is established BEFORE the REQ goes out (an `EOSE` that lands
+    /// first would otherwise be missed), and only that id's `EOSE` sets
+    /// [`ReadCompletion::ConfirmedByEose`]. A deadline that expires, a socket that drops, or a
+    /// stream that ends leaves the read UNCONFIRMED however many rows arrived — a partial answer is
+    /// still returned, honestly flagged, because rows already in hand are useful and pretending they
+    /// are the whole market is not.
+    ///
+    /// This is deliberately NOT `fetch_events`. That helper ends on either an `EOSE` or a spent
+    /// timeout and returns the same `Ok(events)` for both (`job_lifecycle.rs:202` documents the
+    /// same trap), so no caller of it can honestly certify completion. Nor can a preceding liveness
+    /// probe stand in: a probe is a DIFFERENT subscription with a different filter, and its `EOSE`
+    /// is evidence about the probe.
     ///
     /// `budget` bounds the WHOLE read, not each leg. Connect, fetch, liveness probe and recheck
     /// draw down one deadline, because a caller (an MCP tool with a client read-timeout) can only
@@ -445,8 +501,8 @@ mod transport {
         limit: usize,
         budget: Duration,
     ) -> Result<SellerDirectory, DiscoveryError> {
-        use nostr_sdk::pool::relay::ReqExitPolicy;
-        use nostr_sdk::prelude::{Client, Filter, Kind};
+        use nostr_sdk::prelude::{Client, Filter, Kind, SubscriptionId};
+        use nostr_sdk::{RelayMessage, RelayPoolNotification};
 
         let deadline = Instant::now() + budget;
         let secret = crate::home::read_secret_key_hex(home)
@@ -483,58 +539,79 @@ mod transport {
                 limit
             });
 
-        // Through the SINGLE-RELAY api, not the pool: the pool swallows per-relay stream errors into
-        // `Ok(empty)`, so a relay REFUSING this REQ (a CLOSED with a reason, an auth failure) would
-        // read as an empty market. Here a refusal surfaces as `Err` and becomes `DiscoveryError`.
-        let mut events = relay
-            .fetch_events(
-                filter.clone(),
-                remaining(deadline),
-                ReqExitPolicy::ExitOnEOSE,
-            )
-            .await
-            .map_err(|error| DiscoveryError::Relay(format!("fetch seat directory: {error}")))?;
+        // The receiver comes up BEFORE the REQ is sent. An EOSE for a stored-event set the relay
+        // already has can arrive immediately, and a receiver opened after the REQ would miss it and
+        // report a completed read as unconfirmed.
+        let mut notifications = client.notifications();
+        let sub_id = SubscriptionId::new(DIRECTORY_SUB_ID);
 
-        if events.is_empty() {
-            // Out of budget: we hold an empty list we cannot vouch for. Report it as the
-            // unanswered read it is rather than probing on a deadline that has already passed.
-            if remaining(deadline).is_zero() {
-                client.disconnect().await;
-                return Ok(SellerDirectory::unverified());
-            }
-            let served = crate::buyer::relay::probe_relay_serves_our_reqs(
-                &client,
-                keys.public_key(),
-                remaining(deadline),
-            )
-            .await;
-            if !served {
-                client.disconnect().await;
-                return Ok(SellerDirectory::unverified());
-            }
-            // The probe vouches only for a read that FOLLOWS it, so a spent budget here cannot be
-            // reported as a confirmed empty market either.
-            let recheck = remaining(deadline);
-            if recheck.is_zero() {
-                client.disconnect().await;
-                return Ok(SellerDirectory::unverified());
-            }
-            events = relay
-                .fetch_events(filter, recheck, ReqExitPolicy::ExitOnEOSE)
-                .await
-                .map_err(|error| {
-                    DiscoveryError::Relay(format!("fetch seat directory (recheck): {error}"))
-                })?;
-            if events.is_empty() {
-                client.disconnect().await;
-                return Ok(SellerDirectory::empty_confirmed());
-            }
+        // Sent to the ONE relay this client holds. An immediate send failure is a hard error, not
+        // an empty market.
+        if let Err(error) = client.subscribe_with_id(sub_id.clone(), filter, None).await {
+            client.disconnect().await;
+            return Err(DiscoveryError::Relay(format!(
+                "subscribe seat directory: {error}"
+            )));
         }
 
+        let mut events: Vec<nostr_sdk::Event> = Vec::new();
+        let mut refusal: Option<String> = None;
+        // Pessimistic until this subscription's own EOSE says otherwise. Every early exit below
+        // leaves it as it is, so "we fell out of the loop somehow" can only ever mean unconfirmed.
+        let mut completion = ReadCompletion::Unconfirmed;
+
+        let _ = tokio::time::timeout(remaining(deadline), async {
+            loop {
+                match notifications.recv().await {
+                    Ok(RelayPoolNotification::Event {
+                        subscription_id,
+                        event,
+                        ..
+                    }) if subscription_id == sub_id => events.push((*event).clone()),
+                    Ok(RelayPoolNotification::Message {
+                        message: RelayMessage::EndOfStoredEvents(id),
+                        ..
+                    }) if *id == sub_id => {
+                        completion = ReadCompletion::ConfirmedByEose;
+                        return;
+                    }
+                    // A CLOSED naming our subscription is the relay REFUSING this read — an auth
+                    // failure, a policy rejection. It is an error with a reason, and reporting it
+                    // as "no sellers" would be the worst possible lie about it.
+                    Ok(RelayPoolNotification::Message {
+                        message:
+                            RelayMessage::Closed {
+                                subscription_id,
+                                message,
+                            },
+                        ..
+                    }) if *subscription_id == sub_id => {
+                        refusal = Some(message.to_string());
+                        return;
+                    }
+                    Ok(_) => continue,
+                    // The notification stream ending is a lost socket, never a finished read.
+                    Err(_) => return,
+                }
+            }
+        })
+        .await;
+
+        // Cleanup on EVERY path, including the timeout: drop our REQ before the socket goes, so a
+        // relay is not left streaming into a subscription nobody is reading.
+        client.unsubscribe(&sub_id).await;
         client.disconnect().await;
+
+        if let Some(reason) = refusal {
+            return Err(DiscoveryError::Relay(format!(
+                "relay refused the seat-directory subscription: {reason}"
+            )));
+        }
+
         let announcements = events.into_iter().map(|event| AnnouncedSeat {
             author_pubkey: event.pubkey.to_hex().to_ascii_lowercase(),
             created_at: event.created_at.as_secs(),
+            event_id: event.id.to_hex().to_ascii_lowercase(),
             event: EventDraft::new(
                 u16::try_from(event.kind.as_u16()).unwrap_or(event.kind.as_u16()),
                 event
@@ -545,7 +622,7 @@ mod transport {
                 event.content.clone(),
             ),
         });
-        Ok(reduce_directory(announcements, policy))
+        Ok(reduce_directory(announcements, policy, completion))
     }
 
     /// Sync entry point for callers not already on a runtime. `budget` bounds the whole read, as in
@@ -613,19 +690,209 @@ mod tests {
         }
     }
 
+    /// The reducer under a COMPLETED read. Completion is a transport fact, and these tests are
+    /// about the rules; the confirmed/unconfirmed distinction has its own tests below and a
+    /// behavioral one against a scripted relay in `tests/discovery_relay_behavior.rs`.
+    fn reduced(
+        announcements: impl IntoIterator<Item = AnnouncedSeat>,
+        policy: DirectoryPolicy,
+    ) -> SellerDirectory {
+        reduce_directory(announcements, policy, ReadCompletion::ConfirmedByEose)
+    }
+
+    /// A distinct id per (pubkey, created_at), so the ordinary tests carry signed-shaped ids
+    /// without caring what they are. Tie-break tests state their ids explicitly instead.
     fn announced(pubkey: &str, created_at: u64, draft: &HeartbeatDraft) -> AnnouncedSeat {
+        let id = format!("{:0>64}", format!("{}{created_at}", &pubkey[..4]));
+        announced_with_id(pubkey, created_at, &id, draft)
+    }
+
+    fn announced_with_id(
+        pubkey: &str,
+        created_at: u64,
+        event_id: &str,
+        draft: &HeartbeatDraft,
+    ) -> AnnouncedSeat {
+        AnnouncedSeat {
+            event_id: event_id.to_owned(),
+            ..announced_inner(pubkey, created_at, draft)
+        }
+    }
+
+    fn announced_inner(pubkey: &str, created_at: u64, draft: &HeartbeatDraft) -> AnnouncedSeat {
         AnnouncedSeat {
             author_pubkey: pubkey.to_owned(),
             created_at,
+            event_id: String::new(),
             event: draft.to_event_draft(),
         }
+    }
+
+    #[test]
+    fn an_equal_created_at_tie_resolves_to_the_lowest_id_in_either_input_order() {
+        // F2. Two SIGNED beats for one address, same timestamp, opposite `accepting`: one says the
+        // seat is live, the other retracts it. NIP-01 retains the lowest id, so the retraction here
+        // (id "11…") must win both times. Before the id crossed the transport seam this resolved by
+        // whichever event the relay happened to hand over last — a seat live or dead by luck.
+        let live = beat(Some("Rust"), Some(open_policy()));
+        let terminal = retraction_for_state(
+            0,
+            12,
+            false,
+            vec![MINT.to_owned()],
+            vec!["claude".to_owned()],
+            SeatCapability {
+                harness_families: vec!["claude-code".to_owned()],
+                specialty: Some("Rust".to_owned()),
+                ..SeatCapability::default()
+            },
+            open_policy(),
+        );
+        let low = format!("{:1>64}", "");
+        let high = format!("{:f>64}", "");
+
+        for (first, second) in [(&live, &terminal), (&terminal, &live)] {
+            let first_id = if std::ptr::eq(first, &live) {
+                &high
+            } else {
+                &low
+            };
+            let second_id = if std::ptr::eq(second, &live) {
+                &high
+            } else {
+                &low
+            };
+            let directory = reduced(
+                [
+                    announced_with_id(SEAT_A, NOW - 30, first_id, first),
+                    announced_with_id(SEAT_A, NOW - 30, second_id, second),
+                ],
+                DirectoryPolicy::at(NOW),
+            );
+            assert!(
+                directory.sellers.is_empty(),
+                "the lowest-id event is the retraction, so the seat must be retracted whichever \
+                 order it arrives in: {directory:?}"
+            );
+            assert_eq!(directory.skipped.retracted, 1);
+        }
+
+        // And the mirror image: when the LIVE beat holds the lowest id, the seat stays listed in
+        // both orders. A tie-break that always dropped the seat would pass the half above.
+        for (first, second) in [(&live, &terminal), (&terminal, &live)] {
+            let first_id = if std::ptr::eq(first, &live) {
+                &low
+            } else {
+                &high
+            };
+            let second_id = if std::ptr::eq(second, &live) {
+                &low
+            } else {
+                &high
+            };
+            let directory = reduced(
+                [
+                    announced_with_id(SEAT_A, NOW - 30, first_id, first),
+                    announced_with_id(SEAT_A, NOW - 30, second_id, second),
+                ],
+                DirectoryPolicy::at(NOW),
+            );
+            assert_eq!(
+                directory.sellers.len(),
+                1,
+                "the lowest-id event is the live beat, so the seat must be listed whichever order \
+                 it arrives in: {directory:?}"
+            );
+            assert_eq!(directory.skipped.retracted, 0);
+        }
+    }
+
+    #[test]
+    fn a_newer_timestamp_still_outranks_a_lower_id() {
+        // The tie-break must be SECONDARY. An id-first order would let a stale low-id beat outrank
+        // the seat's newer word about itself.
+        let live = beat(Some("Rust"), Some(open_policy()));
+        let terminal = retraction_for_state(
+            0,
+            12,
+            false,
+            vec![MINT.to_owned()],
+            vec!["claude".to_owned()],
+            SeatCapability {
+                harness_families: vec!["claude-code".to_owned()],
+                specialty: Some("Rust".to_owned()),
+                ..SeatCapability::default()
+            },
+            open_policy(),
+        );
+        let low = format!("{:1>64}", "");
+        let high = format!("{:f>64}", "");
+
+        // Older retraction with the LOW id; newer live beat with the HIGH id. Newer wins.
+        let directory = reduced(
+            [
+                announced_with_id(SEAT_A, NOW - 300, &low, &terminal),
+                announced_with_id(SEAT_A, NOW - 30, &high, &live),
+            ],
+            DirectoryPolicy::at(NOW),
+        );
+        assert_eq!(directory.sellers.len(), 1, "{directory:?}");
+
+        // And the reverse: newer retraction with the high id beats an older live beat with the low.
+        let directory = reduced(
+            [
+                announced_with_id(SEAT_A, NOW - 300, &low, &live),
+                announced_with_id(SEAT_A, NOW - 30, &high, &terminal),
+            ],
+            DirectoryPolicy::at(NOW),
+        );
+        assert!(directory.sellers.is_empty(), "{directory:?}");
+    }
+
+    #[test]
+    fn an_unconfirmed_read_never_reports_itself_as_confirmed_however_many_rows_it_holds() {
+        // F1, at the reducer seam. A partial stream carries perfectly well-formed rows; the reducer
+        // cannot tell it from a completed one, so completion is passed IN and never inferred.
+        let live = beat(Some("Rust"), Some(open_policy()));
+
+        let partial = reduce_directory(
+            [announced(SEAT_A, NOW - 30, &live)],
+            DirectoryPolicy::at(NOW),
+            ReadCompletion::Unconfirmed,
+        );
+        assert_eq!(partial.sellers.len(), 1, "partial rows are KEPT");
+        assert!(
+            !partial.read_confirmed,
+            "rows in hand are not evidence the relay finished answering"
+        );
+
+        // The nastiest shape of the same bug: one stale beat arrives, the stream dies, and the
+        // filtered-out row leaves an EMPTY seller list. Confirmed here would read as "the market is
+        // empty" on the strength of an answer that never came.
+        let stale_partial = reduce_directory(
+            [announced(SEAT_A, NOW - DEFAULT_MAX_AGE_SECS - 1, &live)],
+            DirectoryPolicy::at(NOW),
+            ReadCompletion::Unconfirmed,
+        );
+        assert!(stale_partial.sellers.is_empty());
+        assert!(
+            !stale_partial.read_confirmed,
+            "an empty list from an unfinished read is not an empty market"
+        );
+        assert_eq!(
+            stale_partial.events_read, 1,
+            "and it still says what it saw"
+        );
+
+        assert!(ReadCompletion::ConfirmedByEose.is_confirmed());
+        assert!(!ReadCompletion::Unconfirmed.is_confirmed());
     }
 
     #[test]
     fn a_declared_specialty_reaches_the_discovery_output_with_its_pubkey() {
         // The chain scope 1 started, finished: config -> beat -> tag -> parse -> a row a buyer can
         // act on. `pubkey` is the load-bearing field — it is what the targeted post takes.
-        let directory = reduce_directory(
+        let directory = reduced(
             [announced(
                 SEAT_A,
                 NOW - 30,
@@ -669,7 +936,7 @@ mod tests {
         // the real `OfferDraft` -> `to_event_draft` -> `parse_offer` path rather than eyeballed.
         use crate::gateway::{OfferDraft, assert_seller_matches, is_targeted, parse_offer};
 
-        let directory = reduce_directory(
+        let directory = reduced(
             [announced(
                 SEAT_A,
                 NOW - 30,
@@ -718,7 +985,7 @@ mod tests {
     fn a_seat_with_no_specialty_is_still_discoverable() {
         // The migration property the order names: old sellers without a description must not vanish
         // from the directory. Unstated is a missing FIELD, never a missing SEAT.
-        let directory = reduce_directory(
+        let directory = reduced(
             [announced(
                 SEAT_A,
                 NOW - 10,
@@ -735,7 +1002,7 @@ mod tests {
     fn a_legacy_beat_that_states_no_admission_reads_as_unstated_never_closed() {
         // Rendering unstated as `closed` would tell a buyer that every seat older than the §4.2
         // tags refuses it. The seat did not say; the directory must not say either.
-        let directory = reduce_directory(
+        let directory = reduced(
             [announced(SEAT_A, NOW - 10, &beat(Some("Rust"), None))],
             DirectoryPolicy::at(NOW),
         );
@@ -768,7 +1035,7 @@ mod tests {
             },
             open_policy(),
         );
-        let directory = reduce_directory(
+        let directory = reduced(
             [
                 announced(SEAT_A, NOW - 600, &live),
                 announced(SEAT_A, NOW - 60, &terminal),
@@ -784,7 +1051,7 @@ mod tests {
 
         // AND THE OTHER DIRECTION, or the assertion above is satisfied by any rule that drops
         // `accepting=n`: an OLDER retraction must NOT bury a newer live beat.
-        let recovered = reduce_directory(
+        let recovered = reduced(
             [
                 announced(SEAT_A, NOW - 600, &terminal),
                 announced(SEAT_A, NOW - 60, &live),
@@ -802,7 +1069,7 @@ mod tests {
     #[test]
     fn a_stale_or_future_dated_beat_is_not_a_live_seller() {
         let live = beat(Some("Rust"), Some(open_policy()));
-        let stale = reduce_directory(
+        let stale = reduced(
             [announced(SEAT_A, NOW - DEFAULT_MAX_AGE_SECS - 1, &live)],
             DirectoryPolicy::at(NOW),
         );
@@ -811,13 +1078,13 @@ mod tests {
 
         // Exactly AT the window is still live — the bound is inclusive, so a seat is not dropped by
         // one second of arithmetic it cannot observe.
-        let edge = reduce_directory(
+        let edge = reduced(
             [announced(SEAT_A, NOW - DEFAULT_MAX_AGE_SECS, &live)],
             DirectoryPolicy::at(NOW),
         );
         assert_eq!(edge.sellers.len(), 1, "{edge:?}");
 
-        let future = reduce_directory(
+        let future = reduced(
             [announced(
                 SEAT_A,
                 NOW + DEFAULT_MAX_CLOCK_SKEW_SECS + 1,
@@ -829,7 +1096,7 @@ mod tests {
         assert_eq!(future.skipped.future_dated, 1);
 
         // Inside the skew tolerance a seat stays visible, at age zero rather than a wrapped age.
-        let skewed = reduce_directory(
+        let skewed = reduced(
             [announced(SEAT_A, NOW + 10, &live)],
             DirectoryPolicy::at(NOW),
         );
@@ -844,13 +1111,14 @@ mod tests {
         let junk = AnnouncedSeat {
             author_pubkey: SEAT_B.to_owned(),
             created_at: NOW - 10,
+            event_id: format!("{:0>64}", "junk"),
             event: EventDraft::new(
                 crate::heartbeat::SELLER_HEARTBEAT_KIND,
                 vec![crate::gateway::TagSpec::new(["d", "maxplayer-seller"])],
                 "",
             ),
         };
-        let directory = reduce_directory(
+        let directory = reduced(
             [
                 announced(SEAT_A, NOW - 10, &beat(Some("Rust"), Some(open_policy()))),
                 junk,
@@ -869,7 +1137,7 @@ mod tests {
         // its newest — an id-keyed reduce would list the same seat twice at two rates.
         let old = beat(Some("Rust, old text"), Some(open_policy()));
         let new = beat(Some("Rust, current text"), Some(open_policy()));
-        let directory = reduce_directory(
+        let directory = reduced(
             [
                 announced(SEAT_B, NOW - 20, &new),
                 announced(SEAT_A, NOW - 300, &old),
@@ -919,7 +1187,7 @@ mod tests {
 
         // And a REDUCED directory is always a confirmed read: the reducer only ever runs on events
         // the relay actually served, so the unconfirmed value cannot be produced by this path.
-        let reduced = reduce_directory([], DirectoryPolicy::at(NOW));
+        let reduced = reduced([], DirectoryPolicy::at(NOW));
         assert!(reduced.read_confirmed);
         assert_eq!(reduced, answered);
     }
