@@ -122,6 +122,16 @@ These are new, and exist because the grant boundary meets real marketplace code 
 
 ### 13 · Owned-award admission
 
+> **SUPERSEDED — this check is withdrawn, not merely unimplemented.** It tests that a tool grant
+> is refused unless the award is genuinely ours. With no per-job grant there is nothing to
+> refuse, and the tool's availability does not depend on any award. Deleting the check loses
+> nothing, because the property it protected no longer exists.
+>
+> The replacement checks are the ones that survived the model change: parameter validation,
+> job-directory confinement, cross-job refusal, credential containment, and availability
+> tracking the daemon. Those are implemented and run — 32 tests in `crates/maxplayer-tool-kit`
+> plus 27 container checks in `docker/demo.sh`. See [00](00-README.md).
+
 Each case asserts **zero child starts and no grant minted** unless stated:
 
 | Case | Required outcome |

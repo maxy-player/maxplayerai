@@ -45,6 +45,13 @@ existing loader, validator or reviewer.
 
 ## 2. Job lifecycle and the authority model
 
+> **Findings stand; the use they were put to does not.** Everything this section establishes
+> about the repository is verified and still true — an award row is not a win, and the job
+> record carries no service or grant. What the scope correction withdrew is the *inference*
+> that the tool lifecycle should therefore hang off the award boundary. It should not: the tool
+> is enrolled per seller daemon, so §2.2's "the job record has no grant" is no longer a gap to
+> close but simply the correct shape. See [00](00-README.md) for the governing correction.
+
 ### 2.1 An award row is not a win
 
 This is the single most important correction to the first version of this survey, and it

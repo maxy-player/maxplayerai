@@ -27,6 +27,11 @@ manifest         (authored by the seller; selects a profile version and supplies
 job grant        (issued by the holder per job; see 04)
 ```
 
+> **The third layer is withdrawn.** There is no per-job grant: the tool is enrolled once per
+> seller daemon, so the stack ends at the manifest. A job receives an endpoint and a directory,
+> which narrow *where* a call may act but are not a layer of the offering. The narrowing rule
+> below still governs the two layers that remain. See [00](00-README.md).
+
 Each layer may only narrow the layer above it. No layer may widen one.
 
 ## Top-level shape
@@ -66,7 +71,9 @@ operations:                       # one entry per advertised verb; the union of 
       max_items: 20               # matches page_limit; see 03 for the derivation rule
       max_bytes: 262144           # OUTPUT bytes; input and network are counted separately
 
-grant_policy:                     # who may open a job against this offering; see 04
+grant_policy:                     # WITHDRAWN with the per-job grant model; see 00. Retained
+                                  # here only so the surrounding schema reads intact.
+                                  # who may open a job against this offering; see 04
   allowed_openers: ["opener:marketplace-core"]
   allowed_parties: ["party:P"]    # which parties may have jobs opened against THIS holder.
                                   # Listing several parties does NOT let one holder serve

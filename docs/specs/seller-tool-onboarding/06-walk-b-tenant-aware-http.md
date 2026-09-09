@@ -84,6 +84,11 @@ its *request semantics* are unconstrained.
 
 ## Step 4 — Grant and checker
 
+> **SUPERSEDED, and doubly inert:** walk B was already deferred at rung 3, and the grant
+> machinery it inherits from walk A is withdrawn. The sentence below that grant issuance
+> "transfers unchanged" is now vacuous — there is nothing to transfer. The tenant-isolation
+> question this walk exists to raise is untouched and still open. See [00](00-README.md).
+
 Grant issuance, token verification, close and budgets all transfer unchanged; they are
 transport-independent. The checker does not transfer:
 

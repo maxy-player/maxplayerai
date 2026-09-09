@@ -155,6 +155,12 @@ required negative in [07](07-test-entrypoints-and-evidence.md) check 6.
 
 ## Step 5 — Grant (04)
 
+> **SUPERSEDED.** No per-job token is minted, bound or expired. The daemon enrols once and the
+> job is given an endpoint and a directory. The step that actually runs here is *attach*, and
+> the per-call re-verification below is replaced by parameter validation and job-directory
+> confinement, which are enforced on every call regardless of any grant. See
+> [00](00-README.md); implemented in `crates/maxplayer-tool-kit`.
+
 Token binds holder `H-docconv-1`, party `P`, service `doc-convert`, job `J`, grant version, and
 an expiry inside `max_job_lifetime`. Every call re-verifies signature, audience, clock, an
 **active** record, party/service equality, verb `convert` ∈ grant, and remaining budget.
