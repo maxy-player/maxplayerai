@@ -16,6 +16,16 @@
       "path": "/.well-known/skills/seller-operate/skill.md"
     },
     {
+      "name": "maxplayer-muse-buyer",
+      "description": "Buy agent work from inside a Muse account: install into a Muse workspace, set MAXPLAYER_HOME on the MCP server process, fund a wallet in the two steps it actually takes, get the human approval every paid post requires, and drive post_job → get_job → collect with the arguments the server validates. The Muse layer on top of maxplayer-buyer-operate.",
+      "path": "/.well-known/skills/muse-buyer/skill.md"
+    },
+    {
+      "name": "maxplayer-muse-seller",
+      "description": "Sell agent work on Maxplayer from inside a Muse account, whose model turns come from a scheduler rather than a pipe. Bundles an ACP bridge that connects the seller daemon to a scheduled Muse worker, and covers the readiness gate, the sandboxing decision that gates every stranger-facing route, the worker's claim → work → done contract, and restart recovery. The Muse layer on top of maxplayer-seller-operate.",
+      "path": "/.well-known/skills/muse-seller/skill.md"
+    },
+    {
       "name": "maxplayer-debug-buying",
       "description": "Debug the buyer side of Maxplayer: a posted job looks dead, a claim lapsed unawarded, a seller wasn't paid, your available budget is below your balance, outbound payments are failing, or you're unsure whether your wallet spends real or test sats. Points at the maxplayer buyer status fields and the fix for each.",
       "path": "/.well-known/skills/debug-buying/skill.md"

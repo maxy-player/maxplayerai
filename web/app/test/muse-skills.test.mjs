@@ -369,6 +369,121 @@ test("reap releases a dead run's claim and leaves everything else alone", () => 
   assert.equal(reclaimed.job_dir, live, "the released job is workable again after a restart");
 });
 
+// --- the published surface ---------------------------------------------------
+
+const SKILLS_DIR = join(root, ".well-known", "skills");
+const index = JSON.parse(readFileSync(join(SKILLS_DIR, "index.json"), "utf8"));
+const MUSE_SKILLS = ["maxplayer-muse-buyer", "maxplayer-muse-seller"];
+
+function frontmatter(text) {
+  const match = /^---\n([\s\S]*?)\n---\n/.exec(text);
+  assert.ok(match, "a skill must open with a YAML frontmatter block");
+  const fields = {};
+  for (const line of match[1].split("\n")) {
+    const field = /^(\w+):\s*(.*)$/.exec(line);
+    if (field) fields[field[1]] = field[2].trim();
+  }
+  return fields;
+}
+
+test("both Muse skills are published in the discovery index", () => {
+  const names = index.skills.map(({ name }) => name);
+  for (const name of MUSE_SKILLS) {
+    assert.ok(names.includes(name), `${name} is missing from index.json`);
+  }
+});
+
+test("every indexed skill resolves to a file whose frontmatter agrees with the index", () => {
+  for (const skill of index.skills) {
+    assert.match(skill.path, /^\/\.well-known\/skills\/[a-z-]+\/skill\.md$/);
+    const file = join(root, skill.path.slice(1));
+    assert.ok(existsSync(file), `${skill.name} points at a missing file: ${skill.path}`);
+    const fields = frontmatter(readFileSync(file, "utf8"));
+    // Muse finds a skill by searching names and frontmatter, so the frontmatter
+    // name IS the installed identity: a mismatch publishes one skill under two
+    // names and makes the description a trigger for something else.
+    assert.equal(fields.name, skill.name, `${skill.path} frontmatter name`);
+    assert.ok(fields.description && fields.description.length > 40,
+      `${skill.name} needs a description that can trigger a search`);
+    assert.ok(skill.description && skill.description.length > 40,
+      `${skill.name} needs an index description`);
+  }
+});
+
+test("every pointer the Muse skills publish resolves to a shipped file", () => {
+  for (const name of MUSE_SKILLS) {
+    const entry = index.skills.find((skill) => skill.name === name);
+    const dir = dirname(join(root, entry.path.slice(1)));
+    const pages = [join(dir, "skill.md")];
+    const references = join(dir, "references");
+    if (existsSync(references)) {
+      for (const file of readdirSync(references)) pages.push(join(references, file));
+    }
+    let linked = 0;
+    for (const page of pages) {
+      const text = readFileSync(page, "utf8");
+      const links = [...text.matchAll(/\]\((\/\.well-known\/[^)\s]+)\)/g)].map((m) => m[1]);
+      linked += links.length;
+      for (const link of links) {
+        // A published skill's pointers are URLs on a live site. One that does not
+        // resolve to a shipped file is a 404 the reader hits mid-procedure.
+        assert.ok(existsSync(join(root, link.slice(1))),
+          `${page} links ${link}, which is not shipped`);
+      }
+    }
+    assert.ok(linked > 0, `${name} should point at its companions and references`);
+  }
+});
+
+test("the Muse skills carry no operator identity, home path, key or balance", () => {
+  // A public skill that ships one box's identity is not a public skill. These are
+  // the exact shapes the source field reports were full of.
+  const forbidden = [
+    [/\/home\/[a-z]/i, "an absolute home path"],
+    [/\/Users\/[a-z]/i, "an absolute home path"],
+    [/\b[0-9a-f]{64}\b/, "a 64-hex key or pubkey"],
+    [/\blnbc[0-9a-z]{20,}/i, "a Lightning invoice"],
+    [/balance_sats\s*=\s*\d/, "a wallet balance"],
+    [/\bdevice_id\b/, "a device id"],
+  ];
+  for (const name of MUSE_SKILLS) {
+    const entry = index.skills.find((skill) => skill.name === name);
+    const dir = dirname(join(root, entry.path.slice(1)));
+    const files = [join(dir, "skill.md")];
+    for (const sub of ["references", "bin"]) {
+      const subdir = join(dir, sub);
+      if (existsSync(subdir)) {
+        for (const file of readdirSync(subdir)) files.push(join(subdir, file));
+      }
+    }
+    for (const file of files) {
+      const text = readFileSync(file, "utf8");
+      for (const [pattern, what] of forbidden) {
+        assert.equal(pattern.test(text), false, `${file} contains ${what}`);
+      }
+    }
+  }
+});
+
+test("the seller skill ships the executable bridge it tells the reader to run", () => {
+  assert.ok(existsSync(BRIDGE), "the bridge is published inside the skill directory");
+  const skill = readFileSync(join(SKILLS_DIR, "muse-seller", "skill.md"), "utf8");
+  assert.match(skill, /bin\/muse-acp-bridge\.py/);
+  // Each subcommand the skill instructs a worker to run must exist.
+  for (const command of ["selfcheck", "claim", "done", "reap"]) {
+    assert.match(skill, new RegExp(`muse-acp-bridge\\.py[^\\n]*${command}|\`${command}\``),
+      `the skill documents the ${command} subcommand`);
+    assert.equal(
+      spawnSync(PYTHON, [BRIDGE, command === "done" ? "--help" : command, "--help"].slice(0, 3), {
+        encoding: "utf8",
+        env: { ...process.env, MAXPLAYER_MUSE_QUEUE: tempRoot(`cmd-${command}`) },
+      }).status,
+      0,
+      `${command} is a real subcommand`,
+    );
+  }
+});
+
 test("cancelling a live turn propagates to the worker and ends the turn as cancelled", async () => {
   const queue = tempRoot("cancel");
   const workdir = workdirFor("cancel-work");
