@@ -154,6 +154,15 @@ COPY --from=corpus /corpus /opt/cashu/corpus
 COPY --from=mint-builder /out/rust /opt/rust
 ENV CARGO_HOME=/opt/rust/cargo \
     PATH=/opt/rust/toolchain/bin:/opt/rust/cargo/bin:$PATH
+# A LOGIN shell throws the ENV above away: Debian's /etc/profile assigns PATH unconditionally
+# (/etc/profile:5), so `bash -lc rustc` fails in an image where `bash -c rustc` works. That is a
+# trap for anything invoking this image through a login shell, which is the common case for a job
+# harness, so put the toolchain back on PATH for login shells too rather than relying on callers
+# to know. Measured on this image before the fix: `bash -lc` saw the stock six-entry PATH.
+RUN printf '%s\n' 'PATH="/opt/rust/toolchain/bin:/opt/rust/cargo/bin:$PATH"' 'export PATH' \
+      > /etc/profile.d/10-rust-toolchain.sh \
+ && chmod 0644 /etc/profile.d/10-rust-toolchain.sh \
+ && bash -lc 'command -v rustc && command -v cargo' >/dev/null
 # Offline by default: a specialist job must not silently reach crates.io and call that a warm cache,
 # and a contained job may have no route there at all. `--offline` on the command line is redundant
 # once this is set; `CARGO_NET_OFFLINE=false` in a job's environment is the deliberate opt-out.

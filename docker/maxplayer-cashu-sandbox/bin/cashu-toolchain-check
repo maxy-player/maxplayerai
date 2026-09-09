@@ -9,6 +9,16 @@
 #
 # It deliberately does NOT build inside the delivered workdir: compiling there would put a target/
 # directory into the buyer's deliverable.
+#
+# PATH is set here rather than inherited. The image's ENV puts the toolchain on PATH, but a LOGIN
+# shell discards that — Debian's /etc/profile assigns PATH unconditionally — so this script failed
+# with `rustc: not found` under `bash -lc` in an image that was in fact complete. A proof script
+# that reports a false negative depending on how its caller spawned a shell is not a proof, so it
+# now resolves its own toolchain.
+PATH="/opt/rust/toolchain/bin:/opt/rust/cargo/bin:$PATH"
+export PATH
+CARGO_HOME="${CARGO_HOME:-/opt/rust/cargo}"
+export CARGO_HOME
 
 set -eu
 
