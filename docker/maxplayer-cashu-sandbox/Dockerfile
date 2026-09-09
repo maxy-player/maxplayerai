@@ -151,6 +151,20 @@ COPY --from=mint-builder /out/bin/mint-acceptance /usr/local/bin/mint-acceptance
 COPY --from=corpus /corpus /opt/cashu/corpus
 
 # Runtime Rust (advisor F1).
+#
+# A Rust toolchain plus a warm registry is still not a build environment: rustc shells out to a C
+# linker, and this base image ships no compiler at all (measured: no cc, no gcc, no ld, 119 dpkg
+# entries). Without these three packages the offline build dies at `linker \`cc\` not found` after
+# resolving every dependency correctly — which looks like a dependency problem and is not one.
+#
+# These are NOT version-pinned, deliberately. Pinning exact Debian package versions makes the image
+# unbuildable the moment bookworm rotates a point release, and the reproducibility that matters here
+# is the Rust/CDK dependency set, which IS locked. The exact versions installed are recorded into
+# /opt/rust/TOOLCHAIN.txt at build time so a replay can be audited rather than assumed.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends gcc libc6-dev binutils; \
+    rm -rf /var/lib/apt/lists/*
 COPY --from=mint-builder /out/rust /opt/rust
 ENV CARGO_HOME=/opt/rust/cargo \
     PATH=/opt/rust/toolchain/bin:/opt/rust/cargo/bin:$PATH
@@ -204,6 +218,28 @@ RUN set -eux; \
     cashu-toolchain-check --help >/dev/null; \
     test -f /opt/cashu/knowledge/MEMORY.md; \
     test -f /opt/cashu/examples/wallet-roundtrip/Cargo.lock
+
+# The offline build proof runs AT BUILD TIME, so the image cannot ship claiming an offline Rust/CDK
+# environment it does not have. Both failures found by running it — a login shell losing PATH, and a
+# missing C linker — would have shipped silently otherwise. Built in /tmp and deleted: the proof is
+# that it compiled, and a stale target/ tree in the image would only be weight.
+RUN set -eux; \
+    { echo "# runtime build environment, recorded at image build"; \
+      rustc --version; \
+      cargo --version; \
+      gcc --version | head -1; \
+      ld --version | head -1; \
+      dpkg-query -W -f='gcc ${Version}\n' gcc; \
+      dpkg-query -W -f='libc6-dev ${Version}\n' libc6-dev; \
+      dpkg-query -W -f='binutils ${Version}\n' binutils; \
+    } >> /opt/rust/TOOLCHAIN.txt; \
+    chmod 0644 /opt/rust/TOOLCHAIN.txt; \
+    cp -a /opt/cashu/examples/wallet-roundtrip /tmp/offline-build-proof; \
+    cd /tmp/offline-build-proof; \
+    CARGO_TARGET_DIR=/tmp/offline-build-proof-target cargo build --offline --locked; \
+    test -x /tmp/offline-build-proof-target/debug/wallet-roundtrip; \
+    cd /; \
+    rm -rf /tmp/offline-build-proof /tmp/offline-build-proof-target
 
 LABEL ai.maxplayer.specialist="cashu-cdk" \
       ai.maxplayer.cashu.cdk-version="${CDK_VERSION}" \
