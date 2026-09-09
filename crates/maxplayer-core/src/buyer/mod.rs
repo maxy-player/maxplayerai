@@ -527,19 +527,33 @@ fn post_job_kind(params: &PostJobParams) -> Result<JobKind, String> {
 /// CLI/MCP use), record its auto-award intent, and spawn the background auto-award task — the
 /// daemon-drives-the-award half of the 2-call trade loop (post_job → collect). No reservation is
 /// taken at post — funds are reserved at award.
-async fn post_job(context: &Arc<BuyerContext>, id: Value, params: Value) -> Response {
-    let params: PostJobParams = match serde_json::from_value(params) {
-        Ok(params) => params,
-        Err(error) => return Response::err(id, CODE_METHOD_NOT_FOUND, format!("post_job params: {error}")),
-    };
-    let job = match post_job_kind(&params) {
-        Ok(job) => job,
-        Err(message) => return Response::err(id, CODE_METHOD_NOT_FOUND, message),
-    };
-    let payment_mode = match post_job_payment_mode(params.payment.as_deref(), params.amount_sats) {
-        Ok(mode) => mode,
-        Err(message) => return Response::err(id, CODE_METHOD_NOT_FOUND, message),
-    };
+/// The `post_job` RPC body, mapped — the request the lifecycle will be handed, plus the three
+/// values the daemon keeps for its auto-award intent.
+///
+/// A named result rather than a tuple because [`map_post_job_params`] is the boundary a caller
+/// hands a discovered pubkey to, and "which field did the seller end up in" is the whole question
+/// at that boundary.
+pub struct PostJobMapping {
+    pub request: PostJobRequest,
+    pub max_sats: u64,
+    pub harness: Option<String>,
+    pub model: Option<String>,
+}
+
+/// Map a `post_job` RPC body to a [`PostJobRequest`], with NO daemon, relay, wallet or money.
+///
+/// Lifted out of the RPC handler so this boundary can be exercised on its own. It is the mapping a
+/// buyer's pubkey actually travels through: the MCP `post_job` tool routes here, so a value that
+/// `OfferDraft` would accept but this rejects is a value no user can post with. Discovery ends at a
+/// pubkey precisely so it can be handed in here, which is why the handoff is asserted through this
+/// function rather than around it.
+///
+/// Errors are the RPC's own strings, unchanged, so the handler's replies read exactly as before.
+pub fn map_post_job_params(params: Value) -> Result<PostJobMapping, String> {
+    let params: PostJobParams =
+        serde_json::from_value(params).map_err(|error| format!("post_job params: {error}"))?;
+    let job = post_job_kind(&params)?;
+    let payment_mode = post_job_payment_mode(params.payment.as_deref(), params.amount_sats)?;
     let max_sats = params.max_sats.unwrap_or(params.amount_sats);
     let harness = params.harness.clone();
     let model = params.model.clone();
@@ -568,6 +582,24 @@ async fn post_job(context: &Arc<BuyerContext>, id: Value, params: Value) -> Resp
         // read alone would make free jobs postable and — because `authorize_pay_async` refuses a
         // free bind — uncollectable.
         payment_mode,
+    };
+    Ok(PostJobMapping {
+        request,
+        max_sats,
+        harness,
+        model,
+    })
+}
+
+async fn post_job(context: &Arc<BuyerContext>, id: Value, params: Value) -> Response {
+    let PostJobMapping {
+        request,
+        max_sats,
+        harness,
+        model,
+    } = match map_post_job_params(params) {
+        Ok(mapping) => mapping,
+        Err(message) => return Response::err(id, CODE_METHOD_NOT_FOUND, message),
     };
     match job_lifecycle::post_job_async(&context.home, request).await {
         Ok(outcome) => {
