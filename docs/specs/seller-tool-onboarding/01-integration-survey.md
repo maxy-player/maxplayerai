@@ -1,176 +1,242 @@
 # 01 — Integration survey, proposed kit location, real job connection point
 
-Survey of `maxplayerai` at `upstream/main` = `d7b94db` ("release: cut v0.5.8"). Every claim
-below carries a path; anything not observed is marked **NOT FOUND** or **INFERENCE**. Plan v3
-§6 stage 0 requires this inspection before any contract is proposed, precisely so the contract
-does not "invent config as already supported".
+Survey of `maxplayerai` at `upstream/main` = `d7b94db`. Every claim carries a path; anything not
+observed is marked **NOT FOUND** or **INFERENCE**. Plan v3 §6 stage 0 requires this inspection
+before any contract is proposed, precisely so the contract does not "invent config as already
+supported".
+
+> **Revision note (F3).** The first version of this survey stated that credential custody today
+> is "host-held and injected into the container". **That was wrong**, and the error mattered:
+> the seller execution path already runs a per-job host credential proxy that keeps the real
+> secret out of the container and passes a placeholder instead. §4 below is rewritten from the
+> source. The related overstatement in G-6 is corrected in
+> [08](08-gaps-and-unsupported.md).
 
 Workspace members (`Cargo.toml:2-8`): `crates/maxplayer-core`, `crates/maxplayer-desktop`,
 `crates/maxplayer-evals`, `crates/maxplayer`, `crates/maxplayer-relay-write-policy`.
-`crates/buzz/` is on disk but is **not** a workspace member (its own nested workspace).
+`crates/buzz/` is on disk but is **not** a workspace member.
+
+Citation convention: unqualified `store.rs` and `run.rs` are under
+`crates/maxplayer-core/src/seller_node/`; other files are under `crates/maxplayer-core/src/`.
 
 ## 1. Seller onboarding and configuration — what exists
 
 | Thing | Where |
 | --- | --- |
-| `SellerConfig` | `crates/maxplayer-core/src/home.rs:193` |
-| `SandboxConfig` | `crates/maxplayer-core/src/home.rs:550` |
-| root `MaxplayerConfig` | `crates/maxplayer-core/src/home.rs:1471` |
+| `SellerConfig` | `home.rs:193` |
+| `SandboxConfig` | `home.rs:550` |
+| root `MaxplayerConfig` | `home.rs:1471` |
 | `load_config` / `save_config` | `home.rs:1923` / `home.rs:2224` |
-| `require_seller_config` | `crates/maxplayer-core/src/seller.rs:54` |
-| interactive onboarding | `crates/maxplayer/src/sell.rs`, `ensure_seller_config` `:318`, entry `run` `:75` |
-| harness registry | `crates/maxplayer-core/src/seller_agents.rs`: `RegisteredAgent:51`, `AgentRegistry:130`, `resolve:263` |
-| capability tokens | `crates/maxplayer-core/src/capability.rs:36` — `CAPABILITIES = ["node","python","rust"]`, probed by `probe_capabilities:145` |
-| buyer-repo declarative config (per-job, **not** seller-authored) | `crates/maxplayer-core/src/checks.rs`: `DECLARATION_PATH = ".maxplayer/checks.toml"` `:11`, `parse_declaration:184`, 64 KiB limit `:14` |
+| `require_seller_config` | `seller.rs:54` |
+| interactive onboarding | `crates/maxplayer/src/sell.rs`, `ensure_seller_config:318`, entry `run:75` |
+| harness registry | `seller_agents.rs`: `RegisteredAgent:51`, `AgentRegistry:130`, `resolve:263` |
+| capability tokens | `capability.rs:36` — `CAPABILITIES = ["node","python","rust"]`, probed by `probe_capabilities:145` |
+| buyer-repo declarative config (per-job, **not** seller-authored) | `checks.rs`: `DECLARATION_PATH = ".maxplayer/checks.toml"` `:11`, `parse_declaration:184`, 64 KiB limit `:14` |
 
-`SellerConfig` fields are: `agent_command`, `rate_sats`, `takes_no_payment`, `git_remote`,
-`job_timeout_secs`, `agents`, the offer-acceptance flags, and `slots`.
+`SellerConfig` fields: `agent_command`, `rate_sats`, `takes_no_payment`, `git_remote`,
+`job_timeout_secs`, `agents`, offer-acceptance flags, `slots`.
 
-**NOT FOUND: any seller-authored offering / service / listing schema, any tool manifest, and
-any per-offering declarative registration.** Today a seller declares an agent command, a rate,
+**NOT FOUND: any seller-authored offering / service / listing schema, tool manifest, or
+per-offering declarative registration.** Today a seller declares an agent command, a rate,
 harness names, a sandbox mode, and capability *tokens that are probed rather than declared*.
-The word "onboarding" appears only in config-template comments (`home.rs:2092,2151`).
 
-**This is the single most important survey result for stage 0.** Plan v3 §3's manifest has no
-existing home, no existing loader, and no existing reviewer. The manifest in
-[02](02-manifest-schema.md) is therefore entirely **PROPOSED** new surface, and every
-"registration must fail closed" statement in this contract is a requirement on code that does
-not exist — not a description of `load_config`'s behaviour.
+Everything in [02](02-manifest-schema.md) is therefore **PROPOSED** new surface with no
+existing loader, validator or reviewer.
 
-## 2. Job lifecycle — the real connection point
+## 2. Job lifecycle and the authority model
 
-Authoritative seller-side record is SQLite through
-`crates/maxplayer-core/src/seller_node/store.rs`.
+### 2.1 An award row is not a win
 
-- States: `pub enum JobState { Awarded, Executing, Delivered, Paid, Failed }` (`store.rs:708`);
-  `is_finished()` = Delivered | Paid | Failed (`:743`); stored spellings
-  `"awarded"|"executing"|"delivered"|"paid"|"failed"`.
-- Transitions are **plain method calls on `SellerStore`**: `record_offer:1258`,
-  `record_award:1590`, `record_job_checks:1386`, `mark_executing:1699`, `mark_pushed:1714`,
-  `deliver_and_enqueue:1726`. Query: `job_state(&self, job_id: &str):2754`.
-- Job id is **a bare `&str`/`String`** throughout the seller store and exec path. It is the
-  offer event id in hex (`crates/maxplayer/src/mcp.rs:82` documents the `get_job` parameter as
-  "Offer event id (hex)"). Two unrelated `JobId` newtypes exist and are **not** used on the
-  seller path: `event.rs:51` and `payment.rs:33`.
+This is the single most important correction to the first version of this survey, and it
+governs the connection point in §5.
 
-### Consequences the contract must respect
+`Store::record_award(&self, award_id: &str, job_id: &str, buyer_pubkey: &str, now_unix: i64)
+-> Result<Awarded, StoreError>` (`store.rs:1590`) returns
+`enum Awarded { New, Duplicate, NoClaim }` (`store.rs:781-788`). Its own doc comment
+(`store.rs:1584-1589`) is explicit:
 
-1. **There is no job-created or job-closed event bus.** There are function calls. A holder
-   cannot subscribe; it must be invoked. The connection point is therefore a call site, and
-   [04](04-token-grant-contract.md)'s "close is atomic" requirement lands on whoever owns that
-   call site — it is not provided by the store.
-2. **`is_finished()` covers Delivered | Paid | Failed.** Plan v3 §4 requires close on success,
-   failure, cancellation **or timeout**. Cancellation and timeout are not distinct states here;
-   `job_timeout_secs` (`home.rs`, `SellerConfig`) drives a timeout in the exec path rather than
-   a store state. **Named gap G-2 in [08](08-gaps-and-unsupported.md).**
-3. **An unwrapped `String` job id is a weak binding.** Plan v3 §4 binds a token to a job id and
-   requires party/service equality against the authoritative record. With a bare string there
-   is no type-level protection against passing job `K`'s id where `J` is meant. The contract
-   compensates with the explicit record re-check at every call, and the cross-job test in
-   [07](07-test-entrypoints-and-evidence.md) exists to prove it.
+> `#814 WIDENED WHAT A ROW MEANS ... The suppression path now records an authentic buyer award
+> for an offer we recorded but never claimed — someone ELSE's win — so the row means "an award
+> for this job exists", nothing more. The discriminator for "we won" is a CLAIM row ..., never
+> the presence of an award.`
 
-### Proposed real job connection point
+Confirmed in the arms themselves:
 
-**PROPOSED**, for maxie and the advisor to accept or replace:
+- **`Duplicate` returns before the claim is read** — `if inserted == 0 { tx.commit()?; return
+  Ok(Awarded::Duplicate); }` precedes `let claim = claim_state(&tx, job_id)?;`.
+- **`NoClaim` records the award and creates no job** — "Award for a claim we do not hold —
+  record the award, create no job."
+- **`New` is an insertion result**, not cryptographic proof of selection.
 
-| Hook | Call site | Obligation |
+Three distinct callers reach this one method:
+
+| Caller | Location | Meaning |
 | --- | --- | --- |
-| grant open | immediately after `record_award` (`store.rs:1590`), before `mark_executing` | validate opener/party/service/verbs/resources against holder policy **and** the awarded record; issue the token; reserve nothing yet |
-| grant close | on every path that reaches `is_finished()`, **plus** the timeout path driven by `job_timeout_secs` | atomic close per [04](04-token-grant-contract.md) |
+| award handler | `run.rs:6428-6459` | **only the `New` arm dispatches** `spawn_bounded_execution` |
+| suppression | `run.rs:6291-6294` | `suppress_taken_elsewhere` records *someone else's* win |
+| ACCEPT | `run.rs:6172-6182` | binds an award and logs `"... bound from ACCEPT with no prior award ({outcome:?}) — NOT executing"` |
 
-Attaching at award rather than at offer is deliberate: `record_offer` is not yet an authorized
-job, and issuing a grant there would violate "an authenticated opener cannot grant itself more
-authority". The timeout path must be wired explicitly because it does not pass through a store
-state (gap G-2).
+The genuine authority check lives in the caller, not the store. The buyer is taken from our own
+recorded offer — "Only an offer we recorded can be awarded to us; its buyer is the sole
+authorized awarder" (`run.rs:6382-6386`) — and `match_award` (`run.rs:772-788`) requires both
+`award_author == offer_buyer` and equality between the award's claim id and **our published
+local claim id** before returning `AwardMatch::Execute`.
 
-## 3. MCP integration — what exists
+**Consequence: a hook on `record_award` is unsafe.** It would join three paths with different
+authority and lifecycle meaning, and would mint authority for someone else's win.
 
-- `crates/maxplayer/src/mcp.rs` — maxplayer's **own** MCP **server**, exposing job tools to an
-  agent (e.g. `get_job`, whose parameter doc is cited above).
-- `crates/maxplayer-core/src/driver/acp.rs:56` —
-  `pub struct McpServer { pub name: String, pub command: Vec<String> }`, alongside `acp_driver.rs`,
-  `mock.rs` in `crates/maxplayer-core/src/driver/`.
+### 2.2 The job record has no service or grant
 
-So MCP exists on **both** sides: maxplayer serves job tools, and the ACP driver can be told to
-launch MCP servers by `name` + argv `command`.
+`jobs` table (`store.rs:912-929`): `job_id`, `offer_id`, `agent_name`, `state`,
+`created_at_unix`, `updated_at_unix`, `pushed_commit`, `settled_elsewhere_at_unix`.
 
-Critically, `McpServer` is **name + argv only**. It carries no image digest, no environment
-allowlist, no credential store selector, no effects declaration and no per-job resource
-binding. **NOT FOUND: any per-job scoping of MCP tool exposure.** The rung-4 "persistent
-isolated holder" of plan v3 §2 is therefore *not* a configuration of `McpServer`; it is a new
-component that would supply the pinning `McpServer` lacks. **Named gap G-3.**
+`JobState` (`store.rs:708`) is `Awarded/Executing/Delivered/Paid/Failed`; `is_finished()`
+(`store.rs:738-743`) is a **plain predicate**, not an event or callback facility. Job id is a
+bare `String` on the seller path (the `JobId` newtypes at `event.rs:51` and `payment.rs:33` are
+unused here).
 
-## 4. Credentials, isolation and egress — what exists
+**There is no service column and no grant column.** Party/service/grant equality therefore has
+no existing durable representation to check against; the contract must supply one.
 
-This is the strongest existing foundation, and the contract should build on it rather than
-beside it.
+### 2.3 Timeout, failure and restart — corrected
 
-| Thing | Where |
-| --- | --- |
-| seller exec / sandbox policy | `crates/maxplayer-core/src/seller_exec.rs` |
-| docker sandbox image | `docker/maxplayer-sandbox` (`DEFAULT_SANDBOX_IMAGE`, version-pinned by the binary) |
-| network filtering | `docker/maxplayer-netfilter`, `crates/maxplayer-core/src/sandbox_net.rs`, `sandbox_netns.rs` |
-| env allowlist | `SandboxPolicy::forward_env` (`seller_exec.rs:612`), applied by `forwarded_agent_env` (`:913`) over a built-in `FORWARDED_AGENT_ENV` set plus operator extras |
+> **Revision note (F2).** The first version claimed timeout "does not pass through a store
+> state". **That was false.** maxie's ruling and the source agree: timeout *does* reach
+> `Failed`. The real hazard is different, and worse.
 
-`SandboxConfig.mode` (`home.rs:550`) selects `launcher` (default) or `docker`; the docstring
-states docker mode "runs the command inside a container that mounts ONLY the per-job workdir"
-(`home.rs:552`). That per-job-workdir-only mount is real and is the nearest existing analogue
-of the private per-job area in [04](04-token-grant-contract.md).
+The chain exists: deadline-bound agent errors go through `fail_job_with_feedback`
+(`run.rs:7100-7124`) → `fail_job` (`run.rs:8377-8393`) → the store persists `Failed`
+(`store.rs:1780-1787`).
 
-`forwarded_agent_env_from` is written against an injected lookup so the allowlist is testable
-without mutating the process environment (`seller_exec.rs:918-923`) — the same testability the
-checker contract needs.
+The hazard is that **the fail write is best-effort**. `fail_job`'s own doc reads
+"(best-effort; a fail-mark that itself errors is logged, never propagated — the loop keeps
+serving)", and its arms confirm it: `Ok(0)` logs "no job row moved to failed ... nothing was
+healed", and `Err(error)` logs "fail_job write error (continuing)". Marketplace availability is
+correctly prioritised over the fail write — but a holder that trusts that record inherits an
+uncertainty it cannot see.
 
-### The closest existing precedent: `codex_subscription.rs`
+Restart semantics compound this. Restart re-drives `Awarded`/`Executing` rows
+(`run.rs:4597-4634`); graceful shutdown deliberately leaves them for replay
+(`run.rs:4721-4727`); and resume treats a **missing deadline as live**
+(`run.rs:~1548-1578`): "A `None` deadline (absent/unreadable) is treated as LIVE: never fail a
+genuine award on a missing fact — over-skipping is the worse (a lost award)."
 
-`crates/maxplayer-core/src/codex_subscription.rs` is **host-only ChatGPT session support for a
-contained Docker Codex run** (module doc, `:1`). It already implements, for one tool, several
-things plan v3 §4 demands generally:
+That is the right call for a marketplace, and exactly the wrong default for credential
+authority. **The holder must fail closed where the marketplace fails open.** See
+[04](04-token-grant-contract.md) §"Durable holder admission record".
 
-- a **pinned single upstream** the session may reach: `CHATGPT_CODEX_UPSTREAM =
-  "https://chatgpt.com/backend-api/codex"` (`:10`);
-- **token lifetime measured against the job budget**: `ACCESS_TOKEN_MARGIN` of 15 minutes of
-  required remaining life beyond the job timeout (`:12`) — this is exactly plan v3 §2's
-  "lifetime fits the job budget" predicate, already expressed in code;
-- **secrets kept out of logs by construction**: `ChatgptSession` "deliberately has no `Debug`
-  implementation because both fields must stay out of logs and errors" (`:14-19`), and
-  `SessionError` carries no auth-file content (`:31`).
+## 3. MCP integration — and the attachment gap
 
-**INFERENCE:** this is a bespoke, single-vendor implementation of one rung, not a reusable
-holder. It is host-held and injected into the container, which is the *opposite* of plan v3
-§4's "initial login happens in the holder, not by assumed copying from the host". The kit
-should reuse its three ideas — pinned upstream, lifetime-vs-budget margin, no-`Debug` secret
-types — and must not present it as an existing holder.
+- `crates/maxplayer/src/mcp.rs` — maxplayer's own MCP **server**, exposing job tools.
+- `driver/acp.rs:49-59` — `pub struct McpServer { pub name: String, pub command: Vec<String> }`.
 
-## Proposed kit repository location
+Name + argv only: no image digest, no environment allowlist, no credential-store selector, no
+effects declaration, no per-job resource binding.
 
-**PROPOSED.** Stage-0 paper lands where it now sits:
-`docs/specs/seller-tool-onboarding/` (alongside the existing `docs/specs/free-job-lane.md`).
+**And the seller execution path attaches none.** `seller_exec.rs:2408-2412` builds
+`SessionConfig { cwd: launch.cwd, mcp_servers: Vec::new(), env: identity.git_env() }`.
 
-For stage 2, the proposal is a **new workspace member** `crates/maxplayer-tool-kit` rather than
-growth inside `maxplayer-core`, because:
+**This is the attachment gap, and it is decisive for the kit's shape (F3):** no seller job
+receives any MCP server today. A separate crate can define a holder, but **a separate crate
+alone can never attach one to a job.** Stage 2 requires core-side edits at this call site. Any
+statement that a separate crate "makes no runtime changes checkable by diff" describes stage-0
+paper only, and must not be read as implying stage 2 needs no integration edits.
 
-- `maxplayer-core` is already the home of the seller store, exec path and payment code; the
-  holder must be reviewable in isolation, and a separate crate makes its dependency surface
-  auditable;
-- profile pinning and manifest validation want their own test fixtures and their own
-  acceptance run, which plan v3 §5.12 resets on drift;
-- **INFERENCE**: a separate crate makes "no runtime changes to existing behaviour" checkable by
-  diff, which is what maxie's gate asks for at stage 0 and will ask again later.
+## 4. Credentials, isolation and egress — corrected survey
 
-Profiles and fixtures: `crates/maxplayer-tool-kit/profiles/` and `.../fixtures/`. The router
-skill goes through `skill_workshop` at stage 2, never a direct `SKILL.md` write.
+### 4.1 A per-job credential proxy already exists
 
-## GAPS — what this contract must not assume exists
+`seller_exec.rs:2575-2620`, "Credential containment (#647)":
 
-- **G-1** No seller-authored offering/manifest surface exists at all. Everything in 02 is new.
-- **G-2** No cancellation or timeout job state; `is_finished()` is Delivered|Paid|Failed only.
-- **G-3** `McpServer` is name + argv; no digest pinning, env allowlist, credential selector,
-  effects declaration or per-job tool scoping.
-- **G-4** No event bus for job open/close — function call sites only.
-- **G-5** Job id is a bare `String` on the seller path; no type-level job binding.
-- **G-6** No grant, token, budget/reservation or holder concept exists in any form.
-- **G-7** Credential custody today is host-held and vendor-specific (`codex_subscription.rs`),
-  not in-holder enrollment.
+> the real model credential must NOT enter the container: a stranger's job can read
+> `-e ANTHROPIC_API_KEY` and exfiltrate a reusable secret. Start a per-job host proxy that holds
+> the real credential, forward a format-plausible placeholder + a base-URL override pointing at
+> the proxy in its place ... **If containment is required but cannot be established, the job
+> FAILS — there is no fallback to putting the real credential in the container.**
 
-Full treatment, with severity and what each blocks, in [08](08-gaps-and-unsupported.md).
+Supporting surface in `credential_proxy.rs`: `JobCredential:230`, `RunningProxy:956`,
+`impl Drop for RunningProxy:1019` (aborts owned listener/connection tasks),
+`PROXY_HOST_ALIAS = "host.docker.internal":201`. The module doc describes value-based
+substitution — the proxy identifies the job by finding the placeholder in a request header and
+substitutes the real credential on the way out; the return leg scrubs the real credential back
+to the placeholder; a refused destination fails the request and "the caller NEVER falls back".
+
+Network-namespace holder/ownership records exist at `sandbox_netns.rs:63-70,356-363`, with a
+firewall pinhole driven by `[sandbox] proxy_port_range`.
+
+**So the repository already contains a working mediation mechanism with fail-closed
+containment, per-job credential structures, ownership records and lifecycle teardown.** Three
+of plan v3 §4's principles are already implemented here for the model credential, and the kit
+should treat them as prior art rather than invent parallel machinery.
+
+### 4.2 What is nonetheless absent
+
+Scoped precisely, because the first version overstated this:
+
+- **No persistent tool holder.** The proxy mediates a *model* credential for the duration of a
+  run. It is not an enrolled, persistent, third-party-tool login environment.
+- **No durable service/resource grant.** No token bound to holder/party/service/job/grant
+  version/expiry; no reservation counters; no closed-job tombstone.
+- **No per-job MCP tool scoping** (§3).
+- Enrollment is not in scope of the proxy at all.
+
+`codex_subscription.rs` contributes a pinned single upstream (`:10`), a token-lifetime margin
+measured against the job timeout (`:12`), and a no-`Debug` secret type (`:14-19`) — the last of
+which is a pattern the kit should copy directly.
+
+### 4.3 Sandbox and environment — do not mistake reuse for equivalence
+
+`SandboxConfig.mode` (`home.rs:550`) selects `launcher` or `docker`; docker mode "runs the
+command inside a container that mounts ONLY the per-job workdir" (`home.rs:552`). Extra mounts
+exist (`seller_exec.rs:851-854`).
+
+Environment forwarding is **not** empty-by-default: `FORWARDED_AGENT_ENV`
+(`seller_exec.rs:301`) is a built-in allowlist — `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`,
+`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `OPENAI_API_KEY`, … — **plus** anything
+`[sandbox] forward_env` adds (`seller_exec.rs:908`).
+
+Plan v3 §3 requires a reviewed child environment that starts **empty** except reviewed
+tool/runtime variables. That is a *different* policy from the existing one. The existing
+allowlist is a good model and is testable against an injected lookup (`forwarded_agent_env_from`),
+but **reuse is not security equivalence** and the kit must not inherit these defaults.
+
+## 5. Proposed kit location and job connection point
+
+Per maxie's ruling, a separate policy/holder crate with **explicit core adapters** is
+acceptable. Stage-0 paper lives at `docs/specs/seller-tool-onboarding/`; stage 2 proposes a new
+workspace member `crates/maxplayer-tool-kit`, with `profiles/` and `fixtures/`.
+
+**Dependency direction:** `maxplayer-tool-kit` depends on nothing in `maxplayer-core`'s seller
+path. `maxplayer-core` depends on the kit through narrow adapter traits it owns. The kit is
+policy and mechanism; core supplies authority facts and lifecycle events.
+
+### The three core-side adapters
+
+| Adapter | Core call site | Responsibility |
+| --- | --- | --- |
+| **authorization** | the owned-award / eligible-execution boundary — the `Awarded::New` arm at `run.rs:6428-6459`, **after** `match_award` returned `AwardMatch::Execute` | supply positive proof of our own win and the seller-approved service binding; request grant open |
+| **lifecycle** | every terminal path: success, all failure/timeout paths through `fail_job`, cancellation/shutdown (`run.rs:4721-4727`), boot reconciliation (`run.rs:4597-4634`) | request holder close with an explicit reason |
+| **transport** | `SessionConfig`'s `mcp_servers` at `seller_exec.rs:2408-2412` | attach the job's holder MCP endpoint and deliver its job token, without exposing persistent credentials |
+
+**Not** a hook on `record_award`: §2.1 shows that method is reached by suppression and by
+ACCEPT-without-execution, and its `Duplicate` arm never reads a claim.
+
+Full open/close obligations, the durable binding, the duplicate/replay rules and the
+fail-closed protocol are specified in [04](04-token-grant-contract.md).
+
+## GAPS
+
+- **G-1** No seller-authored offering/manifest surface exists.
+- **G-2** Timeout **does** reach `Failed`, but the fail write is best-effort and restart
+  re-drives non-terminal rows treating a missing deadline as live.
+- **G-3** `McpServer` is name + argv, and the seller path attaches **none**; core-side edits are
+  required at `seller_exec.rs:2408-2412`.
+- **G-4** No event bus for job open/close — named call sites only.
+- **G-5** Job id is a bare `String`; no type-level job binding.
+- **G-6** No *persistent tool holder* and no *durable service/resource grant* exist. (A per-job
+  credential proxy, per-job credential structures and namespace ownership records **do** exist —
+  §4.1.)
+- **G-7** Existing custody covers a model credential for one run; no in-holder enrollment of a
+  third-party tool login.
+
+Severity, contract gaps and unsupported cases: [08](08-gaps-and-unsupported.md).
