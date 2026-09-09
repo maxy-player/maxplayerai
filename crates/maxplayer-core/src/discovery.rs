@@ -446,7 +446,7 @@ impl std::error::Error for DiscoveryError {}
 pub use transport::{fetch_directory, fetch_directory_async};
 
 /// The relay leg. Gated with `job_lifecycle`/`profile` because it needs the buyer identity and the
-/// shared `EOSE` liveness probe; every RULE lives in [`reduce_directory`], which is ungated.
+/// relay client; every RULE lives in [`reduce_directory`], which is ungated.
 #[cfg(all(feature = "wallet", feature = "gateway"))]
 mod transport {
     use super::{
@@ -490,19 +490,31 @@ mod transport {
     /// probe stand in: a probe is a DIFFERENT subscription with a different filter, and its `EOSE`
     /// is evidence about the probe.
     ///
-    /// `budget` bounds the WHOLE read, not each leg. Connect, fetch, liveness probe and recheck
-    /// draw down one deadline, because a caller (an MCP tool with a client read-timeout) can only
-    /// honour a promise about the total: four legs of eight seconds is a thirty-two-second tool.
-    /// Running out mid-read yields [`SellerDirectory::unverified`] — an unanswered read, which is
-    /// what it is — never an empty market and never an error.
+    /// A relay that REJECTS our NIP-42 authentication is an error, not silence. That rejection
+    /// arrives on this relay's own notification channel and is never forwarded to the pool's
+    /// (`relay/inner.rs:417-419`), and a refused relay owes the subscription neither an `EOSE` nor
+    /// a `CLOSED` — so a reader watching only the pool waits out its deadline and reports an
+    /// unanswered read, throwing away a rejection that has a reason and a fix.
+    ///
+    /// The REQ goes out through the SINGLE RELAY, whose result is `Result<(), Error>`. The
+    /// pool-level call returns `Result<Output<()>>` and folds per-relay send failures into
+    /// `output.failed`, returning `Ok(output)` even when nothing succeeded (`pool/mod.rs:955-973`),
+    /// so its outer `Err` alone cannot tell a sent REQ from one that reached nobody.
+    ///
+    /// `budget` bounds the read loop rather than each leg, because a caller (an MCP tool with a
+    /// client read-timeout) can only honour a promise about the total. Running out mid-read yields
+    /// an UNCONFIRMED directory — an unanswered read, which is what it is — never an empty market
+    /// and never an error. Connect and cleanup are bounded separately and are not inside that one
+    /// timeout, so this is not a strict wall-clock cap on the whole call.
     pub async fn fetch_directory_async(
         home: &MaxplayerHome,
         policy: DirectoryPolicy,
         limit: usize,
         budget: Duration,
     ) -> Result<SellerDirectory, DiscoveryError> {
-        use nostr_sdk::prelude::{Client, Filter, Kind, SubscriptionId};
-        use nostr_sdk::{RelayMessage, RelayPoolNotification};
+        use nostr_sdk::RelayMessage;
+        use nostr_sdk::pool::relay::RelayNotification;
+        use nostr_sdk::prelude::{Client, Filter, Kind, SubscribeOptions, SubscriptionId};
 
         let deadline = Instant::now() + budget;
         let secret = crate::home::read_secret_key_hex(home)
@@ -517,11 +529,23 @@ mod transport {
             .add_relay(&home.config.relay_url)
             .await
             .map_err(|error| DiscoveryError::Relay(format!("add relay: {error}")))?;
-        client.connect().await;
         let relay = client
             .relay(&home.config.relay_url)
             .await
             .map_err(|error| DiscoveryError::Relay(format!("relay handle: {error}")))?;
+
+        // THIS RELAY'S OWN notifications, and opened BEFORE `connect()` — before any authentication
+        // activity exists to observe. Two reasons, both load-bearing:
+        //
+        // 1. `AuthenticationFailed` is emitted on the RELAY's channel and is NOT forwarded to the
+        //    pool's (`relay/inner.rs:417-419`). A reader watching only pool notifications sees a
+        //    relay that rejected its AUTH as a relay that simply never answered: the rejection has a
+        //    reason and a fix, and reporting it as an unanswered read throws both away.
+        // 2. The challenge and the negative OK can both land during `connect()`. A receiver opened
+        //    afterwards would miss them, which is the same ordering trap the EOSE receiver avoids.
+        let mut notifications = relay.notifications();
+
+        client.connect().await;
         relay
             .wait_for_connection(remaining(deadline).min(RELAY_CONNECT_WAIT))
             .await;
@@ -539,15 +563,18 @@ mod transport {
                 limit
             });
 
-        // The receiver comes up BEFORE the REQ is sent. An EOSE for a stored-event set the relay
-        // already has can arrive immediately, and a receiver opened after the REQ would miss it and
-        // report a completed read as unconfirmed.
-        let mut notifications = client.notifications();
         let sub_id = SubscriptionId::new(DIRECTORY_SUB_ID);
 
-        // Sent to the ONE relay this client holds. An immediate send failure is a hard error, not
-        // an empty market.
-        if let Err(error) = client.subscribe_with_id(sub_id.clone(), filter, None).await {
+        // Subscribed through the SINGLE RELAY, whose result is `Result<(), Error>` — the failure of
+        // THIS relay's REQ, propagated. `Client::subscribe_with_id` returns `Result<Output<()>>`,
+        // and the pool collects per-relay failures into `output.failed` and returns `Ok(output)`
+        // even when NOTHING succeeded (`pool/mod.rs:955-973`); checking only the outer `Err` there
+        // reads a REQ that reached nobody as a REQ that was sent. One relay is the whole market
+        // here, so its disposition is the read's disposition.
+        if let Err(error) = relay
+            .subscribe_with_id(sub_id.clone(), filter, SubscribeOptions::default())
+            .await
+        {
             client.disconnect().await;
             return Err(DiscoveryError::Relay(format!(
                 "subscribe seat directory: {error}"
@@ -556,6 +583,11 @@ mod transport {
 
         let mut events: Vec<nostr_sdk::Event> = Vec::new();
         let mut refusal: Option<String> = None;
+        // A relay that rejected our AUTH. Distinct from `refusal` because the two are different
+        // facts with different fixes — "this relay will not serve you" versus "this relay will not
+        // serve this subscription" — and a reader that collapses them cannot tell an identity
+        // problem from a policy one.
+        let mut auth_failed = false;
         // Pessimistic until this subscription's own EOSE says otherwise. Every early exit below
         // leaves it as it is, so "we fell out of the loop somehow" can only ever mean unconfirmed.
         let mut completion = ReadCompletion::Unconfirmed;
@@ -563,32 +595,38 @@ mod transport {
         let _ = tokio::time::timeout(remaining(deadline), async {
             loop {
                 match notifications.recv().await {
-                    Ok(RelayPoolNotification::Event {
+                    Ok(RelayNotification::Event {
                         subscription_id,
                         event,
-                        ..
                     }) if subscription_id == sub_id => events.push((*event).clone()),
-                    Ok(RelayPoolNotification::Message {
+                    Ok(RelayNotification::Message {
                         message: RelayMessage::EndOfStoredEvents(id),
-                        ..
                     }) if *id == sub_id => {
                         completion = ReadCompletion::ConfirmedByEose;
                         return;
                     }
-                    // A CLOSED naming our subscription is the relay REFUSING this read — an auth
-                    // failure, a policy rejection. It is an error with a reason, and reporting it
-                    // as "no sellers" would be the worst possible lie about it.
-                    Ok(RelayPoolNotification::Message {
+                    // A CLOSED naming our subscription is the relay REFUSING this read — a policy
+                    // rejection with a reason. Reporting it as "no sellers" would be the worst
+                    // possible lie about it.
+                    Ok(RelayNotification::Message {
                         message:
                             RelayMessage::Closed {
                                 subscription_id,
                                 message,
                             },
-                        ..
                     }) if *subscription_id == sub_id => {
                         refusal = Some(message.to_string());
                         return;
                     }
+                    // The relay rejected the AUTH we signed for it. Nothing else is coming: a relay
+                    // that refuses the identity need send neither EOSE nor CLOSED, and waiting out
+                    // the deadline would convert an explicit, actionable rejection into an
+                    // unanswered read — the exact downgrade this arm exists to stop.
+                    Ok(RelayNotification::AuthenticationFailed) => {
+                        auth_failed = true;
+                        return;
+                    }
+                    Ok(RelayNotification::Shutdown) => return,
                     Ok(_) => continue,
                     // The notification stream ending is a lost socket, never a finished read.
                     Err(_) => return,
@@ -601,6 +639,13 @@ mod transport {
         // relay is not left streaming into a subscription nobody is reading.
         client.unsubscribe(&sub_id).await;
         client.disconnect().await;
+
+        if auth_failed {
+            return Err(DiscoveryError::Relay(format!(
+                "relay {} rejected our authentication; the seat directory was not read",
+                home.config.relay_url
+            )));
+        }
 
         if let Some(reason) = refusal {
             return Err(DiscoveryError::Relay(format!(

@@ -296,6 +296,85 @@ async fn a_refused_subscription_is_an_error_with_its_reason_not_an_empty_market(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_rejected_authentication_is_an_error_not_an_unanswered_read() {
+    // RESIDUAL F1a. The relay challenges, the client signs an AUTH, the relay REFUSES it with a
+    // negative OK — and then says nothing at all: no CLOSED, no EOSE. A reader watching only the
+    // pool's notifications cannot see that rejection (`AuthenticationFailed` is emitted on the
+    // RELAY's channel and is not forwarded to the pool's), so it waits out its deadline and reports
+    // an unanswered read. That is a downgrade: "this relay refused your identity" is an explicit,
+    // actionable fact, and "nobody answered" is the absence of one.
+    let relay = ScriptedRelay::start(Script::ChallengeThenRejectAuth(
+        "restricted: this pubkey may not read here".to_owned(),
+    ))
+    .await;
+    let home = buyer_home("auth-rejected", &relay.url());
+
+    let error = read(&home, Duration::from_secs(5))
+        .await
+        .expect_err("a refused authentication must not read as an unanswered market");
+
+    match error {
+        DiscoveryError::Relay(reason) => assert!(
+            reason.contains("authentication"),
+            "the error must name the authentication rejection: {reason}"
+        ),
+        other => panic!("a rejected AUTH must be a relay error, got {other:?}"),
+    }
+
+    // And the exchange really happened the way the case describes: the client answered the
+    // challenge, and no CLOSED or EOSE was ever sent to end the subscription for it.
+    let verbs = relay.verbs().await;
+    assert!(
+        verbs.iter().any(|verb| verb == "AUTH"),
+        "the client must have answered the challenge: {verbs:?}"
+    );
+    assert_read_only_traffic(&relay).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_subscription_that_never_reached_a_relay_is_not_an_answered_market() {
+    // RESIDUAL F1b, the failure-result half. `Client::subscribe_with_id` returns
+    // `Result<Output<()>>` and the pool folds per-relay send failures into `output.failed`,
+    // returning `Ok(output)` even when NOTHING succeeded — so a caller checking only the outer
+    // `Err` treats a REQ that reached nobody as a REQ that was sent. The read now subscribes
+    // through the SINGLE RELAY, whose result is the failure of this relay's REQ.
+    //
+    // Here nothing is listening on the port at all, so the REQ has no relay to reach. Whichever
+    // disposition the SDK produces — a hard error, or an unanswered read — the ONE outcome that
+    // must be impossible is a confirmed directory: there is no market fact to be had from a
+    // subscription that never landed.
+    let port = {
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("probe bind");
+        let port = probe.local_addr().expect("probe addr").port();
+        drop(probe);
+        port
+    };
+    let home = buyer_home("unreachable", &format!("ws://127.0.0.1:{port}"));
+
+    match read(&home, Duration::from_secs(2)).await {
+        Err(DiscoveryError::Relay(reason)) => {
+            assert!(!reason.is_empty(), "a relay error must carry its reason");
+        }
+        Err(other) => panic!("an unreachable relay is a relay error, got {other:?}"),
+        Ok(directory) => {
+            assert!(
+                !directory.read_confirmed,
+                "a subscription that reached no relay must NEVER produce a confirmed \
+                 directory: {directory:?}"
+            );
+            assert!(directory.sellers.is_empty());
+        }
+    }
+
+    assert!(
+        !wallet_store(&home).exists(),
+        "a failed read must not open a wallet"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_read_leaves_no_subscription_open_behind_it() {
     // Cleanup, observed on the wire: a relay must not be left streaming into a subscription nobody
     // reads. The read does both — `unsubscribe` then `disconnect` — and EITHER ends the

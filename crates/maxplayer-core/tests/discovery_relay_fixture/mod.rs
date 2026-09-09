@@ -36,6 +36,14 @@ pub enum Script {
     ServeThenDrop(Vec<String>),
     /// Refuse: `CLOSED` naming the subscription, with a reason.
     Close(String),
+    /// NIP-42, refused: challenge on connect, then answer the client's signed `AUTH` with a
+    /// NEGATIVE `OK` and nothing else — no `CLOSED`, no `EOSE`, ever.
+    ///
+    /// This is the shape that downgraded a rejection into silence. A relay that refuses the
+    /// identity owes the subscription no reply at all, so a reader watching only for `EOSE` or
+    /// `CLOSED` waits out its deadline and reports an unanswered read — throwing away a rejection
+    /// that has both a reason and a fix.
+    ChallengeThenRejectAuth(String),
 }
 
 /// One inbound frame, by verb and subscription id. Enough to answer both questions the tests ask of
@@ -46,7 +54,11 @@ pub struct Frame {
     pub subscription_id: Option<String>,
 }
 
-/// A running scripted relay. Dropping it stops the accept loop.
+/// A running scripted relay.
+///
+/// The accept task outlives a dropped handle — there is no `Drop` impl and none is claimed. Each
+/// test's runtime ends with the test and takes the task with it; a fixture reused on a persistent
+/// runtime would need an explicit abort.
 pub struct ScriptedRelay {
     url: String,
     frames: Arc<Mutex<Vec<Frame>>>,
@@ -105,13 +117,6 @@ impl ScriptedRelay {
             .collect()
     }
 
-    /// Whether a `CLOSE` naming `subscription_id` arrived: the cleanup, observed on the wire.
-    pub async fn closed_subscription(&self, subscription_id: &str) -> bool {
-        self.frames().await.iter().any(|frame| {
-            frame.verb == "CLOSE" && frame.subscription_id.as_deref() == Some(subscription_id)
-        })
-    }
-
     /// Sockets accepted so far.
     pub fn connections(&self) -> usize {
         self.connections.load(std::sync::atomic::Ordering::SeqCst)
@@ -145,6 +150,16 @@ async fn serve_connection(
     let ws = tokio_tungstenite::accept_async(stream).await?;
     let (writer, mut reader) = ws.split();
     let writer = Arc::new(Mutex::new(writer));
+
+    // The challenge goes out unprompted, exactly as a NIP-42 relay does it — before the client has
+    // asked for anything, so the AUTH exchange overlaps connect and the REQ that follows it.
+    if let Script::ChallengeThenRejectAuth(_) = &script {
+        send(
+            &writer,
+            json!(["AUTH", "maxplayer-discovery-fixture-challenge"]),
+        )
+        .await?;
+    }
 
     while let Some(message) = reader.next().await {
         let message = message?;
@@ -204,6 +219,22 @@ async fn serve_connection(
                     Script::Close(reason) => {
                         send(&writer, json!(["CLOSED", sub_id, reason])).await?;
                     }
+                    // Deliberately mute: the rejection was already delivered on the AUTH frame, and
+                    // the point of this case is that NOTHING answers the subscription afterwards.
+                    Script::ChallengeThenRejectAuth(_) => {}
+                }
+            }
+            // The client's signed NIP-42 answer. Refused with a negative OK, which is what the SDK
+            // turns into its `AuthenticationFailed` notification.
+            "AUTH" => {
+                if let Script::ChallengeThenRejectAuth(reason) = &script {
+                    let id = frame
+                        .get(1)
+                        .and_then(|event| event.get("id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    send(&writer, json!(["OK", id, false, reason])).await?;
                 }
             }
             // An EVENT here would mean the read published something. It is recorded above, and
