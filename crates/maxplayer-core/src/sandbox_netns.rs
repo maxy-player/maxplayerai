@@ -788,6 +788,34 @@ mod tests {
         assert!(!holder_argv.iter().any(|a| a == "NET_ADMIN"), "{holder_argv:?}");
     }
 
+    /// The containment plane runs on the daemon's own runtime, never the job's.
+    ///
+    /// Measured in the gVisor repro (aarch64, runsc release-20260817.0, evidence
+    /// `docs/gvisor-dns-delivery/evidence/gate2a-runsc-holder-FAIL-*.txt`): a runsc container
+    /// joining a **runsc** holder's namespace sees `lo` only — no eth0, no route, every lookup
+    /// `EAI_AGAIN` — because a gVisor sandbox's netstack lives inside that sandbox and a second one
+    /// cannot enter it. Joining a **runc** holder, the same runsc job gets the holder's interface
+    /// and address, so the host kernel's rules govern its traffic. `iptables-nft` also refuses to
+    /// initialise inside gVisor, so a sandboxed sidecar could not install the plan even if the
+    /// namespace were shared.
+    ///
+    /// So this is not a default anyone may "improve" by threading the seat's runtime through: doing
+    /// that returns a job with no network at all, and a policy nothing enforces.
+    #[test]
+    fn the_containment_plane_never_carries_the_jobs_runtime() {
+        let holder = holder_argv("h", "net", "img", 1000, 1000, "abc", &seat_b());
+        assert!(
+            !holder.iter().any(|a| a == "--runtime"),
+            "the holder must run on the daemon runtime, or the job cannot join its namespace: \
+             {holder:?}"
+        );
+        let sidecar = sidecar_argv(&NetnsHolder::adopt("h".into()), "netfilter");
+        assert!(
+            !sidecar.iter().any(|a| a == "--runtime"),
+            "the sidecar must run on the daemon runtime, or iptables cannot initialise: {sidecar:?}"
+        );
+    }
+
     #[test]
     fn the_sidecar_takes_the_plan_on_stdin_and_is_told_nothing_else() {
         let holder = NetnsHolder::adopt("h".into());
