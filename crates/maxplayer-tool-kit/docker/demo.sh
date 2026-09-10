@@ -188,17 +188,77 @@ docker run --rm --network none -v "$VOL_SOCK_A:/run/holder" -v "$VOL_WORK_A:/wor
     ls /var/lib/holder 2>&1 || true
     echo "--- search for a session token ---"
     grep -rl "sess-" /work /run /etc /tmp 2>/dev/null || echo "NO_TOKEN_FOUND"
-    echo "--- the secret search runs separately, see job-a-secret-search.txt ---"
+    echo "--- the secret search runs on the host, see job-a-fs-scan.txt ---"
   ' > "$EV/job-a-container-view.txt" 2>&1 || true
-# The secret is passed as an environment variable to a separate container rather than written
-# into the script above, so the real value never appears in the recorded command text. This is
-# the search that counts; the listing above is context, not evidence.
-docker run --rm --network none -v "$VOL_SOCK_A:/run/holder" -v "$VOL_WORK_A:/work" \
-  -e NEEDLE="$SECRET" "$IMAGE" \
-  sh -c 'grep -rl "$NEEDLE" /work /run /etc /tmp /usr/local/bin 2>/dev/null || echo "NOT_FOUND"' \
-  > "$EV/job-a-secret-search.txt" 2>&1 || true
 
-check "credential_absent_from_job_container" "NOT_FOUND" "$(tr -d '\n' < "$EV/job-a-secret-search.txt")"
+# ---------------------------------------------------------------------------
+# Credential absence: observed from the HOST, never by handing the container the secret.
+#
+# What this replaces (advisor F1). The previous version passed the live secret into the probe
+# container as -e NEEDLE and grepped from inside. That was worthless three times over: it put
+# the credential inside the very container whose cleanliness was the claim, so a positive would
+# have been self-inflicted; `grep -rl ... || echo NOT_FOUND` printed NOT_FOUND for *any*
+# non-match exit including a scan that never ran; and a trailing `|| true` swallowed docker
+# failures, so an unstarted container also read as "absent". The check could not fail.
+#
+# The shape now: the container's filesystem is exported to the host with no secret anywhere in
+# its environment, and the scan happens here, where the secret legitimately lives. Errors are
+# fatal instead of absence. The scanner is a single function used by both the real check and a
+# negative control, so the control actually exercises the code that makes the claim.
+# ---------------------------------------------------------------------------
+
+# Export the job container's searchable surface. No -e, no secret: this container is handed
+# nothing but its own two mounts. A capture failure aborts rather than reporting a clean scan.
+capture_job_fs() {
+  _cap_sock="$1"; _cap_work="$2"; _cap_out="$3"
+  if ! docker run --rm --network none -v "$_cap_sock:/run/holder" -v "$_cap_work:/work" "$IMAGE" \
+      tar -cf - -C / work run/holder etc/maxplayer usr/local/bin > "$_cap_out" 2>"$_cap_out.err"; then
+    echo "FATAL: filesystem capture failed; see $(basename "$_cap_out").err" >&2
+    return 1
+  fi
+  [ -s "$_cap_out" ] || { echo "FATAL: capture produced an empty archive" >&2; return 1; }
+}
+
+# Count occurrences of the secret in a captured archive. Prints an integer, or "SCAN_ERROR".
+# grep -F takes the needle on stdin-adjacent state only: it is passed as an argument here on
+# the host, where the value is already present in this shell, and never crosses into a container.
+scan_capture_for_secret() {
+  _scan_tar="$1"; _scan_dir="$2"
+  rm -rf "$_scan_dir"; mkdir -p "$_scan_dir"
+  if ! tar -xf "$_scan_tar" -C "$_scan_dir" 2>/dev/null; then
+    echo "SCAN_ERROR"; return 0
+  fi
+  # -a treats every file as text so binaries are searched too, not skipped.
+  LC_ALL=C grep -r -a -F -l -- "$SECRET" "$_scan_dir" 2>/dev/null | wc -l | tr -d ' '
+}
+
+capture_job_fs "$VOL_SOCK_A" "$VOL_WORK_A" "$EV/job-a-fs.tar" || exit 1
+JOB_A_HITS=$(scan_capture_for_secret "$EV/job-a-fs.tar" "$RUN_TMP/scan-real")
+{
+  echo "scanned: job A container filesystem (/work, /run/holder, /etc/maxplayer, /usr/local/bin)"
+  echo "archive_bytes: $(wc -c < "$EV/job-a-fs.tar" | tr -d ' ')"
+  echo "files_in_archive: $(tar -tf "$EV/job-a-fs.tar" 2>/dev/null | wc -l | tr -d ' ')"
+  echo "secret_in_container_env: no (container received no secret; scan is host-side)"
+  echo "files_containing_secret: $JOB_A_HITS"
+} > "$EV/job-a-fs-scan.txt"
+
+check "credential_absent_from_job_container" "0" "$JOB_A_HITS"
+
+# Negative control: the same scanner, the same archive, plus one planted file holding the real
+# secret. If this reports 0 the scanner is blind and the check above means nothing, so a passing
+# absence result is only trustworthy while this line also passes.
+cp "$EV/job-a-fs.tar" "$RUN_TMP/planted.tar"
+mkdir -p "$RUN_TMP/plant/work"
+printf 'leaked=%s\n' "$SECRET" > "$RUN_TMP/plant/work/leaked.txt"
+tar -rf "$RUN_TMP/planted.tar" -C "$RUN_TMP/plant" work/leaked.txt 2>/dev/null
+PLANTED_HITS=$(scan_capture_for_secret "$RUN_TMP/planted.tar" "$RUN_TMP/scan-planted")
+{
+  echo "control: identical scanner over the same archive with one file containing the secret"
+  echo "files_containing_secret: $PLANTED_HITS"
+  echo "interpretation: 1 proves the scanner detects the credential when it IS present"
+} > "$EV/job-a-fs-scan-negative-control.txt"
+
+check "secret_scanner_detects_planted_credential" "1" "$PLANTED_HITS"
 check_contains "holder_state_absent_from_job_container" "No such file or directory" "$(cat "$EV/job-a-container-view.txt")"
 
 # Cross-job attempt: job A reaching for job B's directory by absolute path.
