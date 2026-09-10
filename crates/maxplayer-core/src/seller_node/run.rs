@@ -1644,6 +1644,28 @@ fn uploaded_verification_outcome(
     }
 }
 
+/// How many exact-oid read-backs a recovery spends on ONE marker before it stops asking and takes a
+/// terminal disposition. The wait is already bounded by the offer's own deadline; this bounds the
+/// pathological case where the deadline is far away and the remote keeps answering "could not tell",
+/// so an unverifiable delivery still reaches exactly one outcome instead of being asked forever.
+const UPLOAD_VERIFY_ATTEMPT_CAP: i64 = 8;
+
+/// What a delivery-push failure DID, as performed by [`SellerNodeRunner::handle_delivery_push_failure`].
+/// Returned so the caller — and the tests that drive the real handler — can assert the disposition
+/// rather than infer it from a log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryPushDisposition {
+    /// A terminal `delivery_failed` was emitted. Only reachable when nothing can be on the remote
+    /// unattested: the intent never landed, the authorization failed BEFORE the upload, the upload
+    /// was definitively refused, the remote definitively answered "not there", or the push timed out
+    /// before it began.
+    Failed,
+    /// The job keeps its slot and its durable marker, and NO buyer-visible event was emitted: the
+    /// pack is (or may be) on the remote, so only the remote's own exact-oid answer may complete or
+    /// fail this delivery now. Bounded by the offer deadline and the attempt cap.
+    HeldForVerification,
+}
+
 #[cfg(test)]
 mod uploaded_verification_tests {
     use super::{uploaded_verification_outcome, UploadedVerification};
@@ -2070,103 +2092,196 @@ const _: () = assert!(
     "the delivery upload token's declared lifetime (DELIVERY_PUSH_TIMEOUT + margin) must stay within      the relay's default scoped-token cap, or the relay refuses the token outright instead of      honouring it"
 );
 
-/// The authorized delivery push, leg by leg: mint → upload → mint AGAIN → attest.
+/// The authorized delivery push, leg by leg: JOURNAL INTENT → mint → upload → mint AGAIN → attest.
 ///
 /// This is the shape the relay-401 class of failure turns on, so it is a function with its own
-/// tooth rather than a block inlined in the execute path. Two properties it exists to hold:
+/// tooth rather than a block inlined in the execute path. Four properties it exists to hold:
 ///
-/// 1. `mint` is called INSIDE this future, and the caller only starts this future once the
-///    delivery-push lock is held — so an upload token is never minted before a wait it must survive.
-/// 2. The verification token is minted AFTER `upload` resolves, whatever that took. A NIP-98 token's
+/// 1. `intent` runs FIRST and its failure ABORTS the push. The durable record that this job is about
+///    to put `commit` on the remote exists before the remote can hold it, so a crash, a
+///    cancellation, or a lost write anywhere after this line still leaves a job that can be
+///    reconciled by asking the remote — the recovery never depends on having OBSERVED the upload.
+/// 2. `mint` is called INSIDE this future, and the caller only starts this future once the
+///    delivery-push permit is held — so an upload token is never minted before a wait it must
+///    survive.
+/// 3. The verification token is minted AFTER `upload` resolves, whatever that took. A NIP-98 token's
 ///    life is measured from its `created_at`, so a token minted before a slow transfer is already
 ///    outside the relay's ±60 s window when the read-back runs: the push lands and its own
 ///    verification 401s.
+/// 4. A mint failure is reported with the STAGE it happened at: before the upload nothing is on the
+///    remote and the delivery may fail; after it, the pack is there and only the remote may decide.
 ///
-/// `relay_git` is false for a public/anonymous https remote, which takes no header at all; `mint` is
-/// then never called. `upload_expiry` is the NIP-40 expiration declared on the upload token only.
+/// `stage` is published for the caller's timeout arm, which cannot otherwise tell a push that never
+/// started from one whose pack is already in flight. `relay_git` is false for a public/anonymous
+/// https remote, which takes no header at all; `mint` is then never called. `upload_expiry` is the
+/// NIP-40 expiration declared on the upload token only.
 async fn mint_upload_mint_attest<T, MintFut, UploadFut, AttestFut>(
     relay_git: bool,
     upload_expiry: i64,
+    stage: &std::sync::atomic::AtomicU8,
+    intent: impl FnOnce() -> Result<(), DeliveryPushErr>,
     mint: impl Fn(Option<i64>) -> MintFut,
     upload: impl FnOnce(Option<String>) -> UploadFut,
-    journal: impl FnOnce(&T),
     attest: impl FnOnce(T, Option<String>) -> AttestFut,
 ) -> Result<String, DeliveryPushErr>
 where
-    MintFut: std::future::Future<Output = Result<String, DeliveryPushErr>>,
+    MintFut: std::future::Future<Output = Result<String, String>>,
     UploadFut: std::future::Future<Output = Result<T, DeliveryPushErr>>,
     AttestFut: std::future::Future<Output = Result<String, DeliveryPushErr>>,
 {
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    stage.store(PushStage::BeforeUpload.as_u8(), AtomicOrdering::SeqCst);
+    // PRE-EFFECT and REQUIRED. Everything after this line is recoverable; nothing before it needs to
+    // be, because nothing before it can have reached the remote.
+    intent()?;
     let upload_header = if relay_git {
-        Some(mint(Some(upload_expiry)).await?)
+        Some(
+            mint(Some(upload_expiry))
+                .await
+                .map_err(DeliveryPushErr::PreUploadAuth)?,
+        )
     } else {
         None
     };
+    // From here the pack may reach the remote at any moment — including after this future is dropped,
+    // because the blocking upload op finishes on its own thread.
+    stage.store(PushStage::UploadOutstanding.as_u8(), AtomicOrdering::SeqCst);
     let uploaded = upload(upload_header).await?;
-    // The uploaded-but-unverified fact is journaled HERE: after the remote accepted the pack, before
-    // anything else can fail. Everything between this line and a successful attestation — the second
-    // mint, the read-back, a kill, a power loss — happens with the fact already durable, which is the
-    // difference between a recoverable delivery and a pack on a remote that nothing remembers.
-    journal(&uploaded);
-    let verify_header = if relay_git { Some(mint(None).await?) } else { None };
+    // The remote ACCEPTED it. The upload leg has already journaled that fact from inside its blocking
+    // op — not here — so a caller that timed out or was cancelled during the transfer cannot lose it.
+    stage.store(PushStage::AfterUpload.as_u8(), AtomicOrdering::SeqCst);
+    let verify_header = if relay_git {
+        Some(
+            mint(None)
+                .await
+                // The pack is on the remote and this token is what would have proved it. A failure
+                // here is NOT the same event as a failure before the upload, and the caller must not
+                // be able to treat it as one.
+                .map_err(DeliveryPushErr::PostUploadAuth)?,
+        )
+    } else {
+        None
+    };
     attest(uploaded, verify_header).await
 }
 
-/// #562 delivery-push failure: distinguishes the transport/push error (which carries the reason for
-/// the operator log — the LEG-1 detail) from the bounded-timeout firing, so all of them route to the
-/// SINGLE `delivery_failed` handling while logging distinctly (never a new state).
-#[derive(Debug)]
-enum DeliveryPushErr {
-    /// Minting the leg's NIP-98 authorization failed (sign refused, or the signer actor is gone).
-    /// Nothing was sent: this fires before the leg it would have authorized.
-    Auth(String),
-    /// The upload itself failed; the inner error carries the transport reason (409 / auth / io).
-    Push(seller_git::SellerGitError),
-    /// The pack was accepted and the remote reported status for the delivery ref, but the read-back
-    /// that must see the ref at the gated oid failed. Distinct from [`DeliveryPushErr::Push`] in the
-    /// LOG only — the job still fails `delivery_failed`, no new state — because "uploaded, not
-    /// verified" is the one thing the relay-401 incident could not tell from "never uploaded".
-    Attest(seller_git::SellerGitError),
-    /// The push did not settle within [`DELIVERY_PUSH_TIMEOUT`] (seconds); the lock was released.
-    TimedOut(u64),
+/// WHERE a delivery push had got to when it stopped. The distinction the relay-401 incident could
+/// not make, and the one that decides whether a failure may be terminal: once the pack is (or may
+/// be) on the remote, only the remote's own exact-oid answer may complete OR fail this delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PushStage {
+    /// Nothing has been sent: the intent is journaled, the upload has not begun.
+    BeforeUpload,
+    /// The upload is in flight. It may already have landed — a `git-receive-pack` the caller stopped
+    /// waiting for still runs to completion on its blocking thread.
+    UploadOutstanding,
+    /// The remote ACCEPTED the pack; the read-back is what remains.
+    AfterUpload,
 }
 
-/// #562: run a delivery push under `lock` — serializing concurrent deliveries to this seat's ONE
-/// delivery remote (concurrent `git-receive-pack` to one repo is what the relay 409s) — and bounded
-/// by `timeout` so a hung push releases the lock rather than starving every later delivery. Pure over
-/// (lock, timeout, push) so the serialization + timeout are unit-testable WITHOUT a relay. The lock is
-/// held ONLY across the push and released the instant it settles or times out. The push oid is stable
-/// (invariant 2), so ORDERING pushes never duplicates a delivery — this is exactly-once.
+impl PushStage {
+    /// A delivery past `BeforeUpload` may be on the remote, so no local decision may fail it: it is
+    /// held for the exact-oid read-back instead.
+    fn upload_may_have_landed(self) -> bool {
+        !matches!(self, PushStage::BeforeUpload)
+    }
+
+    fn from_u8(raw: u8) -> Self {
+        match raw {
+            1 => PushStage::UploadOutstanding,
+            2 => PushStage::AfterUpload,
+            _ => PushStage::BeforeUpload,
+        }
+    }
+
+    fn as_u8(self) -> u8 {
+        match self {
+            PushStage::BeforeUpload => 0,
+            PushStage::UploadOutstanding => 1,
+            PushStage::AfterUpload => 2,
+        }
+    }
+}
+
+/// #562 delivery-push failure, STAGE-AWARE: each variant says what had already happened when it
+/// fired, because "the signer refused" and "the read-back timed out" have opposite terminal rights
+/// depending on whether a pack is on the remote. The one thing no variant may do is fail a job whose
+/// delivery may be sitting on the remote unattested — that is the landed-pack-orphaned defect.
+#[derive(Debug)]
+enum DeliveryPushErr {
+    /// The DURABLE PRE-EFFECT intent could not be journaled. Nothing was sent: this fires before the
+    /// upload it would have made recoverable, and refusing here is the point — an upload nothing
+    /// remembers is the fault this whole path exists to prevent.
+    IntentUnrecorded(String),
+    /// Minting the UPLOAD leg's NIP-98 authorization failed. Nothing was sent.
+    PreUploadAuth(String),
+    /// Minting the VERIFICATION leg's authorization failed AFTER the remote accepted the pack. The
+    /// pack is on the remote; only the read-back is missing. Never terminal.
+    PostUploadAuth(String),
+    /// The upload itself failed; the inner error carries the transport reason (409 / auth / io).
+    Push(seller_git::SellerGitError),
+    /// The read-back's RAW transport outcome, unclassified on purpose: the live handler and the
+    /// resumed handler run it through the SAME classifier, so a definitive rejection fails closed and
+    /// an unknown (401 / io) stays unresolved in both lanes.
+    Attest(crate::git_transport::TransportError),
+    /// The push did not settle within [`DELIVERY_PUSH_TIMEOUT`]. `stage` says whether an upload
+    /// effect may be outstanding; the serialization permit is held by the blocking op either way.
+    TimedOut { secs: u64, stage: PushStage },
+}
+
+/// #562 + custody: run a delivery push under `gate` — serializing concurrent deliveries to this
+/// seat's ONE delivery remote (concurrent `git-receive-pack` to one repo is what the relay 409s) —
+/// and bounded by `timeout` so a hung push does not starve every later delivery. Pure over
+/// (gate, timeout, stage, push) so the serialization + timeout are unit-testable WITHOUT a relay.
 ///
-/// `push` is called only ONCE THE LOCK IS HELD, and it owns the whole authorized sequence: mint,
-/// upload, mint again, attest. That ordering is the fix for the relay-401 class of failure — a token
-/// minted before the wait for this lock has already spent part of the relay's ±60 s NIP-98 window on
-/// waiting, and the delivery ahead of it may hold the lock for up to `timeout`.
+/// The permit is OWNED and handed to `push`, which passes it down into the blocking upload op. That
+/// is the custody rule: a timeout returns control to the caller, but it does NOT admit the next
+/// delivery while this one's `git-receive-pack` may still be running — a `spawn_blocking` task
+/// outlives the future that awaited it, and releasing the permit on the caller's clock is exactly how
+/// two receive-packs end up on one repo. Whatever `push` does not move into the blocking op is
+/// dropped with its future, so a push that never reached the upload releases the permit at once.
+///
+/// `push` is called only ONCE THE PERMIT IS HELD, and it owns the whole authorized sequence: journal
+/// intent, mint, upload, mint again, attest. That ordering is the fix for the relay-401 class of
+/// failure — a token minted before the wait for this permit has already spent part of the relay's
+/// ±60 s NIP-98 window on waiting, and the delivery ahead of it may hold the permit for up to
+/// `timeout`. `stage` lets the timeout arm report WHERE the push had got to, which is what keeps a
+/// timeout from failing a delivery whose pack is already on the remote.
 async fn serialized_bounded_push<Fut>(
-    lock: &tokio::sync::Mutex<()>,
+    gate: &std::sync::Arc<tokio::sync::Semaphore>,
     timeout: Duration,
-    push: impl FnOnce() -> Fut,
+    stage: &std::sync::atomic::AtomicU8,
+    push: impl FnOnce(tokio::sync::OwnedSemaphorePermit) -> Fut,
 ) -> Result<String, DeliveryPushErr>
 where
     Fut: std::future::Future<Output = Result<String, DeliveryPushErr>>,
 {
-    let _guard = lock.lock().await;
-    match tokio::time::timeout(timeout, push()).await {
+    let permit = match std::sync::Arc::clone(gate).acquire_owned().await {
+        Ok(permit) => permit,
+        Err(error) => {
+            // The gate is closed only on shutdown; nothing was sent, so this is a pre-upload refusal.
+            return Err(DeliveryPushErr::IntentUnrecorded(format!(
+                "delivery push gate closed ({error})"
+            )));
+        }
+    };
+    match tokio::time::timeout(timeout, push(permit)).await {
         Ok(Ok(oid)) => Ok(oid),
         Ok(Err(error)) => Err(error),
-        Err(_elapsed) => Err(DeliveryPushErr::TimedOut(timeout.as_secs())),
+        Err(_elapsed) => Err(DeliveryPushErr::TimedOut {
+            secs: timeout.as_secs(),
+            stage: PushStage::from_u8(stage.load(std::sync::atomic::Ordering::SeqCst)),
+        }),
     }
-    // `_guard` drops here — the lock is released the instant the push settles OR times out, never held
-    // into the sign/enqueue tail.
 }
 
 #[cfg(test)]
 mod serialized_bounded_push_tests {
-    use super::{serialized_bounded_push, DeliveryPushErr};
-    use crate::seller_git::SellerGitError;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use super::{serialized_bounded_push, DeliveryPushErr, PushStage};
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+    use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
     // #562 core: concurrent deliveries to ONE remote must serialize — the push closure records peak
     // concurrency, and under the lock peak is exactly 1. Red-on-revert: drop the `_guard` in
@@ -2174,19 +2289,21 @@ mod serialized_bounded_push_tests {
     // concurrent git-receive-pack the relay 409s).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_pushes_serialize_to_one_at_a_time() {
-        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let gate = Arc::new(Semaphore::new(1));
         let inflight = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
         let mut handles = Vec::new();
         for i in 0..8u32 {
-            let (lock, inflight, peak) = (lock.clone(), inflight.clone(), peak.clone());
+            let (gate, inflight, peak) = (gate.clone(), inflight.clone(), peak.clone());
             handles.push(tokio::spawn(async move {
-                serialized_bounded_push(&lock, Duration::from_secs(5), || async move {
+                let stage = AtomicU8::new(0);
+                serialized_bounded_push(&gate, Duration::from_secs(5), &stage, |permit| async move {
                     let now = inflight.fetch_add(1, Ordering::SeqCst) + 1;
                     peak.fetch_max(now, Ordering::SeqCst);
                     tokio::task::yield_now().await; // a racer would overlap here if unserialized
                     tokio::time::sleep(Duration::from_millis(5)).await;
                     inflight.fetch_sub(1, Ordering::SeqCst);
+                    drop(permit);
                     Ok::<_, DeliveryPushErr>(format!("oid{i}"))
                 })
                 .await
@@ -2207,17 +2324,24 @@ mod serialized_bounded_push_tests {
     // proceeds promptly rather than blocking behind the hung one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_hung_push_times_out_and_frees_the_lock() {
-        let lock = tokio::sync::Mutex::new(());
-        let hung = serialized_bounded_push(&lock, Duration::from_millis(50), || async move {
+        let gate = Arc::new(Semaphore::new(1));
+        let stage = AtomicU8::new(0);
+        let hung = serialized_bounded_push(&gate, Duration::from_millis(50), &stage, |permit| async move {
+            // A push that never began: the permit is dropped, so nothing is holding custody.
+            drop(permit);
             tokio::time::sleep(Duration::from_secs(30)).await;
             Ok::<_, DeliveryPushErr>("never".to_string())
         })
         .await;
-        assert!(matches!(hung, Err(DeliveryPushErr::TimedOut(_))), "a hung push must time out");
-        // The lock is free again: the next push acquires it and completes promptly (not starved).
+        assert!(
+            matches!(hung, Err(DeliveryPushErr::TimedOut { stage: PushStage::BeforeUpload, .. })),
+            "a hung push must time out, reporting the stage it reached: {hung:?}"
+        );
+        // The gate is free again: the next push acquires it and completes promptly (not starved).
         let next = tokio::time::timeout(
             Duration::from_secs(2),
-            serialized_bounded_push(&lock, Duration::from_secs(5), || async move {
+            serialized_bounded_push(&gate, Duration::from_secs(5), &stage, |permit| async move {
+                drop(permit);
                 Ok::<_, DeliveryPushErr>("next-oid".to_string())
             }),
         )
@@ -2225,17 +2349,60 @@ mod serialized_bounded_push_tests {
         .expect("the next delivery must not be starved behind the timed-out push");
         assert!(matches!(next, Ok(oid) if oid == "next-oid"));
     }
+
+    // F3 CUSTODY. The upload leg keeps the serialization permit INSIDE its blocking op, so a caller
+    // that times out does not admit the next delivery while `git-receive-pack` is still running —
+    // concurrent receive-packs against one relay remote are exactly what #562 serializes away.
+    // Red-on-revert: drop the permit when the caller's future is dropped (return it instead of
+    // moving it into the op) and the second push is admitted while the first is still uploading.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_timed_out_upload_keeps_the_permit_until_the_transfer_ends() {
+        let gate = Arc::new(Semaphore::new(1));
+        let stage = Arc::new(AtomicU8::new(0));
+        let stage_in_op = stage.clone();
+        let (uploading_tx, uploading_rx) = tokio::sync::oneshot::channel::<OwnedSemaphorePermit>();
+        // The caller times out at 50 ms; the transfer "keeps running" holding the permit.
+        let timed_out = serialized_bounded_push(&gate, Duration::from_millis(50), &stage, |permit| async move {
+            stage_in_op.store(PushStage::UploadOutstanding.as_u8(), Ordering::SeqCst);
+            // Custody handed to the still-running transfer, exactly as the blocking op holds it.
+            uploading_tx.send(permit).expect("the transfer takes custody");
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok::<_, DeliveryPushErr>("never".to_string())
+        })
+        .await;
+        assert!(
+            matches!(
+                timed_out,
+                Err(DeliveryPushErr::TimedOut { stage: PushStage::UploadOutstanding, .. })
+            ),
+            "a timeout during the transfer must report that the upload may have landed: {timed_out:?}"
+        );
+        let held = uploading_rx.await.expect("the transfer holds the permit");
+        assert_eq!(
+            gate.available_permits(),
+            0,
+            "the next delivery must NOT be admitted while the timed-out transfer is still running"
+        );
+        drop(held); // the receive-pack ends
+        assert_eq!(gate.available_permits(), 1, "custody is released when the transfer ends");
+    }
 }
 
 #[cfg(test)]
 mod delivery_push_leg_tests {
     use super::{
-        mint_upload_mint_attest, serialized_bounded_push, DeliveryPushErr,
+        mint_upload_mint_attest, serialized_bounded_push, DeliveryPushErr, PushStage,
         DELIVERY_PUSH_TIMEOUT, DELIVERY_PUSH_TOKEN_MARGIN_SECS,
     };
-    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+    use tokio::sync::Semaphore;
+
+    /// A stage cell for the tests that do not assert on it.
+    fn stage_cell() -> AtomicU8 {
+        AtomicU8::new(PushStage::BeforeUpload.as_u8())
+    }
 
     /// What the delivery push did, in the order it did it — the fake clock reading at each step. This
     /// is the sequence the relay-401 class turns on, so the tests assert on the SEQUENCE, not on
@@ -2299,27 +2466,32 @@ mod delivery_push_leg_tests {
     async fn the_verification_token_is_minted_after_a_slow_upload_not_before_it() {
         let recorder = Recorder::default();
         let upload_expiry = 10_000;
+        let stage = stage_cell();
         let attested = mint_upload_mint_attest(
             true,
             upload_expiry,
-            |expiration| {
+            &stage,
+            || Ok(()),
+            {
                 let recorder = recorder.clone();
-                async move { Ok(recorder.mint(expiration)) }
+                move |expiration| {
+                    let recorder = recorder.clone();
+                    async move { Ok::<_, String>(recorder.mint(expiration)) }
+                }
             },
-            |header| {
+            {
                 let recorder = recorder.clone();
-                async move {
+                move |header| async move {
                     assert!(header.is_some(), "a relay-git upload leg carries a token");
                     // The transfer itself: 200 s on the wire, well past the relay's window.
                     recorder.clock.fetch_add(200, Ordering::SeqCst);
+                    // Journaled from inside the transfer, before the caller is resumed.
+                    recorder.push(Step::Journal {
+                        at: recorder.now(),
+                        commit: "uploaded-oid".to_string(),
+                    });
                     Ok("uploaded-oid".to_string())
                 }
-            },
-            |uploaded: &String| {
-                recorder.push(Step::Journal {
-                    at: recorder.now(),
-                    commit: uploaded.clone(),
-                });
             },
             |uploaded: String, header| {
                 let recorder = recorder.clone();
@@ -2370,15 +2542,17 @@ mod delivery_push_leg_tests {
     async fn only_the_upload_token_declares_an_expiration_and_it_is_bounded() {
         let recorder = Recorder::default();
         let upload_expiry = super::delivery_push_token_lifetime_secs();
+        let stage = stage_cell();
         mint_upload_mint_attest(
             true,
             upload_expiry,
+            &stage,
+            || Ok(()),
             |expiration| {
                 let recorder = recorder.clone();
-                async move { Ok(recorder.mint(expiration)) }
+                async move { Ok::<_, String>(recorder.mint(expiration)) }
             },
             |_header| async { Ok("uploaded".to_string()) },
-            |_uploaded: &String| {},
             |_uploaded: String, _header| async { Ok("oid".to_string()) },
         )
         .await
@@ -2404,19 +2578,27 @@ mod delivery_push_leg_tests {
     #[tokio::test]
     async fn a_public_remote_mints_no_token_for_either_leg() {
         let recorder = Recorder::default();
+        let stage = stage_cell();
         mint_upload_mint_attest(
             false,
             10_000,
-            |expiration| {
+            &stage,
+            || Ok(()),
+            {
                 let recorder = recorder.clone();
-                async move { Ok(recorder.mint(expiration)) }
+                move |expiration| {
+                    let recorder = recorder.clone();
+                    async move { Ok::<_, String>(recorder.mint(expiration)) }
+                }
             },
-            |header| async move {
-                assert!(header.is_none(), "no auth on a public remote");
-                Ok("uploaded".to_string())
-            },
-            |uploaded: &String| {
-                recorder.push(Step::Journal { at: 0, commit: uploaded.clone() });
+            {
+                let recorder = recorder.clone();
+                move |header: Option<String>| async move {
+                    assert!(header.is_none(), "no auth on a public remote");
+                    // The journal is the upload leg's own act now — written inside the transfer.
+                    recorder.push(Step::Journal { at: 0, commit: "uploaded".to_string() });
+                    Ok("uploaded".to_string())
+                }
             },
             |_uploaded: String, header| async move {
                 assert!(header.is_none(), "no auth on a public remote");
@@ -2441,41 +2623,48 @@ mod delivery_push_leg_tests {
     // token's `created_at` is 0 ⇒ this fails.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_upload_token_is_minted_after_the_push_lock_is_acquired() {
-        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let gate = Arc::new(Semaphore::new(1));
         let recorder = Recorder::default();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
 
         let first = {
-            let (lock, recorder) = (lock.clone(), recorder.clone());
+            let (gate, recorder) = (gate.clone(), recorder.clone());
             tokio::spawn(async move {
-                serialized_bounded_push(&lock, Duration::from_secs(30), || async move {
-                    // The delivery ahead of ours holds the lock while time passes on the wire.
+                let stage = stage_cell();
+                serialized_bounded_push(&gate, Duration::from_secs(30), &stage, |permit| async move {
+                    // The delivery ahead of ours holds the permit while time passes on the wire.
                     release_rx.await.expect("released");
                     recorder.clock.fetch_add(300, Ordering::SeqCst);
+                    drop(permit);
                     Ok::<_, DeliveryPushErr>("first-oid".to_string())
                 })
                 .await
             })
         };
 
-        // Give the first delivery the lock, then queue ours behind it.
+        // Give the first delivery the permit, then queue ours behind it.
         tokio::task::yield_now().await;
         let second = {
-            let (lock, recorder) = (lock.clone(), recorder.clone());
+            let (gate, recorder) = (gate.clone(), recorder.clone());
             tokio::spawn(async move {
-                serialized_bounded_push(&lock, Duration::from_secs(30), || {
+                let stage = stage_cell();
+                serialized_bounded_push(&gate, Duration::from_secs(30), &stage, |permit| {
                     mint_upload_mint_attest(
                         true,
                         10_000,
+                        &stage,
+                        || Ok(()),
                         {
                             let recorder = recorder.clone();
                             move |expiration| {
                                 let recorder = recorder.clone();
-                                async move { Ok(recorder.mint(expiration)) }
+                                async move { Ok::<_, String>(recorder.mint(expiration)) }
                             }
                         },
-                        |_header| async { Ok("uploaded".to_string()) },
-                        |_uploaded: &String| {},
+                        |_header| async move {
+                            drop(permit);
+                            Ok("uploaded".to_string())
+                        },
                         |_uploaded: String, _header| async { Ok("second-oid".to_string()) },
                     )
                 })
@@ -2509,22 +2698,28 @@ mod delivery_push_leg_tests {
     async fn a_failed_verification_mint_refuses_before_the_read_back() {
         let recorder = Recorder::default();
         let mints = Arc::new(AtomicI64::new(0));
+        let stage = stage_cell();
         let result = mint_upload_mint_attest(
             true,
             10_000,
+            &stage,
+            || Ok(()),
             |_expiration| {
                 let mints = mints.clone();
                 async move {
                     if mints.fetch_add(1, Ordering::SeqCst) == 0 {
                         Ok("upload-token".to_string())
                     } else {
-                        Err(DeliveryPushErr::Auth("signer actor gone (test)".into()))
+                        Err("signer actor gone (test)".to_string())
                     }
                 }
             },
-            |_header| async { Ok("uploaded-oid".to_string()) },
-            |uploaded: &String| {
-                recorder.push(Step::Journal { at: 0, commit: uploaded.clone() });
+            {
+                let recorder = recorder.clone();
+                move |_header| async move {
+                    recorder.push(Step::Journal { at: 0, commit: "uploaded-oid".to_string() });
+                    Ok("uploaded-oid".to_string())
+                }
             },
             |_uploaded: String, _header| {
                 let recorder = recorder.clone();
@@ -2535,7 +2730,14 @@ mod delivery_push_leg_tests {
             },
         )
         .await;
-        assert!(matches!(result, Err(DeliveryPushErr::Auth(_))), "{result:?}");
+        // F1: the SECOND mint's failure is its own variant — the pack is already on the remote, and
+        // the caller must not be able to read this as a push that never landed.
+        assert!(matches!(result, Err(DeliveryPushErr::PostUploadAuth(_))), "{result:?}");
+        assert_eq!(
+            PushStage::from_u8(stage.load(Ordering::SeqCst)),
+            PushStage::AfterUpload,
+            "the stage records that the pack was accepted before the mint failed"
+        );
         assert_eq!(
             recorder.steps(),
             vec![Step::Journal { at: 0, commit: "uploaded-oid".to_string() }],
@@ -2550,29 +2752,31 @@ mod delivery_push_leg_tests {
     #[tokio::test]
     async fn a_readback_failure_still_leaves_the_upload_journaled() {
         let recorder = Recorder::default();
+        let stage = stage_cell();
         let result = mint_upload_mint_attest(
             true,
             10_000,
+            &stage,
+            || Ok(()),
             |expiration| {
                 let recorder = recorder.clone();
-                async move { Ok(recorder.mint(expiration)) }
+                async move { Ok::<_, String>(recorder.mint(expiration)) }
             },
-            |_header| {
+            {
                 let recorder = recorder.clone();
-                async move {
+                move |_header| async move {
                     recorder.clock.fetch_add(200, Ordering::SeqCst);
+                    // Journaled from INSIDE the transfer, before it returns to the caller.
+                    recorder.push(Step::Journal {
+                        at: recorder.now(),
+                        commit: "landed-oid".to_string(),
+                    });
                     Ok("landed-oid".to_string())
                 }
             },
-            |uploaded: &String| {
-                recorder.push(Step::Journal {
-                    at: recorder.now(),
-                    commit: uploaded.clone(),
-                });
-            },
             |_uploaded: String, _header| async {
                 Err(DeliveryPushErr::Attest(
-                    crate::seller_git::SellerGitError::AuthFailed("401 Unauthorized".into()),
+                    crate::git_transport::TransportError::Auth("401 Unauthorized".into()),
                 ))
             },
         )
@@ -4515,7 +4719,12 @@ pub struct SellerNodeRunner {
     /// `git-receive-pack` to one repo is what the relay 409s (the multi-slot delivery hazard). Held
     /// ONLY across the push (execution stays parallel) and bounded by [`DELIVERY_PUSH_TIMEOUT`], so a
     /// hung push releases it rather than starving every later delivery behind the lock.
-    delivery_push_lock: tokio::sync::Mutex<()>,
+    /// #562 + custody: admits ONE delivery push at a time to this seat's single delivery remote.
+    /// A semaphore rather than a mutex because the permit must be able to OUTLIVE the async caller:
+    /// the upload runs on a blocking thread that finishes even if its awaiting future is dropped at
+    /// a timeout, so the permit travels INTO that blocking op and is released when the
+    /// `git-receive-pack` actually ends — never while one is still in flight.
+    delivery_push_gate: std::sync::Arc<tokio::sync::Semaphore>,
     /// #541: relay-derived set of SETTLED offer ids (a co-signed kind-3400 receipt has been seen).
     /// Read before any claim to skip a terminal offer that re-appears via backfill or redelivery.
     /// Populated by [`Self::on_receipt`] from the live receipt subscription and its boot/reconnect
@@ -4856,7 +5065,7 @@ impl SellerNodeRunner {
             agents,
             slots,
             capacity_skip_pending: std::sync::atomic::AtomicBool::new(false),
-            delivery_push_lock: tokio::sync::Mutex::new(()),
+            delivery_push_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             terminal_offers: TerminalOffers::new(TERMINAL_OFFERS_CAP, TERMINAL_AUTHORS_PER_OFFER),
             fed_under_rate_offers: FedUnderRateOffers::new(FED_UNDER_RATE_OFFERS_CAP),
             shutdown: shutdown::ShutdownChannel::new(),
@@ -5492,6 +5701,10 @@ impl SellerNodeRunner {
                     self.sweep_lapsed_claims();
                     self.reconsider_capacity_skips().await;
                     self.start_due_harness_probes();
+                    // Held deliveries (uploaded/intended, unverified) are swept on THIS clock, so a
+                    // seat that just keeps running still verifies or lapses them — recovery no longer
+                    // waits for a new award or a reboot.
+                    self.sweep_uploaded_verifications().await;
                     self.drain().await;
                     continue;
                 }
@@ -7624,11 +7837,15 @@ impl SellerNodeRunner {
         // It is NOT part of `is_live_residual` above: a row with this marker still gets the #563
         // relay-derive, and a positive settled-elsewhere finding still outranks the verification
         // (the buyer has left; there is nobody to deliver to).
-        let uploaded_unverified = match self.node.store().uploaded_unverified_commit(job_id) {
-            Ok(v) => v,
+        // A read that FAILED is not a read that said "nothing". Degrading it to None is what would
+        // authorize the agent to run again for a delivery that may already be on the remote, so an
+        // unreadable marker declines to decide: this pass does nothing and the next tick asks again.
+        // (Absence, once actually read, still runs the agent — that is the #552 foil.)
+        let uploaded_unverified = match self.node.store().upload_marker(job_id) {
+            Ok(marker) => marker.map(|marker| marker.commit),
             Err(error) => {
-                opline!("seller node execute job_id={job_id}: uploaded_unverified read failed ({error}); assuming nothing uploaded-unverified");
-                None
+                opline!("seller node execute job_id={job_id}: upload marker read failed ({error}); declining to decide this pass — no agent run and no push while it is unknown whether a delivery is already on the remote");
+                return;
             }
         };
         match resume_action_with_upload_marker(
@@ -8022,10 +8239,20 @@ impl SellerNodeRunner {
             // holding a token the relay has already aged out. Both stay branch-scoped to `push_ref`
             // and repo-root-bound to `seller.git_remote`, signed THROUGH the signer actor — the
             // custody, the ref binding and the exact-oid attestation are unchanged.
+            // WHERE the push got to, published for the timeout arm below: a timeout cannot otherwise
+            // tell a push that never started from one whose pack is already in flight, and those two
+            // have opposite terminal rights.
+            let push_stage = std::sync::atomic::AtomicU8::new(PushStage::BeforeUpload.as_u8());
+            // The journal the upload leg runs from INSIDE its blocking op, on an owned store handle:
+            // a cancelled or timed-out caller is not there to run a post-await callback, and the fact
+            // that the remote accepted the pack must not depend on the caller still waiting.
+            let journal_store = self.node.store().clone();
+            let journal_job = job_id.to_owned();
             let commit = match serialized_bounded_push(
-                &self.delivery_push_lock,
+                &self.delivery_push_gate,
                 DELIVERY_PUSH_TIMEOUT,
-                || {
+                &push_stage,
+                |permit| {
                     // A slow pack upload spans several HTTP legs under ONE token. Sizing the NIP-40
                     // expiration to the whole-operation bound is what lets a relay that grants
                     // scoped-token lifetimes (Requirement B) keep authorizing those legs; a relay on
@@ -8035,33 +8262,55 @@ impl SellerNodeRunner {
                     mint_upload_mint_attest(
                         relay_git_remote,
                         upload_expiry,
+                        &push_stage,
+                        || {
+                            // DURABLE PRE-EFFECT INTENT, and it is REQUIRED: this job is about to put
+                            // `gated_oid` on the remote, and from the next line onward the remote may
+                            // hold it whatever happens to this process. If the write does not land we
+                            // do NOT push — an upload nothing remembers is the fault this path exists
+                            // to prevent, and refusing costs one delivery instead of orphaning a pack.
+                            match self.node.store().mark_upload_intent(job_id, &gated_oid, now_unix()) {
+                                Ok(1..) => Ok(()),
+                                Ok(_) => Err(DeliveryPushErr::IntentUnrecorded(
+                                    "no jobs row accepted the upload intent".to_owned(),
+                                )),
+                                Err(error) => Err(DeliveryPushErr::IntentUnrecorded(error.to_string())),
+                            }
+                        },
                         |expiry| self.mint_delivery_push_header(&seller.git_remote, &push_ref, expiry),
                         |header| async {
+                            let journal_store = journal_store.clone();
+                            let journal_job = journal_job.clone();
                             seller_git::neutralize_then_upload_off_runtime(
                                 workdir.clone(),
                                 seller.git_remote.clone(),
                                 branch.clone(),
                                 gated_oid.clone(),
                                 header,
+                                move |uploaded: &crate::git_transport::UploadedDelivery| {
+                                    // Upgrade intent → uploaded, inside the blocking op. Not
+                                    // load-bearing (the intent row already makes this job
+                                    // reconciliable); it sharpens what the operator and the sweep see.
+                                    if let Err(error) = journal_store.mark_uploaded_unverified(
+                                        &journal_job,
+                                        uploaded.gated_oid(),
+                                        now_unix(),
+                                    ) {
+                                        eprintln!("seller push journal job_id={journal_job}: uploaded-unverified upgrade failed ({error}); the pre-upload intent still stands");
+                                    }
+                                },
+                                // Custody: the serialization permit rides into the blocking op, so
+                                // the next delivery is admitted when this receive-pack ENDS, not when
+                                // this caller stops waiting for it.
+                                Some(permit),
                             )
                             .await
                             .map_err(DeliveryPushErr::Push)
                         },
-                        |uploaded: &crate::git_transport::UploadedDelivery| {
-                            // DURABLE state, not a log line: the pack is on the remote and nothing
-                            // has attested it. A resume reads THIS column and re-verifies; it is
-                            // deliberately not `mark_pushed`, which means verified and is finalized
-                            // from without re-checking the remote.
-                            if let Err(error) = self.node.store().mark_uploaded_unverified(
-                                job_id,
-                                uploaded.gated_oid(),
-                                now_unix(),
-                            ) {
-                                opline!("seller node execute job_id={job_id}: uploaded-unverified journal write failed ({error}); a crash before the read-back would lose the upload");
-                            }
-                        },
                         |uploaded, header| async {
-                            seller_git::attest_pushed_branch_off_runtime(uploaded, header)
+                            // RAW transport outcome: the same classifier decides for this live pass
+                            // and for a resumed one.
+                            seller_git::attest_upload_off_runtime(uploaded, header, "push")
                                 .await
                                 .map_err(DeliveryPushErr::Attest)
                         },
@@ -8071,38 +8320,11 @@ impl SellerNodeRunner {
             .await
             {
                 Ok(oid) => oid,
-                Err(DeliveryPushErr::Auth(detail)) => {
-                    opline!("seller node execute fail job_id={job_id}: delivery push authorization failed ({detail})");
-                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
-                    return;
-                }
-                Err(DeliveryPushErr::Push(error)) => {
-                    opline!("seller node execute fail job_id={job_id}: git push failed ({error})");
-                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
-                    return;
-                }
-                Err(DeliveryPushErr::Attest(error)) => {
-                    // The pack was accepted and the remote reported status for the delivery ref; only
-                    // the read-back failed — the 401 class, and the ONE outcome that must not be
-                    // failed here. Failing it would emit a terminal delivery_failed for a delivery
-                    // that is (probably) sitting on the remote, and a `failed` row is terminal: no
-                    // later resume would ever look at it again, so the landed pack would be
-                    // unreachable forever.
-                    //
-                    // Instead: the uploaded-unverified marker is ALREADY durable (journaled between
-                    // the legs above), and this row stays slot-occupying, so the next resume
-                    // re-verifies it under a freshly minted token and completes it from the remote's
-                    // own answer — no re-push, no agent re-run. It is bounded: when the offer's
-                    // deadline passes, `resume_action` fails the row (SkipLapsed), so exactly ONE
-                    // terminal buyer event is ever emitted for this job — a delivery, or a failure.
-                    opline!("seller node execute job_id={job_id}: delivery uploaded but remote verification failed ({error}); uploaded-unverified marker journaled — the next resume re-verifies it (no re-push, no re-run)");
-                    return;
-                }
-                Err(DeliveryPushErr::TimedOut(secs)) => {
-                    // Timeout lands in the SAME delivery_failed handling (lead 37896 — no new state); the
-                    // lock is already released, so later deliveries are not starved behind this one.
-                    opline!("seller node execute fail job_id={job_id}: git push exceeded {secs}s (delivery-push lock released; treated as delivery_failed)");
-                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
+                Err(error) => {
+                    // ONE production handler for every push failure, stage-aware, shared with the
+                    // tests that prove it: it decides terminal-or-held and performs the store effects.
+                    self.handle_delivery_push_failure(job_id, &offer.buyer_pubkey, error)
+                        .await;
                     return;
                 }
             };
@@ -8627,7 +8849,7 @@ impl SellerNodeRunner {
         remote: &str,
         push_ref: &str,
         expiration_unix: Option<i64>,
-    ) -> Result<String, DeliveryPushErr> {
+    ) -> Result<String, String> {
         match self
             .node
             .signer()
@@ -8635,10 +8857,183 @@ impl SellerNodeRunner {
             .await
         {
             Ok(Ok(header)) => Ok(header),
-            Ok(Err(error)) => Err(DeliveryPushErr::Auth(format!(
-                "push auth sign failed ({error})"
-            ))),
-            Err(error) => Err(DeliveryPushErr::Auth(format!("signer actor gone ({error})"))),
+            Ok(Err(error)) => Err(format!("push auth sign failed ({error})")),
+            Err(error) => Err(format!("signer actor gone ({error})")),
+        }
+    }
+
+    /// THE production disposition for every delivery-push failure, stage-aware.
+    ///
+    /// One rule decides all of them: **a delivery that may be on the remote may not be failed here.**
+    /// A `failed` row is terminal — resume precedence skips it before any marker can help — so
+    /// failing a job whose pack the remote already accepted orphans that pack forever. Only two kinds
+    /// of authority may end such a job: the remote's own exact-oid answer, or the offer's deadline.
+    ///
+    /// Everything that fires BEFORE the pack can exist keeps the old terminal behavior, because
+    /// nothing is orphaned by failing it: an unrecorded intent, an authorization refused before the
+    /// upload, a definitively refused upload, a timeout that fired before the transfer began.
+    ///
+    /// Returns what it did, so the caller and the tests read the disposition instead of a log line.
+    async fn handle_delivery_push_failure(
+        &self,
+        job_id: &str,
+        buyer_pubkey: &str,
+        error: DeliveryPushErr,
+    ) -> DeliveryPushDisposition {
+        let fail = |detail: String| async move {
+            opline!("seller node execute fail job_id={job_id}: {detail}");
+            self.fail_job_with_feedback(
+                job_id,
+                buyer_pubkey,
+                ReasonCode::DeliveryFailed,
+                DELIVERY_FAILURE_FEEDBACK,
+                None,
+            )
+            .await;
+            DeliveryPushDisposition::Failed
+        };
+        let hold = |detail: String| {
+            opline!("seller node execute job_id={job_id}: {detail}; the delivery is journaled and held for the exact-oid read-back — no failure event, no re-push, no agent re-run (bounded by the offer deadline)");
+            DeliveryPushDisposition::HeldForVerification
+        };
+        match error {
+            // Nothing was sent, and nothing WILL be: we refuse to upload what we could not first
+            // record. Failing costs one delivery; uploading anyway would risk a pack nothing knows about.
+            DeliveryPushErr::IntentUnrecorded(detail) => {
+                fail(format!(
+                    "delivery push refused before it began: the upload intent could not be journaled ({detail}) — never uploading a pack this seat could not first record"
+                ))
+                .await
+            }
+            // The signer refused BEFORE the upload: nothing reached the remote.
+            DeliveryPushErr::PreUploadAuth(detail) => {
+                fail(format!(
+                    "delivery push authorization failed before the upload ({detail})"
+                ))
+                .await
+            }
+            // THE F1 CASE. The pack is on the remote and the token that would have proved it never
+            // got signed. Failing here is what orphaned a landed delivery: the row went terminal and
+            // no resume ever looked at it again. It is held instead.
+            DeliveryPushErr::PostUploadAuth(detail) => hold(format!(
+                "the pack was accepted and the VERIFICATION authorization then failed ({detail})"
+            )),
+            DeliveryPushErr::Push(error) => match &error {
+                // An io fault mid-upload cannot tell us whether the remote took the pack. Unknown is
+                // not refused: hold it and let the read-back decide.
+                seller_git::SellerGitError::Io(detail) => hold(format!(
+                    "the upload could not be resolved ({detail}) — whether the remote holds the pack is unknown"
+                )),
+                // Refused (auth/rejected/no-sentinel/git failure): the remote did not take it.
+                _ => fail(format!("git push failed ({error})")).await,
+            },
+            // THE F5 CASE. The read-back's RAW outcome, classified by the SAME function the resumed
+            // lane uses: the remote's definitive "not there" fails closed on this live pass instead of
+            // waiting for a resume, and an unknown (401 / io) stays unresolved instead of failing a
+            // delivery that is probably sitting on the remote.
+            DeliveryPushErr::Attest(error) => {
+                match uploaded_verification_outcome(Err(&error)) {
+                    UploadedVerification::FailClosed => {
+                        fail(format!(
+                            "the remote answered and does not hold the delivery at the pushed oid ({error}) — failing closed, never re-pushing"
+                        ))
+                        .await
+                    }
+                    UploadedVerification::Unresolved => hold(format!(
+                        "the pack was accepted and the read-back could not be resolved ({error})"
+                    )),
+                    // `Ok` never reaches this handler; treat it as unresolved rather than inventing a
+                    // delivery from an error path.
+                    UploadedVerification::Deliver => hold(format!(
+                        "the read-back reported an error that classified as success ({error})"
+                    )),
+                }
+            }
+            // THE F3 CASE. A timeout says the caller stopped waiting, never that the remote stopped
+            // receiving: the blocking upload runs to completion on its own thread and still holds the
+            // serialization permit. Only a timeout that fired BEFORE the transfer began may be fatal.
+            DeliveryPushErr::TimedOut { secs, stage } => {
+                if stage.upload_may_have_landed() {
+                    hold(format!(
+                        "the delivery push exceeded {secs}s at stage {stage:?}; the upload may be on the remote (its blocking op keeps the serialization permit until it ends)"
+                    ))
+                } else {
+                    fail(format!(
+                        "delivery push exceeded {secs}s before the upload began (nothing was sent; the delivery-push permit is free)"
+                    ))
+                    .await
+                }
+            }
+        }
+    }
+
+    /// Has this job's offer deadline passed, as of NOW? `false` when the deadline is unknown — never
+    /// fail a genuine delivery on a fact we could not read (the same asymmetry `resume_action` uses).
+    fn offer_deadline_lapsed(&self, job_id: &str) -> bool {
+        match self.node.store().offer_row(job_id) {
+            Ok(Some(offer)) => offer.deadline_unix <= now_unix(),
+            _ => false,
+        }
+    }
+
+    /// The ONE terminal disposition for a journaled delivery that will not be completed: the
+    /// deadline passed, or the attempt cap was reached. Emits the same `delivery_failed` feedback the
+    /// live path emits, so a buyer cannot tell the lanes apart, and does it exactly once — a row that
+    /// is already terminal is skipped by `fail_job`'s own state guard.
+    async fn fail_uploaded_delivery(&self, job_id: &str, why: &str) {
+        opline!("seller node verify job_id={job_id}: failing the journaled delivery — {why}");
+        match self.node.store().offer_row(job_id) {
+            Ok(Some(offer)) => {
+                self.fail_job_with_feedback(
+                    job_id,
+                    &offer.buyer_pubkey,
+                    ReasonCode::DeliveryFailed,
+                    DELIVERY_FAILURE_FEEDBACK,
+                    None,
+                )
+                .await;
+            }
+            _ => self.fail_job(job_id).await,
+        }
+    }
+
+    /// LIVENESS WITHOUT A RESTART: sweep the jobs that still owe the remote a read-back.
+    ///
+    /// A held delivery used to depend on something else happening — a new award, or a reboot — to be
+    /// looked at again, so an idle-but-running seat could sit on a landed pack indefinitely. This runs
+    /// on the node's own drain tick: every held row is either verified now, or failed when its offer
+    /// deadline has passed. Both outcomes are terminal-or-progress; neither re-pushes and neither
+    /// re-runs an agent.
+    ///
+    /// The enumeration already excludes delivered, receipted and verified rows, and
+    /// `verify_uploaded_delivery` charges the attempt cap, so the sweep cannot spin.
+    async fn sweep_uploaded_verifications(&self) {
+        let held = match self.node.store().jobs_awaiting_upload_verification() {
+            Ok(held) => held,
+            Err(error) => {
+                opline!("seller node sweep: jobs_awaiting_upload_verification read failed (continuing): {error}");
+                return;
+            }
+        };
+        for row in held {
+            let now = now_unix();
+            if row.deadline_unix.is_some_and(|deadline| deadline <= now) {
+                opline!(
+                    "seller node sweep job_id={}: the offer deadline passed with the delivery still unverified — one terminal disposition, no restart needed",
+                    row.job_id
+                );
+                self.fail_uploaded_delivery(&row.job_id, "the offer deadline passed while held")
+                    .await;
+                continue;
+            }
+            opline!(
+                "seller node sweep job_id={}: re-verifying a journaled delivery (stage={:?}, attempts={})",
+                row.job_id,
+                row.marker.stage,
+                row.marker.attempts
+            );
+            self.verify_uploaded_delivery(&row.job_id, &row.marker.commit)
+                .await;
         }
     }
 
@@ -8668,6 +9063,31 @@ impl SellerNodeRunner {
             self.fail_job(job_id).await;
             return;
         };
+        // BOUND THE RETRY before spending another one. The offer deadline bounds the wait in wall
+        // time; this bounds it in attempts, so a remote that keeps answering "could not tell" cannot
+        // hold a slot forever. Charged BEFORE the attempt, so a crash mid-attempt still costs one.
+        match self.node.store().bump_upload_verify_attempt(job_id, now_unix()) {
+            Ok(attempts) if attempts > UPLOAD_VERIFY_ATTEMPT_CAP => {
+                opline!("seller node verify fail job_id={job_id}: {attempts} read-back attempts spent on the journaled delivery (cap {UPLOAD_VERIFY_ATTEMPT_CAP}) — taking the one terminal disposition rather than asking forever");
+                self.fail_uploaded_delivery(job_id, "the read-back attempt cap was reached")
+                    .await;
+                return;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                // The counter is the bound; without it this path could spin. Decide nothing.
+                opline!("seller node verify job_id={job_id}: attempt counter write failed ({error}); marker left standing, nothing asked");
+                return;
+            }
+        }
+        // The offer's own budget, read HERE and re-read at completion below: a delivery finalized
+        // after the deadline is a post-settlement result the buyer will not pay for.
+        if self.offer_deadline_lapsed(job_id) {
+            opline!("seller node verify fail job_id={job_id}: the offer deadline passed before the read-back could run — one terminal disposition, no late delivery");
+            self.fail_uploaded_delivery(job_id, "the offer deadline passed before verification")
+                .await;
+            return;
+        }
         // The SAME ref this job's delivery is always pushed to — derived from the job id exactly as
         // the push and the finalize derive it, never read back from anywhere a job could influence.
         let branch = format!("maxplayer/{}", &job_id[..8.min(job_id.len())]);
@@ -8697,10 +9117,25 @@ impl SellerNodeRunner {
             push_ref.clone(),
             commit.to_owned(),
         );
-        let readback = seller_git::verify_journaled_upload_off_runtime(journaled, header).await;
+        // The SAME leg, the SAME raw error class the live pass classifies (F5): one classifier, two
+        // lanes, so "the remote says no" and "we could not ask" cannot swap places between them.
+        let readback = seller_git::attest_upload_off_runtime(journaled, header, "resume").await;
         let verdict = uploaded_verification_outcome(readback.as_ref().map(|_| ()));
         match verdict {
             UploadedVerification::Deliver => {
+                // AT COMPLETION, not at entry: the read-back awaited a signer and a network, and the
+                // deadline may have passed while it did. The exact-oid gate agreeing does not buy the
+                // right to enqueue a result the offer no longer admits, and this row must still reach
+                // exactly ONE terminal disposition.
+                if self.offer_deadline_lapsed(job_id) {
+                    opline!("seller node verify fail job_id={job_id}: the remote verified commit={commit} but the offer deadline passed while the read-back ran — no late delivery is enqueued");
+                    self.fail_uploaded_delivery(
+                        job_id,
+                        "the offer deadline passed while the read-back ran",
+                    )
+                    .await;
+                    return;
+                }
                 // The remote agrees at the exact oid. Arm the VERIFIED marker first (which clears
                 // the unverified one in the same statement), so a crash in the sign+enqueue window
                 // resumes as an ordinary #552 finalize instead of asking the remote again.
@@ -18333,6 +18768,372 @@ mod tests {
             ),
             "the unrunnable fault must be the recorded verdict: {verdict:?}"
         );
+    }
+
+    // ---- F1–F5: the REAL delivery-push failure orchestration ------------------------------------
+    //
+    // These drive the PRODUCTION handler (`handle_delivery_push_failure`, the one and only decision
+    // point the live push routes every failure through) on a REAL `SellerNodeRunner`, against a REAL
+    // store and a REAL relay. Nothing here reconstructs a decision from a helper: each case asserts
+    // the three facts a buyer and an operator can actually observe afterwards —
+    //   1. the durable job state,
+    //   2. whether the recovery marker still stands, and
+    //   3. whether a terminal buyer-visible feedback event (kind 3404) went on the wire.
+    //
+    // The dividing line under test: a delivery that MAY be on the remote must never be failed
+    // locally, because a `failed` row is terminal and would orphan the pack; a delivery that CANNOT
+    // be on the remote must still fail immediately, exactly as before.
+
+    /// Kind-3404 feedback events the seller actually published — the buyer-visible terminal event.
+    async fn feedback_on_the_wire(fixture: &PGateRelay) -> usize {
+        fixture
+            .event_kind_count(u64::from(crate::kinds::JOB_FEEDBACK_KIND))
+            .await
+    }
+
+    /// Bounded wait for `want` feedback events, so a slow publish cannot make a green run look red.
+    async fn feedback_settles_at_least(fixture: &PGateRelay, want: usize) -> usize {
+        let deadline = std::time::Instant::now() + FIXTURE_WAIT;
+        loop {
+            let count = feedback_on_the_wire(fixture).await;
+            if count >= want || std::time::Instant::now() >= deadline {
+                return count;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// A job that is awarded, undelivered, and carries a durable uploaded-unverified marker: the
+    /// exact row every one of these failures happens on.
+    fn seed_job_with_upload_marker(
+        runner: &SellerNodeRunner,
+        job_id: &str,
+        buyer_hex: &str,
+        deadline_unix: i64,
+        now: i64,
+        uploaded: bool,
+    ) {
+        let store = runner.node.store();
+        store
+            .record_offer(
+                &crate::seller_node::store::Offer {
+                    payment_mode: crate::gateway::PaymentMode::Sat,
+                    offer_id: job_id.to_owned(),
+                    buyer_pubkey: buyer_hex.to_owned(),
+                    amount_sats: 100,
+                    unit: "sat".to_owned(),
+                    task: "held delivery".to_owned(),
+                    deadline_unix,
+                    targeted: true,
+                    requested_agent: None,
+                    output: Some("text/plain".to_owned()),
+                },
+                now,
+            )
+            .expect("record the offer this delivery belongs to");
+        let draft = claim_draft(
+            job_id,
+            buyer_hex,
+            &"s".repeat(64),
+            crate::gateway::ClaimPayment::Sat("creq"),
+            &[],
+            &Default::default(),
+        );
+        store
+            .claim_and_enqueue(job_id, job_id, Some("creq"), &draft, now, now + 3_600, now)
+            .expect("park the claim");
+        // A UNIQUE award id per job — one shared id would make every award after the first a
+        // duplicate, and no jobs row would exist to hold the marker.
+        let award_id = format!("{}{}", &job_id[..32], "9".repeat(32));
+        store
+            .record_award(&award_id, job_id, buyer_hex, now)
+            .expect("record the award that creates the jobs row");
+        let commit = "d".repeat(40);
+        assert_eq!(
+            store
+                .mark_upload_intent(job_id, &commit, now)
+                .expect("journal the pre-effect upload intent"),
+            1,
+            "harness check: the intent must land on exactly this job's row (state={:?})",
+            store.job_state(job_id)
+        );
+        if uploaded {
+            store
+                .mark_uploaded_unverified(job_id, &commit, now)
+                .expect("upgrade the marker to uploaded");
+        }
+    }
+
+    /// F1 + F3 + F5(unresolved). Every failure that leaves the pack possibly ON the remote keeps the
+    /// job alive: no terminal state, marker intact, and NOT ONE buyer-visible event — because only
+    /// the remote's own exact-oid answer (or the offer deadline) may end such a delivery.
+    ///
+    /// F1 is the second entry: an authorization failure on the VERIFICATION mint, after the remote
+    /// accepted the pack. That is the 401-incident shape, and it used to be terminal.
+    ///
+    /// RED ON REVERT: route any of these arms back through `fail(...)` in
+    /// `handle_delivery_push_failure` and that case's job goes `failed` and publishes a 3404 ⇒ both
+    /// the state assertion and the "no buyer event" assertion fire.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_delivery_that_may_be_on_the_remote_is_held_and_never_failed_locally() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("pushheld");
+        let runner = boot_against(&root, &fixture, false).await;
+        let buyer = "b".repeat(64);
+        let now = now_unix();
+        let deadline = now + 3_600;
+
+        let held_cases: Vec<(&str, DeliveryPushErr)> = vec![
+            (
+                "1",
+                // F3: the caller stopped waiting; `git-receive-pack` did not.
+                DeliveryPushErr::TimedOut {
+                    secs: 150,
+                    stage: PushStage::UploadOutstanding,
+                },
+            ),
+            (
+                "2",
+                // F1: the pack landed and the token that would have proved it never got signed.
+                DeliveryPushErr::PostUploadAuth("signer actor gone".to_owned()),
+            ),
+            (
+                "3",
+                // F5: a 401 on the read-back says nothing about where the pack is.
+                DeliveryPushErr::Attest(crate::git_transport::TransportError::Auth(
+                    "401 Unauthorized".to_owned(),
+                )),
+            ),
+            (
+                "4",
+                // F5: an io fault on the read-back is "could not tell", not "not there".
+                DeliveryPushErr::Attest(crate::git_transport::TransportError::Io(
+                    "connection reset".to_owned(),
+                )),
+            ),
+            (
+                "5",
+                // An io fault mid-upload cannot tell us whether the remote took the pack.
+                DeliveryPushErr::Push(crate::seller_git::SellerGitError::Io(
+                    "broken pipe during receive-pack".to_owned(),
+                )),
+            ),
+        ];
+
+        for (seed, error) in held_cases {
+            let job = seed.repeat(64);
+            seed_job_with_upload_marker(&runner, &job, &buyer, deadline, now, true);
+            let label = format!("{error:?}");
+            let disposition = runner
+                .handle_delivery_push_failure(&job, &buyer, error)
+                .await;
+            assert_eq!(
+                disposition,
+                DeliveryPushDisposition::HeldForVerification,
+                "{label} may have left the pack on the remote and must be held"
+            );
+            assert_eq!(
+                runner.node.store().job_state(&job).expect("job state"),
+                Some(crate::seller_node::store::JobState::Awarded),
+                "{label} must not put the job in a terminal state — a `failed` row is never \
+                 revisited, so the landed pack would be orphaned"
+            );
+            let marker = runner
+                .node
+                .store()
+                .upload_marker(&job)
+                .expect("marker read")
+                .expect("the recovery marker must still stand");
+            assert_eq!(marker.commit, "d".repeat(40));
+        }
+
+        // The whole point, stated the way the buyer experiences it.
+        assert_eq!(
+            feedback_on_the_wire(&fixture).await,
+            0,
+            "a held delivery must publish NO terminal buyer event — the remote's answer decides it"
+        );
+        // And the recovery lane can still see every one of them.
+        assert_eq!(
+            runner
+                .node
+                .store()
+                .jobs_awaiting_upload_verification()
+                .expect("awaiting")
+                .len(),
+            5,
+            "every held delivery must be enumerable for the no-restart sweep"
+        );
+
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The other side of the same line, and the regression guard on it: a failure that happened
+    /// BEFORE the pack could exist — or a definitive "not there" from the remote itself — still
+    /// fails immediately, with exactly ONE buyer-visible event per job. Holding these would be its
+    /// own bug: nothing is on the remote, so nothing can ever complete them.
+    ///
+    /// F2's teeth are the first entry: an upload intent that could not be journaled refuses the push
+    /// outright rather than uploading a pack the store would not remember.
+    /// F5's teeth are the last two: the remote ANSWERED, so this fails closed on the live pass.
+    ///
+    /// RED ON REVERT: hold any of these (or drop the intent requirement) and that job stays
+    /// `awarded` with no buyer event ⇒ the state and the count assertions fire.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_delivery_that_cannot_be_on_the_remote_still_fails_once() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("pushfail");
+        let runner = boot_against(&root, &fixture, false).await;
+        let buyer = "b".repeat(64);
+        let now = now_unix();
+        let deadline = now + 3_600;
+
+        let fail_cases: Vec<(&str, DeliveryPushErr)> = vec![
+            (
+                "6",
+                // F2: no durable intent ⇒ never upload. Nothing was sent.
+                DeliveryPushErr::IntentUnrecorded("disk full".to_owned()),
+            ),
+            (
+                "7",
+                DeliveryPushErr::PreUploadAuth("signer refused before the upload".to_owned()),
+            ),
+            (
+                "8",
+                DeliveryPushErr::Push(crate::seller_git::SellerGitError::AuthFailed(
+                    "401 on receive-pack".to_owned(),
+                )),
+            ),
+            (
+                "9",
+                // F5: the remote answered and the delivery ref is absent / at another oid.
+                DeliveryPushErr::Attest(crate::git_transport::TransportError::Rejected(
+                    "ref is at another oid".to_owned(),
+                )),
+            ),
+            (
+                "a",
+                // F5: an allowlist refusal never reached a network and never will.
+                DeliveryPushErr::Attest(crate::git_transport::TransportError::Transport(
+                    "remote is not an allowed locator".to_owned(),
+                )),
+            ),
+            (
+                "c",
+                // F3: a timeout BEFORE the transfer began — nothing was sent.
+                DeliveryPushErr::TimedOut {
+                    secs: 150,
+                    stage: PushStage::BeforeUpload,
+                },
+            ),
+        ];
+
+        let expected = fail_cases.len();
+        for (seed, error) in fail_cases {
+            let job = seed.repeat(64);
+            seed_job_with_upload_marker(&runner, &job, &buyer, deadline, now, false);
+            let label = format!("{error:?}");
+            let disposition = runner
+                .handle_delivery_push_failure(&job, &buyer, error)
+                .await;
+            assert_eq!(
+                disposition,
+                DeliveryPushDisposition::Failed,
+                "{label} cannot have left a pack on the remote and must fail now"
+            );
+            assert_eq!(
+                runner.node.store().job_state(&job).expect("job state"),
+                Some(crate::seller_node::store::JobState::Failed),
+                "{label} must reach the terminal delivery_failed state"
+            );
+        }
+
+        assert_eq!(
+            feedback_settles_at_least(&fixture, expected).await,
+            expected,
+            "exactly one terminal buyer event per failed delivery — no more, no fewer"
+        );
+        assert!(
+            runner
+                .node
+                .store()
+                .jobs_awaiting_upload_verification()
+                .expect("awaiting")
+                .is_empty(),
+            "a terminally failed job must never be handed to the recovery sweep again"
+        );
+
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// F4 — the recovery OWNS its own liveness and its own bound, with no restart in the story.
+    ///
+    /// Two held deliveries that must each reach exactly one terminal outcome from the node's own
+    /// drain tick: one whose offer deadline has passed, and one that has spent its read-back budget.
+    /// The old shape had neither — a held row waited for a new award or a reboot to be looked at
+    /// again, and an unverifiable one could be asked forever.
+    ///
+    /// RED ON REVERT: delete the `sweep_uploaded_verifications` body (or the deadline/attempt-cap
+    /// branches inside it) and both jobs stay `awarded` with zero buyer events ⇒ this fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_sweep_resolves_held_deliveries_without_a_restart() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("pushsweep");
+        let runner = boot_against(&root, &fixture, false).await;
+        let store = runner.node.store().clone();
+        let buyer = "b".repeat(64);
+        let now = now_unix();
+
+        // (a) held, and its offer deadline has passed: the delivery can no longer be sold.
+        let lapsed = "e".repeat(64);
+        seed_job_with_upload_marker(&runner, &lapsed, &buyer, now - 60, now, true);
+        // (b) held, deadline live, but the read-back budget is spent: it must still end.
+        let exhausted = "f".repeat(64);
+        seed_job_with_upload_marker(&runner, &exhausted, &buyer, now + 3_600, now, true);
+        for _ in 0..UPLOAD_VERIFY_ATTEMPT_CAP {
+            store
+                .bump_upload_verify_attempt(&exhausted, now)
+                .expect("spend a read-back attempt");
+        }
+
+        assert_eq!(
+            store.jobs_awaiting_upload_verification().expect("awaiting").len(),
+            2,
+            "harness check: both deliveries start held"
+        );
+
+        // ONE tick of the loop's own sweep — no restart, no new award, no agent.
+        runner.sweep_uploaded_verifications().await;
+
+        for job in [&lapsed, &exhausted] {
+            assert_eq!(
+                store.job_state(job).expect("job state"),
+                Some(crate::seller_node::store::JobState::Failed),
+                "a held delivery that can no longer be completed must reach ONE terminal outcome"
+            );
+        }
+        assert_eq!(
+            feedback_settles_at_least(&fixture, 2).await,
+            2,
+            "exactly one terminal buyer event per resolved delivery"
+        );
+        assert!(
+            store.jobs_awaiting_upload_verification().expect("awaiting").is_empty(),
+            "the sweep must not leave the rows it resolved on its own worklist"
+        );
+
+        // A second tick changes nothing: the bound is a bound, not a loop.
+        runner.sweep_uploaded_verifications().await;
+        assert_eq!(
+            feedback_on_the_wire(&fixture).await,
+            2,
+            "re-sweeping must not emit a second terminal event for the same job"
+        );
+
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 

@@ -650,6 +650,38 @@ impl From<rusqlite::Error> for StoreError {
     }
 }
 
+
+/// WHICH SIDE of the upload side effect a delivery's recovery marker was written on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadStage {
+    /// Written BEFORE the pack was sent: the remote may or may not hold it. Required, not
+    /// best-effort — a delivery whose intent could not be journaled is never attempted.
+    Intent,
+    /// Written after the remote ACCEPTED the pack, from inside the blocking upload op.
+    Uploaded,
+}
+
+/// A delivery that owes the remote an exact-oid read-back before it may be completed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadMarker {
+    /// The oid the read-back must find the delivery ref at. Never re-pushed from here.
+    pub commit: String,
+    pub stage: UploadStage,
+    /// When the marker was written (unix seconds); operator evidence, never a decision input.
+    pub at_unix: i64,
+    /// Read-backs already spent on this marker. Bounds the retry.
+    pub attempts: i64,
+}
+
+/// One row of [`SellerStore::jobs_awaiting_upload_verification`]: the job, its marker, and the
+/// offer deadline that bounds its recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AwaitingVerification {
+    pub job_id: String,
+    pub marker: UploadMarker,
+    pub deadline_unix: Option<i64>,
+}
+
 /// An offer the relay ingester has seen and the node may claim.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Offer {
@@ -942,7 +974,20 @@ impl SellerStore {
                  uploaded_unverified_commit TEXT,
                  -- When the upload above was journaled (unix seconds). Operator evidence and the
                  -- age an inspection reads; the recovery decision never depends on it.
-                 uploaded_unverified_at_unix INTEGER
+                 uploaded_unverified_at_unix INTEGER,
+                 -- WHICH SIDE OF THE SIDE EFFECT the row was written on: 'intent' means the pack was
+                 -- about to be sent and may or may not have landed; 'uploaded' means the remote
+                 -- ACCEPTED it. The 'intent' write happens BEFORE the upload and is REQUIRED — a
+                 -- delivery whose intent could not be journaled is not attempted — which is what
+                 -- makes a crash, a cancellation or a lost write between about-to-push and pushed
+                 -- recoverable: BOTH stages resume the same way, by asking the remote, so the
+                 -- reconciliation never depends on having observed the acceptance. NULL with a commit
+                 -- set is a row from the first cut of this marker and reads as 'uploaded'.
+                 uploaded_unverified_stage TEXT,
+                 -- How many read-back attempts the recovery has spent on this marker. Bounds the
+                 -- retry so an unverifiable delivery reaches ONE terminal disposition instead of
+                 -- being asked forever. NULL/absent reads as 0.
+                 uploaded_verify_attempts INTEGER
              );
              -- One delivery per job (the seller-authored snapshot the daemon published).
              CREATE TABLE IF NOT EXISTS deliveries (
@@ -1153,6 +1198,16 @@ impl SellerStore {
             conn.execute_batch(
                 "ALTER TABLE jobs ADD COLUMN uploaded_unverified_at_unix INTEGER;",
             )?;
+        }
+        // The stage ('intent' before the upload, 'uploaded' after the remote accepted it) and the
+        // bounded attempt counter. A store from the first cut of this marker reads NULL for both:
+        // NULL stage on a row that HAS a commit means that row was written post-acceptance, so it
+        // reads as 'uploaded', and NULL attempts reads as 0. Additive + idempotent.
+        if !Self::column_exists(conn, "jobs", "uploaded_unverified_stage")? {
+            conn.execute_batch("ALTER TABLE jobs ADD COLUMN uploaded_unverified_stage TEXT;")?;
+        }
+        if !Self::column_exists(conn, "jobs", "uploaded_verify_attempts")? {
+            conn.execute_batch("ALTER TABLE jobs ADD COLUMN uploaded_verify_attempts INTEGER;")?;
         }
         // #686: the buyer's declared output type. A store from a pre-#686 binary reads NULL for its
         // existing offers — those jobs simply state no output type in their agent prompt — and is
@@ -1747,6 +1802,8 @@ impl SellerStore {
                 SET pushed_commit = ?2,
                     uploaded_unverified_commit = NULL,
                     uploaded_unverified_at_unix = NULL,
+                    uploaded_unverified_stage = NULL,
+                    uploaded_verify_attempts = NULL,
                     updated_at_unix = ?3
               WHERE job_id = ?1",
             params![job_id, commit, now_unix],
@@ -1754,49 +1811,182 @@ impl SellerStore {
         Ok(())
     }
 
-    /// Journal an UPLOADED-BUT-NOT-YET-VERIFIED delivery: the remote accepted the pack for `commit`
-    /// and the exact-oid read-back has not confirmed it. Written BEFORE the read-back leg runs
-    /// (arm-state-after-the-event: the event is the accepted upload), so a 401 on the read-back, a
-    /// crash, or a kill between the two legs leaves the fact in the store rather than only in the
-    /// operator log — a log line recording a fact is not the fact.
+    /// Journal the INTENT to upload a delivery, BEFORE the pack is sent: this job is about to push
+    /// `commit` to its delivery ref, and from this moment the remote may hold it.
     ///
-    /// This is NOT `mark_pushed`. A row with only this marker is resumed by RE-VERIFYING the remote
-    /// under a freshly minted token; it is never finalized on the strength of the marker alone, and
-    /// the delivery it may become is never re-pushed and never re-run through the agent.
-    /// Idempotent — last write wins; does NOT change `state`.
-    pub fn mark_uploaded_unverified(
+    /// This is the pre-side-effect half of the recovery, and it is REQUIRED, not best-effort: the
+    /// caller refuses to upload when this write does not land. That is what closes the window a
+    /// post-effect journal cannot — a crash, a cancellation, or a lost write between the remote
+    /// accepting the pack and the seat learning that it did. Both stages resume identically (ask the
+    /// remote at the exact oid), so the recovery never depends on having OBSERVED the acceptance.
+    ///
+    /// Returns the number of rows moved; 0 means there is no such job row and the caller must treat
+    /// the intent as unrecorded. Never downgrades a marker already at `uploaded` for the same commit,
+    /// and does NOT change `state`.
+    pub fn mark_upload_intent(
         &self,
         job_id: &str,
         commit: &str,
         now_unix: i64,
-    ) -> Result<(), StoreError> {
+    ) -> Result<usize, StoreError> {
         let conn = self.lock()?;
-        conn.execute(
+        let moved = conn.execute(
             "UPDATE jobs
                 SET uploaded_unverified_commit = ?2,
+                    uploaded_unverified_stage =
+                        CASE WHEN uploaded_unverified_commit = ?2
+                                  AND uploaded_unverified_stage = 'uploaded'
+                             THEN 'uploaded' ELSE 'intent' END,
                     uploaded_unverified_at_unix = ?3,
                     updated_at_unix = ?3
               WHERE job_id = ?1",
             params![job_id, commit, now_unix],
         )?;
-        Ok(())
+        Ok(moved)
     }
 
-    /// The uploaded-but-unverified delivery oid for `job_id`, if any. `Some` on a slot-occupying row
-    /// means: the pack was accepted, nothing has attested it, and a resume owes the remote a
-    /// read-back before this job may be completed. `None` ⇒ nothing uploaded-unverified (either
-    /// never uploaded, or already verified — see [`Self::pushed_commit`]).
-    pub fn uploaded_unverified_commit(&self, job_id: &str) -> Result<Option<String>, StoreError> {
+    /// Upgrade the marker to UPLOADED: the remote ACCEPTED the pack for `commit` and the exact-oid
+    /// read-back has not confirmed it yet.
+    ///
+    /// Unlike [`Self::mark_upload_intent`] this write is not load-bearing for recovery — the intent
+    /// row already makes the job reconciliable — it sharpens the operator's picture and the log. It
+    /// is written from INSIDE the blocking upload op, so a cancelled or timed-out caller cannot lose
+    /// it. Returns rows moved; idempotent, last write wins; does NOT change `state`.
+    pub fn mark_uploaded_unverified(
+        &self,
+        job_id: &str,
+        commit: &str,
+        now_unix: i64,
+    ) -> Result<usize, StoreError> {
         let conn = self.lock()?;
-        let commit: Option<String> = conn
+        let moved = conn.execute(
+            "UPDATE jobs
+                SET uploaded_unverified_commit = ?2,
+                    uploaded_unverified_stage = 'uploaded',
+                    uploaded_unverified_at_unix = ?3,
+                    updated_at_unix = ?3
+              WHERE job_id = ?1",
+            params![job_id, commit, now_unix],
+        )?;
+        Ok(moved)
+    }
+
+    /// The full upload marker for `job_id`: the oid, which side of the side effect it was written on,
+    /// when, and how many read-backs the recovery has already spent on it. `Some` on a slot-occupying
+    /// row means a resume owes the remote a read-back before this job may be completed.
+    pub fn upload_marker(&self, job_id: &str) -> Result<Option<UploadMarker>, StoreError> {
+        let conn = self.lock()?;
+        let row = conn
             .query_row(
-                "SELECT uploaded_unverified_commit FROM jobs WHERE job_id = ?1",
+                "SELECT uploaded_unverified_commit,
+                        uploaded_unverified_stage,
+                        uploaded_unverified_at_unix,
+                        uploaded_verify_attempts
+                   FROM jobs WHERE job_id = ?1",
+                [job_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(row.and_then(|(commit, stage, at_unix, attempts)| {
+            commit.map(|commit| UploadMarker {
+                commit,
+                // A row from the first cut of this marker has no stage and was written only after the
+                // remote accepted the pack: that is `Uploaded`, not a guess.
+                stage: match stage.as_deref() {
+                    Some("intent") => UploadStage::Intent,
+                    _ => UploadStage::Uploaded,
+                },
+                at_unix: at_unix.unwrap_or(0),
+                attempts: attempts.unwrap_or(0),
+            })
+        }))
+    }
+
+    /// The uploaded-but-unverified delivery oid for `job_id`, if any — [`Self::upload_marker`]
+    /// narrowed to the oid, for readers that need nothing else.
+    pub fn uploaded_unverified_commit(&self, job_id: &str) -> Result<Option<String>, StoreError> {
+        Ok(self.upload_marker(job_id)?.map(|marker| marker.commit))
+    }
+
+    /// Count one read-back attempt against the marker and return the NEW total. The recovery bounds
+    /// itself on this: an unverifiable delivery must reach one terminal disposition, not be asked
+    /// forever. Returns 0 when there is no marker to charge.
+    pub fn bump_upload_verify_attempt(
+        &self,
+        job_id: &str,
+        now_unix: i64,
+    ) -> Result<i64, StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE jobs
+                SET uploaded_verify_attempts = COALESCE(uploaded_verify_attempts, 0) + 1,
+                    updated_at_unix = ?2
+              WHERE job_id = ?1 AND uploaded_unverified_commit IS NOT NULL",
+            params![job_id, now_unix],
+        )?;
+        let attempts: Option<i64> = conn
+            .query_row(
+                "SELECT uploaded_verify_attempts FROM jobs WHERE job_id = ?1",
                 [job_id],
                 |row| row.get(0),
             )
             .optional()?
             .flatten();
-        Ok(commit)
+        Ok(attempts.unwrap_or(0))
+    }
+
+    /// Every SLOT-OCCUPYING job that still owes the remote a read-back, with its marker and its
+    /// offer deadline. This is the liveness half of the recovery: a seat that keeps running (no
+    /// restart) sweeps these, so an unresolved delivery is either verified, or lapsed when its offer
+    /// deadline passes — never left waiting for the next boot.
+    ///
+    /// Rows that already have a delivery, a receipt or a verified commit are excluded here as well as
+    /// by the resume precedence: this enumeration must not hand the sweep a job that is already done.
+    pub fn jobs_awaiting_upload_verification(
+        &self,
+    ) -> Result<Vec<AwaitingVerification>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT j.job_id,
+                    j.uploaded_unverified_commit,
+                    j.uploaded_unverified_stage,
+                    j.uploaded_unverified_at_unix,
+                    j.uploaded_verify_attempts,
+                    o.deadline_unix
+               FROM jobs j
+               LEFT JOIN offers o ON o.offer_id = j.offer_id
+              WHERE j.uploaded_unverified_commit IS NOT NULL
+                AND j.pushed_commit IS NULL
+                AND j.state IN ('awarded','executing')
+                AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.job_id = j.job_id)
+                AND NOT EXISTS (SELECT 1 FROM receipts r WHERE r.job_id = j.job_id)
+              ORDER BY j.uploaded_unverified_at_unix ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(AwaitingVerification {
+                    job_id: row.get(0)?,
+                    marker: UploadMarker {
+                        commit: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                        stage: match row.get::<_, Option<String>>(2)?.as_deref() {
+                            Some("intent") => UploadStage::Intent,
+                            _ => UploadStage::Uploaded,
+                        },
+                        at_unix: row.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                        attempts: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                    },
+                    deadline_unix: row.get::<_, Option<i64>>(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Record a delivery and enqueue its result event in ONE transaction. Idempotent — a replay for
@@ -3343,6 +3533,143 @@ mod tests {
             Some(commit.as_str())
         );
         assert_eq!(store.uploaded_unverified_commit("job-1").expect("read"), None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // F2 — THE PRE-EFFECT INTENT, across a restart. The gap this closes: the old marker was written
+    // only AFTER the remote accepted the pack, so a crash (or a kill, or an OOM) DURING the upload
+    // left a row that says "nothing was ever sent" while the remote may hold the pack. A resume then
+    // re-runs the agent and re-pushes blind.
+    //
+    // The intent is written BEFORE the pack is sent, so the recoverable window starts one line
+    // earlier than the side effect. The upgrade to `uploaded` sharpens it; both survive a reopen,
+    // which is what a restart is here.
+    //
+    // Bite (measured): make `mark_upload_intent` a no-op and the reopened read returns None for
+    // `crashed-mid-upload` — the exact blind-rerun state.
+    #[test]
+    fn an_upload_intent_is_journaled_before_the_pack_is_sent_and_survives_a_restart() {
+        let path = temp_db("upload-intent");
+        let _ = std::fs::remove_file(&path);
+        let commit = "c".repeat(40);
+        {
+            let store = SellerStore::open(&path).expect("open");
+            insert_job(&store, "crashed-mid-upload", JobState::Executing);
+            insert_job(&store, "accepted", JobState::Executing);
+            // Both jobs declare their intent; only the second learns the remote took the pack.
+            for job in ["crashed-mid-upload", "accepted"] {
+                assert_eq!(
+                    store.mark_upload_intent(job, &commit, 100).expect("intent"),
+                    1,
+                    "the intent write must report the row it moved — a required write that moved \
+                     nothing must be visible to the caller, which refuses to upload on it"
+                );
+            }
+            store
+                .mark_uploaded_unverified("accepted", &commit, 101)
+                .expect("upgrade to uploaded");
+        }
+        let store = SellerStore::open(&path).expect("reopen — the restart");
+        let crashed = store
+            .upload_marker("crashed-mid-upload")
+            .expect("read")
+            .expect("a job that MIGHT have uploaded must still be reconciliable after a crash");
+        assert_eq!(crashed.commit, commit);
+        assert_eq!(
+            crashed.stage,
+            UploadStage::Intent,
+            "the marker must say which SIDE of the side effect it was written on"
+        );
+        assert_eq!(crashed.attempts, 0, "no read-back has been spent yet");
+        assert_eq!(
+            store.upload_marker("accepted").expect("read").expect("marker").stage,
+            UploadStage::Uploaded
+        );
+        // Neither is a verified delivery: the exact-oid gate has not run for either.
+        for job in ["crashed-mid-upload", "accepted"] {
+            assert_eq!(
+                store.pushed_commit(job).expect("read"),
+                None,
+                "an intent is never a verified push"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // The other half of "required": the write must REPORT that it moved nothing. A job row that is
+    // not there yields 0, and the caller (`mint_upload_mint_attest`'s intent closure) refuses the
+    // push rather than uploading a pack the store would not remember.
+    //
+    // Bite (measured): return `Ok(1)` unconditionally from `mark_upload_intent` and this goes red —
+    // and production would then upload on a write that never landed.
+    #[test]
+    fn an_upload_intent_for_an_unknown_job_moves_no_rows() {
+        let (store, path) = fresh_store("upload-intent-unknown");
+        assert_eq!(
+            store
+                .mark_upload_intent("no-such-job", &"d".repeat(40), 5)
+                .expect("intent"),
+            0,
+            "no row accepted the intent, and the caller must be able to tell"
+        );
+        assert_eq!(store.upload_marker("no-such-job").expect("read"), None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // F4 — the RECOVERY WORKLIST and its bound, at the store level: the sweep enumerates exactly the
+    // deliveries that owe the remote a read-back, carries each one's offer deadline (so it can lapse
+    // them without a restart), and counts the read-backs already spent (so an unverifiable delivery
+    // cannot be asked forever). Verified, delivered and terminal rows are excluded by construction.
+    //
+    // Bite (measured): drop the `pushed_commit IS NULL` clause and the verified job reappears on the
+    // worklist; drop the `state IN (...)` clause and the failed job does, each re-asking the remote
+    // about a delivery that is already decided.
+    #[test]
+    fn the_recovery_worklist_carries_the_deadline_and_counts_the_attempts() {
+        let (store, path) = fresh_store("upload-worklist");
+        let commit = "e".repeat(40);
+        for job in ["held", "verified", "terminal"] {
+            insert_job(&store, job, JobState::Awarded);
+            let mut offer = sample_offer(&format!("offer-{job}"));
+            offer.deadline_unix = 9_000;
+            store.record_offer(&offer, 1).expect("record the offer");
+            store.mark_upload_intent(job, &commit, 10).expect("intent");
+        }
+        store.mark_uploaded_unverified("held", &commit, 11).expect("uploaded");
+        // One is verified by the remote; one went terminal. Neither may be swept again.
+        store.mark_pushed("verified", &commit, 12).expect("verified");
+        store.fail_job("terminal", 12).expect("fail");
+
+        let worklist = store.jobs_awaiting_upload_verification().expect("worklist");
+        assert_eq!(
+            worklist.iter().map(|row| row.job_id.as_str()).collect::<Vec<_>>(),
+            vec!["held"],
+            "only a delivery that still owes the remote a read-back belongs on the worklist"
+        );
+        assert_eq!(
+            worklist[0].deadline_unix,
+            Some(9_000),
+            "the sweep must be able to lapse a held delivery without reading anything else"
+        );
+        assert_eq!(worklist[0].marker.attempts, 0);
+
+        // The bound: attempts are counted, reported, and durable.
+        assert_eq!(store.bump_upload_verify_attempt("held", 13).expect("bump"), 1);
+        assert_eq!(store.bump_upload_verify_attempt("held", 14).expect("bump"), 2);
+        drop(store);
+        let store = SellerStore::open(&path).expect("reopen");
+        assert_eq!(
+            store.upload_marker("held").expect("read").expect("marker").attempts,
+            2,
+            "a restart must not hand a stuck delivery a fresh retry budget"
+        );
+        // And arming the verified marker clears the counter with the rest of the marker.
+        store.mark_pushed("held", &commit, 15).expect("verified");
+        assert_eq!(store.upload_marker("held").expect("read"), None);
+        assert!(store
+            .jobs_awaiting_upload_verification()
+            .expect("worklist")
+            .is_empty());
         let _ = std::fs::remove_file(&path);
     }
 

@@ -879,47 +879,47 @@ pub async fn neutralize_then_upload_off_runtime(
     branch: String,
     gated_oid: String,
     header: Option<String>,
+    journal: impl FnOnce(&git_transport::UploadedDelivery) + Send + 'static,
+    custody: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<git_transport::UploadedDelivery, SellerGitError> {
     off_runtime(move || {
+        // `custody` is the serialization permit for this seat's ONE delivery remote, and it is held
+        // HERE — inside the blocking op — not by the async caller. A `spawn_blocking` task runs to
+        // completion even when the future awaiting it is dropped, so an outer timeout or a
+        // cancellation releases nothing while a `git-receive-pack` is still in flight: the next
+        // delivery is admitted when this op ends, not when its caller gives up. Dropped with this
+        // closure on every exit path.
+        let _custody = custody;
         neutralize_push_config(&workdir)?;
         let uploaded =
             git_transport::upload_gated_branch(&workdir, &remote_url, &branch, &gated_oid, header)?;
+        // The remote has ACCEPTED the pack. Journal that fact from inside the blocking op, BEFORE
+        // the result is handed back to a caller that may already have timed out or been cancelled —
+        // a post-await journal cannot run for a caller that is no longer there.
+        journal(&uploaded);
         eprintln!("seller push path=inprocess remote={remote_url} branch={branch} uploaded");
         Ok(uploaded)
     })
     .await
 }
 
-/// Off-runtime leg 2: attest `uploaded` against the remote's advertisement under `header` — the
-/// token the caller minted after the upload settled. Returns the attested (delivered) oid.
-pub async fn attest_pushed_branch_off_runtime(
-    uploaded: git_transport::UploadedDelivery,
-    header: Option<String>,
-) -> Result<String, SellerGitError> {
-    off_runtime(move || {
-        let oid = git_transport::attest_pushed_branch(&uploaded, header)?;
-        eprintln!(
-            "seller push path=inprocess remote={} branch={} attested",
-            uploaded.remote_url(),
-            uploaded.target_ref()
-        );
-        Ok(oid)
-    })
-    .await
-}
-
-/// The read-back a RESUME owes a delivery whose upload was journaled durably: the same attestation
-/// leg 2 runs, on a freshly minted token, against an `UploadedDelivery` re-hydrated from the store.
+/// Leg 2, for BOTH lanes: attest `uploaded` against the remote's advertisement under `header` — the
+/// token the caller minted after the upload settled (live) or at resume time (recovery). Returns the
+/// attested (delivered) oid.
 ///
-/// It returns the transport's OWN error class rather than a [`SellerGitError`], because the resume
-/// decision turns on a distinction `SellerGitError` folds away: `From<TransportError>` maps BOTH
-/// `Rejected` (the remote answered, and the ref is absent or at another oid — fail closed, the
-/// delivery is not there) and `Auth` (a 401/403 — we could not ask, so nothing is decided) onto
-/// `AuthFailed`. Completing or failing a delivery on the wrong one of those is exactly the mistake
-/// this path exists to prevent.
-pub async fn verify_journaled_upload_off_runtime(
+/// It returns the transport's OWN error class rather than a [`SellerGitError`], and BOTH the live
+/// push and the resumed verification call THIS function, because the decision turns on a distinction
+/// `SellerGitError` folds away: `From<TransportError>` maps BOTH `Rejected` (the remote answered, and
+/// the ref is absent or at another oid — definitive, fail closed) and `Auth` (a 401/403 — we could
+/// not ask, so nothing is decided) onto `AuthFailed`. A live pass that treated a definitive rejection
+/// as an unknown, or an unknown as a rejection, would take exactly the wrong terminal action; one
+/// classifier over one raw outcome is what keeps the two lanes honest about which happened.
+///
+/// `lane` names the caller in the operator line only ("push" / "resume").
+pub async fn attest_upload_off_runtime(
     uploaded: git_transport::UploadedDelivery,
     header: Option<String>,
+    lane: &'static str,
 ) -> Result<String, git_transport::TransportError> {
     let remote_url = uploaded.remote_url().to_owned();
     let target_ref = uploaded.target_ref().to_owned();
@@ -928,14 +928,14 @@ pub async fn verify_journaled_upload_off_runtime(
     {
         Ok(Ok(oid)) => {
             eprintln!(
-                "seller push path=inprocess remote={remote_url} ref={target_ref} re-attested from journal"
+                "seller push path=inprocess lane={lane} remote={remote_url} ref={target_ref} attested"
             );
             Ok(oid)
         }
         Ok(Err(error)) => Err(error),
         // A blocking task that did not complete is an IO-class unknown, NOT a rejection: the remote
-        // never answered, so the resume must leave the journal standing rather than fail a delivery
-        // that may well be on the remote.
+        // never answered, so the caller must leave the delivery reconciliable rather than fail a
+        // delivery that may well be on the remote.
         Err(error) => Err(git_transport::TransportError::Io(format!(
             "blocking git task did not complete: {error}"
         ))),
