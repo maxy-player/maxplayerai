@@ -863,21 +863,47 @@ pub fn neutralize_push_config(workdir: &Path) -> Result<(), SellerGitError> {
     Ok(())
 }
 
-/// Off-runtime: neutralise `workdir`'s config, THEN push the gated commit. This is the host-path
-/// delivery push. The layout gate and the whole-file config replacement run first, so an
+/// Off-runtime: neutralise `workdir`'s config, THEN upload the gated commit. This is leg 1 of the
+/// host-path delivery push. The layout gate and the whole-file config replacement run first, so an
 /// `insteadOf`/`pushInsteadOf`/`include` the agent planted is gone before libgit2 reads the config;
-/// the push then sends the object `gated_oid`, binds every leg to `remote_url`, and reads the
-/// remote's advertisement back. Both run in one blocking op, so nothing runs between them.
-pub async fn neutralize_then_push_off_runtime(
+/// the upload then sends the object `gated_oid` and binds every leg to `remote_url`. Both run in one
+/// blocking op, so nothing runs between them.
+///
+/// The remote read-back is NOT part of this call: it is
+/// [`attest_pushed_branch_off_runtime`], which the caller runs under a token minted AFTER this
+/// returns, so a transfer that outlives the relay's ±60 s NIP-98 window cannot leave the
+/// verification leg holding an already-expired token.
+pub async fn neutralize_then_upload_off_runtime(
     workdir: PathBuf,
     remote_url: String,
     branch: String,
     gated_oid: String,
     header: Option<String>,
-) -> Result<String, SellerGitError> {
+) -> Result<git_transport::UploadedDelivery, SellerGitError> {
     off_runtime(move || {
         neutralize_push_config(&workdir)?;
-        push_branch_with_header(&workdir, &remote_url, &branch, &gated_oid, header)
+        let uploaded =
+            git_transport::upload_gated_branch(&workdir, &remote_url, &branch, &gated_oid, header)?;
+        eprintln!("seller push path=inprocess remote={remote_url} branch={branch} uploaded");
+        Ok(uploaded)
+    })
+    .await
+}
+
+/// Off-runtime leg 2: attest `uploaded` against the remote's advertisement under `header` — the
+/// token the caller minted after the upload settled. Returns the attested (delivered) oid.
+pub async fn attest_pushed_branch_off_runtime(
+    uploaded: git_transport::UploadedDelivery,
+    header: Option<String>,
+) -> Result<String, SellerGitError> {
+    off_runtime(move || {
+        let oid = git_transport::attest_pushed_branch(&uploaded, header)?;
+        eprintln!(
+            "seller push path=inprocess remote={} branch={} attested",
+            uploaded.remote_url(),
+            uploaded.target_ref()
+        );
+        Ok(oid)
     })
     .await
 }

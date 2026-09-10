@@ -1729,35 +1729,106 @@ const _: () = assert!(
      the whole-op TimedOut arm and false-strands a maybe-accepted delivery while masking the real Push error"
 );
 
+/// The margin added to [`DELIVERY_PUSH_TIMEOUT`] when the upload leg's token declares a NIP-40
+/// expiration: the whole-operation bound plus the slack for signing and the final status read. The
+/// token still dies with the operation it authorizes.
+const DELIVERY_PUSH_TOKEN_MARGIN_SECS: u64 = 30;
+
+/// The declared lifetime of the delivery UPLOAD token, in seconds: exactly the window in which the
+/// push it authorizes can still be running. A relay that grants scoped tokens a longer life
+/// (Requirement B) keeps authorizing a slow pack's later legs under it; a relay on the historical
+/// ±60 s rule ignores the tag entirely, so this is never a widening. It is bounded well under the
+/// relay brief's default 6-hour cap
+/// ([`crate::seller_exec::DEFAULT_CONTAINER_DELIVERY_TOKEN_CAP_SECS`]) — the compile-time assert
+/// below keeps it there, so no edit to the push timeout can silently mint an over-cap token.
+fn delivery_push_token_lifetime_secs() -> i64 {
+    (DELIVERY_PUSH_TIMEOUT.as_secs() + DELIVERY_PUSH_TOKEN_MARGIN_SECS) as i64
+}
+
+const _: () = assert!(
+    DELIVERY_PUSH_TIMEOUT.as_secs() + DELIVERY_PUSH_TOKEN_MARGIN_SECS
+        <= crate::seller_exec::DEFAULT_CONTAINER_DELIVERY_TOKEN_CAP_SECS,
+    "the delivery upload token's declared lifetime (DELIVERY_PUSH_TIMEOUT + margin) must stay within      the relay's default scoped-token cap, or the relay refuses the token outright instead of      honouring it"
+);
+
+/// The authorized delivery push, leg by leg: mint → upload → mint AGAIN → attest.
+///
+/// This is the shape the relay-401 class of failure turns on, so it is a function with its own
+/// tooth rather than a block inlined in the execute path. Two properties it exists to hold:
+///
+/// 1. `mint` is called INSIDE this future, and the caller only starts this future once the
+///    delivery-push lock is held — so an upload token is never minted before a wait it must survive.
+/// 2. The verification token is minted AFTER `upload` resolves, whatever that took. A NIP-98 token's
+///    life is measured from its `created_at`, so a token minted before a slow transfer is already
+///    outside the relay's ±60 s window when the read-back runs: the push lands and its own
+///    verification 401s.
+///
+/// `relay_git` is false for a public/anonymous https remote, which takes no header at all; `mint` is
+/// then never called. `upload_expiry` is the NIP-40 expiration declared on the upload token only.
+async fn mint_upload_mint_attest<T, MintFut, UploadFut, AttestFut>(
+    relay_git: bool,
+    upload_expiry: i64,
+    mint: impl Fn(Option<i64>) -> MintFut,
+    upload: impl FnOnce(Option<String>) -> UploadFut,
+    attest: impl FnOnce(T, Option<String>) -> AttestFut,
+) -> Result<String, DeliveryPushErr>
+where
+    MintFut: std::future::Future<Output = Result<String, DeliveryPushErr>>,
+    UploadFut: std::future::Future<Output = Result<T, DeliveryPushErr>>,
+    AttestFut: std::future::Future<Output = Result<String, DeliveryPushErr>>,
+{
+    let upload_header = if relay_git {
+        Some(mint(Some(upload_expiry)).await?)
+    } else {
+        None
+    };
+    let uploaded = upload(upload_header).await?;
+    let verify_header = if relay_git { Some(mint(None).await?) } else { None };
+    attest(uploaded, verify_header).await
+}
+
 /// #562 delivery-push failure: distinguishes the transport/push error (which carries the reason for
-/// the operator log — the LEG-1 detail) from the bounded-timeout firing, so both route to the SINGLE
-/// `delivery_failed` handling while logging distinctly (never a new state).
+/// the operator log — the LEG-1 detail) from the bounded-timeout firing, so all of them route to the
+/// SINGLE `delivery_failed` handling while logging distinctly (never a new state).
 #[derive(Debug)]
 enum DeliveryPushErr {
-    /// The push itself failed; the inner error carries the transport reason (409 / auth / io).
+    /// Minting the leg's NIP-98 authorization failed (sign refused, or the signer actor is gone).
+    /// Nothing was sent: this fires before the leg it would have authorized.
+    Auth(String),
+    /// The upload itself failed; the inner error carries the transport reason (409 / auth / io).
     Push(seller_git::SellerGitError),
+    /// The pack was accepted and the remote reported status for the delivery ref, but the read-back
+    /// that must see the ref at the gated oid failed. Distinct from [`DeliveryPushErr::Push`] in the
+    /// LOG only — the job still fails `delivery_failed`, no new state — because "uploaded, not
+    /// verified" is the one thing the relay-401 incident could not tell from "never uploaded".
+    Attest(seller_git::SellerGitError),
     /// The push did not settle within [`DELIVERY_PUSH_TIMEOUT`] (seconds); the lock was released.
     TimedOut(u64),
 }
 
-/// #562: push a delivery under `lock` — serializing concurrent deliveries to this seat's ONE delivery
-/// remote (concurrent `git-receive-pack` to one repo is what the relay 409s) — and bounded by
-/// `timeout` so a hung push releases the lock rather than starving every later delivery. Pure over
+/// #562: run a delivery push under `lock` — serializing concurrent deliveries to this seat's ONE
+/// delivery remote (concurrent `git-receive-pack` to one repo is what the relay 409s) — and bounded
+/// by `timeout` so a hung push releases the lock rather than starving every later delivery. Pure over
 /// (lock, timeout, push) so the serialization + timeout are unit-testable WITHOUT a relay. The lock is
 /// held ONLY across the push and released the instant it settles or times out. The push oid is stable
 /// (invariant 2), so ORDERING pushes never duplicates a delivery — this is exactly-once.
+///
+/// `push` is called only ONCE THE LOCK IS HELD, and it owns the whole authorized sequence: mint,
+/// upload, mint again, attest. That ordering is the fix for the relay-401 class of failure — a token
+/// minted before the wait for this lock has already spent part of the relay's ±60 s NIP-98 window on
+/// waiting, and the delivery ahead of it may hold the lock for up to `timeout`.
 async fn serialized_bounded_push<Fut>(
     lock: &tokio::sync::Mutex<()>,
     timeout: Duration,
     push: impl FnOnce() -> Fut,
 ) -> Result<String, DeliveryPushErr>
 where
-    Fut: std::future::Future<Output = Result<String, seller_git::SellerGitError>>,
+    Fut: std::future::Future<Output = Result<String, DeliveryPushErr>>,
 {
     let _guard = lock.lock().await;
     match tokio::time::timeout(timeout, push()).await {
         Ok(Ok(oid)) => Ok(oid),
-        Ok(Err(error)) => Err(DeliveryPushErr::Push(error)),
+        Ok(Err(error)) => Err(error),
         Err(_elapsed) => Err(DeliveryPushErr::TimedOut(timeout.as_secs())),
     }
     // `_guard` drops here — the lock is released the instant the push settles OR times out, never held
@@ -1791,7 +1862,7 @@ mod serialized_bounded_push_tests {
                     tokio::task::yield_now().await; // a racer would overlap here if unserialized
                     tokio::time::sleep(Duration::from_millis(5)).await;
                     inflight.fetch_sub(1, Ordering::SeqCst);
-                    Ok::<_, SellerGitError>(format!("oid{i}"))
+                    Ok::<_, DeliveryPushErr>(format!("oid{i}"))
                 })
                 .await
             }));
@@ -1814,7 +1885,7 @@ mod serialized_bounded_push_tests {
         let lock = tokio::sync::Mutex::new(());
         let hung = serialized_bounded_push(&lock, Duration::from_millis(50), || async move {
             tokio::time::sleep(Duration::from_secs(30)).await;
-            Ok::<_, SellerGitError>("never".to_string())
+            Ok::<_, DeliveryPushErr>("never".to_string())
         })
         .await;
         assert!(matches!(hung, Err(DeliveryPushErr::TimedOut(_))), "a hung push must time out");
@@ -1822,12 +1893,276 @@ mod serialized_bounded_push_tests {
         let next = tokio::time::timeout(
             Duration::from_secs(2),
             serialized_bounded_push(&lock, Duration::from_secs(5), || async move {
-                Ok::<_, SellerGitError>("next-oid".to_string())
+                Ok::<_, DeliveryPushErr>("next-oid".to_string())
             }),
         )
         .await
         .expect("the next delivery must not be starved behind the timed-out push");
         assert!(matches!(next, Ok(oid) if oid == "next-oid"));
+    }
+}
+
+#[cfg(test)]
+mod delivery_push_leg_tests {
+    use super::{
+        mint_upload_mint_attest, serialized_bounded_push, DeliveryPushErr,
+        DELIVERY_PUSH_TOKEN_MARGIN_SECS, DELIVERY_PUSH_TIMEOUT,
+    };
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// One minted token, as the relay would see it: the fake clock reading at `created_at` and the
+    /// NIP-40 expiration the caller asked for.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct Minted {
+        created_at: i64,
+        expiration: Option<i64>,
+    }
+
+    /// A fake clock the fake upload advances, so "the transfer took longer than the relay's window"
+    /// is a value this test can assert on instead of a sleep.
+    #[derive(Clone, Default)]
+    struct Recorder {
+        clock: Arc<AtomicI64>,
+        minted: Arc<Mutex<Vec<Minted>>>,
+    }
+
+    impl Recorder {
+        fn mint(&self, expiration: Option<i64>) -> Minted {
+            let token = Minted {
+                created_at: self.clock.load(Ordering::SeqCst),
+                expiration,
+            };
+            self.minted.lock().expect("minted").push(token);
+            token
+        }
+
+        fn minted(&self) -> Vec<Minted> {
+            self.minted.lock().expect("minted").clone()
+        }
+    }
+
+    /// The relay's historical NIP-98 rule, which is what a token minted before a slow transfer runs
+    /// into: `created_at` must be within ±60 s of the relay's clock when the request arrives.
+    const RELAY_FRESHNESS_WINDOW_SECS: i64 = 60;
+
+    // THE FIX, stated as the relay would judge it: a pack that takes longer than the relay's ±60 s
+    // freshness window must not leave the post-upload verification holding the upload's token. The
+    // fake upload advances the clock by 200 s — past the window — and the verification token must be
+    // minted at the LATER clock reading, so the relay would still accept it.
+    // Red-on-revert: mint once before the upload and pass that one token to both legs (v0.5.8's
+    // shape) and the verification token's age is 200 s ⇒ this fails.
+    #[tokio::test]
+    async fn the_verification_token_is_minted_after_a_slow_upload_not_before_it() {
+        let recorder = Recorder::default();
+        let upload_expiry = 10_000;
+        let attested = mint_upload_mint_attest(
+            true,
+            upload_expiry,
+            |expiration| {
+                let recorder = recorder.clone();
+                async move { Ok(format!("{:?}", recorder.mint(expiration))) }
+            },
+            |header| {
+                let recorder = recorder.clone();
+                async move {
+                    assert!(header.is_some(), "a relay-git upload leg carries a token");
+                    // The transfer itself: 200 s on the wire, well past the relay's window.
+                    recorder.clock.fetch_add(200, Ordering::SeqCst);
+                    Ok("uploaded".to_string())
+                }
+            },
+            |uploaded: String, header| async move {
+                assert_eq!(uploaded, "uploaded");
+                assert!(header.is_some(), "the read-back leg carries a token of its own");
+                Ok("attested-oid".to_string())
+            },
+        )
+        .await
+        .expect("the legs run");
+
+        assert_eq!(attested, "attested-oid");
+        let minted = recorder.minted();
+        assert_eq!(minted.len(), 2, "one token per leg, not one for both: {minted:?}");
+        assert_eq!(minted[0].created_at, 0, "the upload token is minted before the transfer");
+        assert_eq!(
+            minted[1].created_at, 200,
+            "the verification token is minted AFTER the transfer settled: {minted:?}"
+        );
+        let now = recorder.clock.load(Ordering::SeqCst);
+        assert!(
+            now - minted[1].created_at <= RELAY_FRESHNESS_WINDOW_SECS,
+            "the verification token must be inside the relay's ±60 s window when the read-back runs"
+        );
+        assert!(
+            now - minted[0].created_at > RELAY_FRESHNESS_WINDOW_SECS,
+            "the upload's token is exactly the one the relay would have refused for the read-back"
+        );
+    }
+
+    // The two tokens are not interchangeable: only the upload leg declares an expiration (the slow-
+    // transfer seam), and it is bounded by the push's own whole-operation ceiling. The verification
+    // leg is a single immediate request, so it takes the plain fresh token.
+    #[tokio::test]
+    async fn only_the_upload_token_declares_an_expiration_and_it_is_bounded() {
+        let recorder = Recorder::default();
+        let upload_expiry = super::delivery_push_token_lifetime_secs();
+        mint_upload_mint_attest(
+            true,
+            upload_expiry,
+            |expiration| {
+                let recorder = recorder.clone();
+                async move { Ok(format!("{:?}", recorder.mint(expiration))) }
+            },
+            |_header| async { Ok("uploaded".to_string()) },
+            |_uploaded: String, _header| async { Ok("oid".to_string()) },
+        )
+        .await
+        .expect("the legs run");
+
+        let minted = recorder.minted();
+        assert_eq!(
+            minted[0].expiration,
+            Some(upload_expiry),
+            "the upload token declares the push window as its lifetime"
+        );
+        assert_eq!(
+            minted[1].expiration, None,
+            "the verification token is used immediately; it needs no extended life"
+        );
+        assert_eq!(
+            upload_expiry as u64,
+            DELIVERY_PUSH_TIMEOUT.as_secs() + DELIVERY_PUSH_TOKEN_MARGIN_SECS,
+            "the declared lifetime is the push's own ceiling plus its margin — not an open-ended token"
+        );
+    }
+
+    // A public/anonymous https remote is not auth-gated: no token is minted for either leg, exactly
+    // as before the split.
+    #[tokio::test]
+    async fn a_public_remote_mints_no_token_for_either_leg() {
+        let recorder = Recorder::default();
+        mint_upload_mint_attest(
+            false,
+            10_000,
+            |expiration| {
+                let recorder = recorder.clone();
+                async move { Ok(format!("{:?}", recorder.mint(expiration))) }
+            },
+            |header| async move {
+                assert!(header.is_none(), "no auth on a public remote");
+                Ok("uploaded".to_string())
+            },
+            |_uploaded: String, header| async move {
+                assert!(header.is_none(), "no auth on a public remote");
+                Ok("oid".to_string())
+            },
+        )
+        .await
+        .expect("the legs run");
+        assert!(recorder.minted().is_empty(), "no token is minted for a public remote");
+    }
+
+    // The other half of the fix: the upload token is minted only once the delivery-push lock is HELD.
+    // A delivery that waits behind another one must not spend its token's window waiting. The first
+    // delivery holds the lock while the clock advances 300 s; the second's token must carry the LATER
+    // reading.
+    // Red-on-revert: mint before calling `serialized_bounded_push` (v0.5.8's shape) and the second
+    // token's `created_at` is 0 ⇒ this fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_upload_token_is_minted_after_the_push_lock_is_acquired() {
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let recorder = Recorder::default();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let first = {
+            let (lock, recorder) = (lock.clone(), recorder.clone());
+            tokio::spawn(async move {
+                serialized_bounded_push(&lock, Duration::from_secs(30), || async move {
+                    // The delivery ahead of ours holds the lock while time passes on the wire.
+                    release_rx.await.expect("released");
+                    recorder.clock.fetch_add(300, Ordering::SeqCst);
+                    Ok::<_, DeliveryPushErr>("first-oid".to_string())
+                })
+                .await
+            })
+        };
+
+        // Give the first delivery the lock, then queue ours behind it.
+        tokio::task::yield_now().await;
+        let second = {
+            let (lock, recorder) = (lock.clone(), recorder.clone());
+            tokio::spawn(async move {
+                serialized_bounded_push(&lock, Duration::from_secs(30), || {
+                    mint_upload_mint_attest(
+                        true,
+                        10_000,
+                        |expiration| {
+                            let recorder = recorder.clone();
+                            async move { Ok(format!("{:?}", recorder.mint(expiration))) }
+                        },
+                        |_header| async { Ok("uploaded".to_string()) },
+                        |_uploaded: String, _header| async { Ok("second-oid".to_string()) },
+                    )
+                })
+                .await
+            })
+        };
+
+        tokio::task::yield_now().await;
+        assert!(
+            recorder.minted().is_empty(),
+            "nothing may be minted while the delivery is still waiting for the lock"
+        );
+        release_tx.send(()).expect("release the first delivery");
+        assert_eq!(first.await.expect("joined").expect("first push"), "first-oid");
+        assert_eq!(second.await.expect("joined").expect("second push"), "second-oid");
+
+        let minted = recorder.minted();
+        assert_eq!(minted.len(), 2, "the queued delivery minted both of its own tokens");
+        assert_eq!(
+            minted[0].created_at, 300,
+            "the upload token is minted after the lock was acquired, not before the wait: {minted:?}"
+        );
+    }
+
+    // An authorization failure on the SECOND mint is its own outcome: nothing is attested, and the
+    // caller sees `Auth` (a signer problem) rather than a transport error it would read as a failed
+    // push.
+    #[tokio::test]
+    async fn a_failed_verification_mint_refuses_before_the_read_back() {
+        let attempted = Arc::new(AtomicI64::new(0));
+        let mints = Arc::new(AtomicI64::new(0));
+        let result = mint_upload_mint_attest(
+            true,
+            10_000,
+            |_expiration| {
+                let mints = mints.clone();
+                async move {
+                    if mints.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Ok("upload-token".to_string())
+                    } else {
+                        Err(DeliveryPushErr::Auth("signer actor gone (test)".into()))
+                    }
+                }
+            },
+            |_header| async { Ok("uploaded".to_string()) },
+            |_uploaded: String, _header| {
+                let attempted = attempted.clone();
+                async move {
+                    attempted.fetch_add(1, Ordering::SeqCst);
+                    Ok("never".to_string())
+                }
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(DeliveryPushErr::Auth(_))), "{result:?}");
+        assert_eq!(
+            attempted.load(Ordering::SeqCst),
+            0,
+            "no read-back may run without its own authorization"
+        );
     }
 }
 
@@ -7210,23 +7545,10 @@ impl SellerNodeRunner {
             // actor (which owns the seller key), so the push path is NOT a third custody site — the key
             // stays confined to the actor + the authenticated relay client, never re-read here. A
             // public/anonymous https remote takes no header (auth applies to relay-git remotes only).
-            let push_header = if crate::delivery_transport::is_relay_git_locator(&seller.git_remote) {
-                match self.node.signer().http_auth_header(seller.git_remote.clone(), Some(push_ref.clone()), None).await {
-                    Ok(Ok(header)) => Some(header),
-                    Ok(Err(error)) => {
-                        opline!("seller node execute fail job_id={job_id}: push auth sign failed ({error})");
-                        self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
-                        return;
-                    }
-                    Err(error) => {
-                        opline!("seller node execute fail job_id={job_id}: signer actor gone ({error})");
-                        self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
-                        return;
-                    }
-                }
-            } else {
-                None
-            };
+            // The header is NOT minted here. Both legs mint inside the closure below, which runs
+            // only once the delivery-push lock is held — see `serialized_bounded_push`.
+            let relay_git_remote =
+                crate::delivery_transport::is_relay_git_locator(&seller.git_remote);
             // #562: serialize the delivery push to this seat's ONE delivery remote, bounded so a hung
             // push frees the lock instead of starving every later delivery. Concurrent awarded jobs push
             // per-job branches to the same repo, and concurrent git-receive-pack to one repo is what the
@@ -7237,26 +7559,69 @@ impl SellerNodeRunner {
             // (tests/hostile_local_git_config.rs); the transport also binds every leg to
             // `seller.git_remote`. Safe here: the job container has already exited, so no agent
             // process is alive to re-plant the redirect between the rewrite and the push. Both run in
-            // one blocking op inside `neutralize_then_push_off_runtime`, which pushes the gated object
-            // and returns the oid the remote attests.
+            // one blocking op inside `neutralize_then_upload_off_runtime`, which uploads the gated
+            // object; the attestation is a second leg with a second, freshly minted token.
+            //
+            // Authorization freshness (the relay-401 class): BOTH tokens are minted inside this
+            // closure, which `serialized_bounded_push` runs only after the lock is held. The upload
+            // token therefore never spends its ±60 s NIP-98 window waiting behind another delivery
+            // (which may hold the lock for up to DELIVERY_PUSH_TIMEOUT), and the verification token
+            // is minted AFTER the pack is on the wire, so a slow transfer cannot leave the read-back
+            // holding a token the relay has already aged out. Both stay branch-scoped to `push_ref`
+            // and repo-root-bound to `seller.git_remote`, signed THROUGH the signer actor — the
+            // custody, the ref binding and the exact-oid attestation are unchanged.
             let commit = match serialized_bounded_push(
                 &self.delivery_push_lock,
                 DELIVERY_PUSH_TIMEOUT,
                 || {
-                    seller_git::neutralize_then_push_off_runtime(
-                        workdir.clone(),
-                        seller.git_remote.clone(),
-                        branch.clone(),
-                        gated_oid.clone(),
-                        push_header,
+                    // A slow pack upload spans several HTTP legs under ONE token. Sizing the NIP-40
+                    // expiration to the whole-operation bound is what lets a relay that grants
+                    // scoped-token lifetimes (Requirement B) keep authorizing those legs; a relay on
+                    // the historical ±60 s rule ignores the tag and behaves exactly as before.
+                    // Bounded by the push's own ceiling — nothing longer.
+                    let upload_expiry = now_unix() + delivery_push_token_lifetime_secs();
+                    mint_upload_mint_attest(
+                        relay_git_remote,
+                        upload_expiry,
+                        |expiry| self.mint_delivery_push_header(&seller.git_remote, &push_ref, expiry),
+                        |header| async {
+                            seller_git::neutralize_then_upload_off_runtime(
+                                workdir.clone(),
+                                seller.git_remote.clone(),
+                                branch.clone(),
+                                gated_oid.clone(),
+                                header,
+                            )
+                            .await
+                            .map_err(DeliveryPushErr::Push)
+                        },
+                        |uploaded, header| async {
+                            seller_git::attest_pushed_branch_off_runtime(uploaded, header)
+                                .await
+                                .map_err(DeliveryPushErr::Attest)
+                        },
                     )
                 },
             )
             .await
             {
                 Ok(oid) => oid,
+                Err(DeliveryPushErr::Auth(detail)) => {
+                    opline!("seller node execute fail job_id={job_id}: delivery push authorization failed ({detail})");
+                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
+                    return;
+                }
                 Err(DeliveryPushErr::Push(error)) => {
                     opline!("seller node execute fail job_id={job_id}: git push failed ({error})");
+                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
+                    return;
+                }
+                Err(DeliveryPushErr::Attest(error)) => {
+                    // The pack was accepted and the remote reported status for the delivery ref; only
+                    // the read-back failed. Same delivery_failed handling as any other push failure
+                    // (no new state) — the distinct line is what tells an operator the difference the
+                    // 401 incident could not be told from a push that never landed.
+                    opline!("seller node execute fail job_id={job_id}: delivery uploaded but remote verification failed ({error})");
                     self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
                     return;
                 }
@@ -7775,6 +8140,32 @@ impl SellerNodeRunner {
             Err(error) => Err(ContainerDeliveryFailure::Delivery(format!(
                 "signer actor gone ({error})"
             ))),
+        }
+    }
+
+    /// Mint the branch-scoped NIP-98 header for ONE leg of the host delivery push, through the
+    /// signer actor (the seller key never leaves it). Called once per leg, each time from inside the
+    /// delivery-push lock, so every leg carries authorization minted for THAT leg — the whole point
+    /// being that a NIP-98 token's life is measured from `created_at`, not from when it is used.
+    /// `expiration_unix` is `Some` only where the leg may span several HTTP requests (the upload).
+    /// The header is returned to the caller and never logged.
+    async fn mint_delivery_push_header(
+        &self,
+        remote: &str,
+        push_ref: &str,
+        expiration_unix: Option<i64>,
+    ) -> Result<String, DeliveryPushErr> {
+        match self
+            .node
+            .signer()
+            .http_auth_header(remote.to_owned(), Some(push_ref.to_owned()), expiration_unix)
+            .await
+        {
+            Ok(Ok(header)) => Ok(header),
+            Ok(Err(error)) => Err(DeliveryPushErr::Auth(format!(
+                "push auth sign failed ({error})"
+            ))),
+            Err(error) => Err(DeliveryPushErr::Auth(format!("signer actor gone ({error})"))),
         }
     }
 
