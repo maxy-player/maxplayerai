@@ -928,7 +928,21 @@ impl SellerStore {
                  -- crash mid-derive leaves the row re-checkable. Provenance-honest: relay-derived,
                  -- DISTINCT from a local deliveries row. NULL means not derived-settled; a unix ts
                  -- means when we derived it.
-                 settled_elsewhere_at_unix INTEGER
+                 settled_elsewhere_at_unix INTEGER,
+                 -- The UPLOADED-BUT-NOT-YET-VERIFIED delivery oid, journaled as soon as the remote
+                 -- ACCEPTED the pack and BEFORE the exact-oid read-back runs. It records one fact
+                 -- and only that fact: the pack is (probably) on the remote and nothing has
+                 -- confirmed it. It is DELIBERATELY a different column from `pushed_commit`:
+                 -- `pushed_commit` means VERIFIED (resume finalizes from it without re-checking the
+                 -- remote), so writing the upload's oid there would let a resume complete a delivery
+                 -- no one ever attested. A resume that finds THIS column set re-runs the read-back
+                 -- under a freshly minted token and only then arms `pushed_commit`. NULL ⇒ nothing
+                 -- uploaded-unverified; `mark_pushed` clears it in the same statement that arms the
+                 -- verified marker, so the two can never both stand.
+                 uploaded_unverified_commit TEXT,
+                 -- When the upload above was journaled (unix seconds). Operator evidence and the
+                 -- age an inspection reads; the recovery decision never depends on it.
+                 uploaded_unverified_at_unix INTEGER
              );
              -- One delivery per job (the seller-authored snapshot the daemon published).
              CREATE TABLE IF NOT EXISTS deliveries (
@@ -1128,6 +1142,17 @@ impl SellerStore {
         // + idempotent, exactly like the columns above.
         if !Self::column_exists(conn, "jobs", "settled_elsewhere_at_unix")? {
             conn.execute_batch("ALTER TABLE jobs ADD COLUMN settled_elsewhere_at_unix INTEGER;")?;
+        }
+        // The uploaded-but-unverified delivery marker. A store from a binary without it reads NULL
+        // (nothing uploaded-unverified) and is armed going forward at upload time. Additive +
+        // idempotent, exactly like the columns above.
+        if !Self::column_exists(conn, "jobs", "uploaded_unverified_commit")? {
+            conn.execute_batch("ALTER TABLE jobs ADD COLUMN uploaded_unverified_commit TEXT;")?;
+        }
+        if !Self::column_exists(conn, "jobs", "uploaded_unverified_at_unix")? {
+            conn.execute_batch(
+                "ALTER TABLE jobs ADD COLUMN uploaded_unverified_at_unix INTEGER;",
+            )?;
         }
         // #686: the buyer's declared output type. A store from a pre-#686 binary reads NULL for its
         // existing offers — those jobs simply state no output type in their agent prompt — and is
@@ -1713,11 +1738,65 @@ impl SellerStore {
     /// `delivered` stays with `deliver_and_enqueue`).
     pub fn mark_pushed(&self, job_id: &str, commit: &str, now_unix: i64) -> Result<(), StoreError> {
         let conn = self.lock()?;
+        // ONE statement arms the verified marker and clears the uploaded-but-unverified one, so no
+        // crash can leave a row claiming both "verified at X" and "unverified upload pending". The
+        // verified marker is the only one a resume finalizes from; the unverified one is the only
+        // one a resume re-checks the remote for. They are mutually exclusive by construction here.
         conn.execute(
-            "UPDATE jobs SET pushed_commit = ?2, updated_at_unix = ?3 WHERE job_id = ?1",
+            "UPDATE jobs
+                SET pushed_commit = ?2,
+                    uploaded_unverified_commit = NULL,
+                    uploaded_unverified_at_unix = NULL,
+                    updated_at_unix = ?3
+              WHERE job_id = ?1",
             params![job_id, commit, now_unix],
         )?;
         Ok(())
+    }
+
+    /// Journal an UPLOADED-BUT-NOT-YET-VERIFIED delivery: the remote accepted the pack for `commit`
+    /// and the exact-oid read-back has not confirmed it. Written BEFORE the read-back leg runs
+    /// (arm-state-after-the-event: the event is the accepted upload), so a 401 on the read-back, a
+    /// crash, or a kill between the two legs leaves the fact in the store rather than only in the
+    /// operator log — a log line recording a fact is not the fact.
+    ///
+    /// This is NOT `mark_pushed`. A row with only this marker is resumed by RE-VERIFYING the remote
+    /// under a freshly minted token; it is never finalized on the strength of the marker alone, and
+    /// the delivery it may become is never re-pushed and never re-run through the agent.
+    /// Idempotent — last write wins; does NOT change `state`.
+    pub fn mark_uploaded_unverified(
+        &self,
+        job_id: &str,
+        commit: &str,
+        now_unix: i64,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE jobs
+                SET uploaded_unverified_commit = ?2,
+                    uploaded_unverified_at_unix = ?3,
+                    updated_at_unix = ?3
+              WHERE job_id = ?1",
+            params![job_id, commit, now_unix],
+        )?;
+        Ok(())
+    }
+
+    /// The uploaded-but-unverified delivery oid for `job_id`, if any. `Some` on a slot-occupying row
+    /// means: the pack was accepted, nothing has attested it, and a resume owes the remote a
+    /// read-back before this job may be completed. `None` ⇒ nothing uploaded-unverified (either
+    /// never uploaded, or already verified — see [`Self::pushed_commit`]).
+    pub fn uploaded_unverified_commit(&self, job_id: &str) -> Result<Option<String>, StoreError> {
+        let conn = self.lock()?;
+        let commit: Option<String> = conn
+            .query_row(
+                "SELECT uploaded_unverified_commit FROM jobs WHERE job_id = ?1",
+                [job_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(commit)
     }
 
     /// Record a delivery and enqueue its result event in ONE transaction. Idempotent — a replay for
@@ -3194,6 +3273,79 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    // RESTART COVERAGE — the whole point of "durable". An upload the remote accepted whose read-back
+    // never confirmed it is journaled, the process goes away (the store is DROPPED and the sqlite
+    // file reopened, which is what a restart is here), and the fact is still there for the resume to
+    // act on. A log line would not have survived this test, and the fact that recovers the delivery
+    // must be the state, not the log.
+    //
+    // Bite (measured): make `mark_uploaded_unverified` a no-op, or drop the column from the
+    // migration, and the reopened read returns None — the resume then re-runs the agent for a
+    // delivery already on the remote.
+    #[test]
+    fn an_uploaded_unverified_delivery_survives_a_restart() {
+        let path = temp_db("uploaded-unverified");
+        let _ = std::fs::remove_file(&path);
+        let commit = "a".repeat(40);
+        {
+            let store = SellerStore::open(&path).expect("open");
+            insert_job(&store, "job-1", JobState::Executing);
+            // A second job that never uploaded: absence must read as absence, not as a default.
+            insert_job(&store, "job-2", JobState::Executing);
+            store
+                .mark_uploaded_unverified("job-1", &commit, 4_242)
+                .expect("journal the upload");
+        }
+        let store = SellerStore::open(&path).expect("reopen — the restart");
+        assert_eq!(
+            store.uploaded_unverified_commit("job-1").expect("read").as_deref(),
+            Some(commit.as_str()),
+            "the uploaded-but-unverified fact must outlive the process that learned it"
+        );
+        assert_eq!(
+            store.uploaded_unverified_commit("job-2").expect("read"),
+            None,
+            "a job that never uploaded has no marker"
+        );
+        // And it is NOT the verified marker: a resume must not be able to finalize from it.
+        assert_eq!(
+            store.pushed_commit("job-1").expect("read"),
+            None,
+            "an unverified upload is not a pushed (verified) commit — the resume owes the remote a read-back"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // The two markers are mutually exclusive, in ONE statement: arming the VERIFIED marker clears the
+    // unverified one, so no crash can leave a row that both claims a verified commit and asks for a
+    // re-verification. Also holds across a restart — the clear is committed, not in-memory.
+    #[test]
+    fn arming_the_verified_marker_clears_the_unverified_one() {
+        let path = temp_db("marker-exclusive");
+        let _ = std::fs::remove_file(&path);
+        let commit = "b".repeat(40);
+        {
+            let store = SellerStore::open(&path).expect("open");
+            insert_job(&store, "job-1", JobState::Executing);
+            store
+                .mark_uploaded_unverified("job-1", &commit, 10)
+                .expect("journal the upload");
+            store.mark_pushed("job-1", &commit, 11).expect("verified");
+            assert_eq!(
+                store.uploaded_unverified_commit("job-1").expect("read"),
+                None,
+                "the unverified marker is cleared by the same statement that arms the verified one"
+            );
+        }
+        let store = SellerStore::open(&path).expect("reopen");
+        assert_eq!(
+            store.pushed_commit("job-1").expect("read").as_deref(),
+            Some(commit.as_str())
+        );
+        assert_eq!(store.uploaded_unverified_commit("job-1").expect("read"), None);
+        let _ = std::fs::remove_file(&path);
+    }
+
     // TOOTH (#686) — the output type the buyer DECLARED is journaled with the other offer facts and
     // READS BACK across a reopen. Same reason as the harness request above: execution can be a
     // restart away from the claim, and the resumed job composes its agent prompt from this row, so a
@@ -3446,6 +3598,22 @@ mod tests {
         );
         // The migrated column is writable: the refine can arm it going forward on the live store.
         store.mark_settled_elsewhere("old-job", 2).expect("mark on migrated store");
+        // The uploaded-but-unverified columns migrate onto the SAME old table: a store written by a
+        // binary that never had them reads "nothing uploaded-unverified" (never a spurious recovery)
+        // and is armable going forward, so a seat that upgrades mid-flight can journal its next
+        // upload instead of failing to.
+        assert_eq!(
+            store.uploaded_unverified_commit("old-job").expect("read"),
+            None,
+            "a row from before the column is not uploaded-unverified"
+        );
+        store
+            .mark_uploaded_unverified("old-job", &"c".repeat(40), 3)
+            .expect("arm on migrated store");
+        assert_eq!(
+            store.uploaded_unverified_commit("old-job").expect("read").as_deref(),
+            Some("c".repeat(40).as_str())
+        );
         assert!(store.has_settled_elsewhere("old-job").expect("read"), "marker persists post-migration");
         // Idempotent: opening again neither errors nor double-adds.
         drop(store);

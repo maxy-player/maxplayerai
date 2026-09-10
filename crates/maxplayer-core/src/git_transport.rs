@@ -448,6 +448,24 @@ pub struct UploadedDelivery {
 }
 
 impl UploadedDelivery {
+    /// Re-hydrate an upload the seller node JOURNALED durably, so a resume after a crash, a kill, or
+    /// a 401 on the read-back can run the SAME attestation the interrupted push owed — under a
+    /// freshly minted token — instead of re-pushing a pack the remote may already hold.
+    ///
+    /// This constructor is the resume path's only entry, and it grants nothing the read-back does not
+    /// re-check on the wire: [`attest_pushed_branch`] still asserts the outbound allowlist, still
+    /// opens a detached remote bound to `remote_url`, and still refuses unless `target_ref` is
+    /// advertised at exactly `gated_oid`. An `UploadedDelivery` built here is a QUESTION for the
+    /// remote, never an answer — a caller cannot turn it into a delivered oid without that check
+    /// passing.
+    pub fn from_journaled_upload(remote_url: String, target_ref: String, gated_oid: String) -> Self {
+        Self {
+            remote_url,
+            target_ref,
+            gated_oid,
+        }
+    }
+
     /// The repo-root URL every leg of this delivery is bound to.
     pub fn remote_url(&self) -> &str {
         &self.remote_url
@@ -1428,6 +1446,47 @@ mod tests {
         assert!(
             err.to_string().contains(&b.to_string()),
             "names the oid the remote holds: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // RESUME, with real git: an upload whose read-back never happened is re-verified from the
+    // JOURNALED facts alone (remote url + ref + oid — what the store holds), and the exact-oid gate
+    // still decides. Nothing is re-pushed here: the second call touches no workdir.
+    #[test]
+    fn a_journaled_upload_re_verifies_and_still_refuses_a_different_oid() {
+        let root = temp_root("resume-attest");
+        let (workdir, a, b) = workdir_with_moved_branch(&root);
+        let bare = root.join("remote.git");
+        Repository::init_bare(&bare).expect("bare remote");
+        let remote_url = bare.to_str().expect("utf8").to_owned();
+        let repo = crate::seller_git::open_plain_workdir_repo(&workdir).expect("open workdir");
+        // The pre-crash run: the pack lands on the remote, and its `UploadedDelivery` is DROPPED on
+        // purpose — that value did not survive the crash, only the journaled strings below did.
+        drop(upload_gated_object(&repo, &remote_url, "job", &a.to_string(), None).expect("upload A"));
+
+        // What the store journaled — no `UploadedDelivery` survived the crash, only these strings.
+        let journaled = UploadedDelivery::from_journaled_upload(
+            remote_url.clone(),
+            "refs/heads/job".to_owned(),
+            a.to_string(),
+        );
+        assert_eq!(
+            attest_uploaded_delivery(&journaled, None).expect("the pack is on the remote"),
+            a.to_string(),
+            "a resume re-verifies the journaled upload and returns the delivered oid"
+        );
+
+        // FAIL CLOSED on a wrong oid: same remote, same ref, an oid the remote does not hold.
+        let wrong = UploadedDelivery::from_journaled_upload(
+            remote_url,
+            "refs/heads/job".to_owned(),
+            b.to_string(),
+        );
+        let err = attest_uploaded_delivery(&wrong, None).expect_err("the remote disagrees");
+        assert!(
+            matches!(&err, TransportError::Rejected(m) if m.contains("remote attestation failed")),
+            "a journaled oid the remote does not hold is REJECTED, never delivered: {err}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -908,6 +908,40 @@ pub async fn attest_pushed_branch_off_runtime(
     .await
 }
 
+/// The read-back a RESUME owes a delivery whose upload was journaled durably: the same attestation
+/// leg 2 runs, on a freshly minted token, against an `UploadedDelivery` re-hydrated from the store.
+///
+/// It returns the transport's OWN error class rather than a [`SellerGitError`], because the resume
+/// decision turns on a distinction `SellerGitError` folds away: `From<TransportError>` maps BOTH
+/// `Rejected` (the remote answered, and the ref is absent or at another oid — fail closed, the
+/// delivery is not there) and `Auth` (a 401/403 — we could not ask, so nothing is decided) onto
+/// `AuthFailed`. Completing or failing a delivery on the wrong one of those is exactly the mistake
+/// this path exists to prevent.
+pub async fn verify_journaled_upload_off_runtime(
+    uploaded: git_transport::UploadedDelivery,
+    header: Option<String>,
+) -> Result<String, git_transport::TransportError> {
+    let remote_url = uploaded.remote_url().to_owned();
+    let target_ref = uploaded.target_ref().to_owned();
+    match tokio::task::spawn_blocking(move || git_transport::attest_pushed_branch(&uploaded, header))
+        .await
+    {
+        Ok(Ok(oid)) => {
+            eprintln!(
+                "seller push path=inprocess remote={remote_url} ref={target_ref} re-attested from journal"
+            );
+            Ok(oid)
+        }
+        Ok(Err(error)) => Err(error),
+        // A blocking task that did not complete is an IO-class unknown, NOT a rejection: the remote
+        // never answered, so the resume must leave the journal standing rather than fail a delivery
+        // that may well be on the remote.
+        Err(error) => Err(git_transport::TransportError::Io(format!(
+            "blocking git task did not complete: {error}"
+        ))),
+    }
+}
+
 /// Run one blocking git operation on a blocking thread. A panic inside libgit2 surfaces as an error
 /// rather than taking the caller down.
 async fn off_runtime<T, F>(operation: F) -> Result<T, SellerGitError>

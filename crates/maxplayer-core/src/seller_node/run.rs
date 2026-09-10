@@ -1529,6 +1529,10 @@ enum ResumeAction {
     /// from the stored commit (re-sign + enqueue — deterministic + idempotent) WITHOUT re-running the
     /// agent or re-pushing.
     FinalizeFromPushed(String),
+    /// A delivery whose pack the remote ACCEPTED but which nothing ever attested (journaled between
+    /// the two legs): re-run the READ-BACK under a freshly minted token, and complete only if the
+    /// remote advertises the ref at exactly this oid. Never a re-push, never an agent re-run.
+    VerifyUploadedDelivery(String),
     /// Already delivered / receipted, or a terminal state: nothing to do, never re-run.
     SkipTerminal,
     /// The offer's own absolute deadline has already passed: the award can no longer be paid (a buyer
@@ -1578,6 +1582,321 @@ fn resume_action(
     match pushed_commit {
         Some(commit) => ResumeAction::FinalizeFromPushed(commit),
         None => ResumeAction::RunAgent,
+    }
+}
+
+/// [`resume_action`] refined by the uploaded-but-unverified marker.
+///
+/// The marker is consulted LAST, and only where `resume_action` would otherwise `RunAgent` — the
+/// residual that means: slot-occupying, no delivery row, no receipt, not settled elsewhere, deadline
+/// still live, no VERIFIED pushed commit. Every other verdict outranks it, and each for a reason:
+///
+/// - `SkipTerminal` wins so a job that already produced a buyer-visible outcome (delivered,
+///   receipted, settled elsewhere, or failed) can never be completed a SECOND time by a resume that
+///   found an old upload marker. That is the no-duplicate-completion guarantee.
+/// - `SkipLapsed` wins so a verified-late delivery is never emitted after the offer's own deadline.
+/// - `FinalizeFromPushed` wins because `pushed_commit` means ALREADY VERIFIED; re-asking the remote
+///   would be redundant work on the recovery path.
+///
+/// Kept a refinement of `resume_action` rather than a branch inside it so #552/#563's decision keeps
+/// its exact shape and this layer's precedence is provable on its own.
+fn resume_action_with_upload_marker(
+    action: ResumeAction,
+    uploaded_unverified: Option<String>,
+) -> ResumeAction {
+    match (action, uploaded_unverified) {
+        (ResumeAction::RunAgent, Some(commit)) => ResumeAction::VerifyUploadedDelivery(commit),
+        (action, _) => action,
+    }
+}
+
+/// What a resume does with the answer the remote gave about a journaled upload.
+#[derive(Debug, PartialEq, Eq)]
+enum UploadedVerification {
+    /// The remote advertises the ref at exactly the journaled oid: arm the VERIFIED marker and
+    /// finalize from it (re-sign + enqueue, both idempotent). No push, no agent.
+    Deliver,
+    /// The remote ANSWERED, and its answer rules the delivery out: the ref is absent or at another
+    /// oid (`Rejected`), or the locator is refused outright (`Transport`, which never reaches a
+    /// network and can never start doing so). Fail the job — the exact-oid gate said no.
+    FailClosed,
+    /// No answer: authorization refused (`Auth` — a 401/403 says nothing about where the pack is) or
+    /// an io/transport fault. Decide NOTHING: leave the durable marker standing for the next resume.
+    /// Bounded by the offer deadline, which fails the row when it passes.
+    Unresolved,
+}
+
+/// Classify the read-back's outcome. Split from the handler so the fail-closed/leave-it boundary is
+/// unit-testable without a relay — and so the `Auth`-vs-`Rejected` distinction that
+/// `From<TransportError> for SellerGitError` folds away cannot be re-folded here by accident.
+fn uploaded_verification_outcome(
+    result: Result<(), &crate::git_transport::TransportError>,
+) -> UploadedVerification {
+    use crate::git_transport::TransportError;
+    match result {
+        Ok(()) => UploadedVerification::Deliver,
+        Err(TransportError::Rejected(_)) | Err(TransportError::Transport(_)) => {
+            UploadedVerification::FailClosed
+        }
+        Err(TransportError::Auth(_)) | Err(TransportError::Io(_)) => {
+            UploadedVerification::Unresolved
+        }
+    }
+}
+
+#[cfg(test)]
+mod uploaded_verification_tests {
+    use super::{uploaded_verification_outcome, UploadedVerification};
+    use crate::git_transport::TransportError;
+
+    // FAIL CLOSED on the remote's own answer. `Rejected` is what the exact-oid comparison returns
+    // when the ref is absent or at another oid — the delivery is not there, and a re-push is barred,
+    // so the job fails. `Transport` is an allowlist refusal: no network happened and none ever will.
+    #[test]
+    fn a_wrong_oid_or_a_refused_locator_fails_closed() {
+        assert_eq!(
+            uploaded_verification_outcome(Err(&TransportError::Rejected(
+                "remote attestation failed: refs/heads/job is at bbb, not at the pushed aaa".into()
+            ))),
+            UploadedVerification::FailClosed
+        );
+        assert_eq!(
+            uploaded_verification_outcome(Err(&TransportError::Rejected(
+                "remote attestation failed: refs/heads/job is absent from the remote after the push"
+                    .into()
+            ))),
+            UploadedVerification::FailClosed
+        );
+        assert_eq!(
+            uploaded_verification_outcome(Err(&TransportError::Transport("ext: refused".into()))),
+            UploadedVerification::FailClosed
+        );
+    }
+
+    // The AUTH gate, and the reason this classification exists: a 401 on the read-back is exactly
+    // the incident shape, and it says NOTHING about whether the pack is on the remote. It must not
+    // deliver (unverified) and must not fail (the delivery may be there) — it leaves the durable
+    // marker for the next resume. An io fault reads the same way.
+    #[test]
+    fn an_auth_refusal_or_io_fault_resolves_nothing() {
+        assert_eq!(
+            uploaded_verification_outcome(Err(&TransportError::Auth("401 Unauthorized".into()))),
+            UploadedVerification::Unresolved,
+            "a 401 must never be read as 'the delivery is not there'"
+        );
+        assert_eq!(
+            uploaded_verification_outcome(Err(&TransportError::Io("connect: timed out".into()))),
+            UploadedVerification::Unresolved
+        );
+    }
+
+    #[test]
+    fn only_the_remotes_agreement_delivers() {
+        assert_eq!(
+            uploaded_verification_outcome(Ok(())),
+            UploadedVerification::Deliver
+        );
+    }
+}
+
+#[cfg(test)]
+mod upload_marker_precedence_tests {
+    use super::{resume_action, resume_action_with_upload_marker, ResumeAction};
+    use crate::seller_node::store::JobState;
+
+    const NOW: i64 = 1_000_000;
+    const LIVE: Option<i64> = Some(NOW + 3_600);
+    const LAPSED: Option<i64> = Some(NOW - 1);
+
+    fn decide(
+        state: JobState,
+        has_delivery: bool,
+        has_receipt: bool,
+        pushed: Option<&str>,
+        uploaded: Option<&str>,
+        deadline: Option<i64>,
+    ) -> ResumeAction {
+        resume_action_with_upload_marker(
+            resume_action(
+                state,
+                has_delivery,
+                has_receipt,
+                false,
+                pushed.map(ToOwned::to_owned),
+                deadline,
+                NOW,
+            ),
+            uploaded.map(ToOwned::to_owned),
+        )
+    }
+
+    // THE RECOVERY: the exact row the 401 leaves behind — still executing, no delivery, no receipt,
+    // no VERIFIED commit, live deadline, and an uploaded-unverified marker. It re-verifies. Without
+    // the marker the same row runs the agent again, which is what the marker exists to prevent.
+    #[test]
+    fn an_uploaded_unverified_row_verifies_instead_of_re_running_the_agent() {
+        assert_eq!(
+            decide(JobState::Executing, false, false, None, Some("aaa"), LIVE),
+            ResumeAction::VerifyUploadedDelivery("aaa".to_owned())
+        );
+        assert_eq!(
+            decide(JobState::Awarded, false, false, None, Some("aaa"), LIVE),
+            ResumeAction::VerifyUploadedDelivery("aaa".to_owned())
+        );
+        assert_eq!(
+            decide(JobState::Executing, false, false, None, None, LIVE),
+            ResumeAction::RunAgent,
+            "no marker ⇒ the #552 foil is untouched: a genuine mid-flight award still runs"
+        );
+    }
+
+    // NO DUPLICATE BUYER COMPLETION. Every row that already produced (or can no longer produce) a
+    // buyer-visible outcome keeps its verdict even with the marker set: a delivery row, a receipt, a
+    // terminal state, and a lapsed deadline.
+    #[test]
+    fn the_marker_never_overrides_a_terminal_or_lapsed_row() {
+        for state in [JobState::Delivered, JobState::Paid, JobState::Failed] {
+            assert_eq!(
+                decide(state, false, false, None, Some("aaa"), LIVE),
+                ResumeAction::SkipTerminal,
+                "a terminal row is never re-completed from an old upload marker"
+            );
+        }
+        assert_eq!(
+            decide(JobState::Executing, true, false, None, Some("aaa"), LIVE),
+            ResumeAction::SkipTerminal,
+            "a delivery row already exists — verifying could only duplicate it"
+        );
+        assert_eq!(
+            decide(JobState::Executing, false, true, None, Some("aaa"), LIVE),
+            ResumeAction::SkipTerminal
+        );
+        assert_eq!(
+            decide(JobState::Executing, false, false, None, Some("aaa"), LAPSED),
+            ResumeAction::SkipLapsed,
+            "past the deadline the row fails — never a post-deadline delivery"
+        );
+    }
+
+    // RESTART, end to end through the real store: a delivery whose pack the remote accepted and whose
+    // read-back never confirmed it is journaled, the process goes away, and the decision a restart
+    // makes on the REOPENED file is "re-verify" — not "re-run the agent", which is what the same row
+    // without the marker gets. This is the composition `execute_job` performs, over durable state.
+    #[test]
+    fn a_restart_re_verifies_a_journaled_upload_instead_of_re_running() {
+        use crate::seller_node::store::SellerStore;
+
+        let path = std::env::temp_dir().join(format!(
+            "maxplayer-resume-upload-marker-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let commit = "d".repeat(40);
+
+        // The schema, then a mid-flight job row (two of them: one uploaded, one not).
+        {
+            SellerStore::open(&path).expect("create schema");
+        }
+        {
+            let conn = rusqlite::Connection::open(&path).expect("raw open");
+            conn.execute_batch(
+                "INSERT INTO jobs (job_id, offer_id, state, created_at_unix, updated_at_unix)
+                 VALUES ('job-uploaded', 'offer-1', 'executing', 1, 1),
+                        ('job-mid-flight', 'offer-2', 'executing', 1, 1);",
+            )
+            .expect("job rows");
+        }
+        // The run that uploaded and then lost its read-back.
+        {
+            let store = SellerStore::open(&path).expect("open");
+            store
+                .mark_uploaded_unverified("job-uploaded", &commit, NOW)
+                .expect("journal the upload");
+        }
+
+        // THE RESTART: a new process, a new handle on the same file, nothing in memory.
+        let store = SellerStore::open(&path).expect("reopen");
+        let decide_from_store = |job_id: &str| {
+            let state = store
+                .job_state(job_id)
+                .expect("job_state")
+                .expect("job row present");
+            resume_action_with_upload_marker(
+                resume_action(
+                    state,
+                    store.has_delivery(job_id).expect("has_delivery"),
+                    store.has_receipt(job_id).expect("has_receipt"),
+                    store
+                        .has_settled_elsewhere(job_id)
+                        .expect("has_settled_elsewhere"),
+                    store.pushed_commit(job_id).expect("pushed_commit"),
+                    LIVE,
+                    NOW,
+                ),
+                store
+                    .uploaded_unverified_commit(job_id)
+                    .expect("uploaded_unverified_commit"),
+            )
+        };
+        assert_eq!(
+            decide_from_store("job-uploaded"),
+            ResumeAction::VerifyUploadedDelivery(commit.clone()),
+            "the restart owes the remote a read-back for the journaled upload"
+        );
+        assert_eq!(
+            decide_from_store("job-mid-flight"),
+            ResumeAction::RunAgent,
+            "a row with no marker is still a genuine mid-flight award (the #552 foil)"
+        );
+
+        // Once the read-back succeeds, the verified marker takes over and the recovery becomes an
+        // ordinary #552 finalize — across a further restart, and with no second remote round-trip.
+        store
+            .mark_pushed("job-uploaded", &commit, NOW + 1)
+            .expect("verified");
+        drop(store);
+        let store = SellerStore::open(&path).expect("reopen again");
+        assert_eq!(
+            store
+                .uploaded_unverified_commit("job-uploaded")
+                .expect("read"),
+            None
+        );
+        assert_eq!(
+            resume_action_with_upload_marker(
+                resume_action(
+                    store.job_state("job-uploaded").expect("state").expect("row"),
+                    false,
+                    false,
+                    false,
+                    store.pushed_commit("job-uploaded").expect("pushed"),
+                    LIVE,
+                    NOW
+                ),
+                store
+                    .uploaded_unverified_commit("job-uploaded")
+                    .expect("read"),
+            ),
+            ResumeAction::FinalizeFromPushed(commit)
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // A VERIFIED commit outranks an upload marker: `pushed_commit` was written only after a
+    // successful read-back, so the recovery is a finalize, not another remote round-trip.
+    #[test]
+    fn a_verified_pushed_commit_outranks_the_upload_marker() {
+        assert_eq!(
+            decide(
+                JobState::Executing,
+                false,
+                false,
+                Some("verified"),
+                Some("aaa"),
+                LIVE
+            ),
+            ResumeAction::FinalizeFromPushed("verified".to_owned())
+        );
     }
 }
 
@@ -1770,6 +2089,7 @@ async fn mint_upload_mint_attest<T, MintFut, UploadFut, AttestFut>(
     upload_expiry: i64,
     mint: impl Fn(Option<i64>) -> MintFut,
     upload: impl FnOnce(Option<String>) -> UploadFut,
+    journal: impl FnOnce(&T),
     attest: impl FnOnce(T, Option<String>) -> AttestFut,
 ) -> Result<String, DeliveryPushErr>
 where
@@ -1783,6 +2103,11 @@ where
         None
     };
     let uploaded = upload(upload_header).await?;
+    // The uploaded-but-unverified fact is journaled HERE: after the remote accepted the pack, before
+    // anything else can fail. Everything between this line and a successful attestation — the second
+    // mint, the read-back, a kill, a power loss — happens with the fact already durable, which is the
+    // difference between a recoverable delivery and a pack on a remote that nothing remembers.
+    journal(&uploaded);
     let verify_header = if relay_git { Some(mint(None).await?) } else { None };
     attest(uploaded, verify_header).await
 }
@@ -1906,40 +2231,57 @@ mod serialized_bounded_push_tests {
 mod delivery_push_leg_tests {
     use super::{
         mint_upload_mint_attest, serialized_bounded_push, DeliveryPushErr,
-        DELIVERY_PUSH_TOKEN_MARGIN_SECS, DELIVERY_PUSH_TIMEOUT,
+        DELIVERY_PUSH_TIMEOUT, DELIVERY_PUSH_TOKEN_MARGIN_SECS,
     };
     use std::sync::atomic::{AtomicI64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    /// One minted token, as the relay would see it: the fake clock reading at `created_at` and the
-    /// NIP-40 expiration the caller asked for.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    struct Minted {
-        created_at: i64,
-        expiration: Option<i64>,
+    /// What the delivery push did, in the order it did it — the fake clock reading at each step. This
+    /// is the sequence the relay-401 class turns on, so the tests assert on the SEQUENCE, not on
+    /// whether the calls happened.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Step {
+        /// A token minted at this clock reading, carrying this NIP-40 expiration (if any).
+        Mint { at: i64, expiration: Option<i64> },
+        /// The uploaded-but-unverified fact journaled durably at this clock reading.
+        Journal { at: i64, commit: String },
+        /// The read-back ran at this clock reading.
+        Attest { at: i64, authorized: bool },
     }
 
     /// A fake clock the fake upload advances, so "the transfer took longer than the relay's window"
-    /// is a value this test can assert on instead of a sleep.
+    /// is a value these tests assert on instead of a sleep.
     #[derive(Clone, Default)]
     struct Recorder {
         clock: Arc<AtomicI64>,
-        minted: Arc<Mutex<Vec<Minted>>>,
+        steps: Arc<Mutex<Vec<Step>>>,
     }
 
     impl Recorder {
-        fn mint(&self, expiration: Option<i64>) -> Minted {
-            let token = Minted {
-                created_at: self.clock.load(Ordering::SeqCst),
-                expiration,
-            };
-            self.minted.lock().expect("minted").push(token);
-            token
+        fn now(&self) -> i64 {
+            self.clock.load(Ordering::SeqCst)
         }
 
-        fn minted(&self) -> Vec<Minted> {
-            self.minted.lock().expect("minted").clone()
+        fn push(&self, step: Step) {
+            self.steps.lock().expect("steps").push(step);
+        }
+
+        fn mint(&self, expiration: Option<i64>) -> String {
+            let at = self.now();
+            self.push(Step::Mint { at, expiration });
+            format!("token@{at}")
+        }
+
+        fn steps(&self) -> Vec<Step> {
+            self.steps.lock().expect("steps").clone()
+        }
+
+        fn mints(&self) -> Vec<Step> {
+            self.steps()
+                .into_iter()
+                .filter(|step| matches!(step, Step::Mint { .. }))
+                .collect()
         }
     }
 
@@ -1962,7 +2304,7 @@ mod delivery_push_leg_tests {
             upload_expiry,
             |expiration| {
                 let recorder = recorder.clone();
-                async move { Ok(format!("{:?}", recorder.mint(expiration))) }
+                async move { Ok(recorder.mint(expiration)) }
             },
             |header| {
                 let recorder = recorder.clone();
@@ -1970,33 +2312,53 @@ mod delivery_push_leg_tests {
                     assert!(header.is_some(), "a relay-git upload leg carries a token");
                     // The transfer itself: 200 s on the wire, well past the relay's window.
                     recorder.clock.fetch_add(200, Ordering::SeqCst);
-                    Ok("uploaded".to_string())
+                    Ok("uploaded-oid".to_string())
                 }
             },
-            |uploaded: String, header| async move {
-                assert_eq!(uploaded, "uploaded");
-                assert!(header.is_some(), "the read-back leg carries a token of its own");
-                Ok("attested-oid".to_string())
+            |uploaded: &String| {
+                recorder.push(Step::Journal {
+                    at: recorder.now(),
+                    commit: uploaded.clone(),
+                });
+            },
+            |uploaded: String, header| {
+                let recorder = recorder.clone();
+                async move {
+                    assert_eq!(uploaded, "uploaded-oid");
+                    recorder.push(Step::Attest {
+                        at: recorder.now(),
+                        authorized: header.is_some(),
+                    });
+                    Ok("attested-oid".to_string())
+                }
             },
         )
         .await
         .expect("the legs run");
 
         assert_eq!(attested, "attested-oid");
-        let minted = recorder.minted();
-        assert_eq!(minted.len(), 2, "one token per leg, not one for both: {minted:?}");
-        assert_eq!(minted[0].created_at, 0, "the upload token is minted before the transfer");
+        let steps = recorder.steps();
         assert_eq!(
-            minted[1].created_at, 200,
-            "the verification token is minted AFTER the transfer settled: {minted:?}"
+            steps,
+            vec![
+                Step::Mint { at: 0, expiration: Some(upload_expiry) },
+                Step::Journal { at: 200, commit: "uploaded-oid".to_string() },
+                Step::Mint { at: 200, expiration: None },
+                Step::Attest { at: 200, authorized: true },
+            ],
+            "mint → upload → journal → mint AGAIN → attest, in that order"
         );
-        let now = recorder.clock.load(Ordering::SeqCst);
+        let now = recorder.now();
+        // The two mint instants, named: the upload's token was signed before a 200 s transfer, the
+        // verification's after it. Only the second is still inside the relay's tolerance.
+        let upload_minted_at = 0;
+        let verification_minted_at = 200;
         assert!(
-            now - minted[1].created_at <= RELAY_FRESHNESS_WINDOW_SECS,
+            now - verification_minted_at <= RELAY_FRESHNESS_WINDOW_SECS,
             "the verification token must be inside the relay's ±60 s window when the read-back runs"
         );
         assert!(
-            now - minted[0].created_at > RELAY_FRESHNESS_WINDOW_SECS,
+            now - upload_minted_at > RELAY_FRESHNESS_WINDOW_SECS,
             "the upload's token is exactly the one the relay would have refused for the read-back"
         );
     }
@@ -2013,23 +2375,22 @@ mod delivery_push_leg_tests {
             upload_expiry,
             |expiration| {
                 let recorder = recorder.clone();
-                async move { Ok(format!("{:?}", recorder.mint(expiration))) }
+                async move { Ok(recorder.mint(expiration)) }
             },
             |_header| async { Ok("uploaded".to_string()) },
+            |_uploaded: &String| {},
             |_uploaded: String, _header| async { Ok("oid".to_string()) },
         )
         .await
         .expect("the legs run");
 
-        let minted = recorder.minted();
         assert_eq!(
-            minted[0].expiration,
-            Some(upload_expiry),
-            "the upload token declares the push window as its lifetime"
-        );
-        assert_eq!(
-            minted[1].expiration, None,
-            "the verification token is used immediately; it needs no extended life"
+            recorder.mints(),
+            vec![
+                Step::Mint { at: 0, expiration: Some(upload_expiry) },
+                Step::Mint { at: 0, expiration: None },
+            ],
+            "the upload token declares the push window; the verification token needs no extended life"
         );
         assert_eq!(
             upload_expiry as u64,
@@ -2039,7 +2400,7 @@ mod delivery_push_leg_tests {
     }
 
     // A public/anonymous https remote is not auth-gated: no token is minted for either leg, exactly
-    // as before the split.
+    // as before the split. The journal still runs — durability does not depend on auth.
     #[tokio::test]
     async fn a_public_remote_mints_no_token_for_either_leg() {
         let recorder = Recorder::default();
@@ -2048,11 +2409,14 @@ mod delivery_push_leg_tests {
             10_000,
             |expiration| {
                 let recorder = recorder.clone();
-                async move { Ok(format!("{:?}", recorder.mint(expiration))) }
+                async move { Ok(recorder.mint(expiration)) }
             },
             |header| async move {
                 assert!(header.is_none(), "no auth on a public remote");
                 Ok("uploaded".to_string())
+            },
+            |uploaded: &String| {
+                recorder.push(Step::Journal { at: 0, commit: uploaded.clone() });
             },
             |_uploaded: String, header| async move {
                 assert!(header.is_none(), "no auth on a public remote");
@@ -2061,13 +2425,18 @@ mod delivery_push_leg_tests {
         )
         .await
         .expect("the legs run");
-        assert!(recorder.minted().is_empty(), "no token is minted for a public remote");
+        assert!(recorder.mints().is_empty(), "no token is minted for a public remote");
+        assert_eq!(
+            recorder.steps(),
+            vec![Step::Journal { at: 0, commit: "uploaded".to_string() }],
+            "the upload is still journaled durably on an unauthenticated remote"
+        );
     }
 
-    // The other half of the fix: the upload token is minted only once the delivery-push lock is HELD.
-    // A delivery that waits behind another one must not spend its token's window waiting. The first
-    // delivery holds the lock while the clock advances 300 s; the second's token must carry the LATER
-    // reading.
+    // The other half of the freshness fix: the upload token is minted only once the delivery-push
+    // lock is HELD. A delivery that waits behind another one must not spend its token's window
+    // waiting. The first delivery holds the lock while the clock advances 300 s; the second's token
+    // must carry the LATER reading.
     // Red-on-revert: mint before calling `serialized_bounded_push` (v0.5.8's shape) and the second
     // token's `created_at` is 0 ⇒ this fails.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2098,11 +2467,15 @@ mod delivery_push_leg_tests {
                     mint_upload_mint_attest(
                         true,
                         10_000,
-                        |expiration| {
+                        {
                             let recorder = recorder.clone();
-                            async move { Ok(format!("{:?}", recorder.mint(expiration))) }
+                            move |expiration| {
+                                let recorder = recorder.clone();
+                                async move { Ok(recorder.mint(expiration)) }
+                            }
                         },
                         |_header| async { Ok("uploaded".to_string()) },
+                        |_uploaded: &String| {},
                         |_uploaded: String, _header| async { Ok("second-oid".to_string()) },
                     )
                 })
@@ -2112,27 +2485,29 @@ mod delivery_push_leg_tests {
 
         tokio::task::yield_now().await;
         assert!(
-            recorder.minted().is_empty(),
+            recorder.mints().is_empty(),
             "nothing may be minted while the delivery is still waiting for the lock"
         );
         release_tx.send(()).expect("release the first delivery");
         assert_eq!(first.await.expect("joined").expect("first push"), "first-oid");
         assert_eq!(second.await.expect("joined").expect("second push"), "second-oid");
 
-        let minted = recorder.minted();
-        assert_eq!(minted.len(), 2, "the queued delivery minted both of its own tokens");
+        let mints = recorder.mints();
+        assert_eq!(mints.len(), 2, "the queued delivery minted both of its own tokens");
         assert_eq!(
-            minted[0].created_at, 300,
-            "the upload token is minted after the lock was acquired, not before the wait: {minted:?}"
+            mints[0],
+            Step::Mint { at: 300, expiration: Some(10_000) },
+            "the upload token is minted after the lock was acquired, not before the wait: {mints:?}"
         );
     }
 
     // An authorization failure on the SECOND mint is its own outcome: nothing is attested, and the
     // caller sees `Auth` (a signer problem) rather than a transport error it would read as a failed
-    // push.
+    // push. The upload is ALREADY journaled when that happens — which is what makes the failure
+    // recoverable instead of a pack nobody remembers.
     #[tokio::test]
     async fn a_failed_verification_mint_refuses_before_the_read_back() {
-        let attempted = Arc::new(AtomicI64::new(0));
+        let recorder = Recorder::default();
         let mints = Arc::new(AtomicI64::new(0));
         let result = mint_upload_mint_attest(
             true,
@@ -2147,11 +2522,14 @@ mod delivery_push_leg_tests {
                     }
                 }
             },
-            |_header| async { Ok("uploaded".to_string()) },
+            |_header| async { Ok("uploaded-oid".to_string()) },
+            |uploaded: &String| {
+                recorder.push(Step::Journal { at: 0, commit: uploaded.clone() });
+            },
             |_uploaded: String, _header| {
-                let attempted = attempted.clone();
+                let recorder = recorder.clone();
                 async move {
-                    attempted.fetch_add(1, Ordering::SeqCst);
+                    recorder.push(Step::Attest { at: 0, authorized: false });
                     Ok("never".to_string())
                 }
             },
@@ -2159,9 +2537,58 @@ mod delivery_push_leg_tests {
         .await;
         assert!(matches!(result, Err(DeliveryPushErr::Auth(_))), "{result:?}");
         assert_eq!(
-            attempted.load(Ordering::SeqCst),
-            0,
-            "no read-back may run without its own authorization"
+            recorder.steps(),
+            vec![Step::Journal { at: 0, commit: "uploaded-oid".to_string() }],
+            "the upload is journaled and NO read-back runs without its own authorization"
+        );
+    }
+
+    // FAULT INJECTION — upload succeeds, read-back fails. This is the incident's exact shape, and
+    // the property that makes it recoverable: the durable journal is written BEFORE the read-back,
+    // so a 401 (or a kill) on the verification leg leaves the fact in the store, not only in a log.
+    // Red-on-revert: journal after the attestation and this fails — nothing is recorded.
+    #[tokio::test]
+    async fn a_readback_failure_still_leaves_the_upload_journaled() {
+        let recorder = Recorder::default();
+        let result = mint_upload_mint_attest(
+            true,
+            10_000,
+            |expiration| {
+                let recorder = recorder.clone();
+                async move { Ok(recorder.mint(expiration)) }
+            },
+            |_header| {
+                let recorder = recorder.clone();
+                async move {
+                    recorder.clock.fetch_add(200, Ordering::SeqCst);
+                    Ok("landed-oid".to_string())
+                }
+            },
+            |uploaded: &String| {
+                recorder.push(Step::Journal {
+                    at: recorder.now(),
+                    commit: uploaded.clone(),
+                });
+            },
+            |_uploaded: String, _header| async {
+                Err(DeliveryPushErr::Attest(
+                    crate::seller_git::SellerGitError::AuthFailed("401 Unauthorized".into()),
+                ))
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(DeliveryPushErr::Attest(_))),
+            "the caller learns the read-back failed, distinctly from a push that never landed: {result:?}"
+        );
+        assert!(
+            recorder.steps().contains(&Step::Journal {
+                at: 200,
+                commit: "landed-oid".to_string()
+            }),
+            "the uploaded-but-unverified fact is durable even though the delivery never verified: {:?}",
+            recorder.steps()
         );
     }
 }
@@ -7189,7 +7616,25 @@ impl SellerNodeRunner {
             // A fresh award, or any row that already skips/finalizes/fails on local markers: no derive.
             false
         };
-        match resume_action(state, has_delivery, has_receipt, settled_elsewhere, pushed, deadline_unix, now) {
+        // The uploaded-but-unverified marker: a pack the remote accepted whose read-back never
+        // confirmed it (a 401 on the verification leg, or a kill between the two legs). Read
+        // tolerantly like every other marker — a read error degrades to "no marker", which re-drives
+        // the agent exactly as a pre-marker binary would, rather than stalling a genuine award.
+        //
+        // It is NOT part of `is_live_residual` above: a row with this marker still gets the #563
+        // relay-derive, and a positive settled-elsewhere finding still outranks the verification
+        // (the buyer has left; there is nobody to deliver to).
+        let uploaded_unverified = match self.node.store().uploaded_unverified_commit(job_id) {
+            Ok(v) => v,
+            Err(error) => {
+                opline!("seller node execute job_id={job_id}: uploaded_unverified read failed ({error}); assuming nothing uploaded-unverified");
+                None
+            }
+        };
+        match resume_action_with_upload_marker(
+            resume_action(state, has_delivery, has_receipt, settled_elsewhere, pushed, deadline_unix, now),
+            uploaded_unverified,
+        ) {
             ResumeAction::RunAgent => {
                 // #628: an `awarded` row records that a job was bound, never WHICH claim the buyer
                 // chose, so a resume cannot separate a job this seat won from one it lost in an
@@ -7208,6 +7653,13 @@ impl SellerNodeRunner {
                     "seller node execute job_id={job_id}: delivery already pushed (commit={commit}) — finalizing from the stored commit, NOT re-running the agent (#552)"
                 );
                 self.finalize_pushed_delivery(job_id, &commit).await;
+                return;
+            }
+            ResumeAction::VerifyUploadedDelivery(commit) => {
+                opline!(
+                    "seller node execute job_id={job_id}: delivery uploaded but NEVER verified (commit={commit}) — re-verifying the remote under a freshly minted token, NOT re-pushing and NOT re-running the agent"
+                );
+                self.verify_uploaded_delivery(job_id, &commit).await;
                 return;
             }
             ResumeAction::SkipTerminal => {
@@ -7595,6 +8047,19 @@ impl SellerNodeRunner {
                             .await
                             .map_err(DeliveryPushErr::Push)
                         },
+                        |uploaded: &crate::git_transport::UploadedDelivery| {
+                            // DURABLE state, not a log line: the pack is on the remote and nothing
+                            // has attested it. A resume reads THIS column and re-verifies; it is
+                            // deliberately not `mark_pushed`, which means verified and is finalized
+                            // from without re-checking the remote.
+                            if let Err(error) = self.node.store().mark_uploaded_unverified(
+                                job_id,
+                                uploaded.gated_oid(),
+                                now_unix(),
+                            ) {
+                                opline!("seller node execute job_id={job_id}: uploaded-unverified journal write failed ({error}); a crash before the read-back would lose the upload");
+                            }
+                        },
                         |uploaded, header| async {
                             seller_git::attest_pushed_branch_off_runtime(uploaded, header)
                                 .await
@@ -7618,11 +8083,19 @@ impl SellerNodeRunner {
                 }
                 Err(DeliveryPushErr::Attest(error)) => {
                     // The pack was accepted and the remote reported status for the delivery ref; only
-                    // the read-back failed. Same delivery_failed handling as any other push failure
-                    // (no new state) — the distinct line is what tells an operator the difference the
-                    // 401 incident could not be told from a push that never landed.
-                    opline!("seller node execute fail job_id={job_id}: delivery uploaded but remote verification failed ({error})");
-                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
+                    // the read-back failed — the 401 class, and the ONE outcome that must not be
+                    // failed here. Failing it would emit a terminal delivery_failed for a delivery
+                    // that is (probably) sitting on the remote, and a `failed` row is terminal: no
+                    // later resume would ever look at it again, so the landed pack would be
+                    // unreachable forever.
+                    //
+                    // Instead: the uploaded-unverified marker is ALREADY durable (journaled between
+                    // the legs above), and this row stays slot-occupying, so the next resume
+                    // re-verifies it under a freshly minted token and completes it from the remote's
+                    // own answer — no re-push, no agent re-run. It is bounded: when the offer's
+                    // deadline passes, `resume_action` fails the row (SkipLapsed), so exactly ONE
+                    // terminal buyer event is ever emitted for this job — a delivery, or a failure.
+                    opline!("seller node execute job_id={job_id}: delivery uploaded but remote verification failed ({error}); uploaded-unverified marker journaled — the next resume re-verifies it (no re-push, no re-run)");
                     return;
                 }
                 Err(DeliveryPushErr::TimedOut(secs)) => {
@@ -8166,6 +8639,99 @@ impl SellerNodeRunner {
                 "push auth sign failed ({error})"
             ))),
             Err(error) => Err(DeliveryPushErr::Auth(format!("signer actor gone ({error})"))),
+        }
+    }
+
+    /// Resume a delivery whose pack the remote accepted and whose read-back never confirmed it: ask
+    /// the remote, under a FRESHLY minted token, whether it advertises the delivery ref at exactly
+    /// the journaled oid — and complete the job only from that answer.
+    ///
+    /// What this path does NOT do, and each is the point of it:
+    /// - **No re-push.** No workdir is opened and no pack is sent. The job's tree may not even exist
+    ///   any more; the delivery either is on the remote or is not.
+    /// - **No agent re-run.** The result was produced once; re-running a non-deterministic harness
+    ///   would diverge the tree and burn the operator's compute for a delivery already made.
+    /// - **No unverified completion.** The exact-oid gate is the same one the live push runs; a
+    ///   `Deliver` verdict comes only from the remote's own advertisement.
+    /// - **No duplicate buyer completion.** `mark_pushed` then `finalize_pushed_delivery`, whose
+    ///   `deliver_and_enqueue` is idempotent (a job with a delivery row re-enqueues nothing), and a
+    ///   row that already reached a terminal state never arrives here at all
+    ///   (`resume_action_with_upload_marker`).
+    ///
+    /// An unresolved answer (a 401, an io fault) decides nothing and LEAVES the durable marker: the
+    /// next resume asks again. That wait is bounded by the offer's own deadline — once it passes,
+    /// `resume_action` fails the row, so a job that can never be verified still reaches exactly one
+    /// terminal outcome.
+    async fn verify_uploaded_delivery(&self, job_id: &str, commit: &str) {
+        let Some(seller) = self.node.home().config.seller.clone() else {
+            opline!("seller node verify skip job_id={job_id}: no [seller] config");
+            self.fail_job(job_id).await;
+            return;
+        };
+        // The SAME ref this job's delivery is always pushed to — derived from the job id exactly as
+        // the push and the finalize derive it, never read back from anywhere a job could influence.
+        let branch = format!("maxplayer/{}", &job_id[..8.min(job_id.len())]);
+        let push_ref = crate::git_transport::delivery_ref(&branch);
+        let relay_git_remote =
+            crate::delivery_transport::is_relay_git_locator(&seller.git_remote);
+        // Fresh, minted NOW, through the signer actor, repo-root-bound and scoped to the same
+        // `push_ref` as the push's own tokens — and with NO expiration tag: this is one immediate
+        // request, not a transfer that has to outlive a window.
+        let header = if relay_git_remote {
+            match self
+                .mint_delivery_push_header(&seller.git_remote, &push_ref, None)
+                .await
+            {
+                Ok(header) => Some(header),
+                Err(error) => {
+                    // Nothing was asked and nothing is decided: the marker stands.
+                    opline!("seller node verify job_id={job_id}: verification authorization failed ({error:?}); marker left standing for the next resume (no delivery, no failure)");
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let journaled = crate::git_transport::UploadedDelivery::from_journaled_upload(
+            seller.git_remote.clone(),
+            push_ref.clone(),
+            commit.to_owned(),
+        );
+        let readback = seller_git::verify_journaled_upload_off_runtime(journaled, header).await;
+        let verdict = uploaded_verification_outcome(readback.as_ref().map(|_| ()));
+        match verdict {
+            UploadedVerification::Deliver => {
+                // The remote agrees at the exact oid. Arm the VERIFIED marker first (which clears
+                // the unverified one in the same statement), so a crash in the sign+enqueue window
+                // resumes as an ordinary #552 finalize instead of asking the remote again.
+                if let Err(error) = self.node.store().mark_pushed(job_id, commit, now_unix()) {
+                    opline!("seller node verify job_id={job_id}: mark_pushed failed (continuing): {error}");
+                }
+                opline!("seller node verify job_id={job_id}: remote verified at the journaled commit={commit} — finalizing the delivery (no re-push, no re-run)");
+                self.finalize_pushed_delivery(job_id, commit).await;
+            }
+            UploadedVerification::FailClosed => {
+                let detail = readback
+                    .as_ref()
+                    .err()
+                    .map(ToString::to_string)
+                    .unwrap_or_default();
+                opline!("seller node verify fail job_id={job_id}: the remote does not hold the journaled delivery ({detail}) — failing closed, never re-pushing");
+                match self.node.store().offer_row(job_id) {
+                    Ok(Some(offer)) => {
+                        self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
+                    }
+                    _ => self.fail_job(job_id).await,
+                }
+            }
+            UploadedVerification::Unresolved => {
+                let detail = readback
+                    .as_ref()
+                    .err()
+                    .map(ToString::to_string)
+                    .unwrap_or_default();
+                opline!("seller node verify job_id={job_id}: verification unresolved ({detail}) — marker left standing for the next resume; bounded by the offer deadline");
+            }
         }
     }
 
@@ -13328,8 +13894,16 @@ mod tests {
         let has_receipt = store.has_receipt(job_id).expect("has_receipt");
         let settled = store.has_settled_elsewhere(job_id).expect("has_settled_elsewhere");
         let pushed = store.pushed_commit(job_id).expect("pushed_commit");
+        let uploaded = store
+            .uploaded_unverified_commit(job_id)
+            .expect("uploaded_unverified_commit");
         let deadline = store.offer_row(job_id).expect("offer_row").map(|o| o.deadline_unix);
-        resume_action(state, has_delivery, has_receipt, settled, pushed, deadline, now)
+        // The SAME composition `execute_job` performs, marker included — so these tests exercise the
+        // decision a restart actually makes, not a subset of it.
+        resume_action_with_upload_marker(
+            resume_action(state, has_delivery, has_receipt, settled, pushed, deadline, now),
+            uploaded,
+        )
     }
 
     // POSITIVE (spine arm 1) — OUR OWN result is on the relay (delivered by a pre-#552 binary, so no
