@@ -4,8 +4,8 @@
 //! A no-op pass is a failure here: if a leg cannot be run, the harness bails rather than printing
 //! a green tick.
 //!
-//! Two things the first version got wrong, both found by the independent review and both fixed
-//! here, because they are the difference between coverage and the appearance of coverage:
+//! Four things earlier versions got wrong, all found by independent review and all fixed here,
+//! because they are the difference between coverage and the appearance of coverage:
 //!
 //!   * negative legs accepted ANY error. A transport failure is not proof that a double spend was
 //!     rejected, nor that a payment did not happen. Every negative leg now matches the EXACT cdk
@@ -15,8 +15,19 @@
 //!     mint restart proves nothing about the mint. The restart leg now SPENDS THE WHOLE residual
 //!     balance against the restarted mint and reconciles the received total exactly.
 //!
+//!   * conservation was checked against spendable and pending only. Reserved is a THIRD, distinct
+//!     pool (`wallet/balance.rs:23-34`), so value abandoned in reserve was invisible to the very
+//!     check that claimed nothing was stranded. Every drain assertion now covers all three.
+//!   * the sweep derived its fee as `before - locked` — that is not a fee, it is whatever went
+//!     missing, so any unexplained shortfall satisfied `swept + fees == total` by construction. The
+//!     fee is now the one CDK QUOTED, the fixture's zero-fee keyset is asserted against the mint
+//!     rather than trusted from config, and unrelated preparation errors are propagated instead of
+//!     being swallowed by an amount search.
+//!
 //! Recovery is likewise exercised from a genuinely non-empty unresolved state, across a wallet
-//! restart backed by a real sqlite file, not with in-memory stores that never reopen.
+//! restart backed by a real sqlite file, not with in-memory stores that never reopen — and both
+//! outcomes recovery may produce are held to the same complete-value contract, since a partial
+//! reclaim satisfies `reclaimed > 0` and is still a loss.
 //!
 //! Worthless test ecash. This binary talks to http://127.0.0.1:8085 and nothing else.
 
@@ -93,27 +104,44 @@ async fn issue(w: &Wallet, amount: u64) -> Result<u64> {
     Ok(u64::from(proofs.total_amount()?))
 }
 
-/// Send the wallet's ENTIRE spendable balance, net of the fee CDK quotes for it, and return the
-/// token plus the amount actually locked into it. This is what makes the restart leg meaningful:
-/// the mint has to honour every remaining proof, not just one sat of them.
-async fn send_everything(w: &Wallet) -> Result<Option<(String, u64)>> {
-    let have = balance(w).await?;
-    if have == 0 {
+/// One token carrying a wallet's whole spendable balance, with the fee CDK actually QUOTED for it.
+struct SweptToken {
+    token: String,
+    /// Spendable balance immediately before the send.
+    before: u64,
+    /// Amount CDK locked into the token.
+    locked: u64,
+    /// Fee CDK QUOTED for the send — not a residual derived from what went missing.
+    quoted_fee: u64,
+}
+
+/// Send the wallet's ENTIRE spendable balance in one operation. This is what makes the restart leg
+/// meaningful: the mint has to honour every remaining proof, not just one sat of them.
+///
+/// The first version walked down from the full balance trying every smaller amount, swallowing each
+/// error, and the caller then inferred `fee = before - locked`. Two defects, both found by review.
+/// An inferred fee is simply whatever went missing, so ANY unexplained shortfall satisfied the
+/// conservation sum by construction; and discarding every preparation error turned unrelated
+/// failures into fee-search candidates. Concretely: a wallet holding 43 that sent 42 with 1 sat
+/// stranded in Reserved would have had the missing sat relabelled a fee, and passed.
+///
+/// So — one preparation, for the whole balance, fee RETURNED rather than derived, every error
+/// propagated. The active keyset on this fixture charges `input_fee_ppk = 0`, asserted against the
+/// mint itself in the recovery leg, and that is what makes a full-balance send preparable at all.
+/// A failure here is therefore a real finding and must not be searched around.
+async fn send_full_balance(w: &Wallet) -> Result<Option<SweptToken>> {
+    let before = balance(w).await?;
+    if before == 0 {
         return Ok(None);
     }
-    // Walk down from the full balance: the largest sendable amount is `balance - fee`, and the fee
-    // depends on the proof selection, so ask CDK rather than guessing.
-    for amount in (1..=have).rev() {
-        match w.prepare_send(Amount::from(amount), SendOptions::default()).await {
-            Ok(prepared) => {
-                let locked = u64::from(prepared.amount());
-                let token = prepared.confirm(None).await?;
-                return Ok(Some((token.to_string(), locked)));
-            }
-            Err(_) => continue,
-        }
-    }
-    Ok(None)
+    let prepared = w
+        .prepare_send(Amount::from(before), SendOptions::default())
+        .await
+        .with_context(|| format!("prepare_send of the full {before} sat balance"))?;
+    let locked = u64::from(prepared.amount());
+    let quoted_fee = u64::from(prepared.fee());
+    let token = prepared.confirm(None).await?.to_string();
+    Ok(Some(SweptToken { token, before, locked, quoted_fee }))
 }
 
 /// True when this is the exact cdk error the leg claims. `matches!` on the variant, not a substring
@@ -327,19 +355,46 @@ async fn main() -> Result<()> {
     )?;
 
     // ------------------------------------------------------------------ 7. recovery
-    // A genuinely non-empty unresolved state, across a WALLET restart. `confirm()` on a send leaves
-    // the saga in TokenCreated with the proofs committed to a token nobody has redeemed; dropping
-    // the wallet and reopening the same sqlite FILE is the restart. Then recovery must find it.
-    t.leg("recovery of an unresolved send across a wallet restart");
+    // A genuinely non-empty unresolved state, across a WALLET-OBJECT AND STORE REOPEN. `confirm()`
+    // on a send leaves the saga in TokenCreated with the proofs committed to a token nobody has
+    // redeemed; dropping the wallet and reopening the same sqlite FILE is the reopen. Then recovery
+    // must find it AND give the whole funded value back.
+    //
+    // Scope, stated exactly so this is not read as more than it is: the wallet object is dropped and
+    // the same sqlite file is reopened IN THE SAME PROCESS, with the seed held in memory. This is
+    // not an OS-level process crash, not a seed-only restore with no local database, not an
+    // interrupted melt, and not a crash injected at every intermediate saga stage.
+    //
+    // The oracle is complete expected VALUE, not "an error did not happen" and not `reclaimed > 0`:
+    // a partial reclaim satisfies a positivity check and is still a loss. Both outcomes recovery is
+    // allowed to produce — driven forward, or compensated — must land on the same full total with
+    // pending AND reserved both empty.
+    t.leg("recovery of an unresolved send across a wallet-object/store reopen");
     let seed: [u8; 64] = random();
     const RECOVER_FUND: u64 = 32;
     const RECOVER_SEND: u64 = 12;
     let stranded_amount;
     {
         let w = file_wallet(&wallet_db, seed).await?;
+        // The zero-fee contract this leg and the sweep leg both rely on, read from the MINT's active
+        // keyset rather than trusted from test-mint.config.toml. If the fixture ever sets a non-zero
+        // input fee, every exact-value assertion below becomes wrong, so refuse to run rather than
+        // reinterpret the difference as an acceptable fee.
+        let keyset = w.fetch_active_keyset().await?;
+        t.check(
+            "fixture precondition: active keyset charges no input fee",
+            keyset.input_fee_ppk == 0,
+            format!("input_fee_ppk {} on keyset {}", keyset.input_fee_ppk, keyset.id),
+        )?;
         let funded = issue(&w, RECOVER_FUND).await?;
         t.check("recovery wallet funded", funded == RECOVER_FUND, format!("{funded} sats"))?;
         let prep = w.prepare_send(Amount::from(RECOVER_SEND), SendOptions::default()).await?;
+        let prep_fee = u64::from(prep.fee());
+        t.check(
+            "CDK quotes a zero fee for this send, as the keyset implies",
+            prep_fee == 0,
+            format!("quoted fee {prep_fee} sats"),
+        )?;
         stranded_amount = u64::from(prep.amount());
         // Token created and deliberately NEVER redeemed: this is the unresolved state.
         let _token = prep.confirm(None).await?;
@@ -372,15 +427,20 @@ async fn main() -> Result<()> {
 
     // Reclaim it explicitly. revoke_send swaps the proofs back — this is the call that actually
     // returns value to the spendable set, which is what `check_all_pending_proofs` does NOT do.
+    //
+    // Whichever branch runs, the SAME closing contract is asserted below: full funded value back,
+    // nothing pending, nothing reserved. Neither branch is allowed a weaker oracle than the other.
     let still_pending = w2.get_pending_sends().await?;
     let balance_before_revoke = balance(&w2).await?;
+    let recovery_route;
     if let Some(op) = still_pending.first().copied() {
         let reclaimed = u64::from(w2.revoke_send(op).await?);
         let balance_after_revoke = balance(&w2).await?;
+        recovery_route = "revoke_send";
         t.check(
-            "revoke_send reclaims the stranded value",
-            reclaimed > 0,
-            format!("reclaimed {reclaimed} sats of {stranded_amount} locked"),
+            "revoke_send reclaims the WHOLE stranded amount, not merely something",
+            reclaimed == stranded_amount,
+            format!("reclaimed {reclaimed} sats, {stranded_amount} was locked"),
         )?;
         t.check(
             "spendable balance grows by exactly the reclaimed amount",
@@ -393,13 +453,37 @@ async fn main() -> Result<()> {
             format!("{} left", w2.get_pending_sends().await?.len()),
         )?;
     } else {
-        // Recovery compensated it by itself: assert that outcome instead of claiming the other one.
+        // Recovery compensated it by itself: assert THAT outcome, held to the same value contract.
+        recovery_route = "compensated by recover_incomplete_sagas";
         t.check(
             "recovery compensated the send without an explicit revoke",
             report.compensated >= 1,
             format!("compensated {}", report.compensated),
         )?;
+        t.check(
+            "compensation alone already restored the stranded amount",
+            balance_before_revoke == RECOVER_FUND,
+            format!("spendable {balance_before_revoke}, funded {RECOVER_FUND}"),
+        )?;
     }
+
+    // The closing value contract, identical for both routes. input_fee_ppk is 0 on this fixture, so
+    // an issue + send + reclaim cycle is exactly value-preserving; that zero is ASSERTED from the
+    // mint's own active keyset above, not assumed from the config file, so if the fixture ever gains
+    // an input fee this leg fails loudly instead of quietly tolerating a shortfall.
+    let recovered_spendable = balance(&w2).await?;
+    let recovered_pending = u64::from(w2.total_pending_balance().await?);
+    let recovered_reserved = u64::from(w2.total_reserved_balance().await?);
+    t.check(
+        "the complete funded value is spendable again",
+        recovered_spendable == RECOVER_FUND,
+        format!("{recovered_spendable} sats spendable, funded {RECOVER_FUND} (via {recovery_route})"),
+    )?;
+    t.check(
+        "nothing is left pending or RESERVED after recovery",
+        recovered_pending == 0 && recovered_reserved == 0,
+        format!("pending {recovered_pending}, reserved {recovered_reserved}"),
+    )?;
     // What check_all_pending_proofs ACTUALLY does, asserted rather than described: it returns the
     // total of orphaned proofs still pending at the mint, and removes the spent ones. It does not
     // move survivors back to Unspent (cdk 0.17.2 src/wallet/proofs.rs:121-180).
@@ -428,21 +512,38 @@ async fn main() -> Result<()> {
 
     // Now prove it against the MINT: sweep every wallet's whole balance into a fresh wallet. Local
     // totals cannot lie about this, because the mint has to sign every swap.
+    //
+    // Every fee below is the fee CDK QUOTED for that send, and on this fixture it must be zero — the
+    // active keyset's `input_fee_ppk` was asserted to be 0 against the mint in the recovery leg, so
+    // this is a full-value contract, not a tolerance. Nothing here is permitted to explain a
+    // shortfall as a fee after the fact: that is precisely how the previous version could have
+    // called a sat stranded in Reserved a fee and passed.
     let sink = memory_wallet().await?;
     let mut swept = 0u64;
-    let mut fees = 0u64;
+    let mut quoted_fees = 0u64;
     for (name, w) in [("sender", &wallet), ("receiver", &receiver), ("recovery", &w2)] {
         let before = balance(w).await?;
-        match send_everything(w).await? {
-            Some((token, locked)) => {
-                let got = u64::from(sink.receive(&token, ReceiveOptions::default()).await?);
+        match send_full_balance(w).await? {
+            Some(s) => {
+                t.check(
+                    &format!("{name}: CDK quoted a zero fee, so the whole balance is sendable"),
+                    s.quoted_fee == 0 && s.locked == s.before,
+                    format!("locked {} of {} sats, quoted fee {}", s.locked, s.before, s.quoted_fee),
+                )?;
+                let got = u64::from(sink.receive(&s.token, ReceiveOptions::default()).await?);
                 t.check(
                     &format!("{name}: mint honoured the swept token after restart"),
-                    got == locked,
-                    format!("swept {got} of {before} sats"),
+                    got == s.locked,
+                    format!("swept {got} of {} sats", s.before),
+                )?;
+                // Per-wallet completeness, with the fee taken from the quote rather than the gap.
+                t.check(
+                    &format!("{name}: pre-sweep value == received + quoted fee"),
+                    s.before == got + s.quoted_fee,
+                    format!("{} == {got} + {}", s.before, s.quoted_fee),
                 )?;
                 swept += got;
-                fees += before - locked;
+                quoted_fees += s.quoted_fee;
             }
             None => t.check(
                 &format!("{name}: nothing to sweep"),
@@ -454,16 +555,27 @@ async fn main() -> Result<()> {
     let sink_balance = balance(&sink).await?;
     t.check(
         "swept value reconciles exactly with the pre-restart total",
-        sink_balance == swept && swept + fees == total_pre,
-        format!("sink {sink_balance} = swept {swept}; swept + fees {fees} = {total_pre} pre-restart"),
+        sink_balance == swept && swept + quoted_fees == total_pre,
+        format!(
+            "sink {sink_balance} = swept {swept}; swept + quoted fees {quoted_fees} = {total_pre} pre-restart"
+        ),
     )?;
+    t.check(
+        "the whole pre-restart total arrived, no fee was charged at all",
+        quoted_fees == 0 && sink_balance == total_pre,
+        format!("sink {sink_balance} of {total_pre} pre-restart, quoted fees {quoted_fees}"),
+    )?;
+    // Spendable, pending AND RESERVED. Omitting reserved was the hole: an abandoned prepare_send
+    // leaves value in a pool that neither of the other two queries can see (cdk 0.17.2
+    // wallet/balance.rs:23-34 — pending and reserved are distinct proof sets).
     for (name, w) in [("sender", &wallet), ("receiver", &receiver), ("recovery", &w2)] {
         let left = balance(w).await?;
         let pending = u64::from(w.total_pending_balance().await?);
+        let reserved = u64::from(w.total_reserved_balance().await?);
         t.check(
-            &format!("{name} fully drained, nothing stranded"),
-            left == 0 && pending == 0,
-            format!("spendable {left}, pending {pending}"),
+            &format!("{name} fully drained — spendable, pending and reserved all zero"),
+            left == 0 && pending == 0 && reserved == 0,
+            format!("spendable {left}, pending {pending}, reserved {reserved}"),
         )?;
     }
     // No duplicate credit from a rolled-back database: the token spent before the restart is still

@@ -16,9 +16,20 @@ test-mint logs [n]   # last n lines
 test-mint url        # http://127.0.0.1:8085/
 ```
 
-State lives in `$TEST_MINT_WORK_DIR`, default `/work/.test-mint`, inside the job workdir. It dies
-with the container. `reset` between test runs; `restart` when I am specifically testing that
-balances survive a mint bounce.
+State lives in `$TEST_MINT_WORK_DIR`, default **`/var/lib/cashu-test-state/mint`** — container-local
+and deliberately **outside `/work`**. `/work` is the delivered workdir: it is bind-mounted from the
+host and everything in it is handed to the buyer, so mint databases, logs, config and the seed file
+must never land there. `test-mint` refuses to start if its state root resolves inside the delivery
+directory, and `test-mint isolation` is the command that shows this (state root, whether it is
+inside the delivered dir, state file names and sizes, seed mode, and any delivered-dir entry
+matching mint state).
+
+The state root is container-local, so it dies with the container either way. `reset` between test
+runs; `restart` when I am specifically testing that balances survive a mint bounce (it keeps the
+database and the seed).
+
+The seed is written to a `0600` file under that root and passed to `cdk-mintd` as `--seed-file`.
+Never echo it, never pass it as an argument value, never copy it into `/work`.
 
 ## Acceptance harness
 
