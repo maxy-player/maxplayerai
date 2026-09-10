@@ -143,3 +143,40 @@ host side of the veth: FORWARD-chain rules in the root netns keyed to the job
 namespace's source address, and/or a per-job network rather than one shared
 `maxplayer-sbx` bridge (all jobs currently share it, which is why job A could see
 job B at all). Both need measuring before either goes in.
+
+## 2026-09-10 — the shared job namespace is SINGLE-USE for gVisor
+
+`gate5c` tried to measure the two candidate enforcement sites and returned
+`ENETUNREACH` for everything late in the run — including the **runc control**,
+which had worked minutes earlier in that same namespace, and including DNS to
+`1.1.1.1`, which no rule under test touched. A control that dies is not a
+control, so gate5c's verdicts are **void**.
+
+`gate5d` settles why. One namespace, read with `os.networkInterfaces()`:
+
+| moment | interfaces | dns |
+| --- | --- | --- |
+| before any gVisor container | `lo=127.0.0.1 eth0=172.31.16.2` | `34.225.223.145` |
+| during the runsc job | `lo=127.0.0.1 eth0=172.31.16.2` | `34.225.223.145` |
+| after it exits, via runc | `lo=127.0.0.1` | `EAI_AGAIN` |
+| after it exits, via a second runsc job | `lo=127.0.0.1` | `EAI_AGAIN` |
+
+**A gVisor container takes the namespace's addresses into its netstack and does
+not give them back when it exits.** The namespace is usable exactly once. The
+second container to enter it — whatever runtime — finds a namespace with nothing
+but loopback.
+
+### What this voids, and what survives
+- **VOID**: gate5c, both candidates. Measured against a dead namespace.
+- **VOID**: gate 5's git leg (`Could not resolve host: github.com`). It was the
+  second runsc container in that namespace, not a DNS bug.
+- **STANDS**: gate5b. Its runc control ran FIRST, while the namespace was
+  healthy, and was correctly dropped; the runsc probe was the first gVisor
+  container in that namespace. The finding holds: the plan binds runc and not runsc.
+- **STANDS**: gate 4 and gate 2 — one runsc container per namespace in each.
+- **STANDS**: the gate-2 retraction, for the separate dead-address reason.
+
+### Rule for every remaining measurement
+One gVisor container per namespace, and a health check of the namespace
+immediately before any leg whose result is meant to be evidence. Re-run gate5c
+under that rule before either enforcement site is chosen.
