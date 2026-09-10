@@ -42,12 +42,59 @@ that is reported as a limitation, not as a pass.
   `origin/main` @ `b45f865`.
 - 17:41 PDT — disposable lima VM `gvisor-repro` creation started (Ubuntu 24.04
   cloud image, arm64). Shared colima VM deliberately untouched.
+- 17:46 PDT — **failure reproduced** (`evidence/gate1-runsc-vs-runc-20260910T0046Z.txt`).
+- 17:52 PDT — root cause isolated and a containment-preserving fix validated by
+  hand before any code was written.
+
+## Gate 1 result — reproduced (aarch64)
+
+Exact run recorded in `evidence/gate1-runsc-vs-runc-20260910T0046Z.txt`.
+Identical image, identical named bridge, identical container security settings;
+only `--runtime` differs:
+
+| Probe | Result |
+| --- | --- |
+| `dns.lookup(relay.maxplayer.ai)` under `--runtime runsc` | `ERR EAI_AGAIN`, exit 1 |
+| same under `--runtime runc` (control) | `OK 34.225.223.145`, exit 0 |
+| raw UDP datagram to `127.0.0.11:53` under runsc | **TIMEOUT — no answer at all** |
+
+Both containers were handed the *same* `/etc/resolv.conf`
+(`nameserver 127.0.0.11`, docker's embedded resolver, `ExtServers:
+[host(127.0.0.53)]`). Digests: image
+`sha256:1c50e46a35dfe91fcdbbba11876bff312a95567bda98d6dcb7f675c884777412`
+(arm64/linux), docker 29.1.3, runsc release-20260817.0, kernel 6.8.0-134,
+network subnet 172.18.0.0/16.
+
+**Causal source.** The failure is not resolver policy, not the allowlist, and
+not name-specific: a bare UDP packet to `127.0.0.11:53` gets no reply inside the
+sandbox. Docker's embedded DNS on a *user-defined* network is a socket bound by
+the daemon inside the container's network namespace on `127.0.0.11:<ephemeral>`,
+reached through NAT rules installed in that namespace. Under runsc the sandbox
+runs its own network stack and terminates loopback inside the sentry, so those
+packets never reach the namespace-side rules or the daemon's socket. Under runc
+the container shares the host kernel's stack, so they do. That is the whole
+delta, and it explains why the shared job namespace fails identically — the
+holder's namespace has exactly the same embedded resolver.
+
+**`--dns` does not fix it** (measured): with `--dns 1.1.1.1` on a user-defined
+network docker *still* writes `nameserver 127.0.0.11` and merely forwards
+upstream from the daemon side, so the container still fails `EAI_AGAIN`. Any
+fix that only sets docker DNS flags is theatre.
+
+**Validated fix direction** (measured, same runsc runtime, same named network,
+same `--user 65534:65534 --cap-drop ALL --security-opt no-new-privileges`):
+supply the sandbox its own `/etc/resolv.conf` naming real upstream resolvers,
+read-only, instead of the unreachable embedded one. Result: `lookup: OK
+34.225.223.145`, `tls: 200 cert-verified`. Containment is untouched — still the
+named bridge, no host networking, no runc, no added capability. The egress
+policy must then explicitly permit port 53 to exactly those resolver addresses
+and nothing wider.
 
 ## Gate status
 
 | Gate | State |
 | --- | --- |
-| 1 repro + runc control, digests, causal evidence | in progress |
+| 1 repro + runc control, digests, causal evidence | **done (aarch64), evidence committed** |
 | 2 DNS + TLS from real shared job namespace, fresh + recreated | not started |
 | 3 doctor/readiness on the real sandbox route + regression tests | not started |
 | 4 real container-side Git delivery, remote hash match | not started |
