@@ -1,4 +1,15 @@
-# Cashu/CDK specialist seat — runbook
+# Cashu/CDK specialist seat — runbook (HISTORICAL — first round, 2026-09-08/09)
+
+> ⚠️ **Superseded for operations. Do not follow this file to deploy or start the seat.**
+> Use **`RUNBOOK-ADDENDUM.md`**, which is the authoritative operational handoff.
+>
+> This file is retained unchanged below as the historical first-round record, because its evidence
+> is real and was accepted. But three things in it are now **stale and wrong to act on**: the image
+> tag `maxplayer-cashu-sandbox:v0.5.8-local`, the image id `eb91a9…`, and the "22/8" acceptance
+> figure. The addendum carries the current immutable image id, its provenance bounds, the non-root
+> bind-mounted replay recipe, and the human-only selected-field seat setup.
+>
+> Nothing below has been edited; only this banner was added.
 
 Everything below was run first-hand on rocky's Mac Studio on 2026-09-08/09 (PDT). Nothing here is
 relayed from a prior note.
