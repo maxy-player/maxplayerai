@@ -768,3 +768,47 @@ and that is deliberate: they are verbatim records of runs that printed it.
 Editing a recorded run's output to look tidier would falsify the record. The
 abbreviation resolves to the full commit above, which a reviewer can confirm
 with `git rev-parse b45f865`.
+
+## Gate 5k — an unsupported daemon default runtime fails CLOSED
+
+Maxie: *"Missing `--runtime` means daemon default, not guaranteed runc; test
+unsupported defaults fail closed."* The correction lands on the product.
+`holder_argv()` deliberately passes **no `--runtime`**, and a test locks it
+there for a sound reason — a runsc holder's namespace is unusable, a job
+joining it sees `lo` only (gate2a). So the design **assumes the daemon default
+is runc**, and nothing in the product verifies that assumption.
+
+Evidence: `evidence/gate5k-v3-PASS-daemon-default-20260910T0345Z.txt`.
+
+| daemon default | listener | holder runtime | job |
+|---|---|---|---|
+| `runc` (supported) | SERVING | runc | `HEALTHY 172.18.0.3` → **REACHED** |
+| `runsc` (unsupported) | SERVING | runsc | `SICK no-address` → **ENETUNREACH** |
+
+`failing_checks=0`: both legs had a *serving* listener, so leg 2's denial is a
+measurement and not a silence. Leg 1 is the positive control — it proves the
+harness can observe reachability at all. `/etc/docker/daemon.json` was restored
+and the default verified back to `runc` by the EXIT trap.
+
+**Verdict: fails CLOSED.** With an unsupported default the job has no address
+and no route, so there is no egress path to contain. That is an availability
+failure, not a containment bypass — the product breaks loudly rather than
+running jobs uncontained.
+
+**The gap that remains, named not fixed:** nothing detects this at startup. A
+seat whose daemon default is not runc will fail every job with no explanatory
+signal. The honest fix is a doctor/readiness row asserting
+`docker info --format '{{.DefaultRuntime}}' == runc`, which is a product change
+outside the minimum containment repair maxie scoped, so it is recorded here for
+the follow-up rather than smuggled into this branch.
+
+### Three attempts, two failures kept
+
+v1 (`gate5k-CONFOUNDED-harness-defect-*.txt`) started the listener with
+`docker exec` into a runsc holder, which runsc refuses; the target never served
+in either leg, including the control. v2
+(`gate5k-v2-daemon-default-runtime-*.txt`) found the root cause: the sandbox
+image has **no `nc` and no `wget`**, so every probe was doomed before it ran.
+Both are committed. They are also the reason the earlier gates were re-checked:
+gate5f/5g/5h/5i never use those tools — they probe with `--entrypoint node` and
+inline JS — so their SERVING and REACHED readings stand.
