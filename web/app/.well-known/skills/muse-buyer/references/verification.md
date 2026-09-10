@@ -22,7 +22,9 @@ Read from the code, not from anyone's report.
 | `max_sats` is a per-job ceiling for the background auto-award, defaulting to `amount_sats` | same, and `crates/maxplayer-core/src/buyer/mod.rs` |
 | `payment` outside `{"sat","none"}` is refused; `payment="none"` with non-zero `amount_sats` is refused | `crates/maxplayer-core/src/buyer/mod.rs` |
 | `get_job` requires `job_id`; `wait_for`/`timeout_secs` are optional and the timeout is capped | `crates/maxplayer/src/mcp.rs` |
-| `collect` requires `job_id`; its order is accept → verify → **pay** → materialise, and it is idempotent by attempt id | `crates/maxplayer-core/src/collect.rs` |
+| `collect` requires `job_id`. **On a paid job** (`payment: "sat"`) its order is accept → verify → **pay** → materialise, and it is idempotent by attempt id | `crates/maxplayer-core/src/collect.rs` |
+| **On a free job** (`payment: "none"`) there is no payment leg and no attempt id: the free bind is verified and materialised, and the response reports `state: "none"`, `attempt_id: null`, `amount_sats: 0` and **no** `spent_total_sats` | `crates/maxplayer-core/src/collect.rs`, `crates/maxplayer-core/src/buyer/mod.rs` |
+| A retry preserves the pinned award rather than re-transmitting it; an **expired** pending attempt is only probed, so the outcome can stay unresolved or come back refused — retrying is not a convergence guarantee | `crates/maxplayer-core/src/buyer/mod.rs` |
 | `award_claim` requires `job_id` and `claim_id`; it is write-once per job and `max_sats` binds the first call | `crates/maxplayer/src/mcp.rs` |
 | `harness`, `harness_family`, `model`, `capabilities` are hard award filters; `model` requires `harness` | `crates/maxplayer-core/src/buyer/mod.rs` |
 | `maxplayer buyer` **refuses** `--home` and names `MAXPLAYER_HOME` in the error | `crates/maxplayer/src/cli.rs`, tests `buyer_serve_with_home_flag_refuses_instead_of_silently_ignoring_it` and `buyer_status_…` |
@@ -62,10 +64,22 @@ node --test web/app/test/muse-buyer-skill.test.mjs
 ```
 
 It checks the shipped bundle and the published examples: a fresh-home install from the
-skill's own manifest with every link resolving locally, no absolute home path or key
-material in any shipped file, every published tool-call example validating against the
-schema read out of this tree's `mcp.rs`, the free-job rule, the manual-award arguments,
-and the discovery index still listing every pre-existing skill.
+skill's own manifest with every link resolving inside the installed copy and no step
+leaving it, no absolute home path or key material in any shipped file, every published
+tool-call example validating against the schema read out of this tree's `mcp.rs`, the
+free-job rule, the manual-award arguments, and the discovery index still listing every
+pre-existing skill.
+
+The schema check is **not** a general JSON-Schema validator. It reads, for each declared
+property, the `type`, the `enum`, the numeric `minimum` and `maximum`, and an array's
+`items` type — resolving a `maximum` written as a named constant (`get_job`'s
+`timeout_secs` cap, `long_poll::WAIT_FOR_CAP_SECS`) from that constant's own source. Any
+other constraint, or a named bound it cannot resolve, makes the check **fail closed**
+rather than pass silently. Its own negative cases are asserted: a wrong type, an
+out-of-enum value, a below-minimum and an above-maximum number, an undeclared field, a
+missing required field, a post with no target mode, a bare `mint-complete` and a broken
+install manifest each have to be caught, so a green run cannot mean the checker looked
+away.
 
 What it does **not** do: post a job, spend a sat, contact a relay or a mint, or install
 anything into a real Muse account.

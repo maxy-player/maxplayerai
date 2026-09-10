@@ -73,20 +73,21 @@ function installManifest() {
   });
 }
 
-/** The companion bundle the skill says must be installed alongside this one. */
-function companionManifest() {
-  const text = skillText();
-  const marker = text.indexOf("<!-- install-manifest -->");
-  const after = text.slice(marker);
-  const fences = [...after.matchAll(/```[a-z]*\n([\s\S]*?)```/g)];
-  assert.ok(fences.length >= 2,
-    "the skill depends on a companion, so the install must map the companion too");
-  return fences[1][1].split("\n").map((line) => line.trim()).filter(Boolean)
-    .map((row) => {
-      const parts = row.split("->").map((part) => part.trim());
-      assert.equal(parts.length, 2, `companion row "${row}" must be a source -> installed mapping`);
-      return { source: parts[0], target: parts[1] };
-    });
+/**
+ * Every markdown link in the shipped bundle, with the file it appears in.
+ * A link to another published skill would make the bundle depend on a page this
+ * install does not carry, so the closure test needs them all, not just relative ones.
+ */
+function bundleLinks() {
+  const out = [];
+  for (const file of walk(BUYER_DIR)) {
+    if (!file.endsWith(".md")) continue;
+    const text = readFileSync(file, "utf8");
+    for (const match of text.matchAll(/\]\(([^)\s]+)\)/g)) {
+      out.push({ file: relative(BUYER_DIR, file), href: match[1] });
+    }
+  }
+  return out;
 }
 
 test("the install manifest names every file that is shipped, and ships every file it names", () => {
@@ -102,34 +103,71 @@ test("the install manifest names every file that is shipped, and ships every fil
   }
 });
 
-test("the manifest creates the uppercase entry point a Muse workspace reads", () => {
-  const rows = installManifest();
+/** Install-layout problems in a set of manifest rows. */
+function manifestProblems(rows) {
+  const problems = [];
   const core = rows.find((row) => row.source === "skill.md");
-  assert.ok(core, "the manifest must say where the core itself is saved");
-  assert.match(core.target, /\/SKILL\.md$/,
-    `the core installs to ${core.target}; the Muse entry point is uppercase SKILL.md`);
+  if (!core) problems.push("the manifest never says where the core itself is saved");
+  else if (!/\/SKILL\.md$/.test(core.target)) {
+    problems.push(`the core installs to ${core.target}, not to an uppercase SKILL.md entry point`);
+  }
   for (const row of rows) {
     if (row.source === "skill.md") continue;
-    assert.equal(row.target.endsWith(row.source), true,
-      `${row.source} must keep its relative layout when installed, got ${row.target}`);
+    if (!row.target.endsWith(row.source)) {
+      problems.push(`${row.source} loses its relative layout when installed as ${row.target}`);
+    }
   }
+  return problems;
+}
+
+test("the install-layout check rejects a manifest that would not load in a Muse workspace", () => {
+  const good = [
+    { source: "skill.md", target: "~/workspace/skills/muse-buyer/SKILL.md" },
+    { source: "references/settlement.md", target: "~/workspace/skills/muse-buyer/references/settlement.md" },
+  ];
+  assert.deepEqual(manifestProblems(good), [], "a correct manifest must pass");
+  assert.equal(manifestProblems([good[1]]).length, 1,
+    "a manifest with no entry point row must be caught");
+  assert.equal(manifestProblems([
+    { source: "skill.md", target: "~/workspace/skills/muse-buyer/skill.md" }, good[1],
+  ]).length, 1, "a lowercase entry point must be caught: a Muse workspace reads SKILL.md");
+  assert.equal(manifestProblems([
+    good[0], { source: "references/settlement.md", target: "~/workspace/skills/settlement.md" },
+  ]).length, 1, "a flattened reference path breaks the relative links and must be caught");
 });
 
-test("the companion the skill depends on is mapped to an installed path, not merely named", () => {
-  const companions = companionManifest();
-  assert.ok(companions.length >= 1, "the required companion must appear in the install");
-  for (const row of companions) {
-    assert.match(row.source, /^\/\.well-known\/skills\/[^/]+\/skill\.md$/,
-      `the companion source ${row.source} must be a fetchable published path`);
-    assert.match(row.target, /\/SKILL\.md$/,
-      `the companion installs to ${row.target}; it needs the same uppercase entry point`);
-    const local = join(SKILLS_DIR, row.source.replace("/.well-known/skills/", ""));
-    assert.equal(existsSync(local), true,
-      `the companion ${row.source} is not published in this tree, so a reader cannot fetch it`);
+test("the manifest creates the uppercase entry point a Muse workspace reads", () => {
+  const problems = manifestProblems(installManifest());
+  assert.deepEqual(problems, [], `shipped install manifest: ${problems.join("; ")}`);
+});
+
+test("the bundle is self-contained: it requires no other skill and defers to none", () => {
+  // The install is exactly this bundle. A row pointing outside it would mean the reader
+  // must fetch and trust a page whose instructions this gate never checks.
+  for (const row of installManifest()) {
+    assert.equal(row.source.startsWith("/"), false,
+      `manifest row ${row.source} installs a file from outside this bundle`);
+    assert.equal(existsSync(join(BUYER_DIR, row.source)), true,
+      `manifest row ${row.source} is not part of this bundle`);
   }
-  // And the prose must give an absolute way to fetch it, not just a repo path.
-  assert.match(skillText(), /https?:\/\/[^\s)]+buyer-operate/,
-    "an empty-home reader needs a resolvable location for the companion, not a bare name");
+  // No shipped file may link to, or tell the reader to install, another skill.
+  for (const { file, href } of bundleLinks()) {
+    assert.equal(/\.well-known\/skills\//.test(href), false,
+      `${file} links to another published skill (${href}), which this install does not carry`);
+  }
+  const bundle = walk(BUYER_DIR).filter((file) => file.endsWith(".md"))
+    .map((file) => readFileSync(file, "utf8")).join("\n");
+  for (const name of ["buyer-operate", "seller-operate", "debug-buying"]) {
+    const mentions = bundle.split("\n").filter((line) => line.includes(name)
+      && !line.startsWith("description:"));
+    assert.deepEqual(mentions, [],
+      `${name} is named as a dependency or handoff, but nothing installs it: ${mentions[0]}`);
+  }
+  // And the core must say so, so a reader does not go looking for a missing page.
+  assert.match(skillText().replace(/\s+/g, " "), /self-contained/i,
+    "the core must state that the install needs no other skill");
+  assert.match(skillText().replace(/\s+/g, " "), /this bundle governs|takes precedence/i,
+    "where other buyer material disagrees, the core must say which instruction wins");
 });
 
 test("a fresh-home install carries every link the skill follows, with nothing left behind", () => {
@@ -145,9 +183,6 @@ test("a fresh-home install carries every link the skill follows, with nothing le
   for (const row of installManifest()) {
     const written = place(row.target, join(BUYER_DIR, row.source));
     if (row.source === "skill.md") installedCore = written;
-  }
-  for (const row of companionManifest()) {
-    place(row.target, join(SKILLS_DIR, row.source.replace("/.well-known/skills/", "")));
   }
   assert.ok(installedCore && existsSync(installedCore),
     "the install must produce the entry point the manifest promises");
@@ -205,26 +240,58 @@ test("every version the bundle states equals this tree's version, with no stale 
   const version = /^version\s*=\s*"([0-9.]+)"/m.exec(cargo)[1];
   assert.match(skillText(), new RegExp(`\\b${version.replace(/\./g, "\\.")}\\b`),
     `the core must pin this tree's version (${version})`);
-  // Any OTHER maxplayer version stated anywhere in the bundle is stale by construction,
-  // so a future bump turns a forgotten literal red instead of leaving it green.
+  // EVERY version stated anywhere in the bundle must be this tree's, unless that same
+  // statement labels itself a historical field report. The exemption is bound to the
+  // matched line, so one labelled Tier-2 line cannot license a stale claim elsewhere.
+  let checked = 0;
   for (const file of walk(BUYER_DIR)) {
-    const text = readFileSync(file, "utf8");
-    for (const match of text.matchAll(/\bmaxplayer[^\n]{0,40}?\b(\d+\.\d+\.\d+)\b|\bpinned[^\n]{0,30}?\b(\d+\.\d+\.\d+)\b/gi)) {
-      const stated = match[1] || match[2];
-      if (stated === version) continue;
-      // A labelled field report about a different version is allowed to name it.
-      const line = text.split("\n").find((candidate) => candidate.includes(stated)) || "";
-      assert.match(line, /field[- ]report|Tier 2|different version|0\.5\.7/i,
-        `${relative(root, file)} states version ${stated}, which is not this tree's ${version}: ${line.trim()}`);
+    const lines = readFileSync(file, "utf8").split("\n");
+    lines.forEach((line, index) => {
+      for (const match of line.matchAll(/\b(\d+\.\d+\.\d+)\b/g)) {
+        const stated = match[1];
+        checked += 1;
+        if (stated === version) continue;
+        assert.match(line, /field[- ]report|Tier 2/i,
+          `${relative(root, file)}:${index + 1} states version ${stated}, not this tree's `
+          + `${version}, and does not label itself a field report: ${line.trim()}`);
+      }
+    });
+  }
+  assert.ok(checked > 0, "no version statement was found to check; the scan is broken");
+});
+
+/** Funding-instruction problems in a piece of prose, per wallet_cli.rs's real CLI. */
+function fundingProblems(text) {
+  const problems = [];
+  for (const match of text.matchAll(/maxplayer wallet mint-complete([^\n]*)/g)) {
+    const rest = match[1];
+    // The first token after the subcommand must be the positional quote id, not a flag.
+    const first = rest.trim().split(/\s+/)[0] || "";
+    if (!first || first.startsWith("--")) {
+      problems.push(`mint-complete shown without its positional quote id: ${match[0].trim()}`);
     }
   }
+  if (!/quote_id/.test(text)) problems.push("the printed quote_id is never named");
+  return problems;
+}
+
+test("the funding check rejects a bare mint-complete and accepts the shipped one", () => {
+  assert.equal(fundingProblems(
+    'maxplayer wallet mint-complete --home "$MAXPLAYER_HOME"\nquote_id\n').length, 1,
+    "a mint-complete with only flags exits USAGE_ERROR and must be caught");
+  assert.equal(fundingProblems("maxplayer wallet mint-complete\nquote_id\n").length, 1,
+    "a mint-complete with no argument at all must be caught");
+  assert.equal(fundingProblems("maxplayer wallet setup 500\n").length, 1,
+    "prose that never names the printed quote_id must be caught");
+  assert.deepEqual(fundingProblems(
+    'maxplayer wallet mint-complete <quote_id> --home "$H"\n'), [],
+    "the correct positional form must pass");
 });
 
 test("the funding completion command carries the quote id the setup output prints", () => {
   const text = skillText();
-  assert.match(text, /mint-complete\s+<?quote_id>?/,
-    "mint-complete takes a positional quote id; showing it bare teaches an unusable command");
-  assert.match(text, /quote_id/, "the reader must be told to keep the id setup prints");
+  const problems = fundingProblems(text);
+  assert.deepEqual(problems, [], `shipped funding instructions: ${problems.join("; ")}`);
   const wallet = readFileSync(join(REPO, "crates", "maxplayer", "src", "wallet_cli.rs"), "utf8");
   // The file carries a feature-gated stub of the same name; the real implementation is
   // the one compiled with the wallet feature, so take the last definition.
@@ -337,6 +404,32 @@ function braceBlock(text, open) {
   assert.fail("unbalanced schema block in mcp.rs");
 }
 
+/** The crate sources a named schema bound may be defined in. */
+const CONSTANT_SOURCES = [
+  join(REPO, "crates", "maxplayer-core", "src", "long_poll.rs"),
+  join(REPO, "crates", "maxplayer-core", "src", "buyer", "mod.rs"),
+  join(REPO, "crates", "maxplayer", "src", "mcp.rs"),
+];
+
+/**
+ * A numeric schema bound, whether the source writes it as a literal or as a named
+ * constant such as `long_poll::WAIT_FOR_CAP_SECS`. A named bound is looked up in the
+ * crate that defines it; an unresolvable name FAILS the gate instead of silently
+ * becoming null, because a dropped bound is how an example above the real cap goes green.
+ */
+function resolveBound(tool, property, kind, token) {
+  if (/^[0-9]+$/.test(token)) return Number(token);
+  const constant = token.split("::").pop();
+  for (const file of CONSTANT_SOURCES) {
+    if (!existsSync(file)) continue;
+    const found = new RegExp(`const\\s+${constant}\\s*:\\s*[a-z0-9]+\\s*=\\s*([0-9_]+)`)
+      .exec(readFileSync(file, "utf8"));
+    if (found) return Number(found[1].replace(/_/g, ""));
+  }
+  assert.fail(`${tool}.${property} declares ${kind} = ${token}, which this gate cannot `
+    + "resolve to a number; resolve it or narrow the claim rather than ignoring the bound");
+}
+
 /**
  * One MCP tool's DECLARED schema, read out of the Rust source with the constraints
  * intact — not just the property names. A checker that only knows the names would pass
@@ -366,15 +459,22 @@ function toolSchema(name) {
     }
     const type = /"type":\s*"([a-z]+)"/.exec(body);
     const enumeration = /"enum":\s*\[([^\]]*)\]/.exec(body);
-    const minimum = /"minimum":\s*([0-9]+)/.exec(body);
+    const minimum = /"minimum":\s*([A-Za-z0-9_:]+)/.exec(body);
     const maximum = /"maximum":\s*([A-Za-z0-9_:]+)/.exec(body);
+    const itemsAt = body.indexOf('"items"');
+    const itemsType = itemsAt === -1
+      ? null
+      : /"type":\s*"([a-z]+)"/.exec(braceBlock(body, body.indexOf("{", itemsAt)));
+    // A bound written as a Rust constant is still a real bound. Resolve it from the
+    // source that defines it; if it cannot be resolved, fail closed rather than drop it.
     properties.set(match[1], {
       type: type ? type[1] : null,
       values: enumeration
         ? enumeration[1].split(",").map((part) => part.trim().replace(/"/g, "")).filter(Boolean)
         : null,
-      minimum: minimum ? Number(minimum[1]) : null,
-      maximum: maximum && /^[0-9]+$/.test(maximum[1]) ? Number(maximum[1]) : null,
+      minimum: minimum ? resolveBound(name, match[1], "minimum", minimum[1]) : null,
+      maximum: maximum ? resolveBound(name, match[1], "maximum", maximum[1]) : null,
+      items: itemsType ? itemsType[1] : (itemsAt === -1 ? null : "unresolved"),
     });
   }
   return {
@@ -407,6 +507,17 @@ function schemaProblems(tool, args) {
       problems.push(`${key} must be a boolean, got ${actual}`);
     } else if (declared.type === "array" && actual !== "array") {
       problems.push(`${key} must be an array, got ${actual}`);
+    } else if (declared.type === "array" && Array.isArray(value)) {
+      assert.notEqual(declared.items, "unresolved",
+        `${key} declares an items constraint this gate cannot read; resolve it or narrow the claim`);
+      for (const element of value) {
+        const elementType = Array.isArray(element) ? "array" : typeof element;
+        if (declared.items === "string" && elementType !== "string") {
+          problems.push(`${key} must contain strings, got ${elementType}`);
+        } else if (declared.items === "integer" && !Number.isInteger(element)) {
+          problems.push(`${key} must contain integers, got ${elementType}`);
+        }
+      }
     }
     if (declared.minimum !== null && typeof value === "number" && value < declared.minimum) {
       problems.push(`${key} is below the declared minimum ${declared.minimum}`);
@@ -455,32 +566,76 @@ test("the constraint checker itself rejects the shapes it is meant to catch", ()
   // plausible-looking example makes, and each must be caught.
   const base = { task: "t", output: "text/plain", amount_sats: 100, untargeted: true };
   const cases = [
-    [{ ...base, amount_sats: "100" }, /integer/],
-    [{ ...base, payment: "free" }, /enum/],
-    [{ ...base, untargeted: "yes" }, /boolean/],
-    [{ ...base, nonsense_field: 1 }, /does not declare/],
-    [{ output: "text/plain", amount_sats: 1, untargeted: true }, /required argument task/],
+    ["post_job", { ...base, amount_sats: "100" }, /integer/],
+    ["post_job", { ...base, payment: "free" }, /enum/],
+    ["post_job", { ...base, untargeted: "yes" }, /boolean/],
+    ["post_job", { ...base, nonsense_field: 1 }, /does not declare/],
+    ["post_job", { output: "text/plain", amount_sats: 1, untargeted: true }, /required argument task/],
+    // Bounds, both ends. amount_sats declares minimum 0; get_job's timeout_secs
+    // declares minimum 1 and a maximum written as a named constant.
+    ["post_job", { ...base, amount_sats: -1 }, /below the declared minimum 0/],
+    ["get_job", { job_id: "abc", timeout_secs: 0 }, /below the declared minimum 1/],
+    ["get_job", { job_id: "abc", timeout_secs: 11 }, /above the declared maximum 10/],
+    ["get_job", { job_id: "abc", wait_for: "delivery" }, /enum/],
   ];
-  for (const [args, expected] of cases) {
-    const problems = schemaProblems("post_job", args).join("; ");
+  for (const [tool, args, expected] of cases) {
+    const problems = schemaProblems(tool, args).join("; ");
     assert.match(problems, expected,
-      `the checker passed ${JSON.stringify(args)}, which the declared schema forbids`);
+      `the checker passed ${tool} ${JSON.stringify(args)}, which the declared schema forbids`);
   }
   assert.deepEqual(schemaProblems("post_job", base), [],
     "the checker must still accept a valid call");
+  assert.deepEqual(schemaProblems("get_job", { job_id: "abc", timeout_secs: 10 }), [],
+    "the value exactly at the resolved cap is legal and must not be flagged");
+});
+
+test("the long-poll cap is resolved from the constant the schema names, not dropped", () => {
+  // mcp.rs writes get_job.timeout_secs.maximum as long_poll::WAIT_FOR_CAP_SECS. A gate
+  // that keeps only digit literals would treat that as unbounded, and an example above
+  // the real cap would pass while the server refuses it.
+  const cap = toolSchema("get_job").properties.get("timeout_secs").maximum;
+  const longPoll = readFileSync(
+    join(REPO, "crates", "maxplayer-core", "src", "long_poll.rs"), "utf8");
+  const declared = /const\s+WAIT_FOR_CAP_SECS\s*:\s*[a-z0-9]+\s*=\s*([0-9_]+)/.exec(longPoll);
+  assert.ok(declared, "WAIT_FOR_CAP_SECS is gone from this tree; the resolver is stale");
+  assert.equal(cap, Number(declared[1].replace(/_/g, "")),
+    "the gate's cap must equal the constant this tree defines");
+  assert.equal(typeof cap, "number", "a named bound must resolve to a number, never to null");
+  // An unresolvable name must fail closed rather than pass.
+  assert.throws(() => resolveBound("get_job", "timeout_secs", "maximum", "nope::NO_SUCH_CONST"),
+    /cannot resolve/, "an unresolvable bound must fail the gate, not be ignored");
+});
+
+/** Target-mode problems with one post_job argument set, per job_lifecycle.rs's rule. */
+function targetProblems(args) {
+  const targeted = typeof args.seller_pubkey === "string" && args.seller_pubkey.length > 0;
+  const open = args.untargeted === true;
+  if (!targeted && !open) return ["neither seller_pubkey nor untargeted=true: refused"];
+  if (targeted && open) return ["both target modes at once: refused"];
+  return [];
+}
+
+test("the target-mode check rejects a post with no target, and one with both", () => {
+  const base = { task: "t", output: "text/plain", amount_sats: 1 };
+  assert.deepEqual(targetProblems({ ...base }).length, 1,
+    "a post with no target mode must be caught; the schema's three required fields accept it");
+  assert.deepEqual(targetProblems({ ...base, seller_pubkey: "ab", untargeted: true }).length, 1,
+    "a post setting both target modes must be caught");
+  assert.deepEqual(targetProblems({ ...base, seller_pubkey: "ab" }), [],
+    "a targeted post is legal");
+  assert.deepEqual(targetProblems({ ...base, untargeted: true }), [],
+    "an open offer is legal");
+  // A blank pubkey is not a target either.
+  assert.equal(targetProblems({ ...base, seller_pubkey: "" }).length, 1,
+    "a blank seller_pubkey is not a target mode");
 });
 
 test("every post_job example picks a target mode, which the schema alone cannot enforce", () => {
   const posts = publishedExamples().filter((one) => one.tool === "post_job");
   assert.ok(posts.length >= 2, "both the paid and the free route must be shown");
   for (const post of posts) {
-    const args = post.arguments || {};
-    const targeted = typeof args.seller_pubkey === "string" && args.seller_pubkey.length > 0;
-    const open = args.untargeted === true;
-    assert.ok(targeted || open,
-      "a post with neither seller_pubkey nor untargeted=true is refused, whatever the schema accepts");
-    assert.equal(targeted && open, false,
-      "untargeted=true cannot also set seller_pubkey; that combination is refused");
+    const problems = targetProblems(post.arguments || {});
+    assert.deepEqual(problems, [], `published post_job example: ${problems.join("; ")}`);
   }
   // The rule is enforced in the source, not in the MCP schema: prove it is still there.
   const lifecycle = readFileSync(
