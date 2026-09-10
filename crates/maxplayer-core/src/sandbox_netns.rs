@@ -205,13 +205,24 @@ pub fn holder_argv(
 /// `--rm` is safe here specifically because the caller captures stdout and stderr before the container
 /// is removed; the evidence is in hand before the container is gone.
 pub fn sidecar_argv(holder: &NetnsHolder, image: &str) -> Vec<String> {
+    sidecar_argv_for(holder.name(), image)
+}
+
+/// [`sidecar_argv`] for a namespace addressed by NAME.
+///
+/// Exists for the doctor's delivery-route preflight, which builds and tears down its own throwaway
+/// namespace and so holds a name rather than a [`NetnsHolder`] guard. Taking the guard there would
+/// hand out a `Drop` that destroys a namespace the caller did not create. The argv is the same one
+/// the awarded-job path uses because it IS that argv — a preflight rendering its own would test a
+/// sidecar production never runs.
+pub fn sidecar_argv_for(holder: &str, image: &str) -> Vec<String> {
     [
         "docker",
         "run",
         "--rm",
         "--interactive",
         "--network",
-        &holder.network_mode(),
+        &NetnsHolder::network_mode_for(holder),
         "--cap-drop",
         "ALL",
         "--cap-add",
