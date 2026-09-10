@@ -1765,7 +1765,7 @@ mod tests {
     #[test]
     fn a_semantically_different_exception_with_the_same_projection_is_refused() {
         let policy = policy_with_resolvers(&["10.0.0.2", "2001:4860:4860::8888"]);
-        let cases: [(&str, &str); 6] = [
+        let cases: [(&str, &str); 8] = [
             // The destination inverted: port 53 open to everything that is NOT the resolver.
             ("inverted destination", "-A OUTPUT ! -d ADDR -p udp -m udp --dport 53 -j ACCEPT"),
             // The port inverted: every port on the resolver host EXCEPT the one it answers on.
@@ -1778,8 +1778,15 @@ mod tests {
                 "extra state match",
                 "-A OUTPUT -d ADDR -p udp -m udp -m conntrack --ctstate NEW,ESTABLISHED --dport 53 -j ACCEPT",
             ),
+            // An outbound interface nobody rendered: the exception only applies to packets leaving
+            // by that device, so on any other path the job's DNS is dropped — and if the device is
+            // one the policy never reasoned about, the reach it grants was never reviewed.
+            ("extra out interface", "-A OUTPUT -d ADDR -o eth0 -p udp -m udp --dport 53 -j ACCEPT"),
             // Two destinations in one rule: not output this plan could have produced.
             ("duplicate destination", "-A OUTPUT -d ADDR -d 8.8.8.8/32 -p udp -m udp --dport 53 -j ACCEPT"),
+            // Two ports in one rule. Kept separate from the duplicate destination because the
+            // field a reader trusts most is the one it is easiest to read twice and report once.
+            ("duplicate port", "-A OUTPUT -d ADDR -p udp -m udp --dport 53 --dport 5353 -j ACCEPT"),
             // The right rule in the wrong chain: it does not filter this job's egress at all.
             ("wrong chain", "-A FORWARD -d ADDR -p udp -m udp --dport 53 -j ACCEPT"),
         ];
@@ -1817,35 +1824,62 @@ mod tests {
 
     /// The transport, the prefix length and the port are each load-bearing on their own, and each is
     /// wrong in a way a count cannot see.
+    ///
+    /// Both families: the v6 chain is read back by a different binary and carries no proxy pinhole,
+    /// so a v4-only proof of this leaves the half nobody looks at unproven. The widened prefix is
+    /// per-family on purpose — a `/24` and a `/64` are the same mistake at very different scale.
     #[test]
     fn a_wrong_transport_prefix_or_port_in_an_exception_is_refused() {
-        let policy = policy_with_resolvers(&["10.0.0.2"]);
-        let good = normalized_readback(&policy, Family::V4);
-        let rendered = "-A OUTPUT -d 10.0.0.2/32 -p udp -m udp --dport 53 -j ACCEPT";
+        let policy = policy_with_resolvers(&["10.0.0.2", "2001:4860:4860::8888"]);
 
-        // A `/24` that covers the resolver: the job resolves, and it also reaches 254 other hosts on
-        // that LAN before the range DROP below would have stopped it.
-        let widened_prefix =
-            good.replace(rendered, "-A OUTPUT -d 10.0.0.0/24 -p udp -m udp --dport 53 -j ACCEPT");
-        let prefix = policy
-            .verify_readback(Family::V4, &widened_prefix)
-            .expect_err("a /24 is not a /32");
-        assert!(prefix.contains("10.0.0.2/32"), "{prefix}");
+        for (family, host, widened) in [
+            // A `/24` that covers the resolver: the job resolves, and it also reaches 254 other
+            // hosts on that LAN before the range DROP below would have stopped it.
+            (Family::V4, "10.0.0.2/32", "10.0.0.0/24"),
+            // The v6 equivalent, and a whole /64 of them.
+            (Family::V6, "2001:4860:4860::8888/128", "2001:4860:4860::/64"),
+        ] {
+            let good = normalized_readback(&policy, family);
+            let rendered = format!("-A OUTPUT -d {host} -p udp -m udp --dport 53 -j ACCEPT");
+            assert!(
+                good.contains(&rendered),
+                "{}: the fixture must contain the rule being replaced",
+                family.binary()
+            );
 
-        // sctp on port 53: the projection sees a port-53 ACCEPT to the right host.
-        let wrong_transport =
-            good.replace(rendered, "-A OUTPUT -d 10.0.0.2/32 -p sctp --dport 53 -j ACCEPT");
-        let transport = policy
-            .verify_readback(Family::V4, &wrong_transport)
-            .expect_err("sctp is not a transport this policy opens");
-        assert!(transport.contains("never rendered"), "{transport}");
+            let widened_prefix = good.replace(
+                &rendered,
+                &format!("-A OUTPUT -d {widened} -p udp -m udp --dport 53 -j ACCEPT"),
+            );
+            let prefix = policy
+                .verify_readback(family, &widened_prefix)
+                .expect_err("a range is not a host");
+            assert!(prefix.contains(host), "{}: {prefix}", family.binary());
 
-        // Port 5353 — mDNS, not DNS, and not what was rendered.
-        let wrong_port =
-            good.replace(rendered, "-A OUTPUT -d 10.0.0.2/32 -p udp -m udp --dport 5353 -j ACCEPT");
-        let port =
-            policy.verify_readback(Family::V4, &wrong_port).expect_err("5353 is not 53");
-        assert!(port.contains("5353"), "{port}");
+            // sctp on port 53: the projection sees a port-53 ACCEPT to the right host.
+            let wrong_transport = good.replace(
+                &rendered,
+                &format!("-A OUTPUT -d {host} -p sctp --dport 53 -j ACCEPT"),
+            );
+            let transport = policy
+                .verify_readback(family, &wrong_transport)
+                .expect_err("sctp is not a transport this policy opens");
+            assert!(
+                transport.contains("never rendered"),
+                "{}: {transport}",
+                family.binary()
+            );
+
+            // Port 5353 — mDNS, not DNS, and not what was rendered.
+            let wrong_port = good.replace(
+                &rendered,
+                &format!("-A OUTPUT -d {host} -p udp -m udp --dport 5353 -j ACCEPT"),
+            );
+            let port = policy
+                .verify_readback(family, &wrong_port)
+                .expect_err("5353 is not 53");
+            assert!(port.contains("5353"), "{}: {port}", family.binary());
+        }
     }
 
     /// An exception duplicated: the count is wrong, and if something else is missing to make room
@@ -1866,6 +1900,53 @@ mod tests {
         let refused = policy.verify_readback(Family::V4, &doubled).expect_err("udp twice");
         assert!(refused.contains("tcp port-53 exception"), "{refused}");
         assert!(refused.contains("never rendered"), "{refused}");
+    }
+
+    /// The v6 half of the two count-preserving shapes that a v4-only proof leaves open: an extra
+    /// copy of a rendered exception, and a correct exception REORDERED below the DROP that covers
+    /// its address.
+    ///
+    /// Separate from the v4 tests rather than folded into them because the v6 chain is read back by
+    /// its own binary, carries no proxy pinhole and no metadata DROP, and is the one an edit is
+    /// likelier to break unnoticed.
+    #[test]
+    fn an_extra_copy_or_a_sunk_exception_is_refused_in_the_v6_chain() {
+        let policy = policy_with_resolvers(&["2001:4860:4860::8888"]);
+        let good = normalized_readback(&policy, Family::V6);
+        let udp = "-A OUTPUT -d 2001:4860:4860::8888/128 -p udp -m udp --dport 53 -j ACCEPT";
+        let tcp = "-A OUTPUT -d 2001:4860:4860::8888/128 -p tcp -m tcp --dport 53 -j ACCEPT";
+        assert!(good.contains(udp) && good.contains(tcp), "the fixture must hold both: {good}");
+
+        // UDP twice in place of TCP: same total, same ACCEPT total, one transport gains a rule it
+        // does not need while the other loses the one it does.
+        let doubled = good.replace(tcp, udp);
+        assert_eq!(ReadbackRule::parse_all(&doubled).len(), policy.rule_count(Family::V6));
+        let refused = policy
+            .verify_readback(Family::V6, &doubled)
+            .expect_err("udp twice in the v6 chain");
+        assert!(refused.contains("tcp port-53 exception"), "{refused}");
+        assert!(refused.contains("never rendered"), "{refused}");
+
+        // Both exceptions present and correct, the UDP one moved below the first DROP. iptables
+        // takes the first match, so it is present, countable, and doing nothing.
+        let mut lines: Vec<&str> = good.lines().collect();
+        let at = lines.iter().position(|line| *line == udp).expect("the udp exception");
+        lines.remove(at);
+        let first_drop = lines
+            .iter()
+            .position(|line| line.contains("-j DROP"))
+            .expect("the v6 chain must carry a DROP, or there is nothing to sink below");
+        lines.insert(first_drop + 1, udp);
+        let sunk = lines.join("\n");
+        assert_eq!(
+            ReadbackRule::parse_all(&sunk).len(),
+            policy.rule_count(Family::V6),
+            "reordering must not change the count, or the count check is what catches it"
+        );
+        let below = policy
+            .verify_readback(Family::V6, &sunk)
+            .expect_err("an exception below the range DROP is inert");
+        assert!(below.contains("below the first range DROP"), "{below}");
     }
 
     /// **A resolver that is also the gateway, with a proxy range of `53-53`, renders two identical
