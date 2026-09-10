@@ -1,6 +1,6 @@
 # 04 — Token, grant and custody contract
 
-> ## ⚠ Part I is SUPERSEDED. Parts II onward stand.
+> ## ⚠ Part I is SUPERSEDED. Parts II–VII are superseded in part — see the list below before relying on any of them.
 >
 > Governing document: `v2/maxie/runs/seller-tool-scope-correction-20260909.md`
 > (sha256 `683da09559bfc12631062c84ecdf4080778c4b31a3e7c16b3a49a7aa89dc64c3`), which overrides
@@ -20,12 +20,28 @@
 > creates a per-job endpoint and directory, `detach_job` removes them and explicitly reports
 > `tool_still_enrolled: true`. Neither issues, meters nor expires anything.
 >
-> **Still live in this document:** the trust boundary immediately below, and the custody,
-> containment, persistence and re-enrolment obligations in Parts II onward. Those were never
-> about awards and are the parts the implementation actually honours.
+> **Still live in this document — exactly these, and nothing more:** the trust boundary
+> immediately below; enrollment and credential custody (Part IV); job-directory confinement;
+> session persistence across restart; and re-enrolment after vendor-side revocation.
 >
-> Implemented in `crates/maxplayer-tool-kit`; demonstrated in `docker/demo.sh`, whose evidence
-> shows one login serving two sequential jobs and surviving a daemon restart.
+> **Also withdrawn, beyond Part I.** An earlier version of this banner said "Parts II onward
+> stand", which was wrong: those parts carry grant and marketplace machinery that contradicts
+> per-seller enrolment. Specifically withdrawn, and marked in place below — holder admission
+> rows and marketplace reconciliation as authority (Part II); holder-enforced grant expiry, and
+> "a missing deadline is expired" (Part II); per-call token verification against an `admitted`
+> row (Part III); per-job durable budgets and reservations (Part VI); and the rule that only a
+> **newly authorized** job may run after re-enrolment (Part VII), which contradicts the
+> governing same-job recovery requirement.
+>
+> Per the fix order, these are **not to be implemented**. They are withdrawn requirements, not
+> a backlog.
+>
+> **Implementation status, stated precisely.** `crates/maxplayer-tool-kit` implements the
+> per-seller enrolment lifecycle, and its persistence and re-enrolment behaviour is exercised
+> by tests. Two claims that appeared here earlier are corrected: file confinement is **not**
+> yet safe against a buyer replacing a checked path between validation and use (advisor F2), and
+> the container evidence for credential absence and for the stop/restore lifecycle is **under
+> repair** (advisor F1, F3) and must not be cited as established.
 
 Paper artifact. **PROPOSED** throughout. Anchored in plan v3 §4, and revised against the
 stage-0 verdict findings F1, F2 and F6.
@@ -152,6 +168,10 @@ Three consequences, binding:
    **expired**, not live.
 3. A marketplace resume never reopens a grant. Only a fresh authorized open does.
 
+> **WITHDRAWN (all three).** There is no grant to expire and no admission row to be
+> authoritative over. The tool is enrolled while the seller daemon runs. Retained as a record of
+> the withdrawn model only — do not implement.
+
 ### Commit point and ordering
 
 Close has one commit point: the monotonic transition of `state` to `closing` with a
@@ -216,6 +236,12 @@ calls; it does not undo a send, a charge or a publish the vendor accepted. Count
 *admission*, not consequence. Disclosed to the seller; never described as mitigated.
 
 ## Part III — Token verification
+
+> **WITHDRAWN in full.** No per-job token exists, so there is nothing to verify per call. What
+> survives of this section's intent is enforced differently and is implemented: a call is
+> validated against the seller's declared operation grammar, and confined to the job directory
+> belonging to the endpoint the call arrived on — job identity comes from the listener, never
+> from the request body. Do not implement the checks below.
 
 The token binds **holder, party, service, job ID, grant version, expiry**.
 
@@ -287,6 +313,10 @@ Seller hosting is the initial scope; platform-hosted credential custody is defer
 
 ## Part VI — Budgets
 
+> **WITHDRAWN.** Per-job durable budgets, reservations and refunds all presuppose a per-job
+> grant. The one limit that survives is a per-call output ceiling, which is enforced and tested.
+> Do not implement durable per-job counters.
+
 Reserve calls, items and bytes **atomically before execution**, from profile-declared **maxima**.
 Refuse unbounded operations. Counters survive restart, do not reset on renewal, and reset only
 for a separately authorized new job. Refund only reservations **proved** unused.
@@ -300,3 +330,9 @@ On vendor auth expiry mid-operation the holder returns credential-expired, marks
 unhealthy, queues **one** secret-free seller notice, pauses registration and refuses new work.
 Recovery is protected re-enrollment plus a successful health check, after which a **newly
 authorized** job may run. The failed job stays closed. **No write auto-replays.**
+
+> **PARTLY WITHDRAWN.** Live and implemented: on vendor auth failure the holder marks itself
+> unhealthy, fails closed, and recovers through re-enrolment plus a health check. Withdrawn: the
+> restriction to a **newly authorized** job afterwards — it contradicts the governing same-job
+> recovery requirement, since the same job continues against the same seller-level enrolment.
+> "No write auto-replays" stands.
