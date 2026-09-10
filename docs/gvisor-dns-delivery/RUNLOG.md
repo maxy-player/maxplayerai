@@ -385,3 +385,65 @@ the same time.
 All four policies torn down by their rendered inverse; the host kernel went
 from 17 rules each to 0, and `DOCKER-USER`/`INPUT` returned to depth 1, where
 they started.
+
+## Gate 6 — reproducibility, and what this branch does NOT prove
+
+`scripts/run-all-gates.sh` runs the set bounded, writes each gate's output to
+its own evidence file, and prints a verdict per gate. Proof run (aarch64,
+gate1 + gate5f): `ALL GATES: PASS` in 61s —
+`evidence/run-all-gates-proof-summary-20260910T0316Z.txt`. I checked the
+per-gate logs rather than the summary line, because 61s looked too fast for a
+suite that had taken minutes before; both are complete runs, the speed being
+warm images. A full five-gate run through the runner was not executed in one
+sitting; gates 1, 2, 4, 5 and 5f each have their own full-run evidence file
+from a direct run, and the runner is proved on two of them. **Saying which is
+the point of this section.**
+
+### Limitations — each one a thing a reader should not assume
+1. **x86_64 is OUTSTANDING.** Every result here is aarch64, kernel 6.8.0-134,
+   docker 29.1.3, runsc **release-20260817.0**. The host is arm64 and runsc
+   release-20260831.0 ships no aarch64 artifact, so neither a newer runsc nor
+   a different architecture was tested. gVisor's netstack behaviour is the
+   whole subject of this branch, and it is exactly the kind of thing that can
+   differ per platform.
+2. **`br_netfilter` is ABSENT on this host**, and that shaped the measurements.
+   It is why a same-bridge peer is reachable and unbindable here. Where it is
+   enabled, switched frames do enter the chains and that leg may read
+   differently. The per-job network makes the product correct either way — with
+   no on-link peer, the case does not arise — but the MEASUREMENT is
+   host-specific and should not be quoted as universal.
+3. **Host-side IPv6 is not rendered, and v6 denial for a gVisor job is
+   UNPROVEN.** `HostPolicy` deliberately emits no ip6tables rules because
+   `DOCKER-USER` is not guaranteed to exist in the v6 table. The netns plan does
+   cover v6 and its readback is verified per family — but gate5b showed the
+   netns plan does not bind a runsc job. In this VM the job namespace has no
+   global v6 address, so nothing was denied and nothing was proved. **On a host
+   whose jobs do get one, this is an open hole.**
+4. **The container-side git push uses an unauthenticated disposable remote, by
+   design.** A credentialed push would mean putting a secret inside a
+   stranger's sandbox. Gate 4 therefore proves the network path for a write,
+   not an authenticated push.
+5. **The runtime boundary is baseline, not new — but it deserves review.**
+   Holder, sidecar and the host-rule applier carry no `--runtime` and inherit
+   the daemon default; only the JOB carries the configured runtime. That is
+   true of `origin/main` too: `sandbox_netns.rs` there has no `--runtime` in
+   `holder_argv`/`sidecar_argv`, and `seller_exec.rs` `run_argv` (lines
+   681–687) emits it for the job alone. This branch adds the test that pins it
+   (`the_containment_plane_never_carries_the_jobs_runtime`). An operator who
+   sets `default-runtime=runsc` gets a runsc holder; measured, that fails
+   CLOSED (the job sees `lo` only). None of the three helpers executes any
+   seller- or task-controlled input: the holder is `--entrypoint sleep … infinity`,
+   the other two read a plan rendered in Rust.
+6. **The `--network host` rule applier is the one privileged surface this
+   branch adds.** It must be `--network host` because the rules have to land in
+   the root namespace's chains, which is the only place a gVisor job's packets
+   can be seen. It runs our own image, on a Rust-rendered plan, for
+   milliseconds, and it is gone before the job starts; the job never touches
+   it. That is my judgement and it should not be only mine — **advisor review
+   is requested on this specifically.**
+
+### Retractions kept in the record
+Gate 2's "metadata denied (ENETUNREACH)" line is **withdrawn**: nothing listens
+there, so absence was read as enforcement. Gate5c's first run is **VOID**
+(namespace reuse under gVisor) and its file is kept marked VOID. The first
+gate 5 script FAILED and that evidence is kept beside the passing rewrite.
