@@ -73,6 +73,14 @@ const NON_DNS_PORT: &str = "8080";
 
 const RESOLVER_IMAGE: &str = "mxdns-resolver:local";
 const PROBE_IMAGE: &str = "mxdns-probe:local";
+/// The container runtime the payload must actually run under. The whole DNS problem this module
+/// exists for — docker's embedded resolver at `127.0.0.11` never answering — is a gVisor property,
+/// so a result measured under `runc` is not a result about it.
+///
+/// The netns holder and the netfilter sidecar are deliberately NOT bound to it: `holder_argv` and
+/// `sidecar_argv` take no runtime, so on a gVisor seat the sandboxed job joins a `runc` holder's
+/// namespace. That asymmetry is the product's own, and it is the configuration under test.
+const RUNTIME: &str = "runsc";
 
 const SVC_NET: &str = "mxdns-gate-svc";
 const PUB_NET: &str = "mxdns-gate-pub";
@@ -190,7 +198,12 @@ fn config_on(network: &str, dns_servers: Vec<String>) -> SandboxConfig {
         launcher: Vec::new(),
         image: Some(PROBE_IMAGE.to_owned()),
         forward_env: Vec::new(),
-        runtime: None,
+        // ⛔ NOT `None`. An unset runtime emits no `--runtime` flag at all, so the payload lands on
+        // whatever the daemon defaults to — `runc` on this host. Every claim this module makes is
+        // about the gVisor seat, and a gate that silently measured `runc` would be answering a
+        // question nobody asked. The binding is asserted against the running container in
+        // `payload_runtime`, not trusted because it is written here.
+        runtime: Some(RUNTIME.to_owned()),
         network: Some(network.to_owned()),
         proxy_port_range: None,
         file_credentials: Vec::new(),
@@ -218,6 +231,10 @@ impl Workdir {
     }
     fn path(&self) -> &Path {
         &self.0
+    }
+    /// The job id the product derives the holder and payload container names from.
+    fn job(&self) -> String {
+        self.0.file_name().expect("a job id").to_string_lossy().into_owned()
     }
 }
 
@@ -290,9 +307,27 @@ fn field<'a>(stdout: &'a str, key: &str) -> &'a str {
 /// The payload every containment gate runs: it reports what its own resolver file is, whether that
 /// file is writable, what it can resolve over each family's transport, and which of four TCP
 /// destinations it can reach.
+/// The runtime the payload container ACTUALLY ran under, read back out of docker after the fact.
+///
+/// The launch argv is what we asked for; this is what the daemon did. They are not the same claim,
+/// and one gate in this module already shipped a wrong headline because only the first was checked.
+fn payload_runtime(job: &str) -> (String, String) {
+    let name = format!("maxplayer-job-{job}");
+    let (ok, out, err) = docker(&[
+        "inspect",
+        "--format",
+        "{{.HostConfig.Runtime}} {{.HostConfig.NetworkMode}}",
+        &name,
+    ]);
+    assert!(ok, "could not inspect the payload container {name}: {err}");
+    let (runtime, network) = out.split_once(' ').unwrap_or((out.as_str(), ""));
+    (runtime.to_owned(), network.to_owned())
+}
+
 fn probe_script() -> String {
     format!(
         "set -u; \
+         echo KERN=$(dmesg 2>/dev/null | head -1 | tr -d '\\n'); \
          echo SHA=$(sha256sum /etc/resolv.conf | cut -d' ' -f1); \
          if echo tampered >> /etc/resolv.conf 2>/dev/null; then echo RO=no; else echo RO=yes; fi; \
          echo DEFAULT=$(dig +short +time=2 +tries=1 A {DNS_NAME} | head -1); \
@@ -373,6 +408,38 @@ async fn a_contained_job_resolves_over_private_v4_and_v6_and_the_rest_of_that_sp
         Some(resolv.as_path()),
         &probe_script(),
     );
+    // The runtime binding, asserted against the RUNNING container before anything else is read from
+    // it. Every other assertion below is a claim about a gVisor job, and none of them means that
+    // unless this one holds.
+    let (runtime, network) = payload_runtime(&workdir.job());
+    assert_eq!(
+        runtime, RUNTIME,
+        "the payload ran under {runtime}, not {RUNTIME} — these are not gVisor results"
+    );
+    let kern = field(&out, "KERN");
+    assert!(
+        kern.contains("gVisor"),
+        "the payload's own kernel does not identify as gVisor ({kern}) — docker reported \
+         runtime={runtime}, and the two must agree before any result here is a gVisor result"
+    );
+    // The payload must be IN the namespace the rules are in. Without this, a reachable denied
+    // address would be explained by the job never having joined the holder at all, which is a
+    // different defect with a different fix.
+    //
+    // `NetworkMode` reports the RESOLVED container id, not the name the argv asked for, so the
+    // holder name is resolved to its id before comparing. Comparing against the name fails even
+    // when the join is correct.
+    let (ok, holder_id, err) = docker(&["inspect", "--format", "{{.Id}}", &holder]);
+    assert!(ok, "could not resolve the holder's id: {err}");
+    assert_eq!(
+        network,
+        format!("container:{holder_id}"),
+        "the payload did not join the holder's namespace (holder {holder} = {holder_id})"
+    );
+    println!("payload runtime={runtime} network={network}");
+    println!("payload kernel banner={kern}");
+    println!("--- iptables readback of the namespace the payload is in ---\n{v4_rules}");
+
     assert_eq!(field(&out, "SHA"), host_sha, "the job's resolver file is not the one written: {out}\n{err}");
     assert_eq!(field(&out, "RO"), "yes", "the resolver file must be mounted read-only: {out}");
     assert_eq!(field(&out, "DEFAULT"), PUB_HOST_V4, "the written file must resolve: {out}\n{err}");
