@@ -73,13 +73,15 @@ pre-existing skill.
 The schema check is **not** a general JSON-Schema validator. It reads, for each declared
 property, the `type`, the `enum`, the numeric `minimum` and `maximum`, and an array's
 `items` type — resolving a `maximum` written as a named constant (`get_job`'s
-`timeout_secs` cap, `long_poll::WAIT_FOR_CAP_SECS`) from that constant's own source. Any
-other constraint, or a named bound it cannot resolve, makes the check **fail closed**
-rather than pass silently. Its own negative cases are asserted: a wrong type, an
-out-of-enum value, a below-minimum and an above-maximum number, an undeclared field, a
-missing required field, a post with no target mode, a bare `mint-complete` and a broken
-install manifest each have to be caught, so a green run cannot mean the checker looked
-away.
+`timeout_secs` cap, `long_poll::WAIT_FOR_CAP_SECS`) from that constant's own source. It
+**fails closed** in exactly two cases: a recognised `minimum` or `maximum` written as a
+named constant it cannot resolve to a number, and an array `items` constraint it cannot
+read. It does **not** detect arbitrary unknown schema keywords — a constraint it does not
+recognise, such as a `minLength`, is ignored rather than rejected. Its own negative cases
+are asserted: a wrong type, an out-of-enum value, a below-minimum and an above-maximum
+number, an undeclared field, a missing required field, a post with no target mode, a bare
+`mint-complete` and a broken install manifest each have to be caught, so a green run
+cannot mean the checker looked away.
 
 What it does **not** do: post a job, spend a sat, contact a relay or a mint, or install
 anything into a real Muse account.
