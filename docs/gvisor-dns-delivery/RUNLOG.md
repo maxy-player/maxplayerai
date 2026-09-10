@@ -548,3 +548,53 @@ Note the two denials read differently — `timeout` for A, `ENETUNREACH` for B.
 Both are denials, and the difference is not yet explained; it is most likely
 DROP versus an unreachable route at the moment of probe. Recorded as an
 observation, not a claim.
+
+## Fail-closed setup — what the product does, and what now holds it
+
+Maxie: *"…and fail-closed setup/readiness."* Read back from
+`sandbox_netns.rs::establish()`, the host-side path refuses the job at **four**
+distinct points rather than warning and continuing:
+
+1. the holder's address cannot be read → `could not read the job namespace's address`;
+2. the address comes back **empty** → refused, because a policy with no source
+   key `would deny the range host-wide`;
+3. the host-rule applier fails → `host-side containment was not installed`;
+4. the applier's count ≠ the rendered count → `host-side containment is
+   incomplete … the plan was truncated in transit`.
+
+`HostRules` is adopted **before** the applier's result is examined, so a plan
+that failed part-way still has its rules removed on the way out. A namespace
+readback (#797 R1) then asks the kernel directly, because everything above it
+is the installer's own account of its work.
+
+### The gap that was there
+All four guards were held by **reading the source**, not by tests. Gate 5h
+measured the teardown once, on one host. Four rendering tests now lock the
+invariants on every build (`sandbox_net.rs`):
+
+* `the_host_teardown_exactly_inverts_the_install` — same length, `-I`↔`-D`,
+  reverse order, every field otherwise identical. If these two plans drift,
+  teardown leaks rules into a shared chain and a recycled address inherits a
+  dead job's firewall.
+* `every_host_rule_is_keyed_to_the_job_address` — both directions; a rule
+  without `-s` is a deny for the whole range on a chain shared with every
+  container on the daemon.
+* `the_rendered_host_plan_counts_exactly_what_it_renders` — the count guard 4
+  relies on; if rendered count and line count could disagree, a truncated plan
+  would pass the cross-check.
+* `an_empty_job_address_renders_a_source_key_that_is_not_a_host` — asserts the
+  *hazard* (bare `/32`), documenting why guard 2 must never be relaxed.
+
+### Test counts, corrected and verified
+Earlier notes said "60 sandbox + 55 doctor". The doctor tests are **not** in
+`maxplayer-core` — that crate has a `doctor` module with zero `#[test]`. They
+live in the `maxplayer` **binary** target. Verified this run:
+
+| suite | command | result |
+|---|---|---|
+| core lib (all) | `cargo test -p maxplayer-core --lib` | **387 passed, 0 failed** |
+| sandbox filter | `cargo test -p maxplayer-core --lib sandbox` | **65 passed, 0 failed** |
+| doctor | `cargo test -p maxplayer --bins doctor` | **55 passed, 0 failed** (73 filtered) |
+
+The four new tests were confirmed **by name** in the output, not inferred from
+the total moving.

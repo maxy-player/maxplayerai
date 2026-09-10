@@ -1464,4 +1464,93 @@ mod tests {
             "the host policy and the namespace plan disagree about what is denied"
         );
     }
+
+    /// Teardown must remove exactly what install added, in reverse.
+    ///
+    /// Gate 5h proved this on a live host: a recycled address inherited zero stale rules. That
+    /// was one measurement on one machine. This is the invariant, checked on every build — if
+    /// the two plans ever drift apart, teardown leaks rules into a shared chain and the next job
+    /// to be handed this address inherits a dead job's firewall.
+    #[test]
+    fn the_host_teardown_exactly_inverts_the_install() {
+        let policy = HostPolicy { job_addr: "172.18.0.2".to_owned() };
+        let install = policy.install_argv();
+        let teardown = policy.teardown_argv();
+        assert_eq!(
+            install.len(),
+            teardown.len(),
+            "install and teardown must be the same length or teardown leaves rules behind"
+        );
+        for (i, up) in install.iter().enumerate() {
+            let down = &teardown[teardown.len() - 1 - i];
+            assert_eq!(up[1], "-I", "install must insert");
+            assert_eq!(down[1], "-D", "teardown must delete");
+            assert_eq!(
+                up[2..],
+                down[2..],
+                "teardown rule {i} does not match the install rule it is meant to remove"
+            );
+        }
+    }
+
+    /// Every rule, both directions, must carry this job's `/32` source key.
+    ///
+    /// A host rule without `-s` is not this job's policy — it is a deny for the whole range on a
+    /// chain shared with every container on the daemon.
+    #[test]
+    fn every_host_rule_is_keyed_to_the_job_address() {
+        let policy = HostPolicy { job_addr: "172.18.0.2".to_owned() };
+        for argv in policy.install_argv().iter().chain(policy.teardown_argv().iter()) {
+            let at = argv
+                .iter()
+                .position(|arg| arg == "-s")
+                .unwrap_or_else(|| panic!("a host rule with no source key: {argv:?}"));
+            assert_eq!(
+                argv[at + 1],
+                "172.18.0.2/32",
+                "a host rule keyed to something other than this job: {argv:?}"
+            );
+        }
+    }
+
+    /// The count `establish()` cross-checks must equal the number of rules actually rendered.
+    ///
+    /// The applier reports a number and the caller compares it against this one; if the rendered
+    /// count and the plan's line count could disagree, a truncated plan would pass the check.
+    #[test]
+    fn the_rendered_host_plan_counts_exactly_what_it_renders() {
+        let policy = HostPolicy { job_addr: "172.18.0.2".to_owned() };
+        let (plan, count) = crate::sandbox_netns::host_install_stdin(&policy);
+        assert_eq!(count, policy.install_argv().len(), "the install count is not the rule count");
+        assert_eq!(
+            plan.lines().filter(|line| !line.trim().is_empty()).count(),
+            count,
+            "the install plan has a different number of lines than it claims rules"
+        );
+        let (teardown, teardown_count) = crate::sandbox_netns::host_teardown_stdin(&policy);
+        assert_eq!(teardown_count, count, "teardown claims a different rule count than install");
+        assert_eq!(
+            teardown.lines().filter(|line| !line.trim().is_empty()).count(),
+            teardown_count,
+            "the teardown plan has a different number of lines than it claims rules"
+        );
+    }
+
+    /// Why `establish()` refuses an empty address rather than rendering with it.
+    ///
+    /// This test asserts the hazard, not the fix: with no address the source key renders as bare
+    /// `/32`, which is not a host. Such a rule does not scope the deny to this job, so the guard
+    /// in `establish()` is load-bearing and must not be relaxed into a warning.
+    #[test]
+    fn an_empty_job_address_renders_a_source_key_that_is_not_a_host() {
+        let policy = HostPolicy { job_addr: String::new() };
+        let argv = policy.install_argv();
+        let first = &argv[0];
+        let at = first.iter().position(|arg| arg == "-s").expect("a source key");
+        assert_eq!(
+            first[at + 1],
+            "/32",
+            "an empty address must render an obviously-invalid key, which establish() then refuses"
+        );
+    }
 }
