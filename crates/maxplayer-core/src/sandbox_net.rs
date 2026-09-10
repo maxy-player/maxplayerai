@@ -323,26 +323,68 @@ fn with_prefix_len(address: &str, family: Family) -> String {
     }
 }
 
-/// One appended rule as a live namespace reports it, reduced to the fields that decide whether
-/// containment holds.
+/// One predicate of a rule as a live namespace printed it: the flag, its values, and whether
+/// iptables printed `!` in front of it.
 ///
-/// iptables' cosmetic rewriting is discarded deliberately — see [`NetPolicy::verify_readback`] for
-/// what it does to a rule between being given one and printing it back.
+/// **The inversion is the point.** `-d 10.0.0.2/32` and `! -d 10.0.0.2/32` are opposite rules that
+/// differ by one token; a reader that keeps the address and drops the `!` reads the second as the
+/// first and reports a namespace contained when it is wide open — UDP port 53 to every destination
+/// except the resolver, ahead of the DROPs that would have stopped it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Predicate {
+    pub negated: bool,
+    pub key: String,
+    pub values: Vec<String>,
+}
+
+/// One appended rule as a live namespace reports it: its chain and every predicate it carries, in
+/// printed order, with inversions retained.
+///
+/// Nothing is discarded at parse time. What a rule *means* depends on predicates a projection would
+/// throw away — an inverted match, a source address, an inbound interface, a connection-state
+/// match — so they are kept, and the judgement about which of them are permissible is made where
+/// the rule's role is known ([`ReadbackRule::as_exception`]). iptables' cosmetic rewriting is
+/// normalised there too, never dropped here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadbackRule {
-    /// The `-d` value, exactly as printed (so already carrying its prefix length).
-    pub destination: Option<String>,
-    /// The `-j` target.
-    pub target: Option<String>,
-    /// The `--dport` value; a range for the pinhole.
-    pub dport: Option<String>,
-    /// The `-p` value — the transport, as iptables prints it.
-    ///
-    /// Carried because a DNS exception is a *pair* of rules, one per transport, and a count cannot
-    /// tell a udp+tcp pair from two udp rules. A namespace holding two udp ACCEPTs for the same
-    /// resolver passes every count and still fails on exactly the large answers (DNSSEC, long CNAME
-    /// chains) that get retried over TCP.
-    pub protocol: Option<String>,
+    /// The chain the rule was appended to, from the `-A <chain>` that opens the line.
+    pub chain: String,
+    /// Every predicate, in printed order.
+    pub predicates: Vec<Predicate>,
+}
+
+/// An exception rule reduced to the three things that decide what it lets through, and only after
+/// its shape has been proved to be one this policy renders.
+///
+/// Used as a multiset key: the renderer can legally emit two identical ACCEPTs (a resolver that is
+/// also the gateway, with a proxy port range of `53-53`), and role identity is carried alongside
+/// rather than inferred from the rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Exception {
+    pub destination: String,
+    pub protocol: String,
+    pub dport: String,
+}
+
+impl fmt::Display for Exception {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "-d {} -p {} --dport {} -j ACCEPT",
+            self.destination, self.protocol, self.dport
+        )
+    }
+}
+
+/// A single-port range as iptables may print it: `53:53` and `53` are the same rule.
+///
+/// Normalising the printed form is safe; normalising a *wider* range would not be, so only the
+/// start==end case collapses.
+fn normalize_dport(printed: &str) -> String {
+    match printed.split_once(':') {
+        Some((start, end)) if start == end => start.to_owned(),
+        _ => printed.to_owned(),
+    }
 }
 
 impl ReadbackRule {
@@ -356,16 +398,153 @@ impl ReadbackRule {
             .lines()
             .map(str::trim)
             .filter(|line| line.starts_with("-A "))
-            .map(|line| {
-                let fields: Vec<&str> = line.split_whitespace().collect();
-                Self {
-                    destination: arg_value(&fields, "-d").map(str::to_owned),
-                    target: arg_value(&fields, "-j").map(str::to_owned),
-                    dport: arg_value(&fields, "--dport").map(str::to_owned),
-                    protocol: arg_value(&fields, "-p").map(str::to_owned),
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                fields.next()?; // the `-A`
+                let chain = fields.next()?.to_owned();
+                let mut predicates: Vec<Predicate> = Vec::new();
+                let mut negated = false;
+                for field in fields {
+                    if field == "!" {
+                        // iptables prints the inversion as its own token, before the flag.
+                        negated = true;
+                        continue;
+                    }
+                    if field.starts_with('-') {
+                        predicates.push(Predicate {
+                            negated,
+                            key: field.to_owned(),
+                            values: Vec::new(),
+                        });
+                        negated = false;
+                    } else if let Some(current) = predicates.last_mut() {
+                        // A flag can take more than one value: `--tcp-flags FIN,SYN,RST,ACK SYN`.
+                        current.values.push(field.to_owned());
+                    }
                 }
+                Some(Self { chain, predicates })
             })
             .collect()
+    }
+
+    /// The value of `key`, when the rule carries that flag exactly once, un-inverted, with exactly
+    /// one value.
+    ///
+    /// `None` for a repeated, inverted or multi-valued flag rather than the first value found: each
+    /// of those is a different rule from the one this policy renders, and answering with the value
+    /// anyway is how an inverted match passes for a positive one.
+    pub fn value(&self, key: &str) -> Option<&str> {
+        let mut matching = self.predicates.iter().filter(|predicate| predicate.key == key);
+        let first = matching.next()?;
+        if matching.next().is_some() || first.negated || first.values.len() != 1 {
+            return None;
+        }
+        Some(first.values[0].as_str())
+    }
+
+    /// The `-j` target, under the rules of [`ReadbackRule::value`].
+    pub fn target(&self) -> Option<&str> {
+        self.value("-j")
+    }
+
+    /// The `-d` destination, under the rules of [`ReadbackRule::value`].
+    pub fn destination(&self) -> Option<&str> {
+        self.value("-d")
+    }
+
+    /// This rule as one of the exceptions the policy renders, or why it is not one.
+    ///
+    /// **Whitelist, not projection.** The renderer emits exceptions in exactly one shape —
+    /// `-p <transport> -d <host> --dport <ports> -j ACCEPT` in the OUTPUT chain — so anything else
+    /// in an ACCEPT is a rule this policy never asked for, and the honest answer is to refuse it
+    /// rather than to read the parts that look familiar. Each rejected shape below is a rule that a
+    /// four-field projection would have accepted while it let through traffic nobody authorised:
+    ///
+    /// * an inverted predicate (`! -d`, `! --dport`) — the complement of the rule we rendered;
+    /// * an extra predicate (`-s`, `-i`, `-o`, a state match) — either a narrowing that makes the
+    ///   exception inert, so the job cannot resolve, or a widening nobody reviewed;
+    /// * a repeated predicate — iptables prints one `-d` per rule, so two means this is not the
+    ///   output of the plan we sent;
+    /// * another chain — a rule in the wrong chain does not filter this job's egress at all.
+    ///
+    /// Only understood cosmetics are normalised: the redundant `-m udp`/`-m tcp` match module
+    /// iptables adds for its own `--dport`, a single-port range printed bare, and a bare host
+    /// address printed without its prefix length.
+    pub fn as_exception(&self, family: Family) -> Result<Exception, String> {
+        if self.chain != OUTPUT_CHAIN {
+            return Err(format!(
+                "an ACCEPT in chain {} rather than {OUTPUT_CHAIN} — it does not filter this job's \
+                 egress",
+                self.chain
+            ));
+        }
+        if let Some(negated) = self.predicates.iter().find(|predicate| predicate.negated) {
+            return Err(format!(
+                "an ACCEPT whose {} match is INVERTED — it permits the complement of the rule this \
+                 policy renders",
+                negated.key
+            ));
+        }
+
+        let protocol = self
+            .value("-p")
+            .ok_or_else(|| "an ACCEPT that names no single transport".to_owned())?
+            .to_owned();
+        if protocol != "udp" && protocol != "tcp" {
+            return Err(format!("an ACCEPT for transport {protocol:?}, which this policy never opens"));
+        }
+        let destination = self
+            .value("-d")
+            .ok_or_else(|| {
+                "an ACCEPT that names no single destination — unaddressed, it permits every host"
+                    .to_owned()
+            })?
+            .to_owned();
+        let dport = self
+            .value("--dport")
+            .ok_or_else(|| "an ACCEPT that names no single destination port".to_owned())?
+            .to_owned();
+
+        for predicate in &self.predicates {
+            let permitted = match predicate.key.as_str() {
+                "-p" | "-d" | "--dport" | "-j" => true,
+                // The match module iptables inserts for its own port match, and nothing else: `-m
+                // conntrack`, `-m state`, `-m owner` all change what the rule matches.
+                "-m" => predicate.values == [protocol.clone()],
+                _ => false,
+            };
+            if !permitted {
+                return Err(format!(
+                    "an ACCEPT carrying `{} {}`, a predicate this policy never renders on an \
+                     exception — it either narrows the exception until the job cannot use it or \
+                     widens it beyond what was reviewed",
+                    predicate.key,
+                    predicate.values.join(" ")
+                ));
+            }
+            let allowed_repeats = usize::from(predicate.key == "-m");
+            let seen = self
+                .predicates
+                .iter()
+                .filter(|other| other.key == predicate.key)
+                .count();
+            if seen > 1 + allowed_repeats {
+                return Err(format!(
+                    "an ACCEPT carrying {seen} `{}` predicates — iptables prints one per rule, so \
+                     this is not the plan this policy sent",
+                    predicate.key
+                ));
+            }
+        }
+        if self.target() != Some("ACCEPT") {
+            return Err("a rule read as an exception does not jump to ACCEPT".to_owned());
+        }
+
+        Ok(Exception {
+            destination: with_prefix_len(&destination, family),
+            protocol,
+            dport: normalize_dport(&dport),
+        })
     }
 }
 
@@ -596,8 +775,9 @@ impl NetPolicy {
         };
         for destination in denied {
             let dropped = found.iter().any(|rule| {
-                rule.target.as_deref() == Some("DROP")
-                    && rule.destination.as_deref() == Some(*destination)
+                rule.chain == OUTPUT_CHAIN
+                    && rule.target() == Some("DROP")
+                    && rule.destination() == Some(*destination)
             });
             if !dropped {
                 return Err(format!(
@@ -613,16 +793,17 @@ impl NetPolicy {
         // Compared against this index rather than an absolute position, because how many log rules
         // sit ahead of it is a policy choice and not a safety property.
         let first_range_drop = found.iter().position(|rule| {
-            rule.target.as_deref() == Some("DROP")
-                && rule.destination.as_deref().is_some_and(|found| denied.contains(&found))
+            rule.target() == Some("DROP")
+                && rule.destination().is_some_and(|found| denied.contains(&found))
         });
 
         // The metadata DROP is v4-only because the endpoint is a v4 address, and every ACCEPT in
         // that family must sit below it.
         let metadata_dropped_at = if family == Family::V4 {
             let at = found.iter().position(|rule| {
-                rule.target.as_deref() == Some("DROP")
-                    && rule.destination.as_deref() == Some(METADATA_ENDPOINT)
+                rule.chain == OUTPUT_CHAIN
+                    && rule.target() == Some("DROP")
+                    && rule.destination() == Some(METADATA_ENDPOINT)
             });
             let Some(at) = at else {
                 return Err(format!(
@@ -635,133 +816,121 @@ impl NetPolicy {
             None
         };
 
-        let accepts: Vec<(usize, &ReadbackRule)> = found
+        // Every ACCEPT the namespace carries, against every exception this policy rendered, matched
+        // as a MULTISET and consumed one for one.
+        //
+        // A multiset rather than a search by address, because the renderer can legally emit two
+        // byte-identical ACCEPTs: a seat whose resolver IS its gateway, configured with a proxy port
+        // range of `53-53`, renders the DNS TCP exception and the proxy pinhole as the same rule.
+        // Searching for "the TCP port-53 rule for that address" finds two and refuses a namespace
+        // that is exactly right. Roles are carried alongside each expectation instead of inferred
+        // from the rule, so both are still judged on their own terms — including their positions.
+        let mut expected: Vec<(String, Exception, bool)> = Vec::new();
+        for resolver in self.dns_resolvers.iter().filter(|r| resolver_family(r) == family) {
+            let destination = with_prefix_len(resolver, family);
+            for protocol in ["udp", "tcp"] {
+                expected.push((
+                    format!("the {protocol} port-53 exception for the resolver {destination}"),
+                    Exception {
+                        destination: destination.clone(),
+                        protocol: protocol.to_owned(),
+                        dport: "53".to_owned(),
+                    },
+                    false,
+                ));
+            }
+        }
+        if let (Family::V4, Some(ports)) = (family, self.proxy_ports) {
+            expected.push((
+                "the credential proxy pinhole".to_owned(),
+                Exception {
+                    destination: with_prefix_len(&self.gateway, Family::V4),
+                    protocol: "tcp".to_owned(),
+                    dport: normalize_dport(&ports.to_match()),
+                },
+                false,
+            ));
+        }
+
+        let mut unrendered: Vec<String> = Vec::new();
+        let mut matched: Vec<(String, usize)> = Vec::new();
+        for (at, rule) in found.iter().enumerate() {
+            // Judged by the jump, so a rule whose `-j` is repeated or inverted still arrives here
+            // rather than being skipped as "not an ACCEPT".
+            let jumps_to_accept = rule
+                .predicates
+                .iter()
+                .any(|predicate| predicate.key == "-j" && predicate.values == ["ACCEPT"]);
+            if !jumps_to_accept {
+                continue;
+            }
+            match rule.as_exception(family) {
+                Ok(exception) => {
+                    match expected
+                        .iter_mut()
+                        .find(|(_, wanted, taken)| !*taken && *wanted == exception)
+                    {
+                        Some((role, _, taken)) => {
+                            *taken = true;
+                            matched.push((role.clone(), at));
+                        }
+                        None => unrendered.push(format!("`{exception}` at index {at}")),
+                    }
+                }
+                Err(why) => unrendered.push(format!("{why} (at index {at})")),
+            }
+        }
+
+        let missing: Vec<String> = expected
             .iter()
-            .enumerate()
-            .filter(|(_, rule)| rule.target.as_deref() == Some("ACCEPT"))
+            .filter(|(_, _, taken)| !*taken)
+            .map(|(role, exception, _)| format!("{role} (`{exception}`)"))
             .collect();
-        // Two ACCEPTs per resolver of this family (udp and tcp), plus the proxy pinhole — v4 only,
-        // because the proxy is reached over v4. An ACCEPT this policy did not ask for is an egress
-        // hole whatever address it carries, which is why the total is checked before anything is
-        // matched by shape.
-        let proxy_accepts = usize::from(family == Family::V4 && self.proxy_ports.is_some());
-        let wanted = self.dns_pinhole_count(family) + proxy_accepts;
-        if accepts.len() != wanted {
+        if !unrendered.is_empty() || !missing.is_empty() {
+            // Both halves in one error deliberately: "an ACCEPT nobody rendered" and "an exception
+            // that is gone" are usually the same edit seen from two sides, and reporting only one
+            // of them sends the reader looking for the wrong fault.
+            let mut detail = String::new();
+            if !unrendered.is_empty() {
+                detail.push_str(&format!(
+                    "it carries {} this policy never rendered: {}",
+                    if unrendered.len() == 1 { "an ACCEPT" } else { "ACCEPTs" },
+                    unrendered.join("; ")
+                ));
+            }
+            if !unrendered.is_empty() && !missing.is_empty() {
+                detail.push_str(", and ");
+            }
+            if !missing.is_empty() {
+                detail.push_str(&format!("it is missing {}", missing.join("; ")));
+            }
             return Err(format!(
-                "the live namespace has {} ACCEPT rules in {}, expected {wanted} — an unexpected \
-                 ACCEPT is an egress hole",
-                accepts.len(),
+                "the exceptions in the live {} OUTPUT chain are not the ones this policy rendered: \
+                 {detail} — an ACCEPT nobody rendered is an egress hole, and a missing one is reach \
+                 the job was promised and does not have",
                 family.binary()
             ));
         }
 
-        // Each resolver, proved rule by rule rather than counted: the printed host address exactly,
-        // the transport exactly, port 53 exactly, above the range denies, and below the metadata
-        // drop.
-        let mut resolver_accepts: Vec<usize> = Vec::new();
-        for resolver in self.dns_resolvers.iter().filter(|r| resolver_family(r) == family) {
-            let destination = with_prefix_len(resolver, family);
-            for protocol in ["udp", "tcp"] {
-                let matching: Vec<(usize, &ReadbackRule)> = accepts
-                    .iter()
-                    .filter(|(_, rule)| {
-                        rule.destination.as_deref() == Some(destination.as_str())
-                            && rule.protocol.as_deref() == Some(protocol)
-                            && rule.dport.as_deref() == Some("53")
-                    })
-                    .copied()
-                    .collect();
-                if matching.len() != 1 {
+        // Position, per matched exception. Every exception is rendered above the range DROPs and
+        // below the metadata DROP, and iptables takes the first match: below the DROP that covers
+        // its address an exception is inert, and above the metadata DROP it reopens the one endpoint
+        // this policy exists to close.
+        for (role, at) in matched {
+            if let Some(first_range_drop) = first_range_drop {
+                if at > first_range_drop {
                     return Err(format!(
-                        "the live namespace has {} {protocol} port-53 ACCEPTs to {destination}, \
-                         expected exactly 1 — either the job cannot resolve over {protocol}, or a \
-                         rule this policy never rendered is answering for it",
-                        matching.len()
+                        "{role} is at index {at}, below the first range DROP at {first_range_drop} — \
+                         iptables takes the first match, so that rule is inert and the reach it \
+                         grants does not exist"
                     ));
                 }
-                let (at, _) = matching[0];
-                if let Some(first_range_drop) = first_range_drop {
-                    if at > first_range_drop {
-                        return Err(format!(
-                            "the {protocol} port-53 ACCEPT for {destination} is at index {at}, below \
-                             the first range DROP at {first_range_drop} — iptables takes the first \
-                             match, so the resolver is dropped and the job cannot resolve"
-                        ));
-                    }
-                }
-                if let Some(metadata_dropped_at) = metadata_dropped_at {
-                    if at < metadata_dropped_at {
-                        return Err(format!(
-                            "the {protocol} port-53 ACCEPT for {destination} is at index {at}, above \
-                             the metadata DROP at {metadata_dropped_at} — an ACCEPT above that drop \
-                             reopens {METADATA_ENDPOINT}"
-                        ));
-                    }
-                }
-                resolver_accepts.push(at);
-            }
-        }
-
-        // Whatever ACCEPT is left over is the proxy pinhole. Identified by elimination and not by
-        // address, so that a seat whose resolver happens to BE its gateway address still has both
-        // rules judged on their own terms.
-        let remaining: Vec<(usize, &ReadbackRule)> =
-            accepts.iter().filter(|(at, _)| !resolver_accepts.contains(at)).copied().collect();
-
-        if let (Family::V4, Some(ports)) = (family, self.proxy_ports) {
-            let Some((accept_at, pinhole)) = remaining.first().copied() else {
-                return Err("no ACCEPT in the live namespace is the proxy pinhole — the job cannot \
-                            reach its model"
-                    .to_owned());
-            };
-            let gateway = with_prefix_len(&self.gateway, Family::V4);
-            if pinhole.destination.as_deref() != Some(gateway.as_str()) {
-                return Err(format!(
-                    "the pinhole points at {:?}, not the measured proxy address {gateway} — the \
-                     job cannot reach its model, or something else can",
-                    pinhole.destination
-                ));
-            }
-            if pinhole.protocol.as_deref() != Some("tcp") {
-                return Err(format!(
-                    "the pinhole carries protocol {:?}, not tcp — the proxy is an HTTP listener, and \
-                     an exception on another transport is reach this policy never granted",
-                    pinhole.protocol
-                ));
-            }
-            // iptables collapses a single-port range to a bare port, so both spellings of the
-            // same range must be accepted; anything wider is a hole. Derived from `to_match`
-            // rather than from `Display`, which spells a range `start-end` — a form iptables
-            // never prints, so matching against it would prove nothing.
-            let range = ports.to_match();
-            let mut acceptable = vec![range.clone()];
-            if let Some((start, end)) = range.split_once(':') {
-                if start == end {
-                    acceptable.push(start.to_owned());
-                }
-            }
-            let printed = pinhole.dport.as_deref().unwrap_or("");
-            if !acceptable.iter().any(|form| form == printed) {
-                return Err(format!(
-                    "the pinhole opens ports {printed:?}, not the proxy's {} — a wider pinhole is \
-                     still one rule",
-                    ports.to_match()
-                ));
             }
             if let Some(metadata_dropped_at) = metadata_dropped_at {
-                if accept_at < metadata_dropped_at {
+                if at < metadata_dropped_at {
                     return Err(format!(
-                        "the pinhole ACCEPT is at index {accept_at}, above the metadata DROP at \
-                         {metadata_dropped_at} — an ACCEPT above that drop reopens {METADATA_ENDPOINT}"
-                    ));
-                }
-            }
-            if let Some(first_range_drop) = first_range_drop {
-                if accept_at > first_range_drop {
-                    return Err(format!(
-                        "the pinhole ACCEPT is at index {accept_at}, below the first range DROP at \
-                         {first_range_drop} — iptables takes the first match, so the job silently \
-                         loses its model"
+                        "{role} is at index {at}, above the metadata DROP at {metadata_dropped_at} — \
+                         an ACCEPT above that drop reopens {METADATA_ENDPOINT}"
                     ));
                 }
             }
@@ -1533,6 +1702,231 @@ mod tests {
         );
         let below = policy.verify_readback(Family::V4, &sunk).expect_err("below the range DROP");
         assert!(below.contains("below the first range DROP"), "{below}");
+    }
+
+    /// This policy's own rules, spelled the way `iptables -S` printed every rule in the measured
+    /// capture: `-d` hoisted ahead of `-p`, the redundant `-m <transport>` match module made
+    /// explicit, a bare host address given its prefix length, and a single-port range collapsed to a
+    /// bare port.
+    ///
+    /// Synthetic, and labelled so: it is the *normalisation* contract under test, derived from what
+    /// [`MEASURED_V4`] showed the kernel does. A namespace whose readback needs any other rewriting
+    /// accepted is not covered by this helper.
+    fn normalized_readback(policy: &NetPolicy, family: Family) -> String {
+        policy
+            .rules()
+            .iter()
+            .filter(|rule| rule.family == family)
+            .map(|rule| {
+                let sent: Vec<&str> = rule.args.iter().map(String::as_str).collect();
+                let exception = rule.target() == Some("ACCEPT");
+                match (exception, arg_value(&sent, "-p"), arg_value(&sent, "--dport")) {
+                    (true, Some(protocol), Some(dport)) => format!(
+                        "-A {OUTPUT_CHAIN} -d {} -p {protocol} -m {protocol} --dport {} -j ACCEPT",
+                        with_prefix_len(rule.destination().unwrap_or_default(), family),
+                        normalize_dport(dport),
+                    ),
+                    _ => format!("-A {OUTPUT_CHAIN} {}", rule.args.join(" ")),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The positive control for every negative case below: the policy's own rules, after the
+    /// kernel's cosmetic rewriting, verify for both families.
+    ///
+    /// Without this the negatives prove nothing — a verifier that refuses everything would pass all
+    /// of them.
+    #[test]
+    fn the_normalized_spelling_of_this_policys_own_rules_verifies_in_both_families() {
+        let policy = policy_with_resolvers(&["10.0.0.2", "2001:4860:4860::8888"]);
+        assert_eq!(
+            policy.verify_readback(Family::V4, &normalized_readback(&policy, Family::V4)),
+            Ok(())
+        );
+        assert_eq!(
+            policy.verify_readback(Family::V6, &normalized_readback(&policy, Family::V6)),
+            Ok(())
+        );
+    }
+
+    /// **An exception is judged by its whole shape, not by the fields a reader finds familiar.**
+    ///
+    /// Every case here keeps the rule count, the ACCEPT count and every position unchanged, and
+    /// substitutes one semantically different rule for a rendered exception. A reader that projects
+    /// a rule down to destination/target/port/protocol accepts all of them: the inverted matches
+    /// permit the complement of what was rendered (UDP53 to every host EXCEPT the resolver — which
+    /// includes the private ranges whose DROPs sit below — or every port except 53 on the resolver
+    /// host), and the extra predicates either make the exception inert or widen it past review.
+    ///
+    /// Both families, because the v6 chain carries no proxy pinhole and is the one less likely to be
+    /// looked at.
+    #[test]
+    fn a_semantically_different_exception_with_the_same_projection_is_refused() {
+        let policy = policy_with_resolvers(&["10.0.0.2", "2001:4860:4860::8888"]);
+        let cases: [(&str, &str); 6] = [
+            // The destination inverted: port 53 open to everything that is NOT the resolver.
+            ("inverted destination", "-A OUTPUT ! -d ADDR -p udp -m udp --dport 53 -j ACCEPT"),
+            // The port inverted: every port on the resolver host EXCEPT the one it answers on.
+            ("inverted port", "-A OUTPUT -d ADDR -p udp -m udp ! --dport 53 -j ACCEPT"),
+            // A source match nobody rendered: the exception matches only packets from an address
+            // the job does not have, so it is inert and the job cannot resolve.
+            ("extra source", "-A OUTPUT -d ADDR -s SRC -p udp -m udp --dport 53 -j ACCEPT"),
+            // A connection-state match: same projection, different rule.
+            (
+                "extra state match",
+                "-A OUTPUT -d ADDR -p udp -m udp -m conntrack --ctstate NEW,ESTABLISHED --dport 53 -j ACCEPT",
+            ),
+            // Two destinations in one rule: not output this plan could have produced.
+            ("duplicate destination", "-A OUTPUT -d ADDR -d 8.8.8.8/32 -p udp -m udp --dport 53 -j ACCEPT"),
+            // The right rule in the wrong chain: it does not filter this job's egress at all.
+            ("wrong chain", "-A FORWARD -d ADDR -p udp -m udp --dport 53 -j ACCEPT"),
+        ];
+
+        for (family, address, source) in [
+            (Family::V4, "10.0.0.2/32", "10.9.9.9/32"),
+            (Family::V6, "2001:4860:4860::8888/128", "2001:db8::9/128"),
+        ] {
+            let good = normalized_readback(&policy, family);
+            let rendered = format!("-A {OUTPUT_CHAIN} -d {address} -p udp -m udp --dport 53 -j ACCEPT");
+            assert!(good.contains(&rendered), "the fixture must contain the rule being replaced");
+
+            for (name, substitute) in cases {
+                let substitute = substitute.replace("ADDR", address).replace("SRC", source);
+                let broken = good.replace(&rendered, &substitute);
+                assert_eq!(
+                    ReadbackRule::parse_all(&broken).len(),
+                    policy.rule_count(family),
+                    "{name}: the count must stay right, or the count check is what catches it"
+                );
+                let refused = match policy.verify_readback(family, &broken) {
+                    Ok(()) => panic!(
+                        "{name} ({}) was ACCEPTED by the readback verifier: {substitute}",
+                        family.binary()
+                    ),
+                    Err(refused) => refused,
+                };
+                assert!(
+                    refused.contains("udp port-53 exception") || refused.contains("never rendered"),
+                    "{name}: refused for the wrong reason: {refused}"
+                );
+            }
+        }
+    }
+
+    /// The transport, the prefix length and the port are each load-bearing on their own, and each is
+    /// wrong in a way a count cannot see.
+    #[test]
+    fn a_wrong_transport_prefix_or_port_in_an_exception_is_refused() {
+        let policy = policy_with_resolvers(&["10.0.0.2"]);
+        let good = normalized_readback(&policy, Family::V4);
+        let rendered = "-A OUTPUT -d 10.0.0.2/32 -p udp -m udp --dport 53 -j ACCEPT";
+
+        // A `/24` that covers the resolver: the job resolves, and it also reaches 254 other hosts on
+        // that LAN before the range DROP below would have stopped it.
+        let widened_prefix =
+            good.replace(rendered, "-A OUTPUT -d 10.0.0.0/24 -p udp -m udp --dport 53 -j ACCEPT");
+        let prefix = policy
+            .verify_readback(Family::V4, &widened_prefix)
+            .expect_err("a /24 is not a /32");
+        assert!(prefix.contains("10.0.0.2/32"), "{prefix}");
+
+        // sctp on port 53: the projection sees a port-53 ACCEPT to the right host.
+        let wrong_transport =
+            good.replace(rendered, "-A OUTPUT -d 10.0.0.2/32 -p sctp --dport 53 -j ACCEPT");
+        let transport = policy
+            .verify_readback(Family::V4, &wrong_transport)
+            .expect_err("sctp is not a transport this policy opens");
+        assert!(transport.contains("never rendered"), "{transport}");
+
+        // Port 5353 — mDNS, not DNS, and not what was rendered.
+        let wrong_port =
+            good.replace(rendered, "-A OUTPUT -d 10.0.0.2/32 -p udp -m udp --dport 5353 -j ACCEPT");
+        let port =
+            policy.verify_readback(Family::V4, &wrong_port).expect_err("5353 is not 53");
+        assert!(port.contains("5353"), "{port}");
+    }
+
+    /// An exception duplicated: the count is wrong, and if something else is missing to make room
+    /// for it, the multiset match is what catches it.
+    #[test]
+    fn an_extra_copy_of_a_rendered_exception_is_refused() {
+        let policy = policy_with_resolvers(&["10.0.0.2"]);
+        let good = normalized_readback(&policy, Family::V4);
+        let rendered = "-A OUTPUT -d 10.0.0.2/32 -p udp -m udp --dport 53 -j ACCEPT";
+
+        // Duplicated in place of the TCP exception, so the total is untouched: one transport gains a
+        // rule it does not need and the other loses the one it does.
+        let doubled = good.replace(
+            "-A OUTPUT -d 10.0.0.2/32 -p tcp -m tcp --dport 53 -j ACCEPT",
+            rendered,
+        );
+        assert_eq!(ReadbackRule::parse_all(&doubled).len(), policy.rule_count(Family::V4));
+        let refused = policy.verify_readback(Family::V4, &doubled).expect_err("udp twice");
+        assert!(refused.contains("tcp port-53 exception"), "{refused}");
+        assert!(refused.contains("never rendered"), "{refused}");
+    }
+
+    /// **A resolver that is also the gateway, with a proxy range of `53-53`, renders two identical
+    /// ACCEPTs — and that namespace is correct.**
+    ///
+    /// `PortRange::new(53, 53)` is legal, so this is a policy an operator can configure. The two
+    /// rules are byte-identical after the kernel collapses `53:53` to `53`, so a verifier that looks
+    /// up "the tcp port-53 rule for this address" finds two and refuses its own valid readback. Roles
+    /// are matched as a multiset and consumed once each, which is what makes this pass while an
+    /// unexpected third copy still fails.
+    #[test]
+    fn a_resolver_that_is_also_the_proxy_on_port_53_verifies_and_still_refuses_an_extra_copy() {
+        let policy = NetPolicy {
+            gateway: "172.17.0.1".to_owned(),
+            proxy_ports: Some(PortRange::new(53, 53).unwrap()),
+            log_connections: true,
+            dns_resolvers: vec!["172.17.0.1".to_owned()],
+        };
+        // Three exceptions rendered: udp53 and tcp53 for the resolver, tcp53:53 for the proxy — the
+        // last two identical once normalized.
+        assert_eq!(policy.dns_pinhole_count(Family::V4), 2);
+        let readback = normalized_readback(&policy, Family::V4);
+        assert_eq!(
+            readback.matches("-d 172.17.0.1/32 -p tcp -m tcp --dport 53 -j ACCEPT").count(),
+            2,
+            "the renderer really does emit the identical pair this test exists for"
+        );
+        assert_eq!(policy.verify_readback(Family::V4, &readback), Ok(()));
+
+        // A third copy, with a LOG rule displaced so the count still matches: an unexpected
+        // duplicate is still an ACCEPT nobody rendered.
+        let extra = readback.replace(
+            "-d 224.0.0.0/4 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix sbx-net-deny:",
+            "-d 172.17.0.1/32 -p tcp -m tcp --dport 53 -j ACCEPT",
+        );
+        assert_eq!(ReadbackRule::parse_all(&extra).len(), policy.rule_count(Family::V4));
+        let refused = policy.verify_readback(Family::V4, &extra).expect_err("a third copy");
+        assert!(refused.contains("never rendered"), "{refused}");
+    }
+
+    /// The same coexistence with distinct ports: the resolver is the gateway, the proxy is on its own
+    /// range, and the three exceptions are told apart by shape.
+    #[test]
+    fn a_resolver_that_is_also_the_proxy_on_other_ports_verifies() {
+        let policy = NetPolicy {
+            gateway: "172.17.0.1".to_owned(),
+            proxy_ports: Some(PortRange::new(49200, 49299).unwrap()),
+            log_connections: true,
+            dns_resolvers: vec!["172.17.0.1".to_owned()],
+        };
+        let readback = normalized_readback(&policy, Family::V4);
+        assert_eq!(policy.verify_readback(Family::V4, &readback), Ok(()));
+
+        // And the proxy's own range is still not a DNS exception: moving the DNS rules onto the
+        // proxy range leaves the same three ACCEPTs to the same host, and must still be refused.
+        let confused = readback.replace(
+            "-d 172.17.0.1/32 -p udp -m udp --dport 53 -j ACCEPT",
+            "-d 172.17.0.1/32 -p udp -m udp --dport 49200:49299 -j ACCEPT",
+        );
+        let refused = policy.verify_readback(Family::V4, &confused).expect_err("not a resolver rule");
+        assert!(refused.contains("udp port-53 exception"), "{refused}");
     }
 
     /// A v6 resolver is verified against the v6 chain and is invisible to the v4 one — the two are

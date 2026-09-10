@@ -263,10 +263,16 @@ pub struct DockerPolicy {
     /// launch, so both come from one config value rather than being written down twice.
     file_credentials: Vec<crate::home::FileCredential>,
     /// Operator-named resolver addresses for contained jobs, from
-    /// [`crate::home::SandboxConfig::dns_servers`]. Empty ⇒ discover the host's own upstreams at
-    /// launch. Carried on the policy for the same reason as `proxy_ports`: the argv that mounts the
-    /// job's `resolv.conf` and the policy that opens port 53 to those addresses must name the same
-    /// resolvers, or the job is handed a resolver its own firewall drops.
+    /// [`crate::home::SandboxConfig::dns_servers`], **canonicalised and de-duplicated** by
+    /// [`crate::sandbox_dns::from_config`] — the same function every launch resolves through. Empty
+    /// ⇒ nothing usable was configured, so each launch discovers the host's own upstreams.
+    ///
+    /// Canonical rather than raw so that anything reading the policy describes the plan launches
+    /// actually install: two spellings of one address are one resolver and one pair of rules, and a
+    /// blank entry is not a resolver at all. Carried on the policy for the same reason as
+    /// `proxy_ports`: the argv that mounts the job's `resolv.conf` and the policy that opens port 53
+    /// to those addresses must name the same resolvers, or the job is handed a resolver its own
+    /// firewall drops.
     dns_servers: Vec<String>,
     /// Container-side delivery (Track B), `None` ⇒ the host delivery path. Resolved from
     /// [`crate::home::SandboxConfig::container_delivery`] and its two companion keys. Carried on the
@@ -470,8 +476,18 @@ impl SandboxPolicy {
                 // resolver that is a hostname or a loopback stub cannot serve a sandboxed job, and
                 // discovering that at job time would fail every job with an error that names the
                 // symptom rather than the config key.
-                crate::sandbox_dns::from_config(&config.dns_servers)
-                    .map_err(|error| ExecError::Config(error.to_string()))?;
+                //
+                // The CANONICAL addresses are what the policy carries, not the raw config vector.
+                // `sandbox_dns::from_config` trims, drops blanks, canonicalises each address and
+                // de-duplicates, and every launch resolves through it — so a policy holding the raw
+                // list would describe a different plan from the one launches install: `["1.1.1.1",
+                // "1.1.1.1"]` claims four port-53 rules where two are rendered, and `[" "]` claims a
+                // named resolver where a launch performs host discovery. Anything reading the policy
+                // (`doctor` above all) then reports numbers no job will ever have.
+                let configured_resolvers = crate::sandbox_dns::from_config(&config.dns_servers)
+                    .map_err(|error| ExecError::Config(error.to_string()))?
+                    .map(|resolvers| resolvers.addresses().to_vec())
+                    .unwrap_or_default();
                 if let Some(codex) = &config.codex_chatgpt {
                     if !codex.auth_file.is_absolute() {
                         return Err(ExecError::Config(format!(
@@ -599,7 +615,7 @@ impl SandboxPolicy {
                     network,
                     proxy_ports,
                     file_credentials: config.file_credentials.clone(),
-                    dns_servers: config.dns_servers.clone(),
+                    dns_servers: configured_resolvers,
                     container_delivery,
                 });
                 policy.codex_chatgpt = config.codex_chatgpt.clone();
