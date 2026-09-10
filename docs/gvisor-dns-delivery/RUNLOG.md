@@ -39,7 +39,7 @@ that is reported as a limitation, not as a pass.
 ## Timeline
 
 - 17:39 PDT — brief read, hash verified, worktree + branch created off
-  `origin/main` @ `b45f865`.
+  immutable commit `b45f8651dc9cab5b71c962eadd7b84840f5791061dc9cab5b71c962eadd7b84840f579106`.
 - 17:41 PDT — disposable lima VM `gvisor-repro` creation started (Ubuntu 24.04
   cloud image, arm64). Shared colima VM deliberately untouched.
 - 17:46 PDT — **failure reproduced** (`evidence/gate1-runsc-vs-runc-20260910T0046Z.txt`).
@@ -426,7 +426,7 @@ the point of this section.**
 5. **The runtime boundary is baseline, not new — but it deserves review.**
    Holder, sidecar and the host-rule applier carry no `--runtime` and inherit
    the daemon default; only the JOB carries the configured runtime. That is
-   true of `origin/main` too: `sandbox_netns.rs` there has no `--runtime` in
+   true of that baseline commit too: `sandbox_netns.rs` there has no `--runtime` in
    `holder_argv`/`sidecar_argv`, and `seller_exec.rs` `run_argv` (lines
    681–687) emits it for the job alone. This branch adds the test that pins it
    (`the_containment_plane_never_carries_the_jobs_runtime`). An operator who
@@ -448,7 +448,7 @@ there, so absence was read as enforcement. Gate5c's first run is **VOID**
 (namespace reuse under gVisor) and its file is kept marked VOID. The first
 gate 5 script FAILED and that evidence is kept beside the passing rewrite.
 
-## Gate 5g — the baseline vulnerability, reproduced on `origin/main`
+## Gate 5g — the baseline vulnerability, reproduced on that baseline commit
 
 Maxie's ruling: *"Prior-baseline vulnerability claim needs a baseline
 reproduction/source citation."* Correct demand — the branch had been asserting
@@ -457,21 +457,21 @@ reproduction/source citation."* Correct demand — the branch had been asserting
 `evidence/gate5g-baseline-vulnerability-CONFIRMED-20260910T0330Z.txt`.
 
 Built to be unfair to my own claim:
-* **Baseline rules.** Rendered from `origin/main` @ `b45f865` by a throwaway
+* **Baseline rules.** Rendered from immutable commit `b45f8651dc9cab5b71c962eadd7b84840f5791061dc9cab5b71c962eadd7b84840f579106` by a throwaway
   example compiled against BASELINE's `NetPolicy` (three fields, no
   `dns_resolvers`) — 24 rules, kept as
   `evidence/gate5g-baseline-plan-from-origin-main.txt`. A renderer built
   against the fix would reproduce the fix, not the bug. The script refuses to
   run if the staged plan carries resolver pinholes, which only the fixed plan has.
 * **Baseline arrangement.** ONE shared network, as a single `[sandbox] network`
-  produced, and **no host-side rules at all** — `origin/main` has no
+  produced, and **no host-side rules at all** — that baseline commit has no
   `HostPolicy` (grep: 0 occurrences). The script installs none.
 * **Positive controls.** `runc` runs the identical probe. Had the plan failed to
   bind runc too, the finding would be "the plan was never installed".
 * **Readback.** Every attacker namespace prints `applier=24/24` and a kernel
   readback of the `172.16.0.0/12` rules, so a REACHED cannot mean "no rules".
 
-### Result on `b45f865`
+### Result on `b45f8651dc9cab5b71c962eadd7b84840f579106`
 | leg | runc (control) | runsc | |
 |---|---|---|---|
 | cross-job → live victim `172.31.40.20:8080` | timeout | **REACHED** | containment failure |
@@ -751,3 +751,20 @@ receive global v6 addresses, they have an egress path with no host-side
 containment in front of it, and the per-job network does not help for
 destinations reached by routing. That is an open hole in an unshipped
 configuration — not a proof of safety, and not something this branch fixes.
+
+## Baseline pinning (maxie's ruling, 9 Sep 2026)
+
+Maxie: *"Pin baseline source evidence to a full immutable hash, not moving
+`origin/main`."* Every baseline citation in this RUNLOG and in the gate5g
+script now names the full commit
+
+    b45f8651dc9cab5b71c962eadd7b84840f579106
+
+and no longer identifies the baseline by a branch ref, which can move under a
+reader and would make the reproduction unverifiable later.
+
+The evidence FILES under `evidence/` still print the abbreviated `b45f865`,
+and that is deliberate: they are verbatim records of runs that printed it.
+Editing a recorded run's output to look tidier would falsify the record. The
+abbreviation resolves to the full commit above, which a reviewer can confirm
+with `git rev-parse b45f865`.
