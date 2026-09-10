@@ -704,3 +704,50 @@ The Rust branch in `HostRules::drop` is covered by the two unit tests above.
 What the shell gate proves is narrower and worth stating plainly: that the
 per-rule **strategy** clears real rules from real chains where the one-shot
 inverse plan cannot. The gate does not drive `establish()` end to end.
+
+## Gate 5j — IPv6: measured, and the code's stated reason does not hold here
+
+Gate 5 left IPv6 as `NO-V6`/UNPROVEN. Maxie asked for "applicable IPv6".
+Evidence: `evidence/gate5j-ipv6-finding-20260910T0347Z.txt`.
+
+### What is true by construction
+`HostPolicy::argv` uses `Family::V4.binary()` unconditionally, so **no
+host-side IPv6 rule is rendered at all**. The netns plan still carries
+`DENIED_DESTINATIONS_V6`. This is deliberate and documented at
+`sandbox_net.rs`.
+
+### What was measured (aarch64, docker 29.1.3, gvisor-repro)
+* `/etc/docker/daemon.json` declares only the `runsc` runtime — **no IPv6**.
+* `docker info` reports no ipv6 key.
+* Inside a job-shaped holder on a per-job network: `ip -6 addr` shows only
+  `::1/128 scope host`. **Zero global IPv6 addresses.**
+
+So on this host a job has no IPv6 egress path, and host-side v6 containment is
+not exercised. **IPv6 is not-applicable here** — and that is a statement about
+this host, not a safety property of the branch.
+
+### The part that contradicts the code comment
+The doc comment justifies omitting v6 rules like this: *"`ip6tables` has a
+`DOCKER-USER` chain only when the daemon has IPv6 enabled, and a missing chain
+is an install failure that would fail every job launch on a v4-only host."*
+
+Measured on this v4-only host:
+
+```
+$ sudo ip6tables -S DOCKER-USER
+-N DOCKER-USER
+```
+
+**The chain exists**, with IPv6 disabled on the daemon. The stated premise does
+not hold here, so it is not the reason v6 rules are safe to omit. The honest
+reason is the one gate 5 already gave: host-side v6 containment is
+**UNMEASURED**. The comment should be corrected rather than relied on, and I
+have not rewritten it in this branch because changing v6 behaviour is outside
+the minimum repair maxie scoped — it is named here and in the PR instead.
+
+### The hole, stated plainly
+A host **with IPv6 enabled** is **not covered** by this branch. If jobs there
+receive global v6 addresses, they have an egress path with no host-side
+containment in front of it, and the per-job network does not help for
+destinations reached by routing. That is an open hole in an unshipped
+configuration — not a proof of safety, and not something this branch fixes.
