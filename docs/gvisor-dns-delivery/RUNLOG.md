@@ -265,3 +265,56 @@ Three parts, none of which replaces the others:
    ranges off-link) and INPUT for host-directed ones.
 3. **The existing netns OUTPUT plan, kept** — it is what binds a runc job, and
    it costs nothing to leave in place as defence in depth.
+
+## Gate 5f — the product's own host policy, measured against the hole it was built for
+
+`scripts/gate5f-product-host-rules-bind-runsc.sh`, evidence in
+`evidence/gate5f-evidence.txt`. aarch64, kernel 6.8.0-134, docker 29.1.3,
+runsc release-20260817.0, `br_netfilter=absent`, daemon `default-runtime=runc`.
+
+The rules under test are **rendered by the product**, not written by the script:
+`cargo run -p maxplayer-core --example render_host_plan -- 172.31.21.10`, from
+`HostPolicy`, 17 rules (`evidence/gate5f-host-install-rendered.txt`), plus the
+exact inverse for teardown. The probe namespace's address is pinned with
+`--ip` and the script **refuses to run** unless the rendered plan carries
+`-s 172.31.21.10/32`; a plan keyed to the wrong address would deny some other
+container while leaving this job open, and that mistake would otherwise be
+invisible. They are installed by piping the plan into the **same applier image
+the sidecar uses**, in a `--network host` container — the product's path, so
+the image's ability to write the root namespace's chains is itself under test.
+
+### What changed, and what did not
+| leg | before | after | what actually binds it |
+|---|---|---|---|
+| runsc → host `192.168.5.15:49253` (live) | REACHED | timeout | **the new INPUT rules** |
+| runc → host `192.168.5.15:49253` (live) | timeout | timeout | the netns OUTPUT plan, already |
+| runsc → own-network neighbour (live) | timeout | timeout | the per-job network + DOCKER-ISOLATION |
+| runsc → same-bridge neighbour (live) | REACHED | REACHED | **nothing — and that is the point** |
+
+Only the first row is a delta produced by the host policy, and it is the exact
+hole gate5e found: a gVisor job reaching the host itself, which DOCKER-USER
+cannot stop because host-directed packets never traverse FORWARD. Gate5e
+supplies the matching delta for DOCKER-USER (metadata: bare `ECONNREFUSED` vs
+ruled `timeout`). Together the two chains of the rendered plan are each caught
+working, on evidence, against a runsc job.
+
+The rows that did not change are recorded deliberately. The own-network row was
+already denied before the policy was installed, so **this gate does not prove
+the host rules deny cross-job traffic** — the per-job network does that, and
+claiming otherwise would repeat the gate-2 error of reading an absence as
+enforcement. The same-bridge row stays REACHED because switched frames enter no
+chain on a host without `br_netfilter`. That is not a defect in the policy; it
+is why the product gives every job its own network instead of trying to rule
+its way out of a shared one, and it is measured here so that reason stays
+evidenced rather than asserted.
+
+### The route survives
+With the full policy installed: `PUBLIC-PASS dns=34.225.223.145 tls=200
+verified=true` and `PUBLIC-PASS git 7fd1a60b01f91b314f59955a4e4d4e80d8edf11d`.
+
+### Teardown leaves no trace
+The rendered teardown plan removed all 17 rules; host readback for the job
+address went 9/8 → 0/0, and both chains returned to depth 1, the depth they
+had before the run. This is the failure mode `HostRules`' drop guard exists
+to prevent: a leaked container gets noticed, a leaked rule in a shared chain
+does not, and a recycled address would inherit a dead job's policy.
