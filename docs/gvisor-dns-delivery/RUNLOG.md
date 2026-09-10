@@ -222,3 +222,46 @@ network, does a source-keyed DOCKER-USER policy actually deny a runsc job a
 ROUTED private destination that docker isolation does not already block, and
 does it deny the metadata address? Host-directed traffic (the VM's own
 `192.168.5.15`) lands in INPUT, not FORWARD, and needs its own answer.
+
+## 2026-09-10 — gate5e: the enforcement sites, named
+
+Same discipline: fresh holder+plan namespace per probe, one gVisor container in
+each, health printed beside every leg, live listeners.
+
+**1. The host itself (`192.168.5.15:49252`, a real listener, reached by route)**
+
+| leg | result |
+| --- | --- |
+| runc, bare | `timeout` — its netns plan drops 192.168/16 |
+| runsc, bare | **`REACHED`** |
+| runsc, `DOCKER-USER -s <ns>/32 -d 192.168.0.0/16 -j DROP` | **`REACHED`** |
+| runsc, `INPUT -s <ns>/32 -d 192.168.0.0/16 -j DROP` | `timeout` |
+
+A gVisor job can reach the host's own LAN address today, and DOCKER-USER cannot
+stop it: host-directed packets are delivered locally, so they land in **INPUT**
+and never traverse FORWARD. INPUT binds it.
+
+**2. The metadata address.** Nothing listens on it here, so only the difference
+between runs is evidence — and there is one: bare `ECONNREFUSED`, with
+`DOCKER-USER -s <ns>/32 -d 169.254.169.254/32 -j DROP` `timeout`. The rule
+changes the outcome, so DOCKER-USER does bind the metadata address for a runsc
+job. It is reached by route through the gateway, which is why FORWARD sees it
+and the same chain was useless for the host and for a same-bridge peer.
+
+**3. Cross-job, each job on its own network:** runsc → job 2's live listener,
+`timeout`. Per-job networks are the cross-job answer.
+
+**4. The public route survives all of it:** with both rules installed,
+`PUBLIC-PASS dns=34.225.223.145 tls=200 verified=true` and
+`PUBLIC-PASS git 7fd1a60b…`.
+
+### The fix, now fully specified by measurement
+Three parts, none of which replaces the others:
+1. **A per-job network**, not the one shared `maxplayer-sbx` bridge. It contains
+   job-to-job traffic and it converts everything else into routed traffic that
+   host chains can see at all.
+2. **A host-side, source-keyed policy** applied daemon-side for the job
+   namespace's address: DOCKER-USER for routed destinations (metadata, private
+   ranges off-link) and INPUT for host-directed ones.
+3. **The existing netns OUTPUT plan, kept** — it is what binds a runc job, and
+   it costs nothing to leave in place as defence in depth.
