@@ -598,3 +598,60 @@ live in the `maxplayer` **binary** target. Verified this run:
 
 The four new tests were confirmed **by name** in the output, not inferred from
 the total moving.
+
+## Gate 5i — fail-closed, and a defect this branch introduced
+
+`scripts/gate5i-fail-closed-live.sh`, evidence
+`evidence/gate5i-fail-closed-FAIL-teardown-leak-20260910T0339Z.txt`.
+**GATE 5i: FAIL, 2 failing checks.** Kept as a FAIL, unfixed in this commit,
+because it found something real.
+
+### What passed
+* **A — applier cannot start** (bad image tag): 0 rules installed. `establish()`
+  maps this to a hard error.
+* **B — applier without `NET_ADMIN`**: `apply-policy: namespace is PARTIALLY
+  configured — destroy the holder, do not retry`, **0** rules installed.
+* **C — truncated plan**: the code comment claimed a truncated plan "applies
+  cleanly and exits 0, so no exit code reveals it". **Confirmed, measured**:
+  exit `0`, applier reported `9`, kernel held **9 of 17**. The count
+  cross-check is genuinely the only thing that catches it. And the question
+  that matters — with 9 of 17 rules, `runsc` → live host `192.168.5.15:49257`
+  came back **REACHED**. A partially-installed policy leaves the job
+  **uncontained**, so refusing the job is the only safe response.
+
+### What failed — and it is mine
+* **D — teardown of a partial install left all 9 rules in place.** Chain depth
+  went **2 → 11**. The gate leaked rules into a chain shared with every
+  container on the daemon.
+
+Mechanism, confirmed directly against the image rather than inferred:
+
+```
+apply-policy: rule 1 failed: iptables -D DOCKER-USER -s 10.99.99.99/32 ...
+apply-policy: namespace is PARTIALLY configured — destroy the holder, do not retry
+```
+…and the *next* rule in that probe plan never ran. The applier aborts on the
+first failure, by design.
+
+Teardown is the exact inverse — 17 `-D` in reverse order — so it begins with
+rule 17, which a 9-rule partial install never created. That first delete fails,
+the applier aborts, and **none of the 9 real rules come out**.
+
+### Why this is a real defect and not a script artefact
+`apply-policy`'s exit-3 contract says *destroy the holder*. For the **namespace**
+plan that is a complete remedy: the rules live in the holder's netns and die
+with it. My **host-side** plan puts rules in the **root netns**, in `DOCKER-USER`
+and `INPUT`. Destroying the holder removes none of them. The host path reuses an
+applier whose failure contract assumes namespace-scoped rules.
+
+This defeats the intent documented at the adoption site — *"a plan that failed
+part-way has already installed rules, and those rules must come out whichever
+way this returns."* `HostRules` is adopted correctly; the teardown it runs is
+what cannot do the job.
+
+Consequence if shipped: any partial host-rule install strands rules keyed to a
+job address in a shared chain, and gate 5h showed those addresses get recycled.
+Gate 5h passed only because its install was **complete**, so its teardown
+matched rule-for-rule.
+
+**Not fixed in this commit.** The failing gate and its evidence land first.
