@@ -100,3 +100,46 @@ and nothing wider.
 | 4 real container-side Git delivery, remote hash match | not started |
 | 5 private/metadata denial + concurrent public success | not started |
 | 6 bounded gate script, executed test counts, PR | not started |
+
+## 2026-09-10 — gate 5 turned up a hole bigger than the one I was sent for
+
+Gate 5's cross-job leg failed: from a runsc job in a namespace carrying the full
+26-rule plan, a container at `172.31.12.3:8080` — inside `-d 172.16.0.0/12 -j DROP` —
+was **REACHED**.
+
+`gate5b-does-the-plan-bind-a-runsc-job.sh` isolates it. Same namespace, same plan
+(read back from the netns: the DROP is rule 11/12 and it is there), same probe,
+one variable — the job's runtime:
+
+| job runtime | result to a listener inside a DROPped range |
+| --- | --- |
+| runc  | `timeout` — the DROP is enforced |
+| runsc | `REACHED` — the DROP is not |
+
+**The per-job egress plan does not bind the runtime it was written for.** gVisor's
+netstack terminates the network inside the sandbox and writes frames to the veth
+itself; the host kernel's OUTPUT chain in that netns only sees packets from host
+sockets, so it never sees the job's. The chain is installed, correct, verified by
+readback — and irrelevant to a gVisor job.
+
+This is not a regression from the DNS work; it predates this branch. The DNS
+change opens port 53 to a `/32` in a chain that was already not constraining the
+job.
+
+### It also devalues part of my own gate-2 evidence
+Gate 2 recorded `metadata: denied (ENETUNREACH)`. I read that as policy. It is
+not evidence of policy: nothing listens on `169.254.169.254` in this VM, and
+**absence is indistinguishable from enforcement** unless the denied destination
+has a live listener. Every denial leg in gate 5 that "passed" against a dead
+address proves nothing. Only the neighbour leg — a real listener inside a real
+DROP range — was a valid test, and it failed.
+
+Rule for the remaining gates: a denial is only proven against a destination that
+answers when it is allowed to.
+
+### Where containment has to live instead
+Not in the netns OUTPUT chain. The candidate that gVisor cannot bypass is the
+host side of the veth: FORWARD-chain rules in the root netns keyed to the job
+namespace's source address, and/or a per-job network rather than one shared
+`maxplayer-sbx` bridge (all jobs currently share it, which is why job A could see
+job B at all). Both need measuring before either goes in.
