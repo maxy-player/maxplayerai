@@ -447,3 +447,55 @@ Gate 2's "metadata denied (ENETUNREACH)" line is **withdrawn**: nothing listens
 there, so absence was read as enforcement. Gate5c's first run is **VOID**
 (namespace reuse under gVisor) and its file is kept marked VOID. The first
 gate 5 script FAILED and that evidence is kept beside the passing rewrite.
+
+## Gate 5g — the baseline vulnerability, reproduced on `origin/main`
+
+Maxie's ruling: *"Prior-baseline vulnerability claim needs a baseline
+reproduction/source citation."* Correct demand — the branch had been asserting
+"this predates the fix" from source reading alone. Here is the reproduction.
+`scripts/gate5g-baseline-vulnerability-repro.sh`, evidence
+`evidence/gate5g-baseline-vulnerability-CONFIRMED-20260910T0330Z.txt`.
+
+Built to be unfair to my own claim:
+* **Baseline rules.** Rendered from `origin/main` @ `b45f865` by a throwaway
+  example compiled against BASELINE's `NetPolicy` (three fields, no
+  `dns_resolvers`) — 24 rules, kept as
+  `evidence/gate5g-baseline-plan-from-origin-main.txt`. A renderer built
+  against the fix would reproduce the fix, not the bug. The script refuses to
+  run if the staged plan carries resolver pinholes, which only the fixed plan has.
+* **Baseline arrangement.** ONE shared network, as a single `[sandbox] network`
+  produced, and **no host-side rules at all** — `origin/main` has no
+  `HostPolicy` (grep: 0 occurrences). The script installs none.
+* **Positive controls.** `runc` runs the identical probe. Had the plan failed to
+  bind runc too, the finding would be "the plan was never installed".
+* **Readback.** Every attacker namespace prints `applier=24/24` and a kernel
+  readback of the `172.16.0.0/12` rules, so a REACHED cannot mean "no rules".
+
+### Result on `b45f865`
+| leg | runc (control) | runsc | |
+|---|---|---|---|
+| cross-job → live victim `172.31.40.20:8080` | timeout | **REACHED** | containment failure |
+| private egress → live host `192.168.5.15:49255` | timeout | **REACHED** | containment failure |
+
+**BASELINE-VULNERABLE: CONFIRMED, 2 findings.** The netns plan binds a runc job
+and not a gVisor one, and baseline has no second line of defence. The branch
+does not introduce this; it repairs it.
+
+### A confounded first run, kept
+The first attempt read `timeout` on the cross-job leg and looked like baseline
+containment working. It was nothing of the kind. The victim carries the
+baseline plan too, and its listener was running under **runc** — so the plan
+bound the *victim*, and its own OUTPUT rules dropped its replies to a
+172.16/12 peer. The probe measured a victim that could not answer, not an
+attacker that could not reach.
+
+Fixed by running the victim's listener under **runsc**, which is the real
+arrangement on a baseline seat (every job is a gVisor job), and by printing a
+`VICTIM-SERVING` liveness check from inside the victim's own namespace before
+any conclusion is drawn from a timeout. The confounded run is kept as
+`evidence/gate5g-baseline-repro-CONFOUNDED-runc-victim-20260910T0325Z.txt`.
+
+It is the same failure this branch has now hit three times in different
+clothes — gate 2's metadata line, gate5c's voided run, and this — and the
+lesson is identical each time: **a timeout is only evidence when something was
+proved able to answer.**
