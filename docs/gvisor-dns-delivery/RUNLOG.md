@@ -180,3 +180,45 @@ but loopback.
 One gVisor container per namespace, and a health check of the namespace
 immediately before any leg whose result is meant to be evidence. Re-run gate5c
 under that rule before either enforcement site is chosen.
+
+## 2026-09-10 — gate5c, re-run soundly: DOCKER-USER does not bind a bridged gVisor job; a per-job network does
+
+Rewritten under the one-gVisor-container-per-namespace rule, with a health check
+printed beside every leg. Every leg below ran in a namespace verified HEALTHY
+(address present, DNS resolving) immediately before the probe, against a LIVE
+listener.
+
+| leg | runc | runsc |
+| --- | --- | --- |
+| live neighbour, same bridge, no host rule | `timeout` | **`REACHED`** |
+| live neighbour, same bridge, `DOCKER-USER -s <ns>/32 -d 172.16.0.0/12 -j DROP` | `timeout` | **`REACHED`** |
+| live neighbour, **other bridge** | — | `timeout` |
+
+With that DOCKER-USER rule in place the public route the job must keep is
+untouched: `PUBLIC-PASS dns=34.225.223.145 tls=200 verified=true` and
+`PUBLIC-PASS git 7fd1a60b…`.
+
+**(a) DOCKER-USER does not bind a gVisor job talking to a peer on its own bridge.**
+The mechanism is in the environment line: `br_netfilter=absent`. Without
+`bridge-nf-call-iptables`, frames switched between two containers on the same
+bridge never enter iptables' FORWARD path at all, so DOCKER-USER cannot see them.
+The runc leg's `timeout` in that row is its own netns OUTPUT plan doing the work,
+not DOCKER-USER — which is exactly why a control that only ever shows "denied"
+proves nothing about the site under test.
+
+**(b) A per-job network does bind it.** Cross-bridge traffic is routed rather than
+switched, so it meets DOCKER-ISOLATION in the root netns and is dropped, gVisor
+or not.
+
+### The shape of the fix this implies
+A per-job network is not merely nicer isolation, it is what makes host-side
+enforcement possible at all: once the job's only on-link peer is its gateway,
+every other destination is ROUTED, and routed packets from a gVisor sandbox do
+traverse the host's FORWARD path where a source-keyed policy can bind them.
+Shared bridge + gVisor is the combination with no enforcement point.
+
+Still to measure before any of this is written into product code: with a per-job
+network, does a source-keyed DOCKER-USER policy actually deny a runsc job a
+ROUTED private destination that docker isolation does not already block, and
+does it deny the metadata address? Host-directed traffic (the VM's own
+`192.168.5.15`) lands in INPUT, not FORWARD, and needs its own answer.
