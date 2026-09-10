@@ -297,6 +297,18 @@ fn arg_value<'a, S: AsRef<str>>(args: &'a [S], flag: &str) -> Option<&'a str> {
         .map(AsRef::as_ref)
 }
 
+/// Which family an address literal belongs to. A colon is the only thing that distinguishes them
+/// here, and it is sufficient: these are addresses an operator configured or the host printed, not
+/// hostnames — a resolver named rather than addressed is refused before it reaches a policy
+/// ([`crate::sandbox_dns::from_config`]).
+fn resolver_family(address: &str) -> Family {
+    if address.contains(':') {
+        Family::V6
+    } else {
+        Family::V4
+    }
+}
+
 /// An address as iptables prints it: a bare host address gains an explicit prefix length.
 ///
 /// Measured, not assumed — `-d 172.17.0.1` reads back as `-d 172.17.0.1/32`. Comparing the two
@@ -324,6 +336,13 @@ pub struct ReadbackRule {
     pub target: Option<String>,
     /// The `--dport` value; a range for the pinhole.
     pub dport: Option<String>,
+    /// The `-p` value — the transport, as iptables prints it.
+    ///
+    /// Carried because a DNS exception is a *pair* of rules, one per transport, and a count cannot
+    /// tell a udp+tcp pair from two udp rules. A namespace holding two udp ACCEPTs for the same
+    /// resolver passes every count and still fails on exactly the large answers (DNSSEC, long CNAME
+    /// chains) that get retried over TCP.
+    pub protocol: Option<String>,
 }
 
 impl ReadbackRule {
@@ -343,6 +362,7 @@ impl ReadbackRule {
                     destination: arg_value(&fields, "-d").map(str::to_owned),
                     target: arg_value(&fields, "-j").map(str::to_owned),
                     dport: arg_value(&fields, "--dport").map(str::to_owned),
+                    protocol: arg_value(&fields, "-p").map(str::to_owned),
                 }
             })
             .collect()
@@ -361,6 +381,22 @@ pub struct NetPolicy {
     /// Connection and DNS logging (#797 requirement 3). Worth having with or without an allowlist:
     /// it is how anyone notices a job probing the LAN.
     pub log_connections: bool,
+    /// The upstream resolvers the job's `/etc/resolv.conf` names, each opened on port 53 and nothing
+    /// else. Empty ⇒ no DNS pinhole at all, which is correct only for a seat whose jobs need no name
+    /// resolution.
+    ///
+    /// **Why this field exists at all.** Docker's embedded resolver at `127.0.0.11` is a daemon-side
+    /// socket reached through NAT rules inside the container's namespace. Under gVisor the sandbox
+    /// terminates loopback in its own network stack, so those packets never arrive and every lookup
+    /// fails `EAI_AGAIN` — measured, with a runc control that succeeds on the identical image and
+    /// network, and with a bare UDP datagram to `127.0.0.11:53` timing out. `docker run --dns` does
+    /// not help: on a user-defined network the daemon writes `nameserver 127.0.0.11` regardless. So a
+    /// gVisor job is handed real upstream resolvers, and those resolvers need to be reachable through
+    /// a policy that otherwise denies the private ranges wholesale.
+    ///
+    /// Each address is opened as a single host (`/32`, or `/128` for v6) on port 53 only. Never a
+    /// subnet: an operator whose resolver is a LAN address gets that one address, not their LAN.
+    pub dns_resolvers: Vec<String>,
 }
 
 impl NetPolicy {
@@ -425,6 +461,36 @@ impl NetPolicy {
                 ],
                 "the #647 credential proxy — the single host service a job may reach",
             ));
+        }
+
+        // The DNS pinholes, also BEFORE the range drops and for the same reason: a resolver on a
+        // private address is inside a denied range, and a job that cannot resolve cannot deliver.
+        // One rule per transport, because a truncated UDP answer is retried over TCP and a seat that
+        // opened only UDP fails on exactly the large answers (DNSSEC, long CNAME chains) that are
+        // hardest to attribute later.
+        //
+        // Each resolver is pinned to a single host address and to port 53. Never a subnet and never
+        // a wider port range: an operator whose resolver sits on their LAN gets that one address
+        // opened for lookups, not the LAN the rest of this policy exists to deny.
+        for resolver in &self.dns_resolvers {
+            let family = resolver_family(resolver);
+            let destination = with_prefix_len(resolver, family);
+            for protocol in ["udp", "tcp"] {
+                rules.push(Rule::new(
+                    family,
+                    vec![
+                        "-p",
+                        protocol,
+                        "-d",
+                        destination.as_str(),
+                        "--dport",
+                        "53",
+                        "-j",
+                        "ACCEPT",
+                    ],
+                    "the sandbox's own resolver — docker's embedded one is unreachable under gVisor",
+                ));
+            }
         }
 
         for denied in DENIED_DESTINATIONS {
@@ -501,8 +567,17 @@ impl NetPolicy {
     ///   shape an injected rule would take;
     /// * **the pinhole names the measured gateway and only the proxy's ports** — a widened pinhole
     ///   still looks like one rule;
-    /// * **the metadata DROP precedes the pinhole** — order is load-bearing, and an ACCEPT above the
-    ///   metadata drop reopens the one destination the policy exists to close.
+    /// * **the metadata DROP precedes every ACCEPT** — order is load-bearing, and an ACCEPT above
+    ///   the metadata drop reopens the one destination the policy exists to close;
+    /// * **each resolver has exactly one udp and one tcp ACCEPT, on port 53, at its own host
+    ///   address, above the first range DROP** — a count cannot tell a udp+tcp pair from two udp
+    ///   rules, cannot tell a `/32` from a `/24` that covers it, and cannot tell a live exception
+    ///   from one appended below the drop that shadows it. All three pass a count and all three are
+    ///   wrong, one of them silently open.
+    ///
+    /// Both families are judged the same way here. v6 carries no proxy pinhole, so its only
+    /// permitted ACCEPTs are resolver pairs, and an extra one is a hole in the family least likely
+    /// to be looked at.
     pub fn verify_readback(&self, family: Family, stdout: &str) -> Result<(), String> {
         let found = ReadbackRule::parse_all(stdout);
         let expected = self.rule_count(family);
@@ -532,61 +607,148 @@ impl NetPolicy {
             }
         }
 
-        if family == Family::V4 {
-            let metadata_dropped_at = found.iter().position(|rule| {
+        // The first range DROP of this family. Every exception this policy renders — the proxy
+        // pinhole and each resolver pair — is rendered above it, and iptables takes the first match,
+        // so an exception read back BELOW it is inert: present, countable, and doing nothing.
+        // Compared against this index rather than an absolute position, because how many log rules
+        // sit ahead of it is a policy choice and not a safety property.
+        let first_range_drop = found.iter().position(|rule| {
+            rule.target.as_deref() == Some("DROP")
+                && rule.destination.as_deref().is_some_and(|found| denied.contains(&found))
+        });
+
+        // The metadata DROP is v4-only because the endpoint is a v4 address, and every ACCEPT in
+        // that family must sit below it.
+        let metadata_dropped_at = if family == Family::V4 {
+            let at = found.iter().position(|rule| {
                 rule.target.as_deref() == Some("DROP")
                     && rule.destination.as_deref() == Some(METADATA_ENDPOINT)
             });
-            let Some(metadata_dropped_at) = metadata_dropped_at else {
+            let Some(at) = at else {
                 return Err(format!(
                     "{METADATA_ENDPOINT} has no DROP in the live namespace — instance credentials are \
                      reachable from the job"
                 ));
             };
+            Some(at)
+        } else {
+            None
+        };
 
-            let accepts: Vec<(usize, &ReadbackRule)> = found
-                .iter()
-                .enumerate()
-                .filter(|(_, rule)| rule.target.as_deref() == Some("ACCEPT"))
-                .collect();
-            let wanted = usize::from(self.proxy_ports.is_some());
-            if accepts.len() != wanted {
-                return Err(format!(
-                    "the live namespace has {} ACCEPT rules, expected {wanted} — an unexpected ACCEPT \
-                     is an egress hole",
-                    accepts.len()
-                ));
-            }
+        let accepts: Vec<(usize, &ReadbackRule)> = found
+            .iter()
+            .enumerate()
+            .filter(|(_, rule)| rule.target.as_deref() == Some("ACCEPT"))
+            .collect();
+        // Two ACCEPTs per resolver of this family (udp and tcp), plus the proxy pinhole — v4 only,
+        // because the proxy is reached over v4. An ACCEPT this policy did not ask for is an egress
+        // hole whatever address it carries, which is why the total is checked before anything is
+        // matched by shape.
+        let proxy_accepts = usize::from(family == Family::V4 && self.proxy_ports.is_some());
+        let wanted = self.dns_pinhole_count(family) + proxy_accepts;
+        if accepts.len() != wanted {
+            return Err(format!(
+                "the live namespace has {} ACCEPT rules in {}, expected {wanted} — an unexpected \
+                 ACCEPT is an egress hole",
+                accepts.len(),
+                family.binary()
+            ));
+        }
 
-            if let Some(ports) = self.proxy_ports {
-                let (accept_at, pinhole) = accepts[0];
-                let gateway = with_prefix_len(&self.gateway, Family::V4);
-                if pinhole.destination.as_deref() != Some(gateway.as_str()) {
+        // Each resolver, proved rule by rule rather than counted: the printed host address exactly,
+        // the transport exactly, port 53 exactly, above the range denies, and below the metadata
+        // drop.
+        let mut resolver_accepts: Vec<usize> = Vec::new();
+        for resolver in self.dns_resolvers.iter().filter(|r| resolver_family(r) == family) {
+            let destination = with_prefix_len(resolver, family);
+            for protocol in ["udp", "tcp"] {
+                let matching: Vec<(usize, &ReadbackRule)> = accepts
+                    .iter()
+                    .filter(|(_, rule)| {
+                        rule.destination.as_deref() == Some(destination.as_str())
+                            && rule.protocol.as_deref() == Some(protocol)
+                            && rule.dport.as_deref() == Some("53")
+                    })
+                    .copied()
+                    .collect();
+                if matching.len() != 1 {
                     return Err(format!(
-                        "the pinhole points at {:?}, not the measured proxy address {gateway} — the \
-                         job cannot reach its model, or something else can",
-                        pinhole.destination
+                        "the live namespace has {} {protocol} port-53 ACCEPTs to {destination}, \
+                         expected exactly 1 — either the job cannot resolve over {protocol}, or a \
+                         rule this policy never rendered is answering for it",
+                        matching.len()
                     ));
                 }
-                // iptables collapses a single-port range to a bare port, so both spellings of the
-                // same range must be accepted; anything wider is a hole. Derived from `to_match`
-                // rather than from `Display`, which spells a range `start-end` — a form iptables
-                // never prints, so matching against it would prove nothing.
-                let range = ports.to_match();
-                let mut acceptable = vec![range.clone()];
-                if let Some((start, end)) = range.split_once(':') {
-                    if start == end {
-                        acceptable.push(start.to_owned());
+                let (at, _) = matching[0];
+                if let Some(first_range_drop) = first_range_drop {
+                    if at > first_range_drop {
+                        return Err(format!(
+                            "the {protocol} port-53 ACCEPT for {destination} is at index {at}, below \
+                             the first range DROP at {first_range_drop} — iptables takes the first \
+                             match, so the resolver is dropped and the job cannot resolve"
+                        ));
                     }
                 }
-                let printed = pinhole.dport.as_deref().unwrap_or("");
-                if !acceptable.iter().any(|form| form == printed) {
-                    return Err(format!(
-                        "the pinhole opens ports {printed:?}, not the proxy's {} — a wider pinhole is \
-                         still one rule",
-                        ports.to_match()
-                    ));
+                if let Some(metadata_dropped_at) = metadata_dropped_at {
+                    if at < metadata_dropped_at {
+                        return Err(format!(
+                            "the {protocol} port-53 ACCEPT for {destination} is at index {at}, above \
+                             the metadata DROP at {metadata_dropped_at} — an ACCEPT above that drop \
+                             reopens {METADATA_ENDPOINT}"
+                        ));
+                    }
                 }
+                resolver_accepts.push(at);
+            }
+        }
+
+        // Whatever ACCEPT is left over is the proxy pinhole. Identified by elimination and not by
+        // address, so that a seat whose resolver happens to BE its gateway address still has both
+        // rules judged on their own terms.
+        let remaining: Vec<(usize, &ReadbackRule)> =
+            accepts.iter().filter(|(at, _)| !resolver_accepts.contains(at)).copied().collect();
+
+        if let (Family::V4, Some(ports)) = (family, self.proxy_ports) {
+            let Some((accept_at, pinhole)) = remaining.first().copied() else {
+                return Err("no ACCEPT in the live namespace is the proxy pinhole — the job cannot \
+                            reach its model"
+                    .to_owned());
+            };
+            let gateway = with_prefix_len(&self.gateway, Family::V4);
+            if pinhole.destination.as_deref() != Some(gateway.as_str()) {
+                return Err(format!(
+                    "the pinhole points at {:?}, not the measured proxy address {gateway} — the \
+                     job cannot reach its model, or something else can",
+                    pinhole.destination
+                ));
+            }
+            if pinhole.protocol.as_deref() != Some("tcp") {
+                return Err(format!(
+                    "the pinhole carries protocol {:?}, not tcp — the proxy is an HTTP listener, and \
+                     an exception on another transport is reach this policy never granted",
+                    pinhole.protocol
+                ));
+            }
+            // iptables collapses a single-port range to a bare port, so both spellings of the
+            // same range must be accepted; anything wider is a hole. Derived from `to_match`
+            // rather than from `Display`, which spells a range `start-end` — a form iptables
+            // never prints, so matching against it would prove nothing.
+            let range = ports.to_match();
+            let mut acceptable = vec![range.clone()];
+            if let Some((start, end)) = range.split_once(':') {
+                if start == end {
+                    acceptable.push(start.to_owned());
+                }
+            }
+            let printed = pinhole.dport.as_deref().unwrap_or("");
+            if !acceptable.iter().any(|form| form == printed) {
+                return Err(format!(
+                    "the pinhole opens ports {printed:?}, not the proxy's {} — a wider pinhole is \
+                     still one rule",
+                    ports.to_match()
+                ));
+            }
+            if let Some(metadata_dropped_at) = metadata_dropped_at {
                 if accept_at < metadata_dropped_at {
                     return Err(format!(
                         "the pinhole ACCEPT is at index {accept_at}, above the metadata DROP at \
@@ -594,9 +756,28 @@ impl NetPolicy {
                     ));
                 }
             }
+            if let Some(first_range_drop) = first_range_drop {
+                if accept_at > first_range_drop {
+                    return Err(format!(
+                        "the pinhole ACCEPT is at index {accept_at}, below the first range DROP at \
+                         {first_range_drop} — iptables takes the first match, so the job silently \
+                         loses its model"
+                    ));
+                }
+            }
         }
 
         Ok(())
+    }
+
+    /// How many ACCEPT rules this policy's resolvers install for one family: two per resolver, one
+    /// per transport.
+    ///
+    /// The arithmetic the readback's ACCEPT total is built on, so it is public and directly tested:
+    /// a wrong count here would either refuse a correctly contained namespace or make room in the
+    /// total for an ACCEPT nobody rendered.
+    pub fn dns_pinhole_count(&self, family: Family) -> usize {
+        self.dns_resolvers.iter().filter(|resolver| resolver_family(resolver) == family).count() * 2
     }
 }
 
@@ -609,6 +790,7 @@ mod tests {
             gateway: "172.31.0.1".to_owned(),
             proxy_ports: Some(PortRange::new(49200, 49299).unwrap()),
             log_connections: true,
+            dns_resolvers: Vec::new(),
         }
     }
 
@@ -902,6 +1084,7 @@ mod tests {
             gateway: "172.17.0.1".to_owned(),
             proxy_ports: Some(PortRange::new(49200, 49299).unwrap()),
             log_connections: true,
+            dns_resolvers: Vec::new(),
         }
     }
 
@@ -1026,6 +1209,7 @@ mod tests {
             gateway: "172.17.0.1".to_owned(),
             proxy_ports: None,
             log_connections: true,
+            dns_resolvers: Vec::new(),
         };
         // Its own readback is the measured one minus the pinhole.
         let without_pinhole = MEASURED_V4.replace(
@@ -1057,6 +1241,7 @@ mod tests {
             gateway: "172.17.0.1".to_owned(),
             proxy_ports: Some(PortRange::new(49200, 49200).unwrap()),
             log_connections: false,
+            dns_resolvers: Vec::new(),
         };
         let bare = policy
             .rules()
@@ -1093,6 +1278,9 @@ mod tests {
                     gateway: "172.17.0.1".to_owned(),
                     proxy_ports,
                     log_connections,
+                    // Both families, because a v6 resolver renders a different destination and the
+                    // whitespace invariant covers every rendered argument or it covers nothing.
+                    dns_resolvers: vec!["10.0.0.2".to_owned(), "2001:4860:4860::8888".to_owned()],
                 };
                 for rule in policy.rules() {
                     for arg in &rule.args {
@@ -1122,5 +1310,249 @@ mod tests {
             "the predicate used by no_rendered_argument_contains_whitespace cannot see the very \
              argument that broke containment"
         );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // The resolver exceptions.
+    //
+    // These assert the *content* of the rendered rules — protocol, host address, prefix length,
+    // port, target, and position — not how many of them there are. A count check passes on a policy
+    // that opened two UDP rules and no TCP one, or opened port 53 to the wrong address; both are
+    // failures a job would report as "DNS still broken" or as a hole nobody asked for.
+    // ---------------------------------------------------------------------------------------------
+
+    /// The exact argv for one resolver, in order, with nothing inferred.
+    fn expected_pinhole(protocol: &str, destination: &str) -> Vec<String> {
+        ["-p", protocol, "-d", destination, "--dport", "53", "-j", "ACCEPT"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    }
+
+    fn policy_with_resolvers(resolvers: &[&str]) -> NetPolicy {
+        NetPolicy {
+            gateway: "172.17.0.1".to_owned(),
+            proxy_ports: Some(PortRange::new(49200, 49299).unwrap()),
+            log_connections: true,
+            dns_resolvers: resolvers.iter().map(|r| (*r).to_owned()).collect(),
+        }
+    }
+
+    /// A v4 resolver opens exactly one UDP and one TCP rule, to that one address, on port 53 only.
+    #[test]
+    fn a_v4_resolver_renders_one_udp_and_one_tcp_rule_pinned_to_that_address_and_port() {
+        let policy = policy_with_resolvers(&["10.0.0.2"]);
+        let rendered: Vec<&Rule> = policy
+            .rules()
+            .iter()
+            .filter(|rule| rule.args.contains(&"53".to_owned()) && rule.target() == Some("ACCEPT"))
+            .cloned()
+            .collect::<Vec<_>>()
+            .leak()
+            .iter()
+            .collect();
+
+        assert_eq!(rendered.len(), 2, "one transport pair, no more and no fewer");
+        assert_eq!(rendered[0].args, expected_pinhole("udp", "10.0.0.2/32"));
+        assert_eq!(rendered[1].args, expected_pinhole("tcp", "10.0.0.2/32"));
+        assert!(rendered.iter().all(|rule| rule.family == Family::V4));
+        assert!(
+            rendered.iter().all(|rule| rule.family.binary() == "iptables"),
+            "a v4 exception installed by ip6tables is not installed at all"
+        );
+    }
+
+    /// A v6 resolver is a different address family: `/128`, and the other binary. Rendering it as a
+    /// v4 rule would make `iptables` refuse the line and leave the namespace short one rule — the
+    /// exact shape that once left a namespace with no rules at all.
+    #[test]
+    fn a_v6_resolver_renders_128_rules_on_the_v6_binary() {
+        let policy = policy_with_resolvers(&["2001:4860:4860::8888"]);
+        let rendered: Vec<Rule> = policy
+            .rules()
+            .into_iter()
+            .filter(|rule| rule.args.contains(&"53".to_owned()) && rule.target() == Some("ACCEPT"))
+            .collect();
+
+        assert_eq!(rendered.len(), 2);
+        assert_eq!(rendered[0].args, expected_pinhole("udp", "2001:4860:4860::8888/128"));
+        assert_eq!(rendered[1].args, expected_pinhole("tcp", "2001:4860:4860::8888/128"));
+        assert!(rendered.iter().all(|rule| rule.family == Family::V6), "v6 address, v6 family");
+        assert!(rendered.iter().all(|rule| rule.family.binary() == "ip6tables"));
+
+        // And it adds nothing to the v4 chain: the v4 rule count is what it was without a resolver.
+        assert_eq!(
+            policy.rule_count(Family::V4),
+            measured_policy().rule_count(Family::V4),
+            "a v6 resolver changed the v4 chain"
+        );
+    }
+
+    /// Position is the whole property: below the range DROPs the rule is dead (iptables takes the
+    /// first match), above the metadata DROP it would reopen the metadata endpoint.
+    #[test]
+    fn the_resolver_rules_sit_below_the_metadata_drop_and_above_the_range_drops() {
+        let policy = policy_with_resolvers(&["10.0.0.2"]);
+        let v4: Vec<Rule> =
+            policy.rules().into_iter().filter(|rule| rule.family == Family::V4).collect();
+        let at = |predicate: &dyn Fn(&Rule) -> bool| {
+            v4.iter().position(|rule| predicate(rule)).expect("the rule exists")
+        };
+
+        let metadata_drop = at(&|rule| {
+            rule.destination() == Some(METADATA_ENDPOINT) && rule.target() == Some("DROP")
+        });
+        // Filtered to ACCEPT deliberately: the port-53 LOG rule sits at the top of the chain by
+        // design, and matching it here would make this test pass on a policy whose exceptions were
+        // never rendered at all.
+        let first_dns = at(&|rule| {
+            rule.args.contains(&"53".to_owned()) && rule.target() == Some("ACCEPT")
+        });
+        let last_dns = v4
+            .iter()
+            .rposition(|rule| rule.args.contains(&"53".to_owned()) && rule.target() == Some("ACCEPT"))
+            .expect("a resolver rule");
+        let first_range_drop = at(&|rule| {
+            rule.target() == Some("DROP")
+                && rule.destination().is_some_and(|d| DENIED_DESTINATIONS.contains(&d))
+        });
+
+        assert!(
+            metadata_drop < first_dns,
+            "a resolver exception above the metadata DROP reopens 169.254.169.254"
+        );
+        assert!(
+            last_dns < first_range_drop,
+            "a resolver exception below the range DROPs never matches: the job cannot resolve"
+        );
+    }
+
+    /// The pinhole count is per family, because the two chains are installed by different binaries
+    /// and verified separately. A total would make a v6-only seat look like it owed v4 rules.
+    #[test]
+    fn the_pinhole_count_is_per_family() {
+        let policy = policy_with_resolvers(&["10.0.0.2", "1.1.1.1", "2001:4860:4860::8888"]);
+        assert_eq!(policy.dns_pinhole_count(Family::V4), 4, "two v4 resolvers, two transports each");
+        assert_eq!(policy.dns_pinhole_count(Family::V6), 2);
+        assert_eq!(measured_policy().dns_pinhole_count(Family::V4), 0, "no resolver, no exception");
+        assert_eq!(measured_policy().dns_pinhole_count(Family::V6), 0);
+    }
+
+    /// The v4 readback for a policy that carries one resolver.
+    ///
+    /// NOT a live capture, unlike [`MEASURED_V4`]: it is that fixture with the resolver rules
+    /// inserted where the renderer puts them, spelled the way iptables rewrote every other rule in
+    /// the measured run — `-d` hoisted ahead of `-p`, the `-m udp`/`-m tcp` match module made
+    /// explicit, the bare address given its `/32`. Written this way so the verifier is exercised
+    /// against iptables' spelling rather than against our own.
+    fn readback_with_resolver() -> String {
+        MEASURED_V4.replace(
+            "-A OUTPUT -d 10.0.0.0/8 -m limit",
+            "-A OUTPUT -d 10.0.0.2/32 -p udp -m udp --dport 53 -j ACCEPT\n\
+             -A OUTPUT -d 10.0.0.2/32 -p tcp -m tcp --dport 53 -j ACCEPT\n\
+             -A OUTPUT -d 10.0.0.0/8 -m limit",
+        )
+    }
+
+    /// The positive control: a namespace carrying exactly the resolver rules this policy asked for
+    /// verifies, and the same namespace verified against a policy with no resolver does not — so the
+    /// check cannot be passing by ignoring them.
+    #[test]
+    fn a_namespace_with_the_configured_resolver_rules_verifies() {
+        let policy = policy_with_resolvers(&["10.0.0.2"]);
+        assert_eq!(policy.verify_readback(Family::V4, &readback_with_resolver()), Ok(()));
+
+        // The same two rules, in a namespace whose policy configured no resolver — with the count
+        // held at 21 by displacing two LOG rules, so the ACCEPT accounting is the only check that
+        // can catch them. Two port-53 holes nobody asked for must be refused, not tolerated because
+        // they happen to look like DNS.
+        let smuggled = MEASURED_V4
+            .replace(
+                "-A OUTPUT -d 224.0.0.0/4 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix \"sbx-net-deny:\"",
+                "-A OUTPUT -d 10.0.0.2/32 -p udp -m udp --dport 53 -j ACCEPT",
+            )
+            .replace(
+                "-A OUTPUT -d 240.0.0.0/4 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix \"sbx-net-deny:\"",
+                "-A OUTPUT -d 10.0.0.2/32 -p tcp -m tcp --dport 53 -j ACCEPT",
+            );
+        assert_eq!(
+            ReadbackRule::parse_all(&smuggled).len(),
+            measured_policy().rule_count(Family::V4),
+            "the smuggled pair must keep the count right, or the count check fires instead"
+        );
+        let unexpected = measured_policy()
+            .verify_readback(Family::V4, &smuggled)
+            .expect_err("two ACCEPTs nobody configured");
+        assert!(unexpected.contains("ACCEPT"), "{unexpected}");
+    }
+
+    /// Every way a resolver exception can be wrong while the rule *count* is right. Each case keeps
+    /// the count intact deliberately: a count check would pass on all four, and each is a job that
+    /// silently cannot resolve or a hole that was never authorised.
+    #[test]
+    fn a_resolver_exception_that_is_present_but_wrong_is_refused() {
+        let policy = policy_with_resolvers(&["10.0.0.2"]);
+        let good = readback_with_resolver();
+        assert_eq!(
+            ReadbackRule::parse_all(&good).len(),
+            policy.rule_count(Family::V4),
+            "the fixture must have the right count, or every case below fires the count check"
+        );
+
+        // TCP missing for the configured resolver, its slot filled by a TCP exception to a
+        // different address — so the rule count, the ACCEPT count and the UDP rule are all intact
+        // and only the per-resolver transport proof can catch it. This is the shape where a job
+        // resolves until an answer is truncated, then fails on exactly the large answers (DNSSEC,
+        // long CNAME chains) that are hardest to attribute later.
+        let udp_only = good.replace(
+            "-A OUTPUT -d 10.0.0.2/32 -p tcp -m tcp --dport 53 -j ACCEPT",
+            "-A OUTPUT -d 10.0.0.9/32 -p tcp -m tcp --dport 53 -j ACCEPT",
+        );
+        let no_tcp = policy.verify_readback(Family::V4, &udp_only).expect_err("tcp missing");
+        assert!(no_tcp.contains("tcp"), "{no_tcp}");
+
+        // Port 53 opened to a different address — the job cannot resolve, and something else gained
+        // a hole.
+        let wrong_address = good.replace("-d 10.0.0.2/32 -p", "-d 10.0.0.9/32 -p");
+        let moved = policy.verify_readback(Family::V4, &wrong_address).expect_err("wrong address");
+        assert!(moved.contains("10.0.0.2/32"), "{moved}");
+
+        // The exception widened past port 53 to the resolver's whole host: an operator's LAN
+        // resolver box becomes reachable on every port, from inside a sandbox.
+        let widened = good.replace("--dport 53 -j ACCEPT", "--dport 1:65535 -j ACCEPT");
+        let wide = policy.verify_readback(Family::V4, &widened).expect_err("widened");
+        assert!(wide.contains("53"), "{wide}");
+
+        // Both rules present and correct, but below the range DROP that covers 10.0.0.0/8 — iptables
+        // takes the first match, so this namespace looks configured and resolves nothing.
+        let sunk = MEASURED_V4.replace(
+            "-A OUTPUT -d 172.16.0.0/12 -m limit",
+            "-A OUTPUT -d 10.0.0.2/32 -p udp -m udp --dport 53 -j ACCEPT\n\
+             -A OUTPUT -d 10.0.0.2/32 -p tcp -m tcp --dport 53 -j ACCEPT\n\
+             -A OUTPUT -d 172.16.0.0/12 -m limit",
+        );
+        let below = policy.verify_readback(Family::V4, &sunk).expect_err("below the range DROP");
+        assert!(below.contains("below the first range DROP"), "{below}");
+    }
+
+    /// A v6 resolver is verified against the v6 chain and is invisible to the v4 one — the two are
+    /// read back from different binaries, and crossing them would report a correct namespace broken.
+    #[test]
+    fn a_v6_resolver_is_verified_against_the_v6_chain() {
+        let policy = policy_with_resolvers(&["2001:4860:4860::8888"]);
+        let v6 = format!(
+            "-A OUTPUT -d 2001:4860:4860::8888/128 -p udp -m udp --dport 53 -j ACCEPT\n\
+             -A OUTPUT -d 2001:4860:4860::8888/128 -p tcp -m tcp --dport 53 -j ACCEPT\n{MEASURED_V6}"
+        );
+        assert_eq!(policy.verify_readback(Family::V6, &v6), Ok(()));
+        assert_eq!(policy.verify_readback(Family::V4, MEASURED_V4), Ok(()), "v4 chain unchanged");
+
+        // The exceptions opened for a *different* v6 resolver: same rule count, same ACCEPT count,
+        // same port — only the address is wrong. The refusal has to name the resolver this policy
+        // configured, or it is proving presence rather than identity.
+        let elsewhere = v6.replace("-d 2001:4860:4860::8888/128", "-d 2606:4700:4700::1111/128");
+        assert_eq!(ReadbackRule::parse_all(&elsewhere).len(), policy.rule_count(Family::V6));
+        let missing = policy.verify_readback(Family::V6, &elsewhere).expect_err("wrong v6 resolver");
+        assert!(missing.contains("2001:4860:4860::8888/128"), "{missing}");
     }
 }

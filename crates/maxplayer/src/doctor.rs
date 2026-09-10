@@ -1041,20 +1041,41 @@ mod checks {
             Ok(true) => {
                 // Also assert the policy is not vacuously empty. An empty plan would apply perfectly
                 // and contain nothing, which is the failure the sidecar's exit 4 exists to refuse.
+                // The resolvers are this seat's CONFIGURED ones and not an empty placeholder,
+                // because the count does depend on them — two port-53 rules per resolver — and a
+                // render with a resolver input no job will ever use would report a number for a
+                // different policy than the one launches install. Where the seat configured none,
+                // the resolvers are discovered per launch, so the number is a floor and the message
+                // says which case it is rather than certifying either silently.
+                let configured_resolvers = policy.dns_servers().to_vec();
+                let resolvers_named = configured_resolvers.len();
                 let rules = maxplayer_core::sandbox_net::NetPolicy {
-                    // A placeholder: the real address is measured per launch. Only the COUNT is read
-                    // here, and no rule's presence depends on which address this is.
+                    // A placeholder: the real address is measured per launch. No rule's presence
+                    // depends on which address this is.
                     gateway: "172.17.0.1".into(),
                     proxy_ports: policy.proxy_ports(),
                     log_connections: true,
+                    dns_resolvers: configured_resolvers,
                 }
                 .install_plan()
                 .len();
+                let resolver_note = if resolvers_named == 0 {
+                    "`[sandbox] dns_servers` names no resolver, so each job discovers this host's \
+                     own upstreams at launch and adds one udp and one tcp port-53 rule per resolver \
+                     on top of that count"
+                        .to_owned()
+                } else {
+                    format!(
+                        "including one udp and one tcp port-53 rule for each of the \
+                         {resolvers_named} resolver(s) `[sandbox] dns_servers` names"
+                    )
+                };
                 Check::pass(
                     EGRESS_CHECK,
                     format!(
-                        "network '{network}' exists and the policy renders {rules} rules; each job \
-                         gets them installed in its own network namespace before it starts"
+                        "network '{network}' exists and the policy renders {rules} rules \
+                         ({resolver_note}); each job gets them installed in its own network \
+                         namespace before it starts"
                     ),
                 )
             }
@@ -4339,6 +4360,9 @@ mod tests {
             // sandbox field breaks this test and makes someone decide what it should be here.
             network: None,
             proxy_port_range: None,
+            // No resolver named: this check reads the engine floor, and the resolver a job gets is
+            // decided per launch.
+            dns_servers: Vec::new(),
             // Decision for this test, per the note above: none. It asserts the engine-version floor,
             // and a file-sourced credential is a containment concern that would only add a second
             // reason for the check to move.

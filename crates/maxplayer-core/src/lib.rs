@@ -92,6 +92,10 @@ pub mod relay_auth;
 /// HTTP GET inside it needs `git-delivery`, which is the feature that carries `reqwest`.
 pub mod relay_info;
 pub mod runtime_guard;
+/// The resolver a contained job can actually reach, and the `/etc/resolv.conf` that names it.
+/// Ungated for the same reason as [`sandbox_net`] below: under gVisor a job that cannot resolve
+/// cannot deliver, so where its lookups go is policy, and it is compiled and tested on every build.
+pub mod sandbox_dns;
 /// Host-side network containment for a docker job (#797): which destinations a job may reach, and
 /// the `iptables` rules that enforce it on the two chains container traffic actually splits across.
 ///
