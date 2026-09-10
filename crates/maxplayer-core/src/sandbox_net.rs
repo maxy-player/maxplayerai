@@ -699,6 +699,131 @@ impl NetPolicy {
     }
 }
 
+/// Docker's documented hook in the root namespace's FORWARD path. Docker jumps to it before its
+/// own rules, and it survives docker rewriting the rest of the chain — which a bare `-I FORWARD`
+/// does not.
+pub const DOCKER_USER_CHAIN: &str = "DOCKER-USER";
+
+/// The root namespace's INPUT chain: where packets addressed to the host itself land.
+pub const INPUT_CHAIN: &str = "INPUT";
+
+/// The containment a gVisor job cannot step around, installed on the **host** side of the veth.
+///
+/// # Why this exists at all
+///
+/// [`NetPolicy`] renders rules for the job's own namespace, and for a runc job that is the whole
+/// story. For a **gVisor** job it is not. Measured in `docs/gvisor-dns-delivery` (aarch64, runsc
+/// release-20260817.0): with the full 26-rule plan installed and read back in the namespace, a
+/// runsc job REACHED a live listener inside `-d 172.16.0.0/12 -j DROP`, while a runc job in that
+/// same namespace got `timeout`. gVisor terminates the network inside the sandbox and writes
+/// frames to the veth itself, so the host kernel's OUTPUT chain in that namespace — which only
+/// ever sees packets from host sockets — never sees the job's.
+///
+/// So the netns plan stays (it is what binds a runc job, and it costs nothing as defence in depth)
+/// and this is added beside it, where the host kernel handles the packet whatever produced it.
+///
+/// # Why two chains and not one
+///
+/// Also measured, same evidence directory, against live listeners:
+///
+/// | destination | `DOCKER-USER` | `INPUT` |
+/// | --- | --- | --- |
+/// | the host's own LAN address | `REACHED` — useless | `timeout` — binds |
+/// | `169.254.169.254` (routed via the gateway) | binds | — |
+///
+/// Packets addressed to the host are delivered locally and never traverse FORWARD, so DOCKER-USER
+/// cannot see them. Packets routed onward do traverse it. Neither chain covers the other, which is
+/// why both are rendered.
+///
+/// # What this deliberately does not try to cover
+///
+/// A peer on the job's **own bridge** is reached by switching, not routing, and on a host without
+/// `br_netfilter` those frames enter no iptables chain at all — measured `REACHED` with the
+/// DOCKER-USER rule installed. No host rule fixes that. A **per-job network** does, by leaving the
+/// job no on-link peer but its gateway; see `sandbox_netns::establish`.
+///
+/// IPv6 is not rendered here. `ip6tables` has a `DOCKER-USER` chain only when the daemon has IPv6
+/// enabled, and a missing chain is an install failure that would fail every job launch on a v4-only
+/// host. The netns plan still carries [`DENIED_DESTINATIONS_V6`]; host-side v6 containment is
+/// UNMEASURED and named as such in the runlog rather than rendered on faith.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostPolicy {
+    /// The job namespace's own address. Every rule is keyed to it as `-s`, so the policy denies
+    /// this job and nothing else on the host.
+    pub job_addr: String,
+}
+
+/// One host-side rule: the chain it belongs in, what it denies, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRule {
+    pub chain: &'static str,
+    pub destination: String,
+    pub why: &'static str,
+}
+
+impl HostPolicy {
+    /// Every rule this policy installs, in install order.
+    pub fn rules(&self) -> Vec<HostRule> {
+        let mut rules = vec![HostRule {
+            chain: DOCKER_USER_CHAIN,
+            destination: METADATA_ENDPOINT.to_owned(),
+            why: "instance credentials, reached by route through the gateway",
+        }];
+        for denied in DENIED_DESTINATIONS {
+            rules.push(HostRule {
+                chain: DOCKER_USER_CHAIN,
+                destination: (*denied).to_owned(),
+                why: "a private destination the job reaches by route",
+            });
+        }
+        for denied in DENIED_DESTINATIONS {
+            rules.push(HostRule {
+                chain: INPUT_CHAIN,
+                destination: (*denied).to_owned(),
+                why: "the same range addressed to the host itself, which never enters FORWARD",
+            });
+        }
+        rules
+    }
+
+    /// The `iptables` argv that installs the policy.
+    ///
+    /// `-I` rather than `-A`: DOCKER-USER is a shared chain and docker appends its own rules to it,
+    /// so appending would put this policy behind whatever is already there.
+    pub fn install_argv(&self) -> Vec<Vec<String>> {
+        self.rules().iter().map(|rule| self.argv("-I", rule)).collect()
+    }
+
+    /// The argv that removes it, exactly inverting [`Self::install_argv`].
+    ///
+    /// This is not optional housekeeping. These rules are keyed to one job's address in a chain
+    /// that outlives the job; without the teardown the chain grows by one ruleset per job until the
+    /// host is a linear scan, and a recycled address inherits a dead job's policy.
+    pub fn teardown_argv(&self) -> Vec<Vec<String>> {
+        let mut argv: Vec<Vec<String>> =
+            self.rules().iter().map(|rule| self.argv("-D", rule)).collect();
+        argv.reverse();
+        argv
+    }
+
+    fn argv(&self, op: &str, rule: &HostRule) -> Vec<String> {
+        [
+            Family::V4.binary(),
+            op,
+            rule.chain,
+            "-s",
+            &format!("{}/32", self.job_addr),
+            "-d",
+            &rule.destination,
+            "-j",
+            "DROP",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1225,6 +1350,118 @@ mod tests {
             bad.args.iter().any(|arg| arg.chars().any(char::is_whitespace)),
             "the predicate used by no_rendered_argument_contains_whitespace cannot see the very \
              argument that broke containment"
+        );
+    }
+
+    fn host_policy() -> HostPolicy {
+        HostPolicy { job_addr: "172.31.19.2".into() }
+    }
+
+    /// The rule that makes this policy safe to install on a shared host. Every rule is keyed to one
+    /// job's address; a rule that lost its `-s` would deny the range to the WHOLE host, including
+    /// the seller's own traffic and every other job.
+    #[test]
+    fn every_host_rule_is_keyed_to_this_job_and_nothing_else() {
+        let policy = host_policy();
+        for argv in policy.install_argv().iter().chain(policy.teardown_argv().iter()) {
+            let source = argv.windows(2).find(|pair| pair[0] == "-s").map(|pair| &pair[1]);
+            assert_eq!(
+                source.map(String::as_str),
+                Some("172.31.19.2/32"),
+                "a host-side rule without this job's source key denies the range host-wide: {argv:?}"
+            );
+        }
+    }
+
+    /// Two chains, because neither covers the other: DOCKER-USER never sees a packet addressed to
+    /// the host, and INPUT never sees one routed onward. Both results are measured.
+    #[test]
+    fn the_host_policy_covers_the_routed_path_and_the_host_itself() {
+        let rules = host_policy().rules();
+        for denied in DENIED_DESTINATIONS {
+            for chain in [DOCKER_USER_CHAIN, INPUT_CHAIN] {
+                assert!(
+                    rules
+                        .iter()
+                        .any(|rule| rule.chain == chain && rule.destination == *denied),
+                    "{denied} has no DROP in {chain}"
+                );
+            }
+        }
+        assert!(
+            rules
+                .iter()
+                .any(|rule| rule.chain == DOCKER_USER_CHAIN
+                    && rule.destination == METADATA_ENDPOINT),
+            "the metadata endpoint has no host-side DROP on the routed path"
+        );
+    }
+
+    /// The metadata drop goes in FIRST, so no rule this policy adds can precede it.
+    #[test]
+    fn the_metadata_drop_is_the_first_rule_rendered() {
+        assert_eq!(host_policy().rules()[0].destination, METADATA_ENDPOINT);
+    }
+
+    /// Install renders `-I`, never `-A`: DOCKER-USER is shared and docker appends to it, so an
+    /// appended policy sits behind whatever is already there.
+    #[test]
+    fn the_host_policy_inserts_rather_than_appends() {
+        for argv in host_policy().install_argv() {
+            assert_eq!(argv[0], "iptables");
+            assert_eq!(argv[1], "-I", "appending puts this policy behind docker's own rules");
+        }
+    }
+
+    /// Teardown is the exact inverse of install, reversed. These rules outlive the job's container
+    /// in a chain nothing else cleans up: a teardown that misses one leaks a rule per job, and a
+    /// recycled address inherits a dead job's policy.
+    #[test]
+    fn teardown_is_the_exact_inverse_of_install_in_reverse_order() {
+        let policy = host_policy();
+        let install = policy.install_argv();
+        let teardown = policy.teardown_argv();
+        assert_eq!(install.len(), teardown.len());
+        for (installed, removed) in install.iter().rev().zip(teardown.iter()) {
+            let mut expected = installed.clone();
+            expected[1] = "-D".into();
+            assert_eq!(&expected, removed);
+        }
+    }
+
+    /// The exact argv, once, so a silent change to the shape of these rules has to be deliberate.
+    #[test]
+    fn the_first_host_rule_renders_exactly() {
+        assert_eq!(
+            host_policy().install_argv()[0],
+            vec![
+                "iptables",
+                "-I",
+                "DOCKER-USER",
+                "-s",
+                "172.31.19.2/32",
+                "-d",
+                "169.254.169.254/32",
+                "-j",
+                "DROP"
+            ]
+        );
+    }
+
+    /// The host policy reuses [`DENIED_DESTINATIONS`] rather than carrying its own copy. A second
+    /// list is a second thing to forget: the range added to one and not the other is reachable.
+    #[test]
+    fn the_host_policy_denies_every_range_the_namespace_plan_denies() {
+        let host = host_policy().rules();
+        let covered: Vec<&str> = DENIED_DESTINATIONS
+            .iter()
+            .copied()
+            .filter(|denied| host.iter().any(|rule| rule.destination == *denied))
+            .collect();
+        assert_eq!(
+            covered.len(),
+            DENIED_DESTINATIONS.len(),
+            "the host policy and the namespace plan disagree about what is denied"
         );
     }
 }
