@@ -499,3 +499,52 @@ It is the same failure this branch has now hit three times in different
 clothes — gate 2's metadata line, gate5c's voided run, and this — and the
 lesson is identical each time: **a timeout is only evidence when something was
 proved able to answer.**
+
+## Gate 5h — lifecycle: teardown, recycled address, recreation
+
+Maxie: *"Prove selected enforcement path handles runsc, lifecycle
+cleanup/recreation and fail-closed setup/readiness."* Gate 5 proved the rules
+**deny**. It never proved they **go away**, and that gap is dangerous in both
+directions: a rule keyed to job A's address does not stop existing when A does,
+and docker hands addresses back — so the next job to get `172.31.55.2` would
+inherit a firewall written for a stranger (traffic denied that should be
+allowed, or an ACCEPT pinhole that was A's proxy and is now someone else's open
+door). A network that fails to delete wedges the next job with the same id.
+
+`scripts/gate5h-lifecycle-and-recycled-address.sh`, evidence
+`evidence/gate5h-lifecycle-recycled-address-PASS-20260910T0332Z.txt`, plans
+`evidence/gate5h-plans/` (17 install / 17 teardown, rendered by
+`render_host_plan`, never transcribed).
+
+**GATE 5h: PASS — 0 failing checks** (aarch64, runsc release-20260817.0):
+
+| check | result |
+|---|---|
+| A establishes → host rules appear | 0 → **17** rules keyed to `172.31.55.2` |
+| A contained while installed | runsc → live host `timeout` |
+| A tears down → rules gone | **0** rules survive |
+| A tears down → network gone | removed |
+| B **recycles A's address** `172.31.55.2` | genuinely recycled |
+| B inherits stale firewall? | **0** stale rules |
+| B bare (control) → live host | **REACHED** |
+| B after its own rules → live host | **ENETUNREACH** |
+| same job id twice | both came up, no "already exists" wedge |
+| chains returned to start depth | 2 → 2, nothing leaked |
+
+### What each leg is worth
+The recycled-address leg is the strong one, and it is the reason the gate
+exists: a **bare-vs-ruled difference measured against a live listener**
+(`REACHED` → `ENETUNREACH`), on an address that a previous job had owned. It
+rules out both "the listener was never reachable" and "the old rules were doing
+the work".
+
+Leg 1 proves less and should be read that way: it measures job A only with its
+rules installed, with no bare control, so on its own it is consistent with the
+host simply being unreachable from that namespace. It is corroboration, not
+proof; the bare control in leg 3 and gate5f's `REACHED → timeout` carry the
+weight.
+
+Note the two denials read differently — `timeout` for A, `ENETUNREACH` for B.
+Both are denials, and the difference is not yet explained; it is most likely
+DROP versus an unreachable route at the moment of probe. Recorded as an
+observation, not a claim.
