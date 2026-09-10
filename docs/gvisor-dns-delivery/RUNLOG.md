@@ -318,3 +318,70 @@ address went 9/8 → 0/0, and both chains returned to depth 1, the depth they
 had before the run. This is the failure mode `HostRules`' drop guard exists
 to prevent: a leaked container gets noticed, a leaked rule in a shared chain
 does not, and a recycled address would inherit a dead job's policy.
+
+## Gate 5 — denial holds, and three concurrent jobs still deliver
+
+`scripts/gate5-denial-and-concurrent-success.sh` (rewritten),
+evidence `evidence/gate5-denial-and-concurrent-success-PASS-20260910T0311Z.txt`.
+The first version's FAIL is kept beside it as
+`…-20260910T0245Z.txt`. aarch64, kernel 6.8.0-134, docker 29.1.3, runsc
+release-20260817.0, `br_netfilter=absent`, daemon `default-runtime=runc`.
+Five namespaces, each on its own network, each with rules rendered by the
+product and guarded against a stale plan by source key. **Verdict: PASS,
+0 denial legs failing.**
+
+### Denial, before and after the host policy
+| destination | before | after | attributable to |
+|---|---|---|---|
+| host `192.168.5.15:49254`, **live** | REACHED | timeout | **the host policy (INPUT)** |
+| `denied-lan.maxplayer.test:49254` → same live listener, **by name** | REACHED | timeout | **the host policy (INPUT)** |
+| neighbour job `172.31.34.10:8080`, **live** | timeout | timeout | the per-job network, not the policy |
+| `169.254.169.254:80`, nothing listens | ECONNREFUSED | timeout | **the host policy (DOCKER-USER)** — a real difference |
+
+Two legs are new evidence and two are careful non-claims. The by-name leg is
+coverage no earlier gate had: a job that reaches a denied address through a
+NAME is denied exactly as one that dials the address, which matters because
+every real exfiltration attempt is a hostname. It uses a mounted hosts file
+rather than a third-party wildcard DNS service so the leg cannot pass or fail
+for an unrelated reason.
+
+The metadata leg is evidence only because bare and ruled runs DIFFER
+(`ECONNREFUSED` → `timeout`). With nothing listening there, an identical
+result in both sections would prove nothing, and this is the same reasoning
+that made me retract gate 2's "metadata denied" line rather than defend it.
+
+The neighbour leg was already denied before the policy went in, so the host
+policy is **not** credited with it. The per-job network plus docker's own
+isolation does that, and gate5c is where it was isolated.
+
+### IPv6 — measured, and left unproven on purpose
+The job namespace has no global IPv6 address at all (`NO-V6` under both
+runtimes), so there was nothing here to deny and nothing was proved. The
+host-side plan deliberately renders no ip6tables rules, because `DOCKER-USER`
+is not guaranteed to exist in the v6 table. **Host-side IPv6 denial for a
+gVisor job is UNPROVEN and must not be claimed.** The netns plan does cover
+v6, and its readback is verified per family at install time, but gate5b showed
+the netns plan does not bind a runsc job — so on a host where the job DOES get
+a global v6 address, this is an open hole and is listed as such in the
+limitations.
+
+### Concurrent delivery
+Three jobs at once, each with its own network, holder, netns plan and
+host policy installed simultaneously (17 rules each, all reading back on the
+host kernel). Every one delivered:
+
+```
+c1: OK dns=34.225.223.145 tls=200 verified=true  OK git 7fd1a60b…
+c2: OK dns=34.225.223.145 tls=200 verified=true  OK git 7fd1a60b…
+c3: OK dns=34.225.223.145 tls=200 verified=true  OK git 7fd1a60b…
+```
+
+Denial and delivery are therefore not in tension: the policy that blocks the
+host, the metadata address and a denied name by name is the same policy under
+which three jobs resolved, verified a certificate and cloned a repository at
+the same time.
+
+### No leaks
+All four policies torn down by their rendered inverse; the host kernel went
+from 17 rules each to 0, and `DOCKER-USER`/`INPUT` returned to depth 1, where
+they started.
