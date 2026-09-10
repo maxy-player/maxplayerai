@@ -655,3 +655,52 @@ Gate 5h passed only because its install was **complete**, so its teardown
 matched rule-for-rule.
 
 **Not fixed in this commit.** The failing gate and its evidence land first.
+
+## Gate 5i, after the fix — PASS
+
+`evidence/gate5i-fail-closed-PASS-after-fix-20260910T0347Z.txt`. The FAIL run
+is kept alongside it, not overwritten.
+
+**The fix** (`sandbox_netns.rs`): `HostRules` now carries `complete`, set only
+after the applier's count cross-check passes — never at construction. Teardown
+branches on it:
+
+* **complete** → the one-shot inverse plan, exactly as before. Every rule is
+  present, so the inverse matches rule-for-rule and one invocation is correct
+  and cheapest.
+* **not complete** → **one applier invocation per rule**. A failure then means
+  only "that rule was not there", which on this path is expected rather than an
+  error, so a rule that was never created can no longer strand the ones that were.
+
+Adoption still happens **before** the result is examined; that was always right.
+What changed is that the teardown it runs can now cope with the state adoption
+exists to clean up.
+
+Held by two unit tests: `adopted_host_rules_are_not_complete_until_the_count_check_passes`
+(the default must be the rule-by-rule path; the fast path is earned) and
+`the_per_rule_teardown_renders_one_valid_delete_per_rule` (each single-rule plan
+is one line, a delete, still keyed to this job's `/32` — the applier refuses an
+empty plan with exit 4 and a non-iptables binary with exit 5).
+
+**Both strategies now run back to back on the same partial install**, because
+the difference between them *is* the fix:
+
+| leg | result |
+|---|---|
+| C — truncated plan | applier exit `0`, reported `9`, kernel held **9 of 17** |
+| C — runsc → live host with 9 of 17 rules | **REACHED** — a partial policy is no policy |
+| D1 — one-shot inverse (pre-fix) | **9 of 9 remain**, applier aborts on the first absent rule |
+| D2 — per-rule (post-fix) | **removed 9, 0 remain** |
+| chain depth | **2 → 2** |
+
+**GATE 5i: PASS, 0 failing checks.**
+
+D1 is kept deliberately as a live regression witness rather than deleted: if
+the applier's abort-on-first-failure behaviour ever changes, this gate will say
+so instead of quietly preserving a workaround nobody needs any more.
+
+### What this leg does and does not prove
+The Rust branch in `HostRules::drop` is covered by the two unit tests above.
+What the shell gate proves is narrower and worth stating plainly: that the
+per-rule **strategy** clears real rules from real chains where the one-shot
+inverse plan cannot. The gate does not drive `establish()` end to end.

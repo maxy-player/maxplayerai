@@ -457,48 +457,92 @@ impl Drop for JobNetwork {
 pub struct HostRules {
     policy: crate::sandbox_net::HostPolicy,
     image: String,
+    /// Whether the install was **verified complete** — the applier exited 0 and its count matched
+    /// what was rendered. Set after that cross-check, never at construction.
+    ///
+    /// It decides how teardown is run, and gate 5i is why it exists. `apply-policy` aborts on the
+    /// first rule that fails, and the teardown plan is the exact inverse in reverse order. After a
+    /// PARTIAL install that inverse begins with a rule which was never created, so the applier
+    /// aborts on its first line and removes **nothing** — measured: 9 rules installed, 9 rules
+    /// still in `DOCKER-USER` afterwards.
+    ///
+    /// The applier's exit-3 contract tells the caller to destroy the holder, and for the namespace
+    /// plan that is a complete remedy because those rules die with the netns. These do not: they
+    /// are in the root netns, in chains shared with every container on the daemon.
+    complete: bool,
+}
+
+impl HostRules {
+    /// Adopt rules that may be only partly installed. Always the first thing done with them.
+    fn adopt(policy: crate::sandbox_net::HostPolicy, image: String) -> Self {
+        Self { policy, image, complete: false }
+    }
+
+    /// Record that every rendered rule is in the kernel, which licenses the one-shot teardown.
+    fn mark_complete(&mut self) {
+        self.complete = true;
+    }
+}
+
+/// Feeds one plan to the host-rule applier and reports whether it applied cleanly.
+fn run_host_plan(image: &str, plan: &str) -> Result<(), String> {
+    use std::io::Write;
+    let argv = host_rules_argv(image);
+    let (program, args) = argv.split_first().expect("a docker argv is never empty");
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        let _ = stdin.write_all(plan.as_bytes());
+    }
+    drop(child.stdin.take());
+    match child.wait_with_output() {
+        Ok(done) if done.status.success() => Ok(()),
+        Ok(done) => Err(String::from_utf8_lossy(&done.stderr).trim().to_owned()),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 impl Drop for HostRules {
     /// Synchronous, like [`NetnsHolder::drop`] and for the same reason: a task spawned here is
     /// discarded on runtime shutdown, which is the path an aborted job takes.
     fn drop(&mut self) {
-        use std::io::Write;
-        let (plan, _) = host_teardown_stdin(&self.policy);
-        let argv = host_rules_argv(&self.image);
-        let (program, args) = argv.split_first().expect("a docker argv is never empty");
-        let spawned = std::process::Command::new(program)
-            .args(args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn();
-        let mut child = match spawned {
-            Ok(child) => child,
-            Err(error) => {
+        if self.complete {
+            // Every rule is present, so the inverse plan matches it rule for rule and one
+            // invocation is both correct and cheapest.
+            let (plan, _) = host_teardown_stdin(&self.policy);
+            if let Err(error) = run_host_plan(&self.image, &plan) {
                 eprintln!(
-                    "sandbox: could not run the host-rule teardown for {}: {error} — \
+                    "sandbox: host-rule teardown for {} failed: {error} — \
                      DOCKER-USER and INPUT still carry this job's rules",
                     self.policy.job_addr
                 );
-                return;
             }
-        };
-        if let Some(stdin) = child.stdin.as_mut() {
-            let _ = stdin.write_all(plan.as_bytes());
+            return;
         }
-        drop(child.stdin.take());
-        match child.wait_with_output() {
-            Ok(done) if done.status.success() => {}
-            Ok(done) => eprintln!(
-                "sandbox: host-rule teardown for {} failed: {}",
-                self.policy.job_addr,
-                String::from_utf8_lossy(&done.stderr).trim()
-            ),
-            Err(error) => {
-                eprintln!("sandbox: host-rule teardown for {} did not finish: {error}", self.policy.job_addr)
+
+        // The install did not complete, so an unknown prefix of the plan is in the kernel and the
+        // rest never existed. One invocation would abort on the first absent rule and strand the
+        // present ones. Each rule gets its own invocation: a failure then means only "that rule was
+        // not there", which on this path is the expected case and not an error.
+        let rules = self.policy.teardown_argv();
+        let total = rules.len();
+        let mut removed = 0usize;
+        for rule in &rules {
+            let (plan, _) = host_stdin(std::slice::from_ref(rule));
+            if run_host_plan(&self.image, &plan).is_ok() {
+                removed += 1;
             }
         }
+        eprintln!(
+            "sandbox: host-rule install for {} did not complete; removed {removed} of {total} \
+             rules one at a time",
+            self.policy.job_addr
+        );
     }
 }
 
@@ -834,8 +878,7 @@ pub async fn establish(
     let host_applied = run_docker(host_rules_argv(sidecar_image), Some(host_plan)).await;
     // Adopted before the result is examined: a plan that failed part-way has already installed
     // rules, and those rules must come out whichever way this returns.
-    let host_rules =
-        HostRules { policy: host_policy, image: sidecar_image.to_owned() };
+    let mut host_rules = HostRules::adopt(host_policy, sidecar_image.to_owned());
     let (host_applied, _) = host_applied
         .map_err(|error| format!("host-side containment was not installed — {error}"))?;
     let host_applied: usize = host_applied
@@ -847,6 +890,10 @@ pub async fn establish(
              (the plan was truncated in transit)"
         ));
     }
+    // Only now is the one-shot inverse teardown known to match what is in the kernel. Before this
+    // line every early return unwinds rule-by-rule instead, which is the only way a partial
+    // install comes back out (gate 5i).
+    host_rules.mark_complete();
 
     let policy = NetPolicy {
         gateway: proxy_host.clone(),
@@ -1231,5 +1278,41 @@ mod tests {
         let accepts: Vec<&str> = stdin.lines().filter(|l| l.contains("ACCEPT")).collect();
         assert_eq!(accepts.len(), 1, "exactly one pinhole: {accepts:?}");
         assert!(accepts[0].contains(&measured), "the pinhole must name the measured host: {accepts:?}");
+    }
+
+    /// Adoption must assume the install is partial; the one-shot teardown has to be earned.
+    ///
+    /// Gate 5i measured what happens when it is not: a 9-of-17 install torn down by the inverse
+    /// plan removed **nothing**, because the applier aborts on the first rule that was never
+    /// created. So `complete` starts false, and only the count cross-check sets it.
+    #[test]
+    fn adopted_host_rules_are_not_complete_until_the_count_check_passes() {
+        let policy = crate::sandbox_net::HostPolicy { job_addr: "172.18.0.2".to_owned() };
+        let mut rules = HostRules::adopt(policy, "image:tag".to_owned());
+        assert!(!rules.complete, "adoption must assume a partial install");
+        rules.mark_complete();
+        assert!(rules.complete, "the count cross-check is what licenses the one-shot teardown");
+        // Drop shells out to docker; this test is about the flag, not the teardown.
+        std::mem::forget(rules);
+    }
+
+    /// Each rule of the rule-by-rule teardown must stand alone as one valid delete.
+    ///
+    /// This is the path a partial install unwinds through, and the applier refuses an empty plan
+    /// (exit 4) and anything that is not iptables (exit 5), so every single-rule plan must be one
+    /// line, a delete, and still keyed to this job.
+    #[test]
+    fn the_per_rule_teardown_renders_one_valid_delete_per_rule() {
+        let policy = crate::sandbox_net::HostPolicy { job_addr: "172.18.0.2".to_owned() };
+        let rules = policy.teardown_argv();
+        assert!(!rules.is_empty(), "there is nothing to tear down");
+        for rule in &rules {
+            let (plan, count) = host_stdin(std::slice::from_ref(rule));
+            assert_eq!(count, 1, "a per-rule plan must carry exactly one rule");
+            assert_eq!(plan.lines().count(), 1, "a per-rule plan must be one line: {plan:?}");
+            let line = plan.lines().next().expect("one line");
+            assert!(line.starts_with("iptables -D "), "must be a delete: {line}");
+            assert!(line.contains("172.18.0.2/32"), "must stay keyed to this job: {line}");
+        }
     }
 }

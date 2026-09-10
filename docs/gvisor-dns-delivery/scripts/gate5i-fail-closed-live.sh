@@ -146,14 +146,43 @@ else
 fi
 
 echo
-echo "=== gate5i: D. teardown unwinds the partial install ==="
+echo "=== gate5i: D. teardown of a PARTIAL install ==="
+# Two strategies, run back to back on the same partial install, because the difference between
+# them IS the fix. D1 is what HostRules::drop did before gate 5i; it is kept as a live regression
+# witness rather than deleted, so that if the applier's abort-on-first-failure behaviour ever
+# changes, this gate says so instead of silently keeping a workaround nobody needs.
+#
+# Note honestly what this leg is: the Rust branch in HostRules::drop is covered by unit tests
+# (`adopted_host_rules_are_not_complete_until_the_count_check_passes`,
+# `the_per_rule_teardown_renders_one_valid_delete_per_rule`). What a shell gate can prove, and
+# what these two legs do prove, is that the per-rule STRATEGY actually clears real rules from
+# real chains where the one-shot inverse plan cannot.
+echo "  D1: one-shot inverse plan (the pre-fix behaviour)"
 sudo timeout 120 docker run --rm --interactive --network host --cap-drop ALL \
   --cap-add NET_ADMIN --security-opt no-new-privileges "${NETFILTER_IMAGE}" \
   < "${PLANDIR}/${ADDR}-teardown.txt" >/dev/null 2>&1
+LEFT_D1="$(rules_for "${ADDR}")"
+echo "      rules remaining: ${LEFT_D1} (of ${INSTALLED_C} installed)"
+if [ "${LEFT_D1}" -gt 0 ]; then
+  echo "      as expected: the applier aborts on the first never-created rule and removes nothing"
+else
+  echo "      NOTE: the one-shot plan cleared it — the applier no longer aborts; revisit the fix"
+fi
+
+echo "  D2: per-rule teardown (what HostRules::drop now does on the partial path)"
+REMOVED=0
+while IFS= read -r line; do
+  [ -n "${line}" ] || continue
+  if printf '%s\n' "${line}" | sudo timeout 60 docker run --rm --interactive --network host \
+       --cap-drop ALL --cap-add NET_ADMIN --security-opt no-new-privileges \
+       "${NETFILTER_IMAGE}" >/dev/null 2>&1; then
+    REMOVED=$((REMOVED+1))
+  fi
+done < "${PLANDIR}/${ADDR}-teardown.txt"
 LEFT_D="$(rules_for "${ADDR}")"
-echo "  rules keyed to ${ADDR} after teardown: ${LEFT_D}"
-[ "${LEFT_D}" -eq 0 ] && ok "the partial install came out (this is what HostRules-adopted-before-check buys)" \
-  || fail "${LEFT_D} rule(s) survived teardown of a partial install"
+echo "      removed ${REMOVED} rule(s) one at a time; ${LEFT_D} remain"
+[ "${LEFT_D}" -eq 0 ] && ok "the partial install came out — a missing rule no longer strands the present ones" \
+  || fail "${LEFT_D} rule(s) survived even the per-rule teardown"
 
 echo
 echo "=== gate5i: verdict ==="
