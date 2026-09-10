@@ -297,6 +297,17 @@ fn arg_value<'a, S: AsRef<str>>(args: &'a [S], flag: &str) -> Option<&'a str> {
         .map(AsRef::as_ref)
 }
 
+/// Which family an address literal belongs to. A colon is the only thing that distinguishes them
+/// here, and it is sufficient: these are addresses an operator configured or the host printed, not
+/// hostnames — a resolver named rather than addressed is refused before it reaches a policy.
+fn resolver_family(address: &str) -> Family {
+    if address.contains(':') {
+        Family::V6
+    } else {
+        Family::V4
+    }
+}
+
 /// An address as iptables prints it: a bare host address gains an explicit prefix length.
 ///
 /// Measured, not assumed — `-d 172.17.0.1` reads back as `-d 172.17.0.1/32`. Comparing the two
@@ -361,6 +372,22 @@ pub struct NetPolicy {
     /// Connection and DNS logging (#797 requirement 3). Worth having with or without an allowlist:
     /// it is how anyone notices a job probing the LAN.
     pub log_connections: bool,
+    /// The upstream resolvers the job's `/etc/resolv.conf` names, each opened on port 53 and nothing
+    /// else. Empty ⇒ no DNS pinhole at all, which is correct only for a seat whose jobs need no name
+    /// resolution.
+    ///
+    /// **Why this field exists at all.** Docker's embedded resolver at `127.0.0.11` is a daemon-side
+    /// socket reached through NAT rules inside the container's namespace. Under gVisor the sandbox
+    /// terminates loopback in its own network stack, so those packets never arrive and every lookup
+    /// fails `EAI_AGAIN` — measured, with a runc control that succeeds on the identical image and
+    /// network, and with a bare UDP datagram to `127.0.0.11:53` timing out. `docker run --dns` does
+    /// not help: on a user-defined network the daemon writes `nameserver 127.0.0.11` regardless. So a
+    /// gVisor job is handed real upstream resolvers, and those resolvers need to be reachable through
+    /// a policy that otherwise denies the private ranges wholesale.
+    ///
+    /// Each address is opened as a single host (`/32`, or `/128` for v6) on port 53 only. Never a
+    /// subnet: an operator whose resolver is a LAN address gets that one address, not their LAN.
+    pub dns_resolvers: Vec<String>,
 }
 
 impl NetPolicy {
@@ -425,6 +452,32 @@ impl NetPolicy {
                 ],
                 "the #647 credential proxy — the single host service a job may reach",
             ));
+        }
+
+        // The DNS pinholes, also BEFORE the range drops and for the same reason: a resolver on a
+        // private address is inside a denied range, and a job that cannot resolve cannot deliver.
+        // One rule per transport, because a truncated UDP answer is retried over TCP and a seat that
+        // opened only UDP fails on exactly the large answers (DNSSEC, long CNAME chains) that are
+        // hardest to attribute later.
+        for resolver in &self.dns_resolvers {
+            let family = resolver_family(resolver);
+            let destination = with_prefix_len(resolver, family);
+            for protocol in ["udp", "tcp"] {
+                rules.push(Rule::new(
+                    family,
+                    vec![
+                        "-p",
+                        protocol,
+                        "-d",
+                        destination.as_str(),
+                        "--dport",
+                        "53",
+                        "-j",
+                        "ACCEPT",
+                    ],
+                    "the sandbox's own resolver — docker's embedded one is unreachable under gVisor",
+                ));
+            }
         }
 
         for denied in DENIED_DESTINATIONS {
@@ -549,7 +602,12 @@ impl NetPolicy {
                 .enumerate()
                 .filter(|(_, rule)| rule.target.as_deref() == Some("ACCEPT"))
                 .collect();
-            let wanted = usize::from(self.proxy_ports.is_some());
+            // Two ACCEPTs per v4 resolver (udp and tcp), plus the proxy pinhole if this seat has one.
+            // Counted rather than assumed: an ACCEPT this policy did not ask for is an egress hole
+            // whatever its destination, and the count is what catches one that carries a plausible
+            // address.
+            let dns_accepts = self.dns_pinhole_count(Family::V4);
+            let wanted = usize::from(self.proxy_ports.is_some()) + dns_accepts;
             if accepts.len() != wanted {
                 return Err(format!(
                     "the live namespace has {} ACCEPT rules, expected {wanted} — an unexpected ACCEPT \
@@ -558,16 +616,52 @@ impl NetPolicy {
                 ));
             }
 
-            if let Some(ports) = self.proxy_ports {
-                let (accept_at, pinhole) = accepts[0];
-                let gateway = with_prefix_len(&self.gateway, Family::V4);
-                if pinhole.destination.as_deref() != Some(gateway.as_str()) {
+            // Every resolver this policy named must actually be open on 53, and every ACCEPT that is
+            // not the proxy pinhole must be one of those resolvers. The first half catches a job that
+            // cannot resolve; the second catches a hole wearing a resolver's clothes.
+            for resolver in self.dns_resolvers.iter().filter(|r| resolver_family(r) == Family::V4) {
+                let destination = with_prefix_len(resolver, Family::V4);
+                let open = accepts
+                    .iter()
+                    .filter(|(_, rule)| {
+                        rule.destination.as_deref() == Some(destination.as_str())
+                            && rule.dport.as_deref() == Some("53")
+                    })
+                    .count();
+                if open != 2 {
                     return Err(format!(
-                        "the pinhole points at {:?}, not the measured proxy address {gateway} — the \
-                         job cannot reach its model, or something else can",
-                        pinhole.destination
+                        "{destination} has {open} port-53 ACCEPTs in the live namespace, expected 2 \
+                         (udp and tcp) — the job cannot resolve names, so it cannot deliver"
                     ));
                 }
+            }
+
+            // No ACCEPT may sit above the metadata DROP, resolver or not.
+            for (accept_at, rule) in &accepts {
+                if *accept_at < metadata_dropped_at {
+                    return Err(format!(
+                        "an ACCEPT for {:?} is at index {accept_at}, above the metadata DROP at \
+                         {metadata_dropped_at} — an ACCEPT above that drop reopens {METADATA_ENDPOINT}",
+                        rule.destination
+                    ));
+                }
+            }
+
+            if let Some(ports) = self.proxy_ports {
+                let gateway_destination = with_prefix_len(&self.gateway, Family::V4);
+                let pinhole = accepts
+                    .iter()
+                    .find(|(_, rule)| {
+                        rule.destination.as_deref() == Some(gateway_destination.as_str())
+                            && rule.dport.as_deref() != Some("53")
+                    })
+                    .copied();
+                let Some((accept_at, pinhole)) = pinhole else {
+                    return Err(format!(
+                        "no ACCEPT points at the measured proxy address {gateway_destination} — the \
+                         job cannot reach its model"
+                    ));
+                };
                 // iptables collapses a single-port range to a bare port, so both spellings of the
                 // same range must be accepted; anything wider is a hole. Derived from `to_match`
                 // rather than from `Display`, which spells a range `start-end` — a form iptables
@@ -587,16 +681,146 @@ impl NetPolicy {
                         ports.to_match()
                     ));
                 }
-                if accept_at < metadata_dropped_at {
-                    return Err(format!(
-                        "the pinhole ACCEPT is at index {accept_at}, above the metadata DROP at \
-                         {metadata_dropped_at} — an ACCEPT above that drop reopens {METADATA_ENDPOINT}"
-                    ));
-                }
+                let _ = accept_at;
             }
         }
 
         Ok(())
+    }
+
+    /// How many ACCEPT rules this policy's resolvers install for one family: two per resolver, one
+    /// per transport.
+    pub fn dns_pinhole_count(&self, family: Family) -> usize {
+        self.dns_resolvers
+            .iter()
+            .filter(|resolver| resolver_family(resolver) == family)
+            .count()
+            * 2
+    }
+}
+
+/// Docker's documented hook in the root namespace's FORWARD path. Docker jumps to it before its
+/// own rules, and it survives docker rewriting the rest of the chain — which a bare `-I FORWARD`
+/// does not.
+pub const DOCKER_USER_CHAIN: &str = "DOCKER-USER";
+
+/// The root namespace's INPUT chain: where packets addressed to the host itself land.
+pub const INPUT_CHAIN: &str = "INPUT";
+
+/// The containment a gVisor job cannot step around, installed on the **host** side of the veth.
+///
+/// # Why this exists at all
+///
+/// [`NetPolicy`] renders rules for the job's own namespace, and for a runc job that is the whole
+/// story. For a **gVisor** job it is not. Measured in `docs/gvisor-dns-delivery` (aarch64, runsc
+/// release-20260817.0): with the full 26-rule plan installed and read back in the namespace, a
+/// runsc job REACHED a live listener inside `-d 172.16.0.0/12 -j DROP`, while a runc job in that
+/// same namespace got `timeout`. gVisor terminates the network inside the sandbox and writes
+/// frames to the veth itself, so the host kernel's OUTPUT chain in that namespace — which only
+/// ever sees packets from host sockets — never sees the job's.
+///
+/// So the netns plan stays (it is what binds a runc job, and it costs nothing as defence in depth)
+/// and this is added beside it, where the host kernel handles the packet whatever produced it.
+///
+/// # Why two chains and not one
+///
+/// Also measured, same evidence directory, against live listeners:
+///
+/// | destination | `DOCKER-USER` | `INPUT` |
+/// | --- | --- | --- |
+/// | the host's own LAN address | `REACHED` — useless | `timeout` — binds |
+/// | `169.254.169.254` (routed via the gateway) | binds | — |
+///
+/// Packets addressed to the host are delivered locally and never traverse FORWARD, so DOCKER-USER
+/// cannot see them. Packets routed onward do traverse it. Neither chain covers the other, which is
+/// why both are rendered.
+///
+/// # What this deliberately does not try to cover
+///
+/// A peer on the job's **own bridge** is reached by switching, not routing, and on a host without
+/// `br_netfilter` those frames enter no iptables chain at all — measured `REACHED` with the
+/// DOCKER-USER rule installed. No host rule fixes that. A **per-job network** does, by leaving the
+/// job no on-link peer but its gateway; see `sandbox_netns::establish`.
+///
+/// IPv6 is not rendered here. `ip6tables` has a `DOCKER-USER` chain only when the daemon has IPv6
+/// enabled, and a missing chain is an install failure that would fail every job launch on a v4-only
+/// host. The netns plan still carries [`DENIED_DESTINATIONS_V6`]; host-side v6 containment is
+/// UNMEASURED and named as such in the runlog rather than rendered on faith.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostPolicy {
+    /// The job namespace's own address. Every rule is keyed to it as `-s`, so the policy denies
+    /// this job and nothing else on the host.
+    pub job_addr: String,
+}
+
+/// One host-side rule: the chain it belongs in, what it denies, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRule {
+    pub chain: &'static str,
+    pub destination: String,
+    pub why: &'static str,
+}
+
+impl HostPolicy {
+    /// Every rule this policy installs, in install order.
+    pub fn rules(&self) -> Vec<HostRule> {
+        let mut rules = vec![HostRule {
+            chain: DOCKER_USER_CHAIN,
+            destination: METADATA_ENDPOINT.to_owned(),
+            why: "instance credentials, reached by route through the gateway",
+        }];
+        for denied in DENIED_DESTINATIONS {
+            rules.push(HostRule {
+                chain: DOCKER_USER_CHAIN,
+                destination: (*denied).to_owned(),
+                why: "a private destination the job reaches by route",
+            });
+        }
+        for denied in DENIED_DESTINATIONS {
+            rules.push(HostRule {
+                chain: INPUT_CHAIN,
+                destination: (*denied).to_owned(),
+                why: "the same range addressed to the host itself, which never enters FORWARD",
+            });
+        }
+        rules
+    }
+
+    /// The `iptables` argv that installs the policy.
+    ///
+    /// `-I` rather than `-A`: DOCKER-USER is a shared chain and docker appends its own rules to it,
+    /// so appending would put this policy behind whatever is already there.
+    pub fn install_argv(&self) -> Vec<Vec<String>> {
+        self.rules().iter().map(|rule| self.argv("-I", rule)).collect()
+    }
+
+    /// The argv that removes it, exactly inverting [`Self::install_argv`].
+    ///
+    /// This is not optional housekeeping. These rules are keyed to one job's address in a chain
+    /// that outlives the job; without the teardown the chain grows by one ruleset per job until the
+    /// host is a linear scan, and a recycled address inherits a dead job's policy.
+    pub fn teardown_argv(&self) -> Vec<Vec<String>> {
+        let mut argv: Vec<Vec<String>> =
+            self.rules().iter().map(|rule| self.argv("-D", rule)).collect();
+        argv.reverse();
+        argv
+    }
+
+    fn argv(&self, op: &str, rule: &HostRule) -> Vec<String> {
+        [
+            Family::V4.binary(),
+            op,
+            rule.chain,
+            "-s",
+            &format!("{}/32", self.job_addr),
+            "-d",
+            &rule.destination,
+            "-j",
+            "DROP",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
     }
 }
 
@@ -609,6 +833,7 @@ mod tests {
             gateway: "172.31.0.1".to_owned(),
             proxy_ports: Some(PortRange::new(49200, 49299).unwrap()),
             log_connections: true,
+            dns_resolvers: Vec::new(),
         }
     }
 
@@ -902,6 +1127,7 @@ mod tests {
             gateway: "172.17.0.1".to_owned(),
             proxy_ports: Some(PortRange::new(49200, 49299).unwrap()),
             log_connections: true,
+            dns_resolvers: Vec::new(),
         }
     }
 
@@ -1026,6 +1252,7 @@ mod tests {
             gateway: "172.17.0.1".to_owned(),
             proxy_ports: None,
             log_connections: true,
+            dns_resolvers: Vec::new(),
         };
         // Its own readback is the measured one minus the pinhole.
         let without_pinhole = MEASURED_V4.replace(
@@ -1057,6 +1284,7 @@ mod tests {
             gateway: "172.17.0.1".to_owned(),
             proxy_ports: Some(PortRange::new(49200, 49200).unwrap()),
             log_connections: false,
+            dns_resolvers: Vec::new(),
         };
         let bare = policy
             .rules()
@@ -1093,6 +1321,7 @@ mod tests {
                     gateway: "172.17.0.1".to_owned(),
                     proxy_ports,
                     log_connections,
+                    dns_resolvers: vec!["1.1.1.1".to_owned()],
                 };
                 for rule in policy.rules() {
                     for arg in &rule.args {
@@ -1121,6 +1350,207 @@ mod tests {
             bad.args.iter().any(|arg| arg.chars().any(char::is_whitespace)),
             "the predicate used by no_rendered_argument_contains_whitespace cannot see the very \
              argument that broke containment"
+        );
+    }
+
+    fn host_policy() -> HostPolicy {
+        HostPolicy { job_addr: "172.31.19.2".into() }
+    }
+
+    /// The rule that makes this policy safe to install on a shared host. Every rule is keyed to one
+    /// job's address; a rule that lost its `-s` would deny the range to the WHOLE host, including
+    /// the seller's own traffic and every other job.
+    #[test]
+    fn every_host_rule_is_keyed_to_this_job_and_nothing_else() {
+        let policy = host_policy();
+        for argv in policy.install_argv().iter().chain(policy.teardown_argv().iter()) {
+            let source = argv.windows(2).find(|pair| pair[0] == "-s").map(|pair| &pair[1]);
+            assert_eq!(
+                source.map(String::as_str),
+                Some("172.31.19.2/32"),
+                "a host-side rule without this job's source key denies the range host-wide: {argv:?}"
+            );
+        }
+    }
+
+    /// Two chains, because neither covers the other: DOCKER-USER never sees a packet addressed to
+    /// the host, and INPUT never sees one routed onward. Both results are measured.
+    #[test]
+    fn the_host_policy_covers_the_routed_path_and_the_host_itself() {
+        let rules = host_policy().rules();
+        for denied in DENIED_DESTINATIONS {
+            for chain in [DOCKER_USER_CHAIN, INPUT_CHAIN] {
+                assert!(
+                    rules
+                        .iter()
+                        .any(|rule| rule.chain == chain && rule.destination == *denied),
+                    "{denied} has no DROP in {chain}"
+                );
+            }
+        }
+        assert!(
+            rules
+                .iter()
+                .any(|rule| rule.chain == DOCKER_USER_CHAIN
+                    && rule.destination == METADATA_ENDPOINT),
+            "the metadata endpoint has no host-side DROP on the routed path"
+        );
+    }
+
+    /// The metadata drop goes in FIRST, so no rule this policy adds can precede it.
+    #[test]
+    fn the_metadata_drop_is_the_first_rule_rendered() {
+        assert_eq!(host_policy().rules()[0].destination, METADATA_ENDPOINT);
+    }
+
+    /// Install renders `-I`, never `-A`: DOCKER-USER is shared and docker appends to it, so an
+    /// appended policy sits behind whatever is already there.
+    #[test]
+    fn the_host_policy_inserts_rather_than_appends() {
+        for argv in host_policy().install_argv() {
+            assert_eq!(argv[0], "iptables");
+            assert_eq!(argv[1], "-I", "appending puts this policy behind docker's own rules");
+        }
+    }
+
+    /// Teardown is the exact inverse of install, reversed. These rules outlive the job's container
+    /// in a chain nothing else cleans up: a teardown that misses one leaks a rule per job, and a
+    /// recycled address inherits a dead job's policy.
+    #[test]
+    fn teardown_is_the_exact_inverse_of_install_in_reverse_order() {
+        let policy = host_policy();
+        let install = policy.install_argv();
+        let teardown = policy.teardown_argv();
+        assert_eq!(install.len(), teardown.len());
+        for (installed, removed) in install.iter().rev().zip(teardown.iter()) {
+            let mut expected = installed.clone();
+            expected[1] = "-D".into();
+            assert_eq!(&expected, removed);
+        }
+    }
+
+    /// The exact argv, once, so a silent change to the shape of these rules has to be deliberate.
+    #[test]
+    fn the_first_host_rule_renders_exactly() {
+        assert_eq!(
+            host_policy().install_argv()[0],
+            vec![
+                "iptables",
+                "-I",
+                "DOCKER-USER",
+                "-s",
+                "172.31.19.2/32",
+                "-d",
+                "169.254.169.254/32",
+                "-j",
+                "DROP"
+            ]
+        );
+    }
+
+    /// The host policy reuses [`DENIED_DESTINATIONS`] rather than carrying its own copy. A second
+    /// list is a second thing to forget: the range added to one and not the other is reachable.
+    #[test]
+    fn the_host_policy_denies_every_range_the_namespace_plan_denies() {
+        let host = host_policy().rules();
+        let covered: Vec<&str> = DENIED_DESTINATIONS
+            .iter()
+            .copied()
+            .filter(|denied| host.iter().any(|rule| rule.destination == *denied))
+            .collect();
+        assert_eq!(
+            covered.len(),
+            DENIED_DESTINATIONS.len(),
+            "the host policy and the namespace plan disagree about what is denied"
+        );
+    }
+
+    /// Teardown must remove exactly what install added, in reverse.
+    ///
+    /// Gate 5h proved this on a live host: a recycled address inherited zero stale rules. That
+    /// was one measurement on one machine. This is the invariant, checked on every build — if
+    /// the two plans ever drift apart, teardown leaks rules into a shared chain and the next job
+    /// to be handed this address inherits a dead job's firewall.
+    #[test]
+    fn the_host_teardown_exactly_inverts_the_install() {
+        let policy = HostPolicy { job_addr: "172.18.0.2".to_owned() };
+        let install = policy.install_argv();
+        let teardown = policy.teardown_argv();
+        assert_eq!(
+            install.len(),
+            teardown.len(),
+            "install and teardown must be the same length or teardown leaves rules behind"
+        );
+        for (i, up) in install.iter().enumerate() {
+            let down = &teardown[teardown.len() - 1 - i];
+            assert_eq!(up[1], "-I", "install must insert");
+            assert_eq!(down[1], "-D", "teardown must delete");
+            assert_eq!(
+                up[2..],
+                down[2..],
+                "teardown rule {i} does not match the install rule it is meant to remove"
+            );
+        }
+    }
+
+    /// Every rule, both directions, must carry this job's `/32` source key.
+    ///
+    /// A host rule without `-s` is not this job's policy — it is a deny for the whole range on a
+    /// chain shared with every container on the daemon.
+    #[test]
+    fn every_host_rule_is_keyed_to_the_job_address() {
+        let policy = HostPolicy { job_addr: "172.18.0.2".to_owned() };
+        for argv in policy.install_argv().iter().chain(policy.teardown_argv().iter()) {
+            let at = argv
+                .iter()
+                .position(|arg| arg == "-s")
+                .unwrap_or_else(|| panic!("a host rule with no source key: {argv:?}"));
+            assert_eq!(
+                argv[at + 1],
+                "172.18.0.2/32",
+                "a host rule keyed to something other than this job: {argv:?}"
+            );
+        }
+    }
+
+    /// The count `establish()` cross-checks must equal the number of rules actually rendered.
+    ///
+    /// The applier reports a number and the caller compares it against this one; if the rendered
+    /// count and the plan's line count could disagree, a truncated plan would pass the check.
+    #[test]
+    fn the_rendered_host_plan_counts_exactly_what_it_renders() {
+        let policy = HostPolicy { job_addr: "172.18.0.2".to_owned() };
+        let (plan, count) = crate::sandbox_netns::host_install_stdin(&policy);
+        assert_eq!(count, policy.install_argv().len(), "the install count is not the rule count");
+        assert_eq!(
+            plan.lines().filter(|line| !line.trim().is_empty()).count(),
+            count,
+            "the install plan has a different number of lines than it claims rules"
+        );
+        let (teardown, teardown_count) = crate::sandbox_netns::host_teardown_stdin(&policy);
+        assert_eq!(teardown_count, count, "teardown claims a different rule count than install");
+        assert_eq!(
+            teardown.lines().filter(|line| !line.trim().is_empty()).count(),
+            teardown_count,
+            "the teardown plan has a different number of lines than it claims rules"
+        );
+    }
+
+    /// Why `establish()` refuses an empty address rather than rendering with it.
+    ///
+    /// This test asserts the hazard, not the fix: with no address the source key renders as bare
+    /// `/32`, which is not a host. Such a rule does not scope the deny to this job, so the guard
+    /// in `establish()` is load-bearing and must not be relaxed into a warning.
+    #[test]
+    fn an_empty_job_address_renders_a_source_key_that_is_not_a_host() {
+        let policy = HostPolicy { job_addr: String::new() };
+        let argv = policy.install_argv();
+        let first = &argv[0];
+        let at = first.iter().position(|arg| arg == "-s").expect("a source key");
+        assert_eq!(
+            first[at + 1],
+            "/32",
+            "an empty address must render an obviously-invalid key, which establish() then refuses"
         );
     }
 }

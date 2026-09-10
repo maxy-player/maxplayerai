@@ -261,6 +261,12 @@ pub struct DockerPolicy {
     /// same reason as `proxy_ports`: the containment path that reads them is the one that builds the
     /// launch, so both come from one config value rather than being written down twice.
     file_credentials: Vec<crate::home::FileCredential>,
+    /// Operator-named resolver addresses for contained jobs, resolved from
+    /// [`crate::home::SandboxConfig::dns_servers`]. Empty ⇒ discover the host's own upstreams at
+    /// launch. Carried on the policy for the same reason as `proxy_ports`: the argv that mounts the
+    /// job's `resolv.conf` and the policy that opens port 53 to those addresses must name the same
+    /// resolvers, or the job is handed a resolver its own firewall drops.
+    dns_servers: Vec<String>,
 }
 
 /// The agent-auth environment carried from the daemon into the container.
@@ -307,6 +313,13 @@ pub struct JobLaunch<'a> {
     /// rules live in the namespace this names, and they were installed before this job's process
     /// existed. A `Some` here is therefore a containment claim, not a networking preference.
     pub netns: Option<&'a str>,
+    /// A host file to bind-mount read-only at `/etc/resolv.conf`, when this job needs a resolver
+    /// docker will not give it. `None` ⇒ the container keeps whatever the daemon wrote.
+    ///
+    /// Present for gVisor jobs and measured, not assumed: docker's embedded resolver at
+    /// `127.0.0.11` never answers inside a runsc sandbox, and `--dns` does not change what the
+    /// daemon writes on a user-defined network, so the file is the only lever that reaches the job.
+    pub resolv_conf: Option<&'a Path>,
 }
 
 /// What the ACP driver spawns: the process `program` + `args`, and the `cwd` the ACP session runs
@@ -490,6 +503,12 @@ impl SandboxPolicy {
                         )));
                     }
                 }
+                // Validated HERE, at config resolution, for the same reason as the port range: a
+                // resolver that is a hostname or a loopback stub cannot serve a sandboxed job, and
+                // discovering that at job time would fail every job with an error that names the
+                // symptom rather than the config key.
+                crate::sandbox_dns::from_config(&config.dns_servers)
+                    .map_err(|error| ExecError::Config(error.to_string()))?;
                 let mut policy = Self::docker(DockerPolicy {
                     image,
                     forward_env: config.forward_env.clone(),
@@ -497,6 +516,7 @@ impl SandboxPolicy {
                     network,
                     proxy_ports,
                     file_credentials: config.file_credentials.clone(),
+                    dns_servers: config.dns_servers.clone(),
                 });
                 policy.codex_chatgpt = config.codex_chatgpt.clone();
                 Ok(policy)
@@ -555,6 +575,14 @@ impl SandboxPolicy {
     /// port. Read by the containment path so the proxy's bind and the firewall's pinhole name the
     /// same ports — two artifacts that must agree, derived from one config value rather than
     /// written down twice.
+    /// The operator-named resolver addresses, empty when none were configured.
+    pub fn dns_servers(&self) -> &[String] {
+        match &self.kind {
+            PolicyKind::Docker(docker) => &docker.dns_servers,
+            _ => &[],
+        }
+    }
+
     pub fn proxy_ports(&self) -> Option<crate::sandbox_net::PortRange> {
         match &self.kind {
             PolicyKind::Docker(policy) => policy.proxy_ports,
@@ -730,15 +758,31 @@ impl DockerPolicy {
             "-w".into(),
             CONTAINER_WORKDIR.into(),
         ]);
+        // The job's resolver, read-only, when containment wrote one.
+        //
+        // ⛔ Not a preference and not a convenience: under gVisor docker's embedded resolver at
+        // `127.0.0.11` never answers, so without this file every lookup inside the job fails
+        // `EAI_AGAIN` while the identical container under runc resolves fine (measured, with the raw
+        // UDP datagram to `127.0.0.11:53` timing out). `--dns` cannot substitute — on a user-defined
+        // network the daemon writes `nameserver 127.0.0.11` whatever it is told — so the file is the
+        // lever, and `:ro` keeps a stranger's job from rewriting where its own lookups go.
+        if let Some(resolv_conf) = job.resolv_conf {
+            argv.push("-v".into());
+            argv.push(format!("{}:/etc/resolv.conf:ro", resolv_conf.display()));
+        }
         // Egress containment (#797): join the namespace a holder container already owns, where the
         // rendered policy is in force BEFORE this process exists — the rules are not applied to the
         // job, the job is started into them. `crate::sandbox_netns` establishes that; `None` here
         // means it was not established, and the job falls back to the configured network (or, unset,
         // to the daemon default — exactly the behaviour before any of this existed).
         //
-        // Name resolution survives the swap: a container joining a namespace still gets its own
-        // /etc/resolv.conf pointing at docker's embedded resolver on 127.0.0.11 (measured), which is
-        // why `sandbox_net` must never deny loopback.
+        // Name resolution does NOT survive the swap on its own. A container joining a namespace gets
+        // its own /etc/resolv.conf pointing at docker's embedded resolver on 127.0.0.11, and under
+        // gVisor that resolver is unreachable: the sandbox terminates loopback in its own network
+        // stack, so the packet never reaches the NAT rules or the daemon socket behind them
+        // (measured — runsc EAI_AGAIN, runc OK, identical image and network). That is what the
+        // `resolv_conf` mount above exists to fix, and `sandbox_net` still never denies loopback
+        // because a runc seat continues to rely on exactly that resolver.
         match job.netns {
             Some(holder) => {
                 argv.push("--network".into());
@@ -901,6 +945,7 @@ pub fn probe_launch_argv(
         uid,
         gid,
         netns: None,
+            resolv_conf: None,
     };
     let launch = policy.launch(probe_command, &job)?;
     let mut argv = Vec::with_capacity(launch.args.len() + 1);
@@ -2193,8 +2238,33 @@ pub async fn run_agent_job(
     // Established only for a docker policy with a configured network. No network ⇒ no containment,
     // which is the behaviour a seat had before any of this existed; it is not silently claimed.
     let _containment;
+    // The resolver file this job is handed, when it gets one. Declared out here so the argv built
+    // further down can name it: the file is written by the containment path, and only that path
+    // opens port 53 to the addresses inside it.
+    let mut job_resolv_conf: Option<std::path::PathBuf> = None;
     let holder = match (policy.docker_image(), policy.sandbox_network()) {
         (Some(image), Some(network)) => {
+            // Resolvers FIRST, before the namespace exists, so a seat with no usable resolver fails
+            // with that reason and leaves nothing to tear down. Docker's embedded resolver is not an
+            // option here — under gVisor it never answers — so a job that cannot be given a real
+            // resolver is refused rather than launched to fail EAI_AGAIN with no explanation.
+            let resolvers = crate::sandbox_dns::resolve(
+                policy.dns_servers(),
+                crate::sandbox_dns::host_resolv_conf,
+                crate::sandbox_dns::host_resolvectl,
+            )
+            .map_err(|error| ExecError::Policy(format!("[sandbox] {error}")))?;
+            let resolv_path = workdir
+                .parent()
+                .unwrap_or(workdir)
+                .join(format!("resolv-{}.conf", job_id_of(workdir)));
+            std::fs::write(&resolv_path, resolvers.render_resolv_conf()).map_err(|error| {
+                ExecError::Policy(format!(
+                    "[sandbox] could not write the job's resolver file {}: {error}",
+                    resolv_path.display()
+                ))
+            })?;
+            job_resolv_conf = Some(resolv_path);
             let established = crate::sandbox_netns::establish(
                 network,
                 image,
@@ -2208,6 +2278,7 @@ pub async fn run_agent_job(
                 gid,
                 policy.proxy_ports(),
                 true,
+                resolvers.addresses().to_vec(),
             )
             .await
             // Fail the job rather than run it uncontained. The whole point of moving containment into
@@ -2281,6 +2352,10 @@ pub async fn run_agent_job(
         uid,
         gid,
         netns: holder.as_ref().map(|(name, _)| name.as_str()),
+        // Present exactly when containment was established, because that is the only path that
+        // wrote a resolver file and opened port 53 to the addresses in it. Handing a job this file
+        // without those pinholes would point it at a resolver its own firewall drops.
+        resolv_conf: job_resolv_conf.as_deref(),
     };
     let launch = policy.launch(&effective_command, &job)?;
     // The ACP idle/response timeout IS the unified job timeout — never a hardcoded 300s that could
@@ -2962,6 +3037,7 @@ mod tests {
             uid: 1000,
             gid: 1000,
             netns: None,
+            resolv_conf: None,
         }
     }
 
@@ -3065,6 +3141,7 @@ mod tests {
     fn docker_policy_mounts_only_the_job_workdir() {
         let agent_command = argv(&["claude-agent-acp"]);
         let policy = SandboxPolicy::docker(DockerPolicy {
+            dns_servers: Vec::new(),
             image: "maxplayer-sandbox:latest".into(),
             forward_env: Vec::new(),
             runtime: None,
@@ -3130,6 +3207,7 @@ mod tests {
 
     fn docker_policy_for_probe() -> SandboxPolicy {
         SandboxPolicy::docker(DockerPolicy {
+            dns_servers: Vec::new(),
             image: "maxplayer-sandbox:probe".into(),
             forward_env: Vec::new(),
             runtime: None,
@@ -3288,7 +3366,7 @@ mod tests {
         let job_launch = policy
             .launch(
                 &job_command,
-                &JobLaunch { workdir, env: &[], uid, gid, netns: None },
+                &JobLaunch { workdir, env: &[], uid, gid, netns: None, resolv_conf: None },
             )
             .expect("a job renders");
         let job_argv: Vec<String> =
@@ -3331,6 +3409,7 @@ mod tests {
              container and has nothing to say without one",
         );
         let policy = SandboxPolicy::docker(DockerPolicy {
+            dns_servers: Vec::new(),
             image,
             forward_env: Vec::new(),
             runtime: None,
@@ -4019,6 +4098,7 @@ mod tests {
     #[test]
     fn docker_policy_keeps_the_container_alive_for_its_own_diagnostics() {
         let policy = SandboxPolicy::docker(DockerPolicy {
+            dns_servers: Vec::new(),
             image: "maxplayer-sandbox:latest".into(),
             forward_env: Vec::new(),
             runtime: None,
@@ -4059,6 +4139,7 @@ mod tests {
     #[test]
     fn docker_policy_hardens_against_the_strangers_code_it_runs() {
         let policy = SandboxPolicy::docker(DockerPolicy {
+            dns_servers: Vec::new(),
             image: "maxplayer-sandbox:latest".into(),
             forward_env: Vec::new(),
             runtime: None,
@@ -4114,6 +4195,7 @@ mod tests {
     #[test]
     fn job_container_carries_a_deterministic_name_and_label() {
         let policy = SandboxPolicy::docker(DockerPolicy {
+            dns_servers: Vec::new(),
             image: "maxplayer-sandbox:latest".into(),
             forward_env: Vec::new(),
             runtime: None,
@@ -4421,6 +4503,7 @@ mod tests {
     fn docker_runtime_is_named_only_when_configured_and_precedes_the_image() {
         // Unset: no --runtime anywhere.
         let default_rt = SandboxPolicy::docker(DockerPolicy {
+            dns_servers: Vec::new(),
             image: "maxplayer-sandbox:latest".into(),
             forward_env: Vec::new(),
             runtime: None,
@@ -4439,6 +4522,7 @@ mod tests {
 
         // Set: --runtime runsc, before the image.
         let gvisor = SandboxPolicy::docker(DockerPolicy {
+            dns_servers: Vec::new(),
             image: "maxplayer-sandbox:latest".into(),
             forward_env: Vec::new(),
             runtime: Some("runsc".into()),
@@ -4475,6 +4559,7 @@ mod tests {
     #[test]
     fn a_configured_sandbox_network_reaches_the_argv_and_an_unset_one_emits_no_flag() {
         let unset = SandboxPolicy::docker(DockerPolicy {
+            dns_servers: Vec::new(),
             image: "maxplayer-sandbox:latest".into(),
             forward_env: Vec::new(),
             runtime: None,
@@ -4492,6 +4577,7 @@ mod tests {
         );
 
         let joined = SandboxPolicy::docker(DockerPolicy {
+            dns_servers: Vec::new(),
             image: "maxplayer-sandbox:latest".into(),
             forward_env: Vec::new(),
             runtime: None,
@@ -4860,6 +4946,7 @@ mod tests {
             }
         };
         let docker = SandboxPolicy::docker(DockerPolicy {
+            dns_servers: Vec::new(),
             image: "maxplayer-sandbox:latest".into(),
             forward_env: Vec::new(),
             runtime: None,
@@ -5057,6 +5144,7 @@ mod tests {
     fn the_uncontained_audit_counts_both_registries_not_just_the_table() {
         let cred = file_cred();
         let policy = SandboxPolicy::docker(DockerPolicy {
+            dns_servers: Vec::new(),
             image: "maxplayer-sandbox:latest".into(),
             forward_env: vec!["CURSOR_AUTH_TOKEN".into(), "MY_AGENT_TOKEN".into()],
             runtime: None,
@@ -5194,6 +5282,7 @@ mod tests {
             _ => None,
         };
         let policy = SandboxPolicy::docker(DockerPolicy {
+            dns_servers: Vec::new(),
             image: "img".into(),
             forward_env: vec!["MY_AGENT_TOKEN".into(), "ANTHROPIC_API_KEY".into()],
             runtime: None,
@@ -5216,6 +5305,7 @@ mod tests {
     #[test]
     fn forwarded_env_reaches_the_container_argv() {
         let policy = SandboxPolicy::docker(DockerPolicy {
+            dns_servers: Vec::new(),
             image: "maxplayer-sandbox:latest".into(),
             forward_env: Vec::new(),
             runtime: None,
@@ -5264,6 +5354,7 @@ mod tests {
     #[test]
     fn todays_forwarding_leaks_every_real_credential_into_the_container_view() {
         let policy = SandboxPolicy::docker(DockerPolicy {
+            dns_servers: Vec::new(),
             image: "maxplayer-sandbox:latest".into(),
             forward_env: Vec::new(),
             runtime: None,
@@ -5294,6 +5385,7 @@ mod tests {
     #[test]
     fn contained_launch_keeps_every_real_credential_out_of_the_container_view() {
         let policy = SandboxPolicy::docker(DockerPolicy {
+            dns_servers: Vec::new(),
             image: "maxplayer-sandbox:latest".into(),
             forward_env: Vec::new(),
             runtime: None,
@@ -5384,6 +5476,7 @@ mod tests {
     #[test]
     fn docker_launch_without_containment_opens_no_pinhole() {
         let policy = SandboxPolicy::docker(DockerPolicy {
+            dns_servers: Vec::new(),
             image: "img".into(),
             forward_env: Vec::new(),
             runtime: None,
@@ -5408,6 +5501,7 @@ mod tests {
     fn uncontained_forwarded_credentials_flags_only_unrecognized_operator_vars() {
         let docker = |forward_env: Vec<String>| {
             SandboxPolicy::docker(DockerPolicy {
+            dns_servers: Vec::new(),
                 image: "img".into(),
                 forward_env,
                 runtime: None,
@@ -5520,6 +5614,7 @@ mod tests {
         let agent_command = argv(&["sh", "-c", &probe]);
         let policy =
             SandboxPolicy::docker(DockerPolicy {
+            dns_servers: Vec::new(),
                 image,
                 forward_env: Vec::new(),
                 runtime: None,
