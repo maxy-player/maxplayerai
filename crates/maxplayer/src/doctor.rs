@@ -836,6 +836,10 @@ mod checks {
                     gateway: "172.17.0.1".into(),
                     proxy_ports: policy.proxy_ports(),
                     log_connections: true,
+                    // Placeholder alongside the gateway above, and for the same reason: only the
+                    // COUNT is read here. What resolvers a job actually gets is decided per launch
+                    // and proved by the sandbox DNS/TLS preflight, not by this render.
+                    dns_resolvers: Vec::new(),
                 }
                 .install_plan()
                 .len();

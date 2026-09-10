@@ -297,6 +297,17 @@ fn arg_value<'a, S: AsRef<str>>(args: &'a [S], flag: &str) -> Option<&'a str> {
         .map(AsRef::as_ref)
 }
 
+/// Which family an address literal belongs to. A colon is the only thing that distinguishes them
+/// here, and it is sufficient: these are addresses an operator configured or the host printed, not
+/// hostnames — a resolver named rather than addressed is refused before it reaches a policy.
+fn resolver_family(address: &str) -> Family {
+    if address.contains(':') {
+        Family::V6
+    } else {
+        Family::V4
+    }
+}
+
 /// An address as iptables prints it: a bare host address gains an explicit prefix length.
 ///
 /// Measured, not assumed — `-d 172.17.0.1` reads back as `-d 172.17.0.1/32`. Comparing the two
@@ -361,6 +372,22 @@ pub struct NetPolicy {
     /// Connection and DNS logging (#797 requirement 3). Worth having with or without an allowlist:
     /// it is how anyone notices a job probing the LAN.
     pub log_connections: bool,
+    /// The upstream resolvers the job's `/etc/resolv.conf` names, each opened on port 53 and nothing
+    /// else. Empty ⇒ no DNS pinhole at all, which is correct only for a seat whose jobs need no name
+    /// resolution.
+    ///
+    /// **Why this field exists at all.** Docker's embedded resolver at `127.0.0.11` is a daemon-side
+    /// socket reached through NAT rules inside the container's namespace. Under gVisor the sandbox
+    /// terminates loopback in its own network stack, so those packets never arrive and every lookup
+    /// fails `EAI_AGAIN` — measured, with a runc control that succeeds on the identical image and
+    /// network, and with a bare UDP datagram to `127.0.0.11:53` timing out. `docker run --dns` does
+    /// not help: on a user-defined network the daemon writes `nameserver 127.0.0.11` regardless. So a
+    /// gVisor job is handed real upstream resolvers, and those resolvers need to be reachable through
+    /// a policy that otherwise denies the private ranges wholesale.
+    ///
+    /// Each address is opened as a single host (`/32`, or `/128` for v6) on port 53 only. Never a
+    /// subnet: an operator whose resolver is a LAN address gets that one address, not their LAN.
+    pub dns_resolvers: Vec<String>,
 }
 
 impl NetPolicy {
@@ -425,6 +452,32 @@ impl NetPolicy {
                 ],
                 "the #647 credential proxy — the single host service a job may reach",
             ));
+        }
+
+        // The DNS pinholes, also BEFORE the range drops and for the same reason: a resolver on a
+        // private address is inside a denied range, and a job that cannot resolve cannot deliver.
+        // One rule per transport, because a truncated UDP answer is retried over TCP and a seat that
+        // opened only UDP fails on exactly the large answers (DNSSEC, long CNAME chains) that are
+        // hardest to attribute later.
+        for resolver in &self.dns_resolvers {
+            let family = resolver_family(resolver);
+            let destination = with_prefix_len(resolver, family);
+            for protocol in ["udp", "tcp"] {
+                rules.push(Rule::new(
+                    family,
+                    vec![
+                        "-p",
+                        protocol,
+                        "-d",
+                        destination.as_str(),
+                        "--dport",
+                        "53",
+                        "-j",
+                        "ACCEPT",
+                    ],
+                    "the sandbox's own resolver — docker's embedded one is unreachable under gVisor",
+                ));
+            }
         }
 
         for denied in DENIED_DESTINATIONS {
@@ -549,7 +602,12 @@ impl NetPolicy {
                 .enumerate()
                 .filter(|(_, rule)| rule.target.as_deref() == Some("ACCEPT"))
                 .collect();
-            let wanted = usize::from(self.proxy_ports.is_some());
+            // Two ACCEPTs per v4 resolver (udp and tcp), plus the proxy pinhole if this seat has one.
+            // Counted rather than assumed: an ACCEPT this policy did not ask for is an egress hole
+            // whatever its destination, and the count is what catches one that carries a plausible
+            // address.
+            let dns_accepts = self.dns_pinhole_count(Family::V4);
+            let wanted = usize::from(self.proxy_ports.is_some()) + dns_accepts;
             if accepts.len() != wanted {
                 return Err(format!(
                     "the live namespace has {} ACCEPT rules, expected {wanted} — an unexpected ACCEPT \
@@ -558,16 +616,52 @@ impl NetPolicy {
                 ));
             }
 
-            if let Some(ports) = self.proxy_ports {
-                let (accept_at, pinhole) = accepts[0];
-                let gateway = with_prefix_len(&self.gateway, Family::V4);
-                if pinhole.destination.as_deref() != Some(gateway.as_str()) {
+            // Every resolver this policy named must actually be open on 53, and every ACCEPT that is
+            // not the proxy pinhole must be one of those resolvers. The first half catches a job that
+            // cannot resolve; the second catches a hole wearing a resolver's clothes.
+            for resolver in self.dns_resolvers.iter().filter(|r| resolver_family(r) == Family::V4) {
+                let destination = with_prefix_len(resolver, Family::V4);
+                let open = accepts
+                    .iter()
+                    .filter(|(_, rule)| {
+                        rule.destination.as_deref() == Some(destination.as_str())
+                            && rule.dport.as_deref() == Some("53")
+                    })
+                    .count();
+                if open != 2 {
                     return Err(format!(
-                        "the pinhole points at {:?}, not the measured proxy address {gateway} — the \
-                         job cannot reach its model, or something else can",
-                        pinhole.destination
+                        "{destination} has {open} port-53 ACCEPTs in the live namespace, expected 2 \
+                         (udp and tcp) — the job cannot resolve names, so it cannot deliver"
                     ));
                 }
+            }
+
+            // No ACCEPT may sit above the metadata DROP, resolver or not.
+            for (accept_at, rule) in &accepts {
+                if *accept_at < metadata_dropped_at {
+                    return Err(format!(
+                        "an ACCEPT for {:?} is at index {accept_at}, above the metadata DROP at \
+                         {metadata_dropped_at} — an ACCEPT above that drop reopens {METADATA_ENDPOINT}",
+                        rule.destination
+                    ));
+                }
+            }
+
+            if let Some(ports) = self.proxy_ports {
+                let gateway_destination = with_prefix_len(&self.gateway, Family::V4);
+                let pinhole = accepts
+                    .iter()
+                    .find(|(_, rule)| {
+                        rule.destination.as_deref() == Some(gateway_destination.as_str())
+                            && rule.dport.as_deref() != Some("53")
+                    })
+                    .copied();
+                let Some((accept_at, pinhole)) = pinhole else {
+                    return Err(format!(
+                        "no ACCEPT points at the measured proxy address {gateway_destination} — the \
+                         job cannot reach its model"
+                    ));
+                };
                 // iptables collapses a single-port range to a bare port, so both spellings of the
                 // same range must be accepted; anything wider is a hole. Derived from `to_match`
                 // rather than from `Display`, which spells a range `start-end` — a form iptables
@@ -587,16 +681,21 @@ impl NetPolicy {
                         ports.to_match()
                     ));
                 }
-                if accept_at < metadata_dropped_at {
-                    return Err(format!(
-                        "the pinhole ACCEPT is at index {accept_at}, above the metadata DROP at \
-                         {metadata_dropped_at} — an ACCEPT above that drop reopens {METADATA_ENDPOINT}"
-                    ));
-                }
+                let _ = accept_at;
             }
         }
 
         Ok(())
+    }
+
+    /// How many ACCEPT rules this policy's resolvers install for one family: two per resolver, one
+    /// per transport.
+    pub fn dns_pinhole_count(&self, family: Family) -> usize {
+        self.dns_resolvers
+            .iter()
+            .filter(|resolver| resolver_family(resolver) == family)
+            .count()
+            * 2
     }
 }
 
@@ -609,6 +708,7 @@ mod tests {
             gateway: "172.31.0.1".to_owned(),
             proxy_ports: Some(PortRange::new(49200, 49299).unwrap()),
             log_connections: true,
+            dns_resolvers: Vec::new(),
         }
     }
 
@@ -902,6 +1002,7 @@ mod tests {
             gateway: "172.17.0.1".to_owned(),
             proxy_ports: Some(PortRange::new(49200, 49299).unwrap()),
             log_connections: true,
+            dns_resolvers: Vec::new(),
         }
     }
 
@@ -1026,6 +1127,7 @@ mod tests {
             gateway: "172.17.0.1".to_owned(),
             proxy_ports: None,
             log_connections: true,
+            dns_resolvers: Vec::new(),
         };
         // Its own readback is the measured one minus the pinhole.
         let without_pinhole = MEASURED_V4.replace(
@@ -1057,6 +1159,7 @@ mod tests {
             gateway: "172.17.0.1".to_owned(),
             proxy_ports: Some(PortRange::new(49200, 49200).unwrap()),
             log_connections: false,
+            dns_resolvers: Vec::new(),
         };
         let bare = policy
             .rules()
@@ -1093,6 +1196,7 @@ mod tests {
                     gateway: "172.17.0.1".to_owned(),
                     proxy_ports,
                     log_connections,
+                    dns_resolvers: vec!["1.1.1.1".to_owned()],
                 };
                 for rule in policy.rules() {
                     for arg in &rule.args {

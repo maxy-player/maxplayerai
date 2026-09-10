@@ -566,6 +566,7 @@ pub async fn establish(
     gid: u32,
     proxy_ports: Option<crate::sandbox_net::PortRange>,
     log_connections: bool,
+    dns_resolvers: Vec<String>,
 ) -> Result<Containment, String> {
     // Measured BEFORE the holder exists, so a probe failure needs no cleanup.
     let (probe_stdout, _) = run_docker(host_gateway_probe_argv(sidecar_image, proxy_alias), None)
@@ -587,6 +588,7 @@ pub async fn establish(
         gateway: proxy_host.clone(),
         proxy_ports,
         log_connections,
+        dns_resolvers,
     };
     let (plan, expected) = plan_stdin(&policy);
     let (applied, _) = run_docker(sidecar_argv(&holder, sidecar_image), Some(plan))
@@ -635,6 +637,7 @@ mod tests {
             gateway: "172.17.0.1".into(),
             proxy_ports: Some(PortRange::new(9000, 9002).expect("valid range")),
             log_connections: true,
+            dns_resolvers: Vec::new(),
         }
     }
 
@@ -930,6 +933,7 @@ mod tests {
             gateway: measured.clone(),
             proxy_ports: Some(PortRange::new(9000, 9000).expect("valid range")),
             log_connections: false,
+            dns_resolvers: Vec::new(),
         };
         let (stdin, _) = plan_stdin(&policy);
         let accepts: Vec<&str> = stdin.lines().filter(|l| l.contains("ACCEPT")).collect();

@@ -75,6 +75,10 @@ pub mod runtime_guard;
 /// `wallet`-only, so a default-features test run cannot execute a line of them — the policy is the
 /// part that decides what a stranger's job can reach, and it is compiled and tested on every build
 /// rather than only on the money-path one.
+/// The resolver a contained job can reach, and the `resolv.conf` that names it. Ungated for the
+/// same reason as `sandbox_net`: under gVisor a job that cannot resolve cannot deliver, so the
+/// decision about where its lookups go is policy, and it is compiled and tested on every build.
+pub mod sandbox_dns;
 pub mod sandbox_net;
 /// Putting `sandbox_net`'s policy in force: the holder container that owns the job's network
 /// namespace, and the sidecar that installs the rules into it before the job exists. Unconditional
