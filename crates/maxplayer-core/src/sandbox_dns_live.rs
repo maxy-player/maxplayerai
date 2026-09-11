@@ -923,3 +923,233 @@ async fn a_failed_installer_destroys_the_holder_and_leaves_nothing_to_launch_int
         "the holder {name} survived a failed installation:\n{listing}"
     );
 }
+
+/// The agent argv the delivery gate drives. `fake-acp-agent` is the fixture that satisfies the
+/// product's ACP handshake and writes one deliverable; the wrapper in front of it records the
+/// kernel the DELIVERY container itself is running on, INTO the tree that is about to be committed
+/// and pushed.
+///
+/// That is deliberate. `docker inspect` reports what the daemon was asked for; this records what the
+/// process doing the git work actually ran under, and the fixture remote then hands it back from the
+/// other side of the wire. A `runc` delivery cannot produce this file.
+fn delivery_agent_argv() -> Vec<String> {
+    [
+        "sh",
+        "-c",
+        "{ dmesg 2>/dev/null | head -1; cat /proc/version 2>/dev/null; } > /work/KERNEL.txt; \
+         exec /usr/local/bin/fake-acp-agent",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+/// **Gate G — FUNCTIONAL container Git delivery.** A contained job FETCHES a pinned base over
+/// `https` from a DNS-named disposable endpoint and PUSHES the exact gated commit back to it,
+/// through the product's own container-delivery consumer — `maxplayer __deliver phase1`, launched
+/// with the same `launch_with_mounts` argv builder, holder namespace and resolver file the seller
+/// daemon uses (`seller_node::run::deliver_via_container`). No host git runs at any point in the
+/// delivery: the host writes the inputs file, reads the oid file back, and asks the REMOTE what it
+/// holds.
+///
+/// What each assertion is for:
+/// - the endpoint is reached by NAME, so both git legs resolved through the resolver file the launch
+///   wrote — the DNS contract and the delivery contract proven on one wire;
+/// - the pushed commit's PARENT is the seeded base oid, which no local init could produce: the
+///   clone/fetch leg really ran against the remote;
+/// - the ref the remote advertises is the exact oid the orchestrator gated, read back from the
+///   server side, not from the job's own repository;
+/// - `KERNEL.txt` inside the pushed tree carries the delivery container's own gVisor banner.
+///
+/// FIXTURE ACCOMMODATIONS, named so they are not mistaken for product behaviour: the endpoint serves
+/// a self-signed certificate, so the launch environment carries `GIT_SSL_NO_VERIFY` — the product
+/// honours git's own variable (`git_transport.rs:130`) and nothing in the product is changed to
+/// accept it; and the remote is anonymous `https`, so the push token source is
+/// [`PushTokenSource::None`], the same arm the host takes for a non-relay remote. No credential, no
+/// external repository and no relay is involved.
+#[tokio::test]
+#[ignore = "needs docker, the netfilter image, the git fixture image and the pinned sandbox image"]
+async fn functional_g_contained_job_fetches_and_pushes_an_exact_commit_over_dns() {
+    use crate::delivery_orchestrator as orch;
+
+    let _infra = Infra::up();
+    let base_oid = seed_git_fixture();
+    let remote = format!("https://{GIT_NAME}/repo.git");
+
+    // Contemporaneous control, from OUTSIDE containment and on the same fixtures: the endpoint
+    // answers by name and advertises the base. A later delivery failure is then attributable to the
+    // contained path rather than to a dead fixture or an unresolvable name.
+    //
+    // It is built the way the contained holder is built — started on the resolver's network, then
+    // attached to the endpoint's — because a container that can see only one of the two proves
+    // nothing about a path that needs both.
+    const CONTROL_CT: &str = "mxdns-gate-git-control";
+    docker(&["rm", "--force", "--volumes", CONTROL_CT]);
+    let (ok, _, err) = docker(&[
+        "run", "--detach", "--name", CONTROL_CT, "--network", SVC_NET, "--dns", RESOLVER_V4,
+        "--entrypoint", "sh", PROBE_IMAGE, "-c", "sleep 600",
+    ]);
+    assert!(ok, "could not start the control container: {err}");
+    let (ok, _, err) = docker(&["network", "connect", PUB_NET, CONTROL_CT]);
+    assert!(ok, "could not attach {PUB_NET} to the control container: {err}");
+    let (ok, control, control_err) = docker(&[
+        "exec", CONTROL_CT, "sh", "-c",
+        &format!("git -c http.sslVerify=false ls-remote {remote} refs/heads/{GIT_BASE_BRANCH}"),
+    ]);
+    docker(&["rm", "--force", "--volumes", CONTROL_CT]);
+    assert!(ok, "the unfiltered control could not reach the endpoint: {control}\n{control_err}");
+    assert!(
+        control.contains(&base_oid),
+        "the control did not see the seeded base {base_oid}: {control}"
+    );
+
+    let workdir = Workdir::new("gitgate");
+    let job = workdir.job();
+    let config = config_with_image(
+        DELIVERY_IMAGE,
+        vec![RESOLVER_V4.to_owned(), RESOLVER_V6.to_owned()],
+    );
+    let policy = SandboxPolicy::from_config(Some(&config)).expect("a docker policy");
+
+    // The SAME preparation the delivery path performs: containment, holder, resolver file, uid/gid
+    // and the agent argv the orchestrator will drive inside the container.
+    let agent_argv = delivery_agent_argv();
+    let prepared = crate::seller_exec::prepare_launch(
+        &agent_argv,
+        &policy,
+        workdir.path(),
+        &identity(),
+        Duration::from_secs(900),
+    )
+    .await
+    .expect("containment must be established");
+    let holder = prepared.holder_name.clone().expect("a holder");
+    let resolv = prepared.resolv_conf.clone().expect("a resolver file");
+    // The endpoint lives on the public net; without a route "unreachable" and "denied" are the same
+    // failure, and neither would be a statement about DNS.
+    attach_public(&holder);
+
+    // The host-owned exchange directory, outside the workdir, exactly as the daemon places it.
+    let io_dir = std::env::temp_dir().join("mxdns-gate").join(format!("io-{job}"));
+    orch::create_exchange_dir(&io_dir).expect("an exchange directory");
+
+    let branch = format!("maxplayer/{job}");
+    let inputs = orch::Phase1Inputs {
+        job_hash: "cd".repeat(32),
+        seller_pubkey_hex: identity().seller_pubkey_hex().to_owned(),
+        base: Some(orch::Phase1BaseOwned {
+            clone_url: remote.clone(),
+            branch: GIT_BASE_BRANCH.to_owned(),
+            oid: base_oid.clone(),
+        }),
+        delivery_branch: branch.clone(),
+        message: "delivery: live DNS/Git gate".to_owned(),
+        author_date_unix: 1_760_000_000,
+        agent_argv: prepared.effective_command.clone(),
+        workdir: std::path::PathBuf::from(crate::seller_exec::CONTAINER_WORKDIR),
+        out_dir: std::path::PathBuf::from(orch::CONTAINER_EXCHANGE_DIR),
+        prompt: "write the deliverable".to_owned(),
+        deadline_unix: (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock after the epoch")
+            .as_secs())
+            + 600,
+        max_agent_attempts: 1,
+        agent_env_names: prepared.env.iter().map(|(key, _)| key.clone()).collect(),
+        relay_url: remote.clone(),
+        // A non-relay https remote takes no header — the same arm the host selects.
+        push_token: orch::PushTokenSource::None,
+        handoff_nonce: "ef".repeat(16),
+    };
+    orch::write_phase1_inputs(&io_dir.join(orch::PHASE1_INPUTS_FILE), &inputs)
+        .expect("the inputs file must be written");
+
+    let mut launch_env = prepared.env.clone();
+    launch_env.push((
+        orch::CONTAINER_DELIVERY_ENV.to_owned(),
+        orch::CONTAINER_DELIVERY_ENV_VALUE.to_owned(),
+    ));
+    // Fixture accommodation, not a product change: the disposable endpoint is self-signed.
+    launch_env.push(("GIT_SSL_NO_VERIFY".to_owned(), "1".to_owned()));
+
+    let orchestrator: Vec<String> = vec![
+        orch::CONTAINER_ORCHESTRATOR_BIN.to_owned(),
+        "__deliver".to_owned(),
+        "phase1".to_owned(),
+        format!("{}/{}", orch::CONTAINER_EXCHANGE_DIR, orch::PHASE1_INPUTS_FILE),
+    ];
+    let (ok, out, err) = run_delivery(
+        &policy,
+        prepared.uid,
+        prepared.gid,
+        workdir.path(),
+        Some(&holder),
+        Some(resolv.as_path()),
+        &orchestrator,
+        &launch_env,
+        &[(io_dir.clone(), orch::CONTAINER_EXCHANGE_DIR.to_owned())],
+    );
+    // The outcome file is written on EVERY exit, so it carries the reason when the run failed.
+    let outcome = orch::read_outcome(&io_dir).ok().flatten();
+    assert!(ok, "the container delivery failed: {out}\n{err}\noutcome={outcome:?}");
+
+    // The runtime identity of the container that did the git work, from docker's own view. The
+    // delivery container is not removed on exit, so this is read from the container that ran.
+    let (runtime, network) = payload_runtime(&job);
+    assert_eq!(
+        runtime, RUNTIME,
+        "the delivery ran under {runtime}, not {RUNTIME} — this is not a gVisor result"
+    );
+    let (ok, holder_id, inspect_err) = docker(&["inspect", "--format", "{{.Id}}", &holder]);
+    assert!(ok, "could not resolve the holder's id: {inspect_err}");
+    assert_eq!(
+        network,
+        format!("container:{holder_id}"),
+        "the delivery container did not join the holder's namespace"
+    );
+
+    // The host's own read of the result: the oid file on the exchange mount, never a git command.
+    let delivered = orch::read_delivery_oid(&io_dir).expect("the delivery oid must be readable");
+    assert_eq!(
+        outcome.as_ref().map(|o| o.status),
+        Some(orch::Phase1Status::Delivered),
+        "the orchestrator did not report a delivery: {outcome:?}"
+    );
+    assert_eq!(
+        out.lines().last().unwrap_or_default().trim(),
+        delivered,
+        "the orchestrator's stdout oid and its oid file disagree: {out}"
+    );
+
+    // INDEPENDENT verification, on the far side of the wire: what the remote actually holds.
+    let (ok, advertised, err) = git_server(&format!("rev-parse refs/heads/{branch}"));
+    assert!(ok, "the remote has no {branch}: {advertised}\n{err}");
+    assert_eq!(
+        advertised.trim(),
+        delivered,
+        "the remote's ref is not the gated commit: {advertised}"
+    );
+    let (ok, parent, err) = git_server(&format!("rev-parse {delivered}^"));
+    assert!(ok, "the pushed commit has no parent: {parent}\n{err}");
+    assert_eq!(
+        parent.trim(),
+        base_oid,
+        "the pushed commit is not parented on the fetched base — the clone leg did not run"
+    );
+    let (ok, seeded, err) = git_server(&format!("show {delivered}:BASE.txt"));
+    assert!(ok, "the pushed tree is missing the fetched base content: {seeded}\n{err}");
+    assert_eq!(seeded.trim(), "base", "the fetched base content did not survive: {seeded}");
+    let (ok, kernel, err) = git_server(&format!("show {delivered}:KERNEL.txt"));
+    assert!(ok, "the pushed tree carries no kernel record: {kernel}\n{err}");
+    assert!(
+        kernel.contains("gVisor"),
+        "the delivery container's own kernel is not gVisor ({kernel}) — docker reported \
+         runtime={runtime}, and the two must agree before this is a gVisor result"
+    );
+
+    println!("delivery runtime={runtime} network={network}");
+    println!("delivery kernel record={}", kernel.replace('\n', " | "));
+    println!("remote {branch} = {delivered}, parent {parent} = seeded base");
+
+    let _ = std::fs::remove_dir_all(&io_dir);
+}
