@@ -2059,7 +2059,7 @@ impl SellerStore {
     ///   separately from a dedup because an operator reading "already journaled" for a job that was
     ///   actually fenced is reading a delivery that does not exist.
     #[allow(clippy::too_many_arguments)]
-    pub fn deliver_and_enqueue(
+    pub(crate) fn deliver_and_enqueue(
         &self,
         job_id: &str,
         result_ref: &str,
@@ -2068,10 +2068,8 @@ impl SellerStore {
         created_at_unix: i64,
         expires_at_unix: i64,
         now_unix: i64,
-        now_ms: i64,
+        clock: &crate::seller_node::DeliveryClock,
     ) -> Result<DeliveryJournal, StoreError> {
-        // Started BEFORE the lock, so the wait for it can be measured rather than assumed away.
-        let called_at = std::time::Instant::now();
         let mut conn = self.lock()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let exists: bool = tx
@@ -2115,27 +2113,19 @@ impl SellerStore {
             )
             .optional()?;
         // Eligibility is judged at the instant of the WRITE, not at the instant the caller decided
-        // to attempt it. Those differ by the wait for this very lock, which is unbounded and which
-        // the caller cannot observe, so judging by the bare `now_unix` argument leaves exactly the
-        // hole this check exists to close.
+        // to attempt it. Those differ by everything between the caller's own sample and this
+        // statement — argument marshalling, scheduler preemption, and the unbounded wait for this
+        // very lock — none of which the caller can observe. Judging by the bare `now_unix` argument
+        // leaves exactly the hole this check exists to close.
         //
-        // The correction is measured on the MONOTONIC clock, from before the lock to here, and
-        // added to the caller's own timestamp. Reading the wall clock here instead judges callers
-        // on a different clock from the one they pass — which is precisely the regression the first
-        // attempt caused: six existing tests, every one of them working in a synthetic timebase,
-        // had live deliveries refused as long expired. One clock base plus the elapsed wait is what
-        // makes this both atomic and correct.
-        //
-        // R2A: and it is carried in MILLISECONDS, because the same expression in whole seconds
-        // floors twice — once in the caller's own sample, once in the elapsed wait — and each floor
-        // discards up to 999ms of the very interval being measured. Sampled at 100.900 with a
-        // 0.200s wait, second arithmetic computes 100 and admits a delivery whose offer expired at
-        // 101; the real instant, 101.100, is past it. `now_ms` is the caller's own sample at
-        // millisecond precision on that same base, so this stays one coherent clock and simply
-        // stops throwing away the subsecond part. The deadline is a whole second, scaled here
-        // rather than truncating the instant down to meet it.
-        let deciding_ms = now_ms.saturating_add(called_at.elapsed().as_millis() as i64);
-        if deadline.is_some_and(|deadline| deadline.saturating_mul(1_000) <= deciding_ms) {
+        // R2A: so the decision reads a CLOCK here, inside the transaction, rather than arithmetic
+        // on a stale sample. `DeliveryClock` carries the caller's own origin paired with the
+        // monotonic instant it was taken at, and extrapolates it to THIS moment in nanoseconds — one
+        // coherent timebase (so a synthetic-timebase caller is still judged on its own clock) with
+        // no floor anywhere in the path. Whole seconds lost up to 999ms of the measured interval and
+        // whole milliseconds lost up to 999us of it; both admitted deliveries whose offer had in
+        // fact expired. The deadline is a whole second, scaled UP to meet the instant.
+        if deadline.is_some_and(|deadline| clock.deadline_passed(deadline)) {
             tx.commit()?;
             return Ok(DeliveryJournal::DeadlinePassed);
         }
@@ -3657,7 +3647,7 @@ mod tests {
                         1,
                         10_000,
                         1,
-                        1_000,
+                        &crate::seller_node::DeliveryClock::paired_at_unix(1),
                     )
                 });
                 let fail = scope.spawn(|| {
@@ -3744,7 +3734,7 @@ mod tests {
                     1,
                     10_000,
                     1,
-                    1_000,
+                    &crate::seller_node::DeliveryClock::paired_at_unix(1),
                 )
                 .expect("the delivery lands")
                 .enqueued(),
@@ -3815,6 +3805,9 @@ mod tests {
         offer.deadline_unix = 101;
         store.record_offer(&offer, 100).expect("record the offer");
         let sampled_at_ms = 100_900;
+        // The caller's origin, taken HERE — so the wait it is about to spend is inside the
+        // measured interval rather than outside it.
+        let clock = crate::seller_node::DeliveryClock::paired_at_ns(i128::from(sampled_at_ms) * 1_000_000);
         assert!(
             sampled_at_ms < offer.deadline_unix * 1_000,
             "harness check: the offer must be LIVE at the caller's sample, or this proves nothing \
@@ -3843,7 +3836,7 @@ mod tests {
                     100,
                     100 + 10_000,
                     100,
-                    sampled_at_ms,
+                    &clock,
                 )
                 .expect("the write completes rather than erroring")
         });
@@ -3867,6 +3860,202 @@ mod tests {
         );
     }
 
+    /// R2A — ACTUAL PRECISION: a crossing inside the final MILLISECOND is still a crossing.
+    ///
+    /// Round 4 judged this deadline in whole seconds; round 5 judged it in whole milliseconds. The
+    /// second is the first defect at a finer scale, and this test is the one that tells them apart.
+    /// The caller's origin sits **400 microseconds** before the deadline — live — and the decision
+    /// then comes **700 microseconds** later. The true instant, 101.0003, is past the deadline, so
+    /// nothing may be enqueued. Millisecond arithmetic floors the origin down to 100_999ms and the
+    /// wait down to 0ms, computes 100_999 < 101_000, and admits a delivery the offer no longer
+    /// accepts. Neither component is a whole millisecond; their sum is.
+    ///
+    /// The wait is STATED rather than slept: `thread::sleep` on this host overshoots a 600us
+    /// request past a full millisecond, which would hand the millisecond arithmetic the rounding it
+    /// needs to look correct and make this test pass against the defect it exists to catch.
+    ///
+    /// The second half is the half that stops this becoming a "refuse everything" fix: an origin
+    /// 50ms inside the deadline, judged at once, must still DELIVER.
+    ///
+    /// RED ON REVERT: restore the millisecond expression
+    /// (`now_ms + called_at.elapsed().as_millis()`) and the first half returns `Enqueued`.
+    #[test]
+    fn a_crossing_inside_the_final_millisecond_is_still_a_crossing() {
+        let deadline_ns = 101i128 * 1_000_000_000;
+
+        let path = temp_db("sub-ms-crossing");
+        let _ = std::fs::remove_file(&path);
+        let store = SellerStore::open(&path).expect("open");
+        let job = "sub-ms";
+        insert_job(&store, job, JobState::Executing);
+        let mut offer = sample_offer(&format!("offer-{job}"));
+        offer.deadline_unix = 101;
+        store.record_offer(&offer, 100).expect("record the offer");
+        // 400us of room at the sample, then a 700us wait: LIVE at the sample, expired at the write,
+        // and neither margin is a whole millisecond.
+        let clock =
+            crate::seller_node::DeliveryClock::simulated(deadline_ns - 400_000, 700_000);
+        assert!(
+            deadline_ns - 400_000 < deadline_ns,
+            "harness check: the offer is live at the caller's sample"
+        );
+        assert!(
+            clock.now_ns() > deadline_ns,
+            "harness check: the decision instant is past the deadline"
+        );
+        let outcome = store
+            .deliver_and_enqueue(
+                job,
+                &"b".repeat(40),
+                crate::gateway::PaymentMode::Sat,
+                &result(),
+                100,
+                100 + 10_000,
+                100,
+                &clock,
+            )
+            .expect("the write completes rather than erroring");
+        assert_eq!(
+            outcome,
+            DeliveryJournal::DeadlinePassed,
+            "a crossing inside the last millisecond is a crossing: the offer expired before the write"
+        );
+        assert!(
+            store.pending_outbox(200).expect("read the outbox").is_empty(),
+            "nothing may be enqueued for a delivery the offer no longer accepts"
+        );
+        assert_eq!(
+            store.job_state(job).expect("state"),
+            Some(JobState::Executing),
+            "the job must not have been advanced to delivered"
+        );
+
+        // And the other direction: still inside the deadline ⇒ still delivered.
+        let live_path = temp_db("sub-ms-live");
+        let _ = std::fs::remove_file(&live_path);
+        let live = SellerStore::open(&live_path).expect("open");
+        let live_job = "sub-ms-live";
+        insert_job(&live, live_job, JobState::Executing);
+        let mut live_offer = sample_offer(&format!("offer-{live_job}"));
+        live_offer.deadline_unix = 101;
+        live.record_offer(&live_offer, 100).expect("record the offer");
+        let live_clock =
+            crate::seller_node::DeliveryClock::paired_at_ns(deadline_ns - 50_000_000);
+        let live_outcome = live
+            .deliver_and_enqueue(
+                live_job,
+                &"b".repeat(40),
+                crate::gateway::PaymentMode::Sat,
+                &result(),
+                100,
+                100 + 10_000,
+                100,
+                &live_clock,
+            )
+            .expect("the write completes");
+        assert_eq!(
+            live_outcome,
+            DeliveryJournal::Enqueued,
+            "a delivery decided 50ms INSIDE the deadline must still be enqueued"
+        );
+    }
+
+    /// R2A — PREEMPTION BETWEEN THE SAMPLE AND THE STORE, the interval round 5 never counted.
+    ///
+    /// Round 5 started its measurement with `Instant::now()` INSIDE the store. Everything before
+    /// that — argument marshalling, and above all the scheduler preempting the caller between its
+    /// own clock read and the call — was outside the measured interval and therefore free. That
+    /// interval is not sub-millisecond and it is not bounded.
+    ///
+    /// Here the caller samples at 100.0 against deadline 101, is preempted for 1.5s, and only then
+    /// reaches the store. There is NO lock contention at all: the whole crossing happens before the
+    /// store is even entered. The paired origin travels with the caller, so the store extrapolates
+    /// from the caller's own read and sees 101.5 — past the offer.
+    ///
+    /// RED ON REVERT: measure from inside the store (round 5's `called_at`) and this returns
+    /// `Enqueued`, because from the store's point of view no time passed at all.
+    #[test]
+    fn a_preemption_between_the_sample_and_the_store_is_counted() {
+        let path = temp_db("sample-to-store-preemption");
+        let _ = std::fs::remove_file(&path);
+        let store = SellerStore::open(&path).expect("open");
+        let job = "preempted";
+        insert_job(&store, job, JobState::Executing);
+        let mut offer = sample_offer(&format!("offer-{job}"));
+        offer.deadline_unix = 101;
+        store.record_offer(&offer, 100).expect("record the offer");
+        let clock = crate::seller_node::DeliveryClock::paired_at_unix(100);
+        assert!(
+            clock.now_ns() < i128::from(offer.deadline_unix) * 1_000_000_000,
+            "harness check: the offer is LIVE at the caller's own sample"
+        );
+        // The caller loses the CPU here, between its clock read and the store call. No lock is
+        // contended; the store will acquire it instantly.
+        std::thread::sleep(std::time::Duration::from_millis(1_500));
+        let outcome = store
+            .deliver_and_enqueue(
+                job,
+                &"b".repeat(40),
+                crate::gateway::PaymentMode::Sat,
+                &result(),
+                100,
+                100 + 10_000,
+                100,
+                &clock,
+            )
+            .expect("the write completes rather than erroring");
+        assert_eq!(
+            outcome,
+            DeliveryJournal::DeadlinePassed,
+            "time the caller spent before reaching the store is time the offer spent expiring"
+        );
+        assert!(
+            store.pending_outbox(200).expect("read the outbox").is_empty(),
+            "no result may be enqueued for an offer that expired before the write"
+        );
+    }
+
+    /// R2A — the boundary itself, stated exactly rather than raced for.
+    ///
+    /// The deadline is a whole second and the instant is nanoseconds, so the comparison has one
+    /// correct direction: scale the deadline UP. At exactly the deadline the offer is over; one
+    /// nanosecond before it, it is not.
+    #[test]
+    fn the_deadline_boundary_is_judged_at_the_stated_nanosecond() {
+        for (offset_ns, expected) in [
+            (0i128, DeliveryJournal::DeadlinePassed),
+            (-1, DeliveryJournal::Enqueued),
+        ] {
+            let path = temp_db(&format!("ns-boundary-{}", offset_ns + 1));
+            let _ = std::fs::remove_file(&path);
+            let store = SellerStore::open(&path).expect("open");
+            let job = "boundary";
+            insert_job(&store, job, JobState::Executing);
+            let mut offer = sample_offer(&format!("offer-{job}"));
+            offer.deadline_unix = 101;
+            store.record_offer(&offer, 100).expect("record the offer");
+            let at = 101i128 * 1_000_000_000 + offset_ns;
+            let clock = crate::seller_node::DeliveryClock::stated(move || at);
+            let outcome = store
+                .deliver_and_enqueue(
+                    job,
+                    &"b".repeat(40),
+                    crate::gateway::PaymentMode::Sat,
+                    &result(),
+                    100,
+                    100 + 10_000,
+                    100,
+                    &clock,
+                )
+                .expect("the write completes");
+            assert_eq!(
+                outcome, expected,
+                "at deadline{offset_ns:+}ns the decision must be {expected:?}"
+            );
+        }
+    }
+
+
     #[test]
     fn a_deadline_crossed_while_waiting_for_the_store_lock_enqueues_nothing() {
         let path = temp_db("deadline-crossed-under-contention");
@@ -3888,6 +4077,8 @@ mod tests {
         // edge of it.
         offer.deadline_unix = now + 2;
         store.record_offer(&offer, now).expect("record the offer");
+        // Taken at the caller's sample, before the lock is contended.
+        let clock = crate::seller_node::DeliveryClock::paired_at_unix(now);
 
         let outcome = std::thread::scope(|scope| {
             scope.spawn(|| {
@@ -3914,7 +4105,7 @@ mod tests {
                     now,
                     now + 10_000,
                     now,
-                    now * 1_000,
+                    &clock,
                 )
                 .expect("the write completes rather than erroring")
         });
@@ -4828,12 +5019,12 @@ mod tests {
         store.mark_executing(&job, 3).expect("exec");
 
         assert!(store
-            .deliver_and_enqueue(&job, "ref-1", crate::gateway::PaymentMode::Sat, &result(), 4, 999, 5, 5 * 1_000)
+            .deliver_and_enqueue(&job, "ref-1", crate::gateway::PaymentMode::Sat, &result(), 4, 999, 5, &crate::seller_node::DeliveryClock::paired_at_unix(5))
             .expect("deliver").enqueued());
         assert_eq!(store.job_state(&job).expect("state"), Some(JobState::Delivered));
         // Replay: no second delivery, no second result enqueue.
         assert!(!store
-            .deliver_and_enqueue(&job, "ref-1", crate::gateway::PaymentMode::Sat, &result(), 4, 999, 6, 6 * 1_000)
+            .deliver_and_enqueue(&job, "ref-1", crate::gateway::PaymentMode::Sat, &result(), 4, 999, 6, &crate::seller_node::DeliveryClock::paired_at_unix(6))
             .expect("replay").enqueued());
         assert_eq!(
             store.outbox_row(&format!("result:{job}")).expect("row").expect("exists").0,
@@ -6419,7 +6610,7 @@ mod free_lane_tests {
                 .expect("award");
             assert!(
                 store
-                    .deliver_and_enqueue(job, "ref", mode, &wire_draft(crate::gateway::JOB_RESULT_KIND), 3, 9_999, 3, 3 * 1_000)
+                    .deliver_and_enqueue(job, "ref", mode, &wire_draft(crate::gateway::JOB_RESULT_KIND), 3, 9_999, 3, &crate::seller_node::DeliveryClock::paired_at_unix(3))
                     .expect("deliver").enqueued(),
                 "the delivery row must be written for BOTH modes — ruling 3"
             );

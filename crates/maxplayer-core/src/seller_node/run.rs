@@ -58,7 +58,7 @@ use crate::seller_git::{self, DeliveryAgentIdentity};
 use super::outbox::drain_once;
 use super::publisher::RelayPublisher;
 use super::shutdown;
-use super::{now_unix, wall_clock_ms, NodeError, SellerNode};
+use super::{now_unix, NodeError, SellerNode};
 
 /// How long (seconds) the outbox publisher keeps retrying a claim event before it expires. Matches
 /// the legacy claim TTL: a claim outlives a slow relay but never lingers indefinitely.
@@ -1699,14 +1699,18 @@ fn delivery_sample_ms(job_id: &str) -> Option<i64> {
         .and_then(|samples| samples.get(job_id).copied())
 }
 
-fn recovery_step_budget(
-    pass_deadline: Option<std::time::Instant>,
-) -> Option<std::time::Duration> {
+fn recovery_step_budget(pass_deadline: Option<std::time::Instant>) -> crate::seller_node::outbox::DrainBudget {
     let Some(pass_deadline) = pass_deadline else {
-        return Some(RECOVERY_STEP_TIMEOUT);
+        return crate::seller_node::outbox::DrainBudget::Unbudgeted;
     };
     let remaining = pass_deadline.saturating_duration_since(std::time::Instant::now());
-    (!remaining.is_zero()).then(|| remaining.min(RECOVERY_STEP_TIMEOUT))
+    if remaining.is_zero() {
+        // R2B: SPENT, which is not the same fact as "no budget governs me". Collapsing the two into
+        // one `None` is what let a spent pass claim a fresh full terminal-drain ceiling.
+        crate::seller_node::outbox::DrainBudget::Exhausted
+    } else {
+        crate::seller_node::outbox::DrainBudget::Remaining(remaining)
+    }
 }
 
 /// R2B: the ceiling on the drain that follows ONE job's terminal decision.
@@ -1740,13 +1744,15 @@ fn recovery_step_budget_within_offer(
     pass_deadline: Option<std::time::Instant>,
     offer_deadline_unix: i64,
     now_unix: i64,
-) -> Option<std::time::Duration> {
-    let step = recovery_step_budget(pass_deadline)?;
+) -> crate::seller_node::outbox::DrainBudget {
+    let budget = recovery_step_budget(pass_deadline);
     let left = offer_deadline_unix.saturating_sub(now_unix);
     if left <= 0 {
-        return Some(step);
+        // An EXPIRED offer is still owed its one terminal answer, so the ceiling never vetoes the
+        // step that produces it.
+        return budget;
     }
-    Some(step.min(std::time::Duration::from_secs(left as u64)))
+    budget.capped(std::time::Duration::from_secs(left as u64))
 }
 
 /// R2: the ceiling on ONE sweep pass over the held rows, so a long worklist cannot own the tick.
@@ -8659,7 +8665,7 @@ impl SellerNodeRunner {
             }
         }
         // R2B: this job's result, promptly and bounded — not the whole backlog on this lane.
-        self.drain_terminal_event(job_id, None).await;
+        self.drain_terminal_event(job_id, crate::seller_node::outbox::DrainBudget::Unbudgeted).await;
     }
 
     /// Task B2: deliver `job_id` through ONE sandbox container that runs the agent AND all git. The
@@ -9210,16 +9216,23 @@ impl SellerNodeRunner {
     /// deadline passed, or the attempt cap was reached. Emits the same `delivery_failed` feedback the
     /// live path emits, so a buyer cannot tell the lanes apart, and does it exactly once — a row that
     /// is already terminal is skipped by `fail_job`'s own state guard.
-    async fn fail_uploaded_delivery(&self, job_id: &str, why: &str) {
+    /// R2B: the LAPSE route carries the pass budget too.
+    ///
+    /// A failure is a terminal decision like any other, and the publish that follows it is bounded
+    /// by what the sweep has left — not by a fresh ceiling it did not earn. Propagating the
+    /// remainder only through the success tail leaves the cheapest way to overrun a tick wide open:
+    /// fail a row late in a spent pass and the drain starts a new five seconds.
+    async fn fail_uploaded_delivery(&self, job_id: &str, why: &str, budget: crate::seller_node::outbox::DrainBudget) {
         opline!("seller node verify job_id={job_id}: failing the journaled delivery — {why}");
         match self.node.store().offer_row(job_id) {
             Ok(Some(offer)) => {
-                self.fail_job_with_feedback(
+                self.fail_job_with_feedback_budgeted(
                     job_id,
                     &offer.buyer_pubkey,
                     ReasonCode::DeliveryFailed,
                     DELIVERY_FAILURE_FEEDBACK,
                     None,
+                    budget,
                 )
                 .await;
             }
@@ -9274,8 +9287,12 @@ impl SellerNodeRunner {
                     "seller node sweep job_id={}: the offer deadline passed with the delivery still unverified — one terminal disposition, no restart needed",
                     row.job_id
                 );
-                self.fail_uploaded_delivery(&row.job_id, "the offer deadline passed while held")
-                    .await;
+                self.fail_uploaded_delivery(
+                    &row.job_id,
+                    "the offer deadline passed while held",
+                    recovery_step_budget(Some(pass_deadline)),
+                )
+                .await;
                 continue;
             }
             opline!(
@@ -9325,6 +9342,7 @@ impl SellerNodeRunner {
                 self.fail_uploaded_delivery(
                     &row.job_id,
                     "the offer deadline passed before the verified delivery reached a queued result",
+                    recovery_step_budget(Some(pass_deadline)),
                 )
                 .await;
                 continue;
@@ -9358,10 +9376,19 @@ impl SellerNodeRunner {
         payment_mode: crate::gateway::PaymentMode,
         draft: &gateway::EventDraft,
     ) -> Result<crate::seller_node::store::DeliveryJournal, super::store::StoreError> {
-        let now_ms = wall_clock_ms();
-        let now = now_ms / 1_000;
+        // R2A: ONE origin for this attempt, taken HERE — before the hand-off — and paired with the
+        // monotonic instant of the read. Every row timestamp below comes from it, and the store
+        // extrapolates that same origin to the transaction to judge the deadline. Sampling it here
+        // rather than in the store is what makes the sample -> store interval (marshalling,
+        // preemption, the lock wait) counted instead of invisible.
+        let clock = crate::seller_node::DeliveryClock::paired_now();
+        let now = clock.origin_unix();
+        // The seam reports the sample at MILLISECOND precision, taken from the same paired origin
+        // the store will extrapolate. Reporting `now * 1_000` instead re-floors the reading to the
+        // wall second, which is precisely the precision the sub-second oracles measure — a seam
+        // that rounds cannot witness a sub-second carry.
         #[cfg(test)]
-        record_delivery_sample(job_id, now_ms);
+        record_delivery_sample(job_id, (clock.now_ns() / 1_000_000) as i64);
         self.node.store().deliver_and_enqueue(
             job_id,
             result_ref,
@@ -9370,7 +9397,7 @@ impl SellerNodeRunner {
             now,
             now + RESULT_PUBLISH_WINDOW_SECS,
             now,
-            now_ms,
+            &clock,
         )
     }
 
@@ -9411,8 +9438,12 @@ impl SellerNodeRunner {
         match self.node.store().bump_upload_verify_attempt(job_id, now_unix()) {
             Ok(attempts) if attempts > UPLOAD_VERIFY_ATTEMPT_CAP => {
                 opline!("seller node verify fail job_id={job_id}: {attempts} read-back attempts spent on the journaled delivery (cap {UPLOAD_VERIFY_ATTEMPT_CAP}) — taking the one terminal disposition rather than asking forever");
-                self.fail_uploaded_delivery(job_id, "the read-back attempt cap was reached")
-                    .await;
+                self.fail_uploaded_delivery(
+                    job_id,
+                    "the read-back attempt cap was reached",
+                    recovery_step_budget(pass_deadline),
+                )
+                .await;
                 return;
             }
             Ok(_) => {}
@@ -9426,8 +9457,12 @@ impl SellerNodeRunner {
         // after the deadline is a post-settlement result the buyer will not pay for.
         if self.offer_deadline_lapsed(job_id) {
             opline!("seller node verify fail job_id={job_id}: the offer deadline passed before the read-back could run — one terminal disposition, no late delivery");
-            self.fail_uploaded_delivery(job_id, "the offer deadline passed before verification")
-                .await;
+            self.fail_uploaded_delivery(
+                job_id,
+                "the offer deadline passed before verification",
+                recovery_step_budget(pass_deadline),
+            )
+            .await;
             return;
         }
         // The SAME ref this job's delivery is always pushed to — derived from the job id exactly as
@@ -9442,7 +9477,7 @@ impl SellerNodeRunner {
         let header = if relay_git_remote {
             // R2: BOUNDED. A signer actor that stops answering must not hold the drain tick open.
             // An elapsed bound decides nothing — same disposition as a mint that failed outright.
-            let Some(step) = recovery_step_budget(pass_deadline) else {
+            let Some(step) = recovery_step_budget(pass_deadline).step(RECOVERY_STEP_TIMEOUT) else {
                 opline!("seller node verify job_id={job_id}: the pass budget was spent before the verification mint — nothing asked, nothing decided, marker stands");
                 return;
             };
@@ -9476,7 +9511,7 @@ impl SellerNodeRunner {
         // R2: BOUNDED, for the same reason and with the same asymmetry — a remote that never answers
         // is UNRESOLVED, never a failure. The marker stands and the attempt cap (already charged) is
         // what stops this from repeating forever.
-        let Some(step) = recovery_step_budget(pass_deadline) else {
+        let Some(step) = recovery_step_budget(pass_deadline).step(RECOVERY_STEP_TIMEOUT) else {
             opline!("seller node verify job_id={job_id}: the pass budget was spent before the read-back — unresolved, marker stands for the next tick");
             return;
         };
@@ -9504,6 +9539,7 @@ impl SellerNodeRunner {
                     self.fail_uploaded_delivery(
                         job_id,
                         "the offer deadline passed while the read-back ran",
+                        recovery_step_budget(pass_deadline),
                     )
                     .await;
                     return;
@@ -9660,7 +9696,9 @@ impl SellerNodeRunner {
         // already armed, so the next tick finalizes from it — no re-push, no re-run.
         // R2B: and bounded by the OFFER too — a receipt that cannot be written before the offer
         // expires is the tick spent on a result the atomic deadline check will refuse.
-        let Some(step) = recovery_step_budget_within_offer(pass_deadline, offer.deadline_unix, now_unix()) else {
+        let Some(step) = recovery_step_budget_within_offer(pass_deadline, offer.deadline_unix, now_unix())
+            .step(RECOVERY_STEP_TIMEOUT)
+        else {
             opline!("seller node finalize job_id={job_id}: no budget left for the receipt signing within this pass or this offer — nothing enqueued; the verified marker stands");
             return;
         };
@@ -9710,7 +9748,9 @@ impl SellerNodeRunner {
         // await signs through the signer actor too, so leaving it unbounded reopened the exact hole
         // the receipt-signing bound closed — one hung envelope would own the drain tick.
         // R2B: same two ceilings — the pass, and the offer this envelope is for.
-        let Some(step) = recovery_step_budget_within_offer(pass_deadline, offer.deadline_unix, now_unix()) else {
+        let Some(step) = recovery_step_budget_within_offer(pass_deadline, offer.deadline_unix, now_unix())
+            .step(RECOVERY_STEP_TIMEOUT)
+        else {
             opline!("seller node finalize job_id={job_id}: no budget left for the contribution envelope within this pass or this offer — nothing enqueued; the verified marker stands");
             return;
         };
@@ -10246,6 +10286,7 @@ impl SellerNodeRunner {
     /// otherwise). Used at the post-offer execute fail points where the offer buyer is known; the
     /// caller passes the reason_code that names WHICH failure this is (execution vs delivery vs
     /// no_sentinel), so the buyer can class it without parsing the human-readable reason.
+    /// The live routes: no pass governs them, so the terminal publish takes the ordinary ceiling.
     async fn fail_job_with_feedback(
         &self,
         job_id: &str,
@@ -10253,6 +10294,27 @@ impl SellerNodeRunner {
         reason_code: ReasonCode,
         reason: &str,
         reason_detail: Option<&str>,
+    ) {
+        self.fail_job_with_feedback_budgeted(
+            job_id,
+            buyer_pubkey,
+            reason_code,
+            reason,
+            reason_detail,
+            crate::seller_node::outbox::DrainBudget::Unbudgeted,
+        )
+        .await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn fail_job_with_feedback_budgeted(
+        &self,
+        job_id: &str,
+        buyer_pubkey: &str,
+        reason_code: ReasonCode,
+        reason: &str,
+        reason_detail: Option<&str>,
+        budget: crate::seller_node::outbox::DrainBudget,
     ) {
         let mut draft = error_draft(
             job_id,
@@ -10299,10 +10361,12 @@ impl SellerNodeRunner {
                 // Publish it in this pass. The row is already durable, so a crash before this
                 // returns still delivers on the next drain.
                 //
-                // R2B: scoped to this job and bounded. Failure feedback is reached from sweeps and
-                // from lanes holding execution slots, and an unbounded backlog publish here is how
-                // one buyer's error notice came to own the tick.
-                self.drain_terminal_event(job_id, None).await;
+                // R2B: scoped to this job and bounded by WHAT THE CALLER HAS LEFT. Failure feedback
+                // is reached from sweeps and from lanes holding execution slots, and an unbounded
+                // backlog publish here is how one buyer's error notice came to own the tick. The
+                // budget arrives from the caller, so a lapse inside a spent pass publishes nothing
+                // and leaves its durable row to the drain step.
+                self.drain_terminal_event(job_id, budget).await;
             }
             Ok(crate::seller_node::store::FailureJournal::NoOp) => opline!(
                 "seller node job_id={job_id}: failure feedback SUPPRESSED — the job is already terminal (state={}) and keeps its real disposition",
@@ -10326,21 +10390,31 @@ impl SellerNodeRunner {
     ///
     /// `budget` lets a recovery pass hand down what it has left, so a drain inside a sweep can
     /// never outlive the sweep's own ceiling; `None` takes the standing terminal budget.
-    async fn drain_terminal_event(&self, job_id: &str, budget: Option<std::time::Duration>) {
+    async fn drain_terminal_event(&self, job_id: &str, budget: crate::seller_node::outbox::DrainBudget) {
         let now = now_unix();
-        let budget = budget.unwrap_or(TERMINAL_DRAIN_BUDGET).min(TERMINAL_DRAIN_BUDGET);
+        // R2B: a SPENT pass buys nothing here. The event is already durable, so the honest move is
+        // to leave it to the periodic drain rather than open a fresh five-second window on a tick
+        // this caller has already used up.
+        let budget = match budget {
+            crate::seller_node::outbox::DrainBudget::Exhausted => {
+                opline!("seller node terminal publish job_id={job_id}: the pass was spent before the publish — the row is durable and the drain step takes it");
+                return;
+            }
+            crate::seller_node::outbox::DrainBudget::Unbudgeted => crate::seller_node::outbox::DrainBudget::Remaining(TERMINAL_DRAIN_BUDGET),
+            crate::seller_node::outbox::DrainBudget::Remaining(left) => crate::seller_node::outbox::DrainBudget::Remaining(left.min(TERMINAL_DRAIN_BUDGET)),
+        };
         match crate::seller_node::outbox::drain_scoped(
             self.node.store(),
             &self.publisher,
             now,
             Some(job_id),
-            Some(budget),
+            budget,
         )
         .await
         {
-            Ok(report) if report.confirmed > 0 || report.failed > 0 => opline!(
-                "seller node terminal publish job_id={job_id}: confirmed={} failed={} (backlog left to the drain step)",
-                report.confirmed, report.failed
+            Ok(report) if report.confirmed > 0 || report.failed > 0 || report.timed_out > 0 => opline!(
+                "seller node terminal publish job_id={job_id}: confirmed={} failed={} timed_out={} (backlog left to the drain step)",
+                report.confirmed, report.failed, report.timed_out
             ),
             Ok(_) => {}
             Err(error) => {
@@ -15191,7 +15265,7 @@ mod tests {
                 delivered_at,
                 delivered_at + RESULT_PUBLISH_WINDOW_SECS,
                 delivered_at,
-                delivered_at * 1_000,
+                &crate::seller_node::DeliveryClock::paired_at_unix(delivered_at),
             )
             .expect("deliver").enqueued());
         assert_eq!(
@@ -15453,7 +15527,7 @@ mod tests {
 
         // Deliver ⇒ state Delivered ⇒ NOT re-execute-eligible (the guard early-returns).
         assert!(store
-            .deliver_and_enqueue(&job, &"c".repeat(40), crate::gateway::PaymentMode::Sat, &draft, 5000, 5000 + RESULT_PUBLISH_WINDOW_SECS, 5000, 5000 * 1_000)
+            .deliver_and_enqueue(&job, &"c".repeat(40), crate::gateway::PaymentMode::Sat, &draft, 5000, 5000 + RESULT_PUBLISH_WINDOW_SECS, 5000, &crate::seller_node::DeliveryClock::paired_at_unix(5000))
             .expect("deliver").enqueued());
         assert_eq!(store.job_state(&job).expect("state"), Some(JobState::Delivered));
         assert!(
@@ -15515,7 +15589,7 @@ mod tests {
                     5000,
                     5000 + RESULT_PUBLISH_WINDOW_SECS,
                     5000,
-                    5000 * 1_000,
+                    &crate::seller_node::DeliveryClock::paired_at_unix(5000),
                 )
                 .expect("deliver")
                 .enqueued()
@@ -16045,7 +16119,7 @@ mod tests {
             seed(&delivered, live, &format!("{}5", "w".repeat(63)));
             let ddraft = claim_draft(&delivered, &buyer, &seller, crate::gateway::ClaimPayment::Sat(&creq), &[], &Default::default());
             store
-                .deliver_and_enqueue(&delivered, &"c".repeat(40), crate::gateway::PaymentMode::Sat, &ddraft, 4, 4 + RESULT_PUBLISH_WINDOW_SECS, 4, 4 * 1_000)
+                .deliver_and_enqueue(&delivered, &"c".repeat(40), crate::gateway::PaymentMode::Sat, &ddraft, 4, 4 + RESULT_PUBLISH_WINDOW_SECS, 4, &crate::seller_node::DeliveryClock::paired_at_unix(4))
                 .expect("deliver");
             // #563: a live-deadline row a PRIOR resume relay-derived as settled elsewhere. The durable
             // marker must survive the restart and short-circuit the next resume to SkipTerminal WITHOUT
@@ -16227,13 +16301,13 @@ mod tests {
         let now = 5000;
         assert!(
             store
-                .deliver_and_enqueue(&job, &commit_first, crate::gateway::PaymentMode::Sat, &draft, now, now + RESULT_PUBLISH_WINDOW_SECS, now, now * 1_000)
+                .deliver_and_enqueue(&job, &commit_first, crate::gateway::PaymentMode::Sat, &draft, now, now + RESULT_PUBLISH_WINDOW_SECS, now, &crate::seller_node::DeliveryClock::paired_at_unix(now))
                 .expect("deliver").enqueued(),
             "first delivery journals + enqueues the result"
         );
         assert!(
             !store
-                .deliver_and_enqueue(&job, &commit_resume, crate::gateway::PaymentMode::Sat, &draft, now, now + RESULT_PUBLISH_WINDOW_SECS, now, now * 1_000)
+                .deliver_and_enqueue(&job, &commit_resume, crate::gateway::PaymentMode::Sat, &draft, now, now + RESULT_PUBLISH_WINDOW_SECS, now, &crate::seller_node::DeliveryClock::paired_at_unix(now))
                 .expect("re-deliver").enqueued(),
             "resume adopts the existing tip: a second delivery re-enqueues nothing"
         );
@@ -16889,13 +16963,13 @@ mod tests {
         let now = 5000;
         assert!(
             store
-                .deliver_and_enqueue(&job, &"c".repeat(40), crate::gateway::PaymentMode::Sat, &draft, now, now + RESULT_PUBLISH_WINDOW_SECS, now, now * 1_000)
+                .deliver_and_enqueue(&job, &"c".repeat(40), crate::gateway::PaymentMode::Sat, &draft, now, now + RESULT_PUBLISH_WINDOW_SECS, now, &crate::seller_node::DeliveryClock::paired_at_unix(now))
                 .expect("deliver").enqueued(),
             "first (resumed) delivery lands"
         );
         assert!(
             !store
-                .deliver_and_enqueue(&job, &"c".repeat(40), crate::gateway::PaymentMode::Sat, &draft, now, now + RESULT_PUBLISH_WINDOW_SECS, now, now * 1_000)
+                .deliver_and_enqueue(&job, &"c".repeat(40), crate::gateway::PaymentMode::Sat, &draft, now, now + RESULT_PUBLISH_WINDOW_SECS, now, &crate::seller_node::DeliveryClock::paired_at_unix(now))
                 .expect("re-deliver").enqueued(),
             "a resumed re-execution delivers at most once"
         );
@@ -20117,6 +20191,141 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// R2B — A SPENT PASS BUYS NOTHING. Exhausted is not the same fact as unbudgeted.
+    ///
+    /// `recovery_step_budget` answered `None` for two unrelated situations: "no pass governs this
+    /// caller" and "this pass is already spent". The terminal drain read that single `None` as the
+    /// former and handed the caller a fresh full `TERMINAL_DRAIN_BUDGET` — so the cheapest way to
+    /// overrun a tick was to run out of it first. The row is durable either way; the pass that has
+    /// spent its time publishes nothing and the periodic drain does the work.
+    ///
+    /// RED ON REVERT: map `Exhausted` back onto the full terminal budget (round 5's
+    /// `budget.unwrap_or(TERMINAL_DRAIN_BUDGET)`) and the spent pass publishes here ⇒ this fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spent_pass_does_not_buy_a_fresh_terminal_drain() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("spentpass");
+        let runner = boot_against(&root, &fixture, false).await;
+        let store = runner.node.store().clone();
+        let buyer = "b".repeat(64);
+        let now = now_unix();
+        let job = "a".repeat(64);
+        seed_job_with_upload_marker(&runner, &job, &buyer, now + 600, now, true);
+
+        let draft = error_draft(
+            &job,
+            &buyer,
+            &runner.seller_pubkey.to_hex(),
+            ReasonCode::DeliveryFailed,
+            DELIVERY_FAILURE_FEEDBACK,
+        );
+        assert_eq!(
+            store
+                .fail_and_enqueue_feedback(&job, &draft, now, now + 3_600, now)
+                .expect("queue this job's own feedback row"),
+            crate::seller_node::store::FailureJournal::Transitioned,
+            "harness check: this job's OWN event is pending and durable"
+        );
+
+        // A pass with nothing left: not "no budget", but "no time".
+        let started = std::time::Instant::now();
+        runner
+            .drain_terminal_event(&job, crate::seller_node::outbox::DrainBudget::Exhausted)
+            .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            feedback_settles_at_least(&fixture, 1).await,
+            0,
+            "a pass with no time left must not publish: the row is durable and the drain step owns it"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "a spent pass must return at once rather than opening a fresh window (took {elapsed:?})"
+        );
+        assert_eq!(
+            store
+                .outbox_row(&format!("feedback:{job}"))
+                .expect("read the row")
+                .map(|(state, _, published)| (state, published)),
+            Some(("pending".to_string(), None)),
+            "the event is still pending and unpublished, so nothing was lost by deferring it"
+        );
+
+        // And the periodic step, which is what a spent pass defers TO, moves it.
+        runner.drain().await;
+        assert_eq!(
+            feedback_settles_at_least(&fixture, 1).await,
+            1,
+            "the deferred row reaches the relay on the drain tick"
+        );
+
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// R2B — THE LAPSE ROUTE CARRIES THE BUDGET, not only the success route.
+    ///
+    /// Round 5 threaded the remaining budget through `finalize_pushed_delivery` and left the
+    /// failure sites passing a literal `None`. A sweep that lapses a held delivery late in its pass
+    /// therefore started a fresh terminal drain — the same overrun, reached through the failure
+    /// door instead of the success one. Failing a job is a terminal decision like any other.
+    ///
+    /// The durable half is asserted too: the lapse still WRITES its feedback row. Deferring the
+    /// publish must never cost the buyer its answer.
+    ///
+    /// RED ON REVERT: restore `drain_terminal_event(job_id, None)` in the failure path ⇒ the notice
+    /// is published inside the spent pass and this fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_lapse_inside_a_spent_pass_writes_its_row_and_publishes_nothing() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("spentlapse");
+        let runner = boot_against(&root, &fixture, false).await;
+        let store = runner.node.store().clone();
+        let buyer = "b".repeat(64);
+        let now = now_unix();
+        let job = "a".repeat(64);
+        seed_job_with_upload_marker(&runner, &job, &buyer, now + 600, now, true);
+
+        runner
+            .fail_uploaded_delivery(
+                &job,
+                "the offer deadline passed while held",
+                crate::seller_node::outbox::DrainBudget::Exhausted,
+            )
+            .await;
+
+        assert_eq!(
+            store.job_state(&job).expect("state"),
+            Some(crate::seller_node::store::JobState::Failed),
+            "the lapse is terminal in the store whatever the publish budget was"
+        );
+        assert_eq!(
+            store
+                .outbox_row(&format!("feedback:{job}"))
+                .expect("read the row")
+                .map(|(state, _, published)| (state, published)),
+            Some(("pending".to_string(), None)),
+            "the buyer's notice is written and durable, merely not published by this pass"
+        );
+        assert_eq!(
+            feedback_settles_at_least(&fixture, 1).await,
+            0,
+            "a lapse in a spent pass publishes nothing"
+        );
+
+        runner.drain().await;
+        assert_eq!(
+            feedback_settles_at_least(&fixture, 1).await,
+            1,
+            "and the drain step delivers the notice the lapse left it"
+        );
+
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+
     /// R2B — THE OFFER IS A CEILING ON THE STEP, not just the pass.
     ///
     /// Driven directly, because the arithmetic IS the claim: whichever of the pass and the offer
@@ -20127,34 +20336,35 @@ mod tests {
         let far = std::time::Instant::now() + Duration::from_secs(600);
 
         assert_eq!(
-            recovery_step_budget_within_offer(Some(far), 1_000, 998),
+            recovery_step_budget_within_offer(Some(far), 1_000, 998).step(RECOVERY_STEP_TIMEOUT),
             Some(Duration::from_secs(2)),
             "an offer with two seconds left caps a step the pass would have allowed to run long"
         );
         assert_eq!(
-            recovery_step_budget_within_offer(Some(far), 1_000_000, 998),
+            recovery_step_budget_within_offer(Some(far), 1_000_000, 998).step(RECOVERY_STEP_TIMEOUT),
             Some(RECOVERY_STEP_TIMEOUT),
             "a distant offer leaves the standing step ceiling in charge"
         );
         assert_eq!(
-            recovery_step_budget_within_offer(None, 1_000, 998),
+            recovery_step_budget_within_offer(None, 1_000, 998).step(RECOVERY_STEP_TIMEOUT),
             Some(Duration::from_secs(2)),
             "and the offer still binds a step running outside any pass"
         );
         // An expired offer still finishes this route: the terminal event it is owed is produced by
         // completing the step, not by abandoning it. Vetoing here left the job `awarded` forever.
         assert_eq!(
-            recovery_step_budget_within_offer(Some(far), 1_000, 1_000),
+            recovery_step_budget_within_offer(Some(far), 1_000, 1_000).step(RECOVERY_STEP_TIMEOUT),
             Some(RECOVERY_STEP_TIMEOUT),
             "an offer at its deadline is owed a terminal answer, so the step is not vetoed"
         );
         assert_eq!(
-            recovery_step_budget_within_offer(Some(far), 1_000, 1_200),
+            recovery_step_budget_within_offer(Some(far), 1_000, 1_200).step(RECOVERY_STEP_TIMEOUT),
             Some(RECOVERY_STEP_TIMEOUT),
             "and one already past is owed the same"
         );
         assert_eq!(
-            recovery_step_budget_within_offer(Some(std::time::Instant::now()), 1_000_000, 998),
+            recovery_step_budget_within_offer(Some(std::time::Instant::now()), 1_000_000, 998)
+                .step(RECOVERY_STEP_TIMEOUT),
             None,
             "a spent pass still stops the step, whatever the offer allows"
         );
@@ -20190,12 +20400,12 @@ mod tests {
         let job = "c".repeat(64);
         let commit = "c".repeat(40);
 
-        // Sit down at a known position INSIDE the wall second, so an offer expiring at the next
-        // boundary still has a few hundred milliseconds left when the route samples.
-        while !(550..680).contains(&(wall_clock_ms() % 1_000)) {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        let deadline = wall_clock_ms() / 1_000 + 1;
+        // Fix the offer a few seconds out FIRST, then approach it. Deriving the deadline from a
+        // wall position read moments earlier is not atomic: a preemption between the two lands the
+        // deadline a whole second further off, and the wait this oracle measures silently picks up
+        // that second. Choosing the deadline up front and steering toward it keeps the premise
+        // sound under load, which is the only condition a parallel gate run offers.
+        let deadline = crate::seller_node::wall_clock_ms() / 1_000 + 3;
         seed_job_with_upload_marker(&runner, &job, &buyer, deadline, deadline - 60, true);
         assert_eq!(
             store.mark_pushed(&job, &commit, deadline - 60).expect("arm the verified marker"),
@@ -20222,7 +20432,7 @@ mod tests {
             // Release just past the offer: the route has been waiting for this lock since its own
             // sample, so the wait it measures is exactly the crossing.
             let release_at_ms = deadline * 1_000 + 150;
-            let remaining = release_at_ms - wall_clock_ms();
+            let remaining = release_at_ms - crate::seller_node::wall_clock_ms();
             if remaining > 0 {
                 std::thread::sleep(Duration::from_millis(remaining as u64));
             }
@@ -20231,6 +20441,15 @@ mod tests {
         });
         // Let the conflicting transaction take the lock before the route wants it.
         std::thread::sleep(Duration::from_millis(30));
+
+        // Approach the offer to roughly half a second short of it, so the route samples while the
+        // offer is still LIVE and the wait for the lock stays well inside one second. Half a
+        // second of slack in both directions is what makes the two premises below hold on a loaded
+        // host instead of only on an idle one.
+        let enter_at_ms = deadline * 1_000 - 500;
+        while crate::seller_node::wall_clock_ms() < enter_at_ms {
+            std::thread::sleep(Duration::from_millis(2));
+        }
 
         runner.finalize_pushed_delivery(&job, &commit, None).await;
         let (sampled_ms, release_at_ms) = holder.join().expect("the blocking writer finishes");
