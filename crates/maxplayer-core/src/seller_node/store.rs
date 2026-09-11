@@ -854,6 +854,25 @@ pub struct HealthSnapshot {
     pub pending_outbox: i64,
 }
 
+/// What [`SellerStore::deliver_and_enqueue`] actually did. A completion, a replay and a refusal are
+/// three different facts about a job, and collapsing them into a bool is how "already journaled" ends
+/// up printed for a delivery that was never written (R1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryJournal {
+    /// The delivery row was written and the result event queued by THIS call.
+    Enqueued,
+    /// The job already had a delivery row: idempotent no-op, nothing re-enqueued.
+    AlreadyDelivered,
+    /// The job was already terminally `failed`; the result was deliberately NOT enqueued.
+    Fenced,
+}
+
+impl DeliveryJournal {
+    /// True only when this call wrote the delivery — never for a replay or a fence.
+    pub fn enqueued(self) -> bool {
+        matches!(self, DeliveryJournal::Enqueued)
+    }
+}
 impl SellerStore {
     /// Open (creating if absent) the state DB at `path` with WAL + crash-safe pragmas and ensure
     /// the schema is present.
@@ -1791,7 +1810,14 @@ impl SellerStore {
     /// on resume the job FINALIZES from this commit (re-sign + enqueue) rather than re-running the
     /// agent. Idempotent — last write wins; does NOT change `state` (the atomic advance to
     /// `delivered` stays with `deliver_and_enqueue`).
-    pub fn mark_pushed(&self, job_id: &str, commit: &str, now_unix: i64) -> Result<(), StoreError> {
+    ///
+    /// FENCED (R1): a row that already reached a terminal `failed` or `paid` state is NOT resurrected
+    /// into a completion. The reconciliation sweep and a live caller can both be holding an opinion
+    /// about the same delivery; whoever writes a terminal state first owns the outcome, and the loser
+    /// learns it from the returned count — 1 when this call moved the row, 0 when it was already
+    /// settled elsewhere. A caller that finalizes on 0 would publish a result for a job the buyer has
+    /// already been told failed.
+    pub fn mark_pushed(&self, job_id: &str, commit: &str, now_unix: i64) -> Result<usize, StoreError> {
         let conn = self.lock()?;
         // ONE statement arms the verified marker and clears the uploaded-but-unverified one, so no
         // crash can leave a row claiming both "verified at X" and "unverified upload pending". The
@@ -1805,10 +1831,10 @@ impl SellerStore {
                     uploaded_unverified_stage = NULL,
                     uploaded_verify_attempts = NULL,
                     updated_at_unix = ?3
-              WHERE job_id = ?1",
+              WHERE job_id = ?1 AND state NOT IN ('failed','paid')",
             params![job_id, commit, now_unix],
-        )?;
-        Ok(())
+        )
+        .map_err(StoreError::from)
     }
 
     /// Journal the INTENT to upload a delivery, BEFORE the pack is sent: this job is about to push
@@ -1989,8 +2015,17 @@ impl SellerStore {
         Ok(rows)
     }
 
-    /// Record a delivery and enqueue its result event in ONE transaction. Idempotent — a replay for
-    /// a job that already has a delivery row changes nothing and re-enqueues nothing.
+    /// Record a delivery and enqueue its result event in ONE transaction.
+    ///
+    /// Three outcomes, and they are deliberately NOT the same fact (R1):
+    /// - [`DeliveryJournal::Enqueued`] — this call wrote the delivery and queued the result.
+    /// - [`DeliveryJournal::AlreadyDelivered`] — idempotent replay; the job already has a delivery
+    ///   row, so nothing is written and nothing is re-enqueued.
+    /// - [`DeliveryJournal::Fenced`] — the job reached a terminal `failed` state before this caller
+    ///   got here, so the result is NOT enqueued. A racing reconciliation already told the buyer this
+    ///   delivery failed; enqueuing now would publish the opposite outcome for the same job. Reported
+    ///   separately from a dedup because an operator reading "already journaled" for a job that was
+    ///   actually fenced is reading a delivery that does not exist.
     #[allow(clippy::too_many_arguments)]
     pub fn deliver_and_enqueue(
         &self,
@@ -2001,7 +2036,7 @@ impl SellerStore {
         created_at_unix: i64,
         expires_at_unix: i64,
         now_unix: i64,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<DeliveryJournal, StoreError> {
         let mut conn = self.lock()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let exists: bool = tx
@@ -2014,7 +2049,21 @@ impl SellerStore {
             .is_some();
         if exists {
             tx.commit()?;
-            return Ok(false);
+            return Ok(DeliveryJournal::AlreadyDelivered);
+        }
+        // THE FENCE, inside the same immediate transaction as the write it guards: a job whose
+        // terminal answer is already `failed` does not acquire a delivery and a queued result here.
+        let terminal_failure: bool = tx
+            .query_row(
+                "SELECT 1 FROM jobs WHERE job_id = ?1 AND state = 'failed'",
+                [job_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if terminal_failure {
+            tx.commit()?;
+            return Ok(DeliveryJournal::Fenced);
         }
         // §3.2 — ruling 3's record, with the payment stated explicitly rather than inferred from
         // the absence of a receipt. A free job's row is written here and never advances past
@@ -2038,19 +2087,26 @@ impl SellerStore {
             now_unix,
         )?;
         tx.commit()?;
-        Ok(true)
+        Ok(DeliveryJournal::Enqueued)
     }
 
-    /// Mark a job failed. Idempotent (last write wins) but never overwrites a terminal `paid`.
+    /// Mark a job failed, FENCED against every terminal state — `paid`, `delivered` and an existing
+    /// `failed` alike.
     ///
-    /// Returns the number of rows failed — 0 or 1. This is the write `ResumeAction::SkipLapsed`
-    /// uses to heal a stale `awarded` row, so a caller that treats it as unconditional can report a
-    /// heal that never happened: the `state != 'paid'` guard (and an absent row) both yield 0.
+    /// Returns the number of rows failed — 0 or 1 — and that count is the transition itself, not a
+    /// formality. Two things turn on it:
+    /// - A delivered job is never rewritten to `failed`. A reconciliation pass and a live caller can
+    ///   race over one delivery; a late failure must not overwrite a completion the buyer already has.
+    /// - A job already `failed` moves nothing, so the caller can publish buyer feedback EXACTLY once.
+    ///   Feedback published on a no-op write is a second terminal answer for one job.
+    ///
+    /// This is also the write `ResumeAction::SkipLapsed` uses to heal a stale `awarded` row, so a
+    /// caller that treats it as unconditional can report a heal that never happened.
     pub fn fail_job(&self, job_id: &str, now_unix: i64) -> Result<usize, StoreError> {
         let conn = self.lock()?;
         let failed = conn.execute(
             "UPDATE jobs SET state = 'failed', updated_at_unix = ?2
-             WHERE job_id = ?1 AND state != 'paid'",
+             WHERE job_id = ?1 AND state NOT IN ('paid','delivered','failed')",
             params![job_id, now_unix],
         )?;
         Ok(failed)
@@ -3536,6 +3592,105 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    // R1/F3 — A JOURNAL FAULT AND A READ FAULT, ACROSS A REOPEN. Two faults the recovery lane has to
+    // survive without either losing a delivery or inventing one:
+    //
+    //   1. THE UPGRADE WRITE NEVER LANDS. `mark_uploaded_unverified` runs inside the blocking upload
+    //      op and is explicitly best-effort — the production path logs and continues. What must not
+    //      depend on it is RECOVERABILITY: the pre-upload intent was written before the pack was
+    //      sent, and it alone has to keep the row on the worklist across a restart.
+    //   2. THE STAGE COLUMN READS BACK UNKNOWN (an older writer, a partial migration, a hand-edited
+    //      row). The parser must not resolve that to `Intent` — the side that says "the remote
+    //      probably has nothing". It degrades to `Uploaded`, the side that still OWES the remote a
+    //      read-back, so an unreadable marker can only cost an extra question, never a lost pack.
+    //
+    // Bite (measured): make `mark_upload_intent` a no-op and the reopened worklist is EMPTY for the
+    // faulted job — the blind-rerun state. Make the unknown stage parse as `Intent` and the second
+    // half fails instead.
+    #[test]
+    fn a_faulted_journal_upgrade_and_an_unknown_stage_still_reopen_as_a_recoverable_delivery() {
+        let path = temp_db("journal-fault-reopen");
+        let _ = std::fs::remove_file(&path);
+        let commit = "f".repeat(40);
+        {
+            let store = SellerStore::open(&path).expect("open");
+            insert_job(&store, "faulted-upgrade", JobState::Executing);
+            assert_eq!(
+                store
+                    .mark_upload_intent("faulted-upgrade", &commit, 10)
+                    .expect("journal the pre-effect intent"),
+                1,
+                "harness check: the required pre-upload write lands"
+            );
+            // THE FAULT: the in-op upgrade is attempted for a row that is not there (the same shape a
+            // failed write takes on the blocking thread) and its effect is discarded, exactly as the
+            // production path discards it after logging.
+            let upgraded = store
+                .mark_uploaded_unverified("no-such-job", &commit, 11)
+                .map(|_| ())
+                .is_ok();
+            assert!(
+                upgraded || !upgraded,
+                "harness check: the upgrade outcome is deliberately not load-bearing"
+            );
+            assert_eq!(
+                store
+                    .upload_marker("faulted-upgrade")
+                    .expect("read the marker")
+                    .expect("the intent stands")
+                    .stage,
+                UploadStage::Intent,
+                "a faulted upgrade leaves the PRE-UPLOAD intent in place — it never erases it"
+            );
+        }
+
+        // The restart. Nothing in memory survives it; the intent is the only thing that can.
+        let store = SellerStore::open(&path).expect("reopen");
+        let held = store
+            .jobs_awaiting_upload_verification()
+            .expect("worklist after reopen");
+        assert!(
+            held.iter().any(|row| row.job_id == "faulted-upgrade"),
+            "a delivery whose upgrade write faulted is STILL recoverable after a restart — the intent is what makes it so"
+        );
+        assert_eq!(
+            held.iter()
+                .find(|row| row.job_id == "faulted-upgrade")
+                .map(|row| row.marker.commit.clone()),
+            Some(commit.clone()),
+            "and it is recoverable at the EXACT oid the pack was for"
+        );
+
+        // The read fault: a stage value no reader knows.
+        {
+            let conn = store.lock().expect("lock");
+            conn.execute(
+                "UPDATE jobs SET uploaded_unverified_stage = 'something-no-reader-knows' WHERE job_id = ?1",
+                ["faulted-upgrade"],
+            )
+            .expect("write an unknown stage");
+        }
+        assert_eq!(
+            store
+                .upload_marker("faulted-upgrade")
+                .expect("read the marker")
+                .expect("the marker is still there")
+                .stage,
+            UploadStage::Uploaded,
+            "an unreadable stage degrades to the side that still owes the remote a read-back — never to 'nothing was sent'"
+        );
+        assert!(
+            store
+                .jobs_awaiting_upload_verification()
+                .expect("worklist")
+                .iter()
+                .any(|row| row.job_id == "faulted-upgrade"),
+            "and the row stays on the worklist: an unreadable marker decides nothing by itself"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     // F2 — THE PRE-EFFECT INTENT, across a restart. The gap this closes: the old marker was written
     // only AFTER the remote accepted the pack, so a crash (or a kill, or an OOM) DURING the upload
     // left a row that says "nothing was ever sent" while the remote may hold the pack. A resume then
@@ -4174,12 +4329,12 @@ mod tests {
 
         assert!(store
             .deliver_and_enqueue(&job, "ref-1", crate::gateway::PaymentMode::Sat, &result(), 4, 999, 5)
-            .expect("deliver"));
+            .expect("deliver").enqueued());
         assert_eq!(store.job_state(&job).expect("state"), Some(JobState::Delivered));
         // Replay: no second delivery, no second result enqueue.
         assert!(!store
             .deliver_and_enqueue(&job, "ref-1", crate::gateway::PaymentMode::Sat, &result(), 4, 999, 6)
-            .expect("replay"));
+            .expect("replay").enqueued());
         assert_eq!(
             store.outbox_row(&format!("result:{job}")).expect("row").expect("exists").0,
             "pending"
@@ -5765,7 +5920,7 @@ mod free_lane_tests {
             assert!(
                 store
                     .deliver_and_enqueue(job, "ref", mode, &wire_draft(crate::gateway::JOB_RESULT_KIND), 3, 9_999, 3)
-                    .expect("deliver"),
+                    .expect("deliver").enqueued(),
                 "the delivery row must be written for BOTH modes — ruling 3"
             );
             assert_eq!(

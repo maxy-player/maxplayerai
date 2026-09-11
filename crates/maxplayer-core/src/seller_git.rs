@@ -1986,3 +1986,95 @@ mod snapshot_tests {
         let _ = fs::remove_dir_all(&remote);
     }
 }
+
+/// The CUSTODY property of the real blocking wrapper, driven with a controlled fake operation.
+///
+/// Every delivery upload runs through [`off_runtime`], and the serialization permit is passed INTO
+/// the blocking closure rather than held by the async caller. The reason is not stylistic: a
+/// `spawn_blocking` task runs to completion even when the future awaiting it is dropped, so a
+/// delivery timeout or a cancelled task can leave the caller gone while `git-receive-pack` is still
+/// on the wire. If custody were released at cancellation, the next delivery would be admitted to the
+/// same remote mid-transfer.
+///
+/// A git remote cannot express that window on demand, so the operation here is fake and CONTROLLED —
+/// it begins when the wrapper starts it and ends only when this test says so — while the wrapper
+/// itself is the production one. No infrastructure, and the timing is not a race.
+///
+/// RED ON REVERT: hold the permit in the async caller (drop it into the future instead of the
+/// closure) and the abort below frees the gate immediately, so `available_permits()` is 1 while the
+/// operation is still running and the custody assertion fires.
+#[cfg(test)]
+mod off_runtime_custody_tests {
+    use super::{off_runtime, SellerGitError};
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio::sync::Semaphore;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cancelled_caller_does_not_release_custody_before_the_blocking_operation_ends() {
+        let gate = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&gate)
+            .acquire_owned()
+            .await
+            .expect("harness check: take the delivery gate");
+
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (ended_tx, ended_rx) = mpsc::channel::<()>();
+
+        let caller = tokio::spawn(off_runtime(move || {
+            // Custody rides INTO the blocking op, exactly as the upload leg passes it.
+            let _custody = permit;
+            entered_tx.send(()).ok();
+            // The controlled fake operation: this is the whole in-flight window, and it closes on
+            // this test's word, never on a timer.
+            release_rx.recv().ok();
+            ended_tx.send(()).ok();
+            Ok::<(), SellerGitError>(())
+        }));
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("harness check: the blocking operation must actually start");
+        assert_eq!(
+            gate.available_permits(),
+            0,
+            "harness check: the gate is held while the operation runs"
+        );
+
+        // The caller stops waiting — a delivery timeout, a cancelled task, a dropped future.
+        caller.abort();
+        assert!(
+            caller.await.is_err(),
+            "harness check: the awaiting future must be gone"
+        );
+
+        // THE PROPERTY: the operation is STILL running, so nothing may be admitted to the remote.
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            gate.available_permits(),
+            0,
+            "custody must outlive the cancelled caller — the transfer it serializes is still in flight"
+        );
+
+        release_tx
+            .send(())
+            .expect("harness check: end the controlled operation");
+        ended_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the blocking operation must run to completion despite the cancelled caller");
+
+        // And released once the operation ENDS — bounded wait, because the permit drops as the
+        // closure returns, a moment after it announces the end.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while gate.available_permits() == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            gate.available_permits(),
+            1,
+            "custody must be released when the operation ends, or no delivery is ever admitted again"
+        );
+    }
+}
