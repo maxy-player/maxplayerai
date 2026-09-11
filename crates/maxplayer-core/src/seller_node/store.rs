@@ -6541,6 +6541,121 @@ mod tests {
         );
         let _ = std::fs::remove_file(&path);
     }
+
+    /// R2A — A DELAY **BETWEEN THE TWO READINGS** IS STILL ELAPSED TIME.
+    ///
+    /// The pair is built from two separate reads, and whichever is taken second is separated from
+    /// the first by however long this thread happens to be descheduled. Round 6 closed the
+    /// arithmetic AFTER the pair existed and left that construction window open, so a 1.5s sleep
+    /// after the clock was built proved nothing about it: the gap this test injects cannot be
+    /// reached from outside the constructor at all.
+    ///
+    /// The gap STRADDLES the deadline. The first reading happens ~300ms before it, the gap runs
+    /// 600ms, so the second reading lands ~300ms after it and the decision follows immediately.
+    /// Whichever reading is taken first, a correct clock places the decision instant past the
+    /// deadline; only a clock that DISCARDS the interval between its own two reads can believe the
+    /// offer is still live.
+    ///
+    /// The premises are measured from the wall directly, NOT from the clock under test, so the
+    /// mutant fails on the property rather than on a premise guard.
+    ///
+    /// RED ON REVERT: read the wall before the monotonic origin (round 6's order) and the interval
+    /// vanishes — the decision reads ~300ms BEFORE the deadline and the late delivery is enqueued.
+    #[test]
+    fn a_delay_between_the_two_clock_readings_is_counted() {
+        let path = temp_db("pair-gap");
+        let _ = std::fs::remove_file(&path);
+        let store = SellerStore::open(&path).expect("open");
+        let job = "pair-gap";
+        insert_job(&store, job, JobState::Executing);
+
+        // Fix the deadline first, then approach it: deriving it from a position read moments
+        // earlier is not atomic and can pick up a whole second under load.
+        let deadline = crate::seller_node::wall_clock_ms() / 1_000 + 2;
+        let deadline_ms = deadline * 1_000;
+        let mut offer = sample_offer(&format!("offer-{job}"));
+        offer.deadline_unix = deadline;
+        store.record_offer(&offer, deadline - 60).expect("record the offer");
+
+        while crate::seller_node::wall_clock_ms() < deadline_ms - 300 {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        let before = crate::seller_node::wall_clock_ms();
+        let clock = crate::seller_node::DeliveryClock::paired_now_with_gap(|| {
+            std::thread::sleep(std::time::Duration::from_millis(600));
+        });
+        let after = crate::seller_node::wall_clock_ms();
+
+        assert!(
+            before < deadline_ms,
+            "harness check: the offer is still LIVE when construction begins \
+             (before {before}, deadline {deadline_ms})"
+        );
+        assert!(
+            after > deadline_ms,
+            "harness check: the gap must STRADDLE the deadline, or there is no crossing to miss \
+             (after {after}, deadline {deadline_ms})"
+        );
+
+        let outcome = store
+            .deliver_and_enqueue(
+                job,
+                &"b".repeat(40),
+                crate::gateway::PaymentMode::Sat,
+                &result(),
+                deadline - 60,
+                deadline + 10_000,
+                deadline - 60,
+                &clock,
+            )
+            .expect("the write completes rather than erroring");
+
+        assert_eq!(
+            outcome,
+            DeliveryJournal::DeadlinePassed,
+            "the interval between the clock's own two readings is elapsed time like any other"
+        );
+        assert!(
+            store.pending_outbox(deadline + 1).expect("read the outbox").is_empty(),
+            "nothing may be enqueued for a delivery the offer no longer accepts"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// R2A — THE ORDER OF THE PAIR IS THE CLAIM, not merely its precision.
+    ///
+    /// A two-read pair cannot be exact, so the only question is which way it errs. Reading the wall
+    /// first makes the extrapolated instant run BEHIND the truth by the gap, and behind-the-truth
+    /// is the one direction a deadline gate cannot afford: it admits a delivery the offer has
+    /// already refused. Reading the monotonic first makes it run AHEAD, so a refusal can only be
+    /// early — a retry, not a wrongly admitted delivery.
+    ///
+    /// Asserted as an inequality against an independent wall reading rather than as a tolerance, so
+    /// it states the direction rather than a tuned magnitude.
+    ///
+    /// RED ON REVERT: swap the two reads and the clock reports ~600ms in the past ⇒ this fails.
+    #[test]
+    fn the_clock_pair_never_runs_behind_the_truth() {
+        let gap = std::time::Duration::from_millis(600);
+        let clock = crate::seller_node::DeliveryClock::paired_now_with_gap(|| {
+            std::thread::sleep(gap);
+        });
+        let truth_ms = crate::seller_node::wall_clock_ms();
+        let clock_ms = (clock.now_ns() / 1_000_000) as i64;
+
+        assert!(
+            clock_ms >= truth_ms,
+            "a conservative pair never reports an instant EARLIER than the wall it was built from \
+             (clock {clock_ms}, truth {truth_ms}, gap {gap:?})"
+        );
+        // And the gap is actually carried, not merely tolerated: the clock is ahead by about it.
+        assert!(
+            clock_ms - truth_ms >= 500,
+            "the interval between the readings is counted, not discarded \
+             (clock {clock_ms}, truth {truth_ms})"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -6745,4 +6860,3 @@ mod free_lane_tests {
         let _ = std::fs::remove_file(&path);
     }
 }
-

@@ -157,9 +157,9 @@ fn now_unix() -> i64 {
 /// disagree about which instant the caller meant.
 ///
 /// Production now reads the clock through `DeliveryClock`, which pairs the wall reading with the
-/// monotonic instant it was taken at; this millisecond helper remains only for the tests that state
-/// a wall position outright.
-#[cfg(test)]
+/// monotonic instant it was taken at; this millisecond helper reads a wall position outright, for
+/// the one production use that genuinely wants a wall value rather than an elapsed one: comparing
+/// against an offer's absolute `deadline_unix`, which is itself a wall time.
 pub(crate) fn wall_clock_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -214,18 +214,52 @@ enum DeliveryClockOrigin {
 }
 
 impl DeliveryClock {
-    /// The live clock: the wall and the monotonic clock, read together, now.
+    /// The live clock: the MONOTONIC clock first, then the wall.
+    ///
+    /// R2A. The two readings are not simultaneous, and the gap between them has a DIRECTION.
+    ///
+    /// Reading the wall first — as this did — makes `now_ns()` under-report: elapsed is measured
+    /// from a monotonic origin taken AFTER the wall sample, so any preemption between the two
+    /// readings vanishes from every later calculation. Wall sampled at 100.9, 0.2s of preemption,
+    /// immediate store decision: the clock computes 100.9 where the truth is 101.1, and deadline
+    /// 101 is admitted. No wall-clock jump is needed; being descheduled between two adjacent lines
+    /// is enough.
+    ///
+    /// Reading the MONOTONIC first inverts the error. The same gap is now counted twice rather
+    /// than not at all, so the extrapolated instant runs slightly AHEAD of the truth and the
+    /// arithmetic is conservative: a deadline refusal can only ever be EARLY. For a gate that
+    /// decides whether an offer may still be delivered against, early refusal costs a retry while
+    /// late admission costs a delivery the buyer never agreed to pay for. The pair is ordered for
+    /// the error it can afford.
     pub(crate) fn paired_now() -> Self {
-        Self::paired_at_ns(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos() as i128)
-                .unwrap_or(0),
-        )
+        Self::paired_now_with_gap(|| {})
     }
 
-    /// A paired origin at a stated wall instant: the caller's own timebase, extrapolated from here
+    /// `paired_now`, with a seam in the window BETWEEN the two readings.
+    ///
+    /// That window is the whole of the defect, and it cannot be reached from outside: a test that
+    /// waits before construction or after the clock exists exercises neither reading's separation
+    /// from the other. `between` runs in the gap, so a test can state exactly the preemption the
+    /// production pair must survive.
+    pub(crate) fn paired_now_with_gap(between: impl FnOnce()) -> Self {
+        // The monotonic origin FIRST, so whatever happens next is counted rather than lost.
+        let taken_at = std::time::Instant::now();
+        between();
+        let wall_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i128)
+            .unwrap_or(0);
+        Self {
+            origin: DeliveryClockOrigin::Paired { wall_ns, taken_at },
+        }
+    }
+
+    /// A paired origin at a STATED wall instant: the caller's own timebase, extrapolated from here
     /// on the monotonic clock.
+    ///
+    /// No read ordering applies — the wall value is supplied rather than read, so there is no
+    /// second reading to be separated from. Production reads its pair through `paired_now`.
+    #[cfg(test)]
     pub(crate) fn paired_at_ns(wall_ns: i128) -> Self {
         Self {
             origin: DeliveryClockOrigin::Paired {

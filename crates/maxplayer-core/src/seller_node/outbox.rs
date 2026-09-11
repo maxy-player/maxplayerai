@@ -47,26 +47,68 @@ pub struct DrainReport {
 /// `Exhausted` and `Unbudgeted` are different facts and must never collapse into one `None`. A
 /// spent pass that reports "no budget" the same way a live unbudgeted caller does buys itself a
 /// fresh full terminal-drain ceiling, which is precisely the overrun the budget exists to stop.
+///
+/// The live variant carries an **absolute deadline**, not a remaining `Duration`. A `Duration` is a
+/// measurement of the past: it is stale the instant it is taken, and the code that receives it
+/// cannot refresh it. Between a caller sampling "800ms left" and the publish actually starting
+/// there is an offer lookup, a durable write to a store that may be contended, and a signature —
+/// any of which can outlast the grant, so the publish begins on time that no longer exists. An
+/// absolute deadline cannot go stale: every reader subtracts the clock AT THE MOMENT OF USE, which
+/// is after the store write and after signing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrainBudget {
-    /// No pass governs this drain: the periodic outbox step, which is allowed to finish the queue.
+    /// No pass governs this drain: a caller that owns its own time and may finish the queue.
     Unbudgeted,
-    /// This much time is left to the pass.
-    Remaining(std::time::Duration),
+    /// The pass ends at this instant, whatever has happened in between.
+    Until(std::time::Instant),
     /// The pass is spent. Nothing may be started, in flight or otherwise.
     Exhausted,
 }
 
+/// What a budget grants AT THE MOMENT IT IS ASKED.
+///
+/// This exists so that "re-read the clock immediately before use" has exactly ONE implementation.
+/// It previously had two — [`DrainBudget::step`] and an inline copy inside [`drain_scoped`] — and a
+/// mutant that broke one of them left every test green, because the test that claimed the property
+/// went through the other. Two copies of a rule are two rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Grant {
+    /// No pass governs this caller; it may await without a deadline of its own.
+    Ungoverned,
+    /// This much time is left, measured now.
+    For(std::time::Duration),
+    /// The pass is over. Nothing may be started.
+    Spent,
+}
+
 impl DrainBudget {
+    /// The remainder, read from the absolute deadline at THIS instant.
+    ///
+    /// Every decision about whether a remote await may be opened goes through here.
+    pub fn grant_now(self) -> Grant {
+        match self {
+            DrainBudget::Unbudgeted => Grant::Ungoverned,
+            DrainBudget::Until(deadline) => {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    Grant::Spent
+                } else {
+                    Grant::For(left)
+                }
+            }
+            DrainBudget::Exhausted => Grant::Spent,
+        }
+    }
+
     /// The ceiling for ONE awaited step, or `None` when nothing may be started at all.
     ///
     /// `None` here means EXHAUSTED and nothing else, so a caller reading it can act on the one fact
     /// it actually states: decide nothing, leave the durable row, let a later pass resolve it.
     pub fn step(self, ceiling: std::time::Duration) -> Option<std::time::Duration> {
-        match self {
-            DrainBudget::Unbudgeted => Some(ceiling),
-            DrainBudget::Remaining(left) => Some(left.min(ceiling)),
-            DrainBudget::Exhausted => None,
+        match self.grant_now() {
+            Grant::Ungoverned => Some(ceiling),
+            Grant::For(left) => Some(left.min(ceiling)),
+            Grant::Spent => None,
         }
     }
 
@@ -74,8 +116,12 @@ impl DrainBudget {
     /// stays spent, because a ceiling is not a grant.
     pub fn capped(self, ceiling: std::time::Duration) -> DrainBudget {
         match self {
-            DrainBudget::Unbudgeted => DrainBudget::Remaining(ceiling),
-            DrainBudget::Remaining(left) => DrainBudget::Remaining(left.min(ceiling)),
+            DrainBudget::Unbudgeted => {
+                DrainBudget::Until(std::time::Instant::now() + ceiling)
+            }
+            DrainBudget::Until(deadline) => {
+                DrainBudget::Until(deadline.min(std::time::Instant::now() + ceiling))
+            }
             DrainBudget::Exhausted => DrainBudget::Exhausted,
         }
     }
@@ -134,7 +180,6 @@ pub async fn drain_scoped<P: EventPublisher>(
     job_scope: Option<&str>,
     budget: DrainBudget,
 ) -> Result<DrainReport, StoreError> {
-    let started = std::time::Instant::now();
     let mut report = DrainReport::default();
     // Expiry is a local write with no remote await, so it stays whole even for a scoped pass: the
     // retry window is a property of the outbox, not of whoever happened to trigger this drain.
@@ -145,21 +190,15 @@ pub async fn drain_scoped<P: EventPublisher>(
             report.deferred += 1;
             continue;
         }
-        // What is left AT THIS ROW, not what was left when the pass began.
-        let remaining = match budget {
-            DrainBudget::Unbudgeted => None,
-            DrainBudget::Exhausted => {
+        // What is left AT THIS ROW, read from the pass's absolute deadline at this moment — not
+        // what was left when the pass began, and not a Duration sampled before the store write.
+        let remaining = match budget.grant_now() {
+            Grant::Ungoverned => None,
+            Grant::Spent => {
                 report.deferred += 1;
                 continue;
             }
-            DrainBudget::Remaining(total) => {
-                let left = total.saturating_sub(started.elapsed());
-                if left.is_zero() {
-                    report.deferred += 1;
-                    continue;
-                }
-                Some(left)
-            }
+            Grant::For(left) => Some(left),
         };
         // The publish runs INSIDE that remainder. `None` on the outer result is the pass running
         // out mid-flight; the future is dropped and nothing was written.
@@ -337,7 +376,7 @@ mod tests {
             &publisher,
             2,
             None,
-            DrainBudget::Remaining(std::time::Duration::from_millis(50)),
+            DrainBudget::Until(std::time::Instant::now() + std::time::Duration::from_millis(50)),
         )
         .await
         .expect("bounded drain");
@@ -430,8 +469,8 @@ mod tests {
     /// are what spent the rest. Here two 100ms publishes succeed and the third finds ~50ms left, so
     /// it is cut off in flight rather than granted a fourth fresh allowance.
     ///
-    /// RED ON REVERT: pass `total` instead of `total - started.elapsed()` into the per-publish
-    /// timeout and all three confirm ⇒ this fails.
+    /// RED ON REVERT: hand the per-publish timeout the pass's whole original allowance instead of
+    /// the remainder read from its absolute deadline, and all three confirm ⇒ this fails.
     #[tokio::test(flavor = "current_thread")]
     async fn the_remaining_budget_shrinks_across_successful_publishes() {
         let (store, path) = fresh_store("shrink");
@@ -448,7 +487,7 @@ mod tests {
             &publisher,
             2,
             None,
-            DrainBudget::Remaining(std::time::Duration::from_millis(250)),
+            DrainBudget::Until(std::time::Instant::now() + std::time::Duration::from_millis(250)),
         )
         .await
         .expect("bounded drain");
@@ -473,6 +512,57 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// R2B/O-B3 — A GRANT TAKEN BEFORE THE STORE WRITE CANNOT SURVIVE A CONTENDED STORE.
+    ///
+    /// This is the whole reason the budget became an instant. A recovery step samples what it has
+    /// left, THEN looks up the offer, THEN writes durably to a store another connection may be
+    /// holding, THEN signs — and only then publishes. A remaining `Duration` sampled at the top of
+    /// that sequence describes time that is already gone by the bottom of it, and the pass would
+    /// hand the publish its original allowance as though none of the intervening work had happened.
+    ///
+    /// The delay here stands in for that work: the grant is 300ms, 400ms elapses before the pass
+    /// begins, and the correct answer is that NOTHING may be started — not a fresh 300ms window.
+    /// The publisher's call count is asserted, so this is about no remote await having been opened
+    /// at all, rather than about how long one took.
+    ///
+    /// RED ON REVERT: carry a remaining `Duration` and measure it from the pass's own start, and
+    /// the expired grant buys a full fresh window ⇒ a call is made and this fails.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_grant_taken_before_the_store_write_does_not_outlive_it() {
+        let (store, path) = fresh_store("stale-grant");
+        for job in ["a".repeat(64), "b".repeat(64)] {
+            seed_pending(&store, &job);
+        }
+        let publisher = StallingPublisher {
+            calls: RefCell::new(vec![]),
+            per_call: std::time::Duration::from_millis(200),
+        };
+
+        // Sampled BEFORE the intervening work, exactly as a recovery step samples it.
+        let budget = DrainBudget::Until(std::time::Instant::now() + std::time::Duration::from_millis(300));
+        // The offer lookup, the contended durable write, the signature.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        let report = drain_scoped(&store, &publisher, 2, None, budget)
+            .await
+            .expect("the pass completes rather than erroring");
+
+        assert_eq!(
+            publisher.calls.borrow().len(),
+            0,
+            "no remote await may be OPENED on a grant that expired during the store write"
+        );
+        assert_eq!(report.confirmed, 0, "nothing was published");
+        assert_eq!(report.timed_out, 0, "and nothing was cut off, because nothing started");
+        assert_eq!(report.deferred, 2, "both rows were deferred to a later pass");
+        assert_eq!(
+            store.pending_outbox(2).expect("read the outbox").len(),
+            2,
+            "and both are still pending, so deferring cost no events"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// R2B — "SPENT" AND "UNGOVERNED" ARE DIFFERENT ANSWERS.
     ///
     /// The arithmetic is the claim, so it is asserted directly. One `None` for both facts is what
@@ -491,10 +581,24 @@ mod tests {
             None,
             "a spent pass may start nothing at all"
         );
+        let live = DrainBudget::Until(std::time::Instant::now() + std::time::Duration::from_secs(2))
+            .step(ceiling)
+            .expect("a live pass may start a step");
+        assert!(
+            live <= std::time::Duration::from_secs(2)
+                && live > std::time::Duration::from_millis(1_900),
+            "a live pass is bounded by whichever of the two is smaller, measured NOW (got {live:?})"
+        );
+
+        // And the absolute form answers the staleness question the Duration form could not: a
+        // deadline already in the past is spent, without anyone having to re-sample it.
         assert_eq!(
-            DrainBudget::Remaining(std::time::Duration::from_secs(2)).step(ceiling),
-            Some(std::time::Duration::from_secs(2)),
-            "and a live pass is bounded by whichever of the two is smaller"
+            DrainBudget::Until(
+                std::time::Instant::now() - std::time::Duration::from_millis(1)
+            )
+            .step(ceiling),
+            None,
+            "a pass whose deadline has passed may start nothing, however it was obtained"
         );
 
         assert_eq!(
@@ -502,10 +606,13 @@ mod tests {
             DrainBudget::Exhausted,
             "a ceiling is not a grant: capping a spent pass leaves it spent"
         );
-        assert_eq!(
-            DrainBudget::Unbudgeted.capped(ceiling),
-            DrainBudget::Remaining(ceiling),
-            "capping an ungoverned caller makes it bounded"
+        let capped = DrainBudget::Unbudgeted
+            .capped(ceiling)
+            .step(std::time::Duration::from_secs(60))
+            .expect("capping an ungoverned caller leaves it live");
+        assert!(
+            capped <= ceiling && capped > ceiling - std::time::Duration::from_millis(100),
+            "capping an ungoverned caller makes it bounded by the ceiling (got {capped:?})"
         );
     }
 }
