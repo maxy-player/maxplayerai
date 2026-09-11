@@ -865,6 +865,38 @@ pub enum DeliveryJournal {
     AlreadyDelivered,
     /// The job was already terminally `failed`; the result was deliberately NOT enqueued.
     Fenced,
+    /// The offer's deadline had passed at the instant of the durable write. R2: eligibility is
+    /// decided HERE, inside the same immediate transaction as the enqueue, because every check
+    /// made before this point is separated from it by a lock acquisition the checker does not
+    /// hold. A caller that checked a live deadline and then waited on this lock can arrive late.
+    DeadlinePassed,
+}
+
+/// What [`SellerStore::fail_and_enqueue_feedback`] actually did (R1). A failure that moved the row
+/// and a failure that found the job already terminal are different facts, and only the first may
+/// announce itself to the buyer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureJournal {
+    /// This call moved the job to `failed` and queued exactly one buyer feedback event.
+    Transitioned,
+    /// The job was already terminal (`paid`, `delivered` or `failed`): nothing moved, and
+    /// deliberately nothing was announced.
+    NoOp,
+}
+
+impl FailureJournal {
+    /// True only when this call took the job terminal — never for a no-op over a settled job.
+    pub fn transitioned(self) -> bool {
+        matches!(self, FailureJournal::Transitioned)
+    }
+}
+
+/// A delivery the remote already attested, still awaiting its durable result enqueue.
+#[derive(Debug, Clone)]
+pub struct VerifiedAwaitingEnqueue {
+    pub job_id: String,
+    pub commit: String,
+    pub deadline_unix: Option<i64>,
 }
 
 impl DeliveryJournal {
@@ -2037,6 +2069,8 @@ impl SellerStore {
         expires_at_unix: i64,
         now_unix: i64,
     ) -> Result<DeliveryJournal, StoreError> {
+        // Started BEFORE the lock, so the wait for it can be measured rather than assumed away.
+        let called_at = std::time::Instant::now();
         let mut conn = self.lock()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let exists: bool = tx
@@ -2064,6 +2098,36 @@ impl SellerStore {
         if terminal_failure {
             tx.commit()?;
             return Ok(DeliveryJournal::Fenced);
+        }
+        // R2: THE deadline decision, atomic with the write it guards. Both routes reach this
+        // statement — the live execute path and the resumed finalize — so neither can enqueue a
+        // result the offer no longer accepts, however long it waited for this lock. A replay of an
+        // already-delivered job is settled above and is deliberately NOT re-judged here: that job
+        // was delivered on time and stays delivered.
+        let deadline: Option<i64> = tx
+            .query_row(
+                "SELECT o.deadline_unix FROM jobs j
+                   JOIN offers o ON o.offer_id = j.offer_id
+                  WHERE j.job_id = ?1",
+                [job_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        // Eligibility is judged at the instant of the WRITE, not at the instant the caller decided
+        // to attempt it. Those differ by the wait for this very lock, which is unbounded and which
+        // the caller cannot observe, so judging by the bare `now_unix` argument leaves exactly the
+        // hole this check exists to close.
+        //
+        // The correction is measured on the MONOTONIC clock, from before the lock to here, and
+        // added to the caller's own timestamp. Reading the wall clock here instead judges callers
+        // on a different clock from the one they pass — which is precisely the regression the first
+        // attempt caused: six existing tests, every one of them working in a synthetic timebase,
+        // had live deliveries refused as long expired. One clock base plus the elapsed wait is what
+        // makes this both atomic and correct.
+        let deciding_now = now_unix.saturating_add(called_at.elapsed().as_secs() as i64);
+        if deadline.is_some_and(|deadline| deadline <= deciding_now) {
+            tx.commit()?;
+            return Ok(DeliveryJournal::DeadlinePassed);
         }
         // §3.2 — ruling 3's record, with the payment stated explicitly rather than inferred from
         // the absence of a receipt. A free job's row is written here and never advances past
@@ -2110,6 +2174,89 @@ impl SellerStore {
             params![job_id, now_unix],
         )?;
         Ok(failed)
+    }
+
+    /// Fail a job AND queue the buyer's failure feedback in ONE immediate transaction, so the
+    /// terminal event is bound to the terminal transition that won.
+    ///
+    /// R1. Failing and telling the buyer used to be two independent acts: `fail_job` fenced itself
+    /// correctly, then the caller published feedback regardless of whether that fence had moved
+    /// anything. Two consequences, both observed in review: a job already `delivered` could emit
+    /// `delivery_failed` — the exact opposite of its real disposition — and a repeated no-op
+    /// failure could emit that feedback again each time. The converse was also reachable: a crash
+    /// between the state write and a direct relay send lost the event entirely.
+    ///
+    /// Both disappear when the decision and its announcement share a transaction. The feedback is
+    /// queued only on the transition that actually moved the row, and it is queued DURABLY (the
+    /// outbox survives the crash that a direct send does not). `INSERT OR IGNORE` on the job's
+    /// dedup key makes the queueing exactly-once even if a later pass re-enters this call.
+    ///
+    /// The draft is queued UNSIGNED, exactly as every other outbox row is: the drain publisher
+    /// signs each item at its fixed `created_at_unix` when it sends it. That is what lets this be
+    /// one synchronous transaction — no async signing has to happen between deciding the
+    /// disposition and durably recording its announcement.
+    pub fn fail_and_enqueue_feedback(
+        &self,
+        job_id: &str,
+        draft: &EventDraft,
+        created_at_unix: i64,
+        expires_at_unix: i64,
+        now_unix: i64,
+    ) -> Result<FailureJournal, StoreError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let failed = tx.execute(
+            "UPDATE jobs SET state = 'failed', updated_at_unix = ?2
+             WHERE job_id = ?1 AND state NOT IN ('paid','delivered','failed')",
+            params![job_id, now_unix],
+        )?;
+        if failed == 0 {
+            tx.commit()?;
+            return Ok(FailureJournal::NoOp);
+        }
+        enqueue_event(
+            &tx,
+            &format!("feedback:{job_id}"),
+            draft,
+            created_at_unix,
+            expires_at_unix,
+            now_unix,
+        )?;
+        tx.commit()?;
+        Ok(FailureJournal::Transitioned)
+    }
+
+    /// Deliveries the remote has ALREADY attested at the exact oid, which never reached a queued
+    /// result — the strand between `mark_pushed` and `deliver_and_enqueue`.
+    ///
+    /// R2. The unverified worklist deliberately excludes these rows (they need no remote question),
+    /// and boot recovery picks them up, so on a node that keeps running they had no owner at all: a
+    /// finalize that lost its signer round-trip left the buyer waiting indefinitely for a delivery
+    /// this node had already proved. This is the periodic claim on them.
+    pub fn jobs_verified_awaiting_enqueue(
+        &self,
+    ) -> Result<Vec<VerifiedAwaitingEnqueue>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT j.job_id, j.pushed_commit, o.deadline_unix
+               FROM jobs j
+               LEFT JOIN offers o ON o.offer_id = j.offer_id
+              WHERE j.pushed_commit IS NOT NULL
+                AND j.state IN ('awarded','executing')
+                AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.job_id = j.job_id)
+                AND NOT EXISTS (SELECT 1 FROM receipts r WHERE r.job_id = j.job_id)
+              ORDER BY j.updated_at_unix ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(VerifiedAwaitingEnqueue {
+                    job_id: row.get(0)?,
+                    commit: row.get(1)?,
+                    deadline_unix: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Record a collected receipt and mark the job paid. The `receipt_id` is deduped: the first
@@ -3454,6 +3601,242 @@ mod tests {
         }
     }
 
+    /// Two production terminal writers race for ONE job, and the buyer gets ONE answer.
+    ///
+    /// R1. `deliver_and_enqueue` and `fail_and_enqueue_feedback` are the only two ways a job's
+    /// story ends. Before this round they could BOTH land: the failure path wrote its state and
+    /// announced itself without ever asking whether the delivery had already won. This drives them
+    /// concurrently through real store-lock contention — no manual ordering, no injected barrier —
+    /// and then reads back exactly what the buyer would see on the wire.
+    ///
+    /// RED ON REVERT: remove the terminal-failure fence inside `deliver_and_enqueue`, or let
+    /// `fail_and_enqueue_feedback` queue its feedback on a zero-row update, and a job ends up with
+    /// a result AND a `delivery_failed` queued for it ⇒ this fails.
+    #[test]
+    fn two_racing_terminal_decisions_leave_exactly_one_answer_on_the_wire() {
+        // Both ORDERS have to happen. Contention alone is not coverage: spawned together the
+        // delivering lane reaches the lock first essentially every time, and in that order the
+        // failure fence is never consulted — the failure's own state guard carries it. The
+        // dangerous order is the other one (failure first, delivery arriving late onto a job
+        // already taken terminal), so half these rounds hand the failure lane the head start, and
+        // the run asserts at the end that it really saw both dispositions win.
+        let mut saw_delivery_win = false;
+        let mut saw_failure_win = false;
+        for round in 0..8 {
+            let delivery_leads = round % 2 == 0;
+            let lag = std::time::Duration::from_millis(60);
+            let path = temp_db(&format!("race-terminal-{round}"));
+            let _ = std::fs::remove_file(&path);
+            let store = SellerStore::open(&path).expect("open");
+            let job = "raced";
+            insert_job(&store, job, JobState::Executing);
+            let commit = "c".repeat(40);
+            let result_draft = result();
+            let feedback_draft = wire_draft(3404);
+
+            let (delivered, failed) = std::thread::scope(|scope| {
+                let deliver = scope.spawn(|| {
+                    if !delivery_leads {
+                        std::thread::sleep(lag);
+                    }
+                    store.deliver_and_enqueue(
+                        job,
+                        &commit,
+                        crate::gateway::PaymentMode::Sat,
+                        &result_draft,
+                        1,
+                        10_000,
+                        1,
+                    )
+                });
+                let fail = scope.spawn(|| {
+                    if delivery_leads {
+                        std::thread::sleep(lag);
+                    }
+                    store.fail_and_enqueue_feedback(job, &feedback_draft, 1, 10_000, 1)
+                });
+                (
+                    deliver.join().expect("the delivering lane"),
+                    fail.join().expect("the failing lane"),
+                )
+            });
+            let delivered = delivered.expect("deliver_and_enqueue").enqueued();
+            let failed = failed.expect("fail_and_enqueue_feedback").transitioned();
+
+            assert!(
+                delivered ^ failed,
+                "round {round}: exactly ONE lane may take the job terminal (delivered={delivered}, failed={failed})"
+            );
+            let queued: Vec<String> = store
+                .pending_outbox(1)
+                .expect("read the outbox")
+                .into_iter()
+                .map(|item| item.dedup_key)
+                .collect();
+            assert_eq!(
+                queued.len(),
+                1,
+                "round {round}: the buyer is told exactly once, not twice and not never (queued={queued:?})"
+            );
+            let expected = if delivered {
+                format!("result:{job}")
+            } else {
+                format!("feedback:{job}")
+            };
+            assert_eq!(
+                queued[0], expected,
+                "round {round}: the event on the wire must be the one the WINNING disposition implies"
+            );
+            let state = store.job_state(job).expect("state").expect("a job row");
+            let expected_state = if delivered {
+                JobState::Delivered
+            } else {
+                JobState::Failed
+            };
+            assert_eq!(
+                state, expected_state,
+                "round {round}: the durable state agrees with the event that went out"
+            );
+            saw_delivery_win |= delivered;
+            saw_failure_win |= failed;
+        }
+        assert!(
+            saw_delivery_win && saw_failure_win,
+            "this test only covers the fence if BOTH orders actually occurred \
+             (delivery won: {saw_delivery_win}, failure won: {saw_failure_win})"
+        );
+    }
+
+    /// A delivered job never emits the OPPOSITE failure, however many times a late lane tries.
+    ///
+    /// R1. This is the minimal counterexample the review named: finalize succeeds, then a lapsed
+    /// lane replays the failure path. The old shape failed the row (a no-op, correctly fenced) and
+    /// then published `delivery_failed` anyway — the exact opposite of the job's real disposition,
+    /// once per retry. Binding the announcement to the transition is what makes the retries silent.
+    ///
+    /// RED ON REVERT: publish the feedback outside the transition's transaction (or on a zero-row
+    /// update) and the delivered job accumulates one `delivery_failed` per attempt ⇒ this fails.
+    #[test]
+    fn a_delivered_job_emits_no_late_failure_however_often_the_failure_is_retried() {
+        let path = temp_db("delivered-then-late-failure");
+        let _ = std::fs::remove_file(&path);
+        let store = SellerStore::open(&path).expect("open");
+        let job = "settled";
+        insert_job(&store, job, JobState::Executing);
+        assert!(
+            store
+                .deliver_and_enqueue(
+                    job,
+                    &"a".repeat(40),
+                    crate::gateway::PaymentMode::Sat,
+                    &result(),
+                    1,
+                    10_000,
+                    1,
+                )
+                .expect("the delivery lands")
+                .enqueued(),
+            "harness check: the job really is delivered before the late failures arrive"
+        );
+
+        for attempt in 0..3 {
+            let outcome = store
+                .fail_and_enqueue_feedback(job, &wire_draft(3404), 2, 10_000, 2)
+                .expect("the late failure is handled, not an error");
+            assert_eq!(
+                outcome,
+                FailureJournal::NoOp,
+                "attempt {attempt}: a delivered job cannot be taken failed"
+            );
+        }
+
+        assert_eq!(
+            store.job_state(job).expect("state").expect("a job row"),
+            JobState::Delivered,
+            "the job keeps its real disposition"
+        );
+        let queued: Vec<String> = store
+            .pending_outbox(2)
+            .expect("read the outbox")
+            .into_iter()
+            .map(|item| item.dedup_key)
+            .collect();
+        assert_eq!(
+            queued,
+            vec![format!("result:{job}")],
+            "the result is the ONLY thing queued — no opposite failure, and none repeated"
+        );
+    }
+
+    /// A deadline that passes WHILE the writer waits for the store lock enqueues nothing.
+    ///
+    /// R2, and the reason the eligibility clock is read inside the transaction. Every check made
+    /// before this point is separated from the durable write by a lock the checker does not hold:
+    /// this lane is eligible when it calls, waits out a real conflicting transaction, and is no
+    /// longer eligible when it finally gets to write. The crossing is REAL — the offer is live at
+    /// the call and expires during the wait — not a pre-expired row staged to take the branch.
+    ///
+    /// RED ON REVERT: judge the deadline by the caller's `now_unix` argument instead of the clock
+    /// read inside the transaction, and this late result is enqueued ⇒ this fails.
+    #[test]
+    fn a_deadline_crossed_while_waiting_for_the_store_lock_enqueues_nothing() {
+        let path = temp_db("deadline-crossed-under-contention");
+        let _ = std::fs::remove_file(&path);
+        let store = SellerStore::open(&path).expect("open");
+        let job = "latecomer";
+        insert_job(&store, job, JobState::Executing);
+        let now = crate::seller_node::now_unix();
+        let mut offer = sample_offer(&format!("offer-{job}"));
+        // Live when the writer starts, expired a second later — the writer will spend longer than
+        // that waiting for the lock.
+        offer.deadline_unix = now + 1;
+        store.record_offer(&offer, now).expect("record the offer");
+
+        let outcome = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let holder = rusqlite::Connection::open(&path).expect("open the blocking writer");
+                holder
+                    .execute_batch("BEGIN EXCLUSIVE;")
+                    .expect("hold the write lock");
+                std::thread::sleep(std::time::Duration::from_millis(2_500));
+                holder.execute_batch("COMMIT;").expect("release the lock");
+            });
+            // Let the conflicting transaction take the lock first.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            assert!(
+                offer.deadline_unix > crate::seller_node::now_unix(),
+                "harness check: the offer must still be LIVE at the instant this writer starts, \
+                 otherwise this proves nothing about a crossing"
+            );
+            store
+                .deliver_and_enqueue(
+                    job,
+                    &"b".repeat(40),
+                    crate::gateway::PaymentMode::Sat,
+                    &result(),
+                    now,
+                    now + 10_000,
+                    now,
+                )
+                .expect("the write completes rather than erroring")
+        });
+
+        assert_eq!(
+            outcome,
+            DeliveryJournal::DeadlinePassed,
+            "the deadline passed while this writer waited for the lock, so it must NOT enqueue"
+        );
+        assert!(
+            store.pending_outbox(now + 10).expect("read the outbox").is_empty(),
+            "nothing reaches the buyer from a write that lost its eligibility while waiting"
+        );
+        assert_eq!(
+            store.job_state(job).expect("state").expect("a job row"),
+            JobState::Executing,
+            "and the job is not marked delivered by a write that refused"
+        );
+    }
+
     /// A wire-valid draft carrying the protocol tags every maxplayer event needs.
     fn wire_draft(kind: u16) -> EventDraft {
         use crate::gateway::{MAXPLAYER_TAG, PROTOCOL_VERSION};
@@ -3604,6 +3987,10 @@ mod tests {
     //      probably has nothing". It degrades to `Uploaded`, the side that still OWES the remote a
     //      read-back, so an unreadable marker can only cost an extra question, never a lost pack.
     //
+    // The fault is INJECTED ON THE SUBJECT ROW, not simulated beside it: a BEFORE UPDATE trigger
+    // aborts exactly this job's upgrade write, so `mark_uploaded_unverified` fails the way a real
+    // write error fails, on the row whose recovery is in question.
+    //
     // Bite (measured): make `mark_upload_intent` a no-op and the reopened worklist is EMPTY for the
     // faulted job — the blind-rerun state. Make the unknown stage parse as `Intent` and the second
     // half fails instead.
@@ -3622,17 +4009,32 @@ mod tests {
                 1,
                 "harness check: the required pre-upload write lands"
             );
-            // THE FAULT: the in-op upgrade is attempted for a row that is not there (the same shape a
-            // failed write takes on the blocking thread) and its effect is discarded, exactly as the
-            // production path discards it after logging.
-            let upgraded = store
-                .mark_uploaded_unverified("no-such-job", &commit, 11)
-                .map(|_| ())
-                .is_ok();
+            // THE FAULT, on the subject row itself: a trigger that aborts this job's upgrade write.
+            // The production path logs such an error and carries on, which is precisely the state
+            // under test — the upgrade is lost, and only the intent can still save the delivery.
+            {
+                let fault = rusqlite::Connection::open(&path).expect("open a fault connection");
+                fault
+                    .execute_batch(
+                        "CREATE TRIGGER fault_the_upgrade BEFORE UPDATE ON jobs
+                         WHEN NEW.job_id = 'faulted-upgrade'
+                          AND NEW.uploaded_unverified_stage = 'uploaded'
+                         BEGIN SELECT RAISE(ABORT, 'injected journal write fault'); END;",
+                    )
+                    .expect("arm the injected write fault");
+            }
+            let upgrade = store.mark_uploaded_unverified("faulted-upgrade", &commit, 11);
             assert!(
-                upgraded || !upgraded,
-                "harness check: the upgrade outcome is deliberately not load-bearing"
+                upgrade.is_err(),
+                "harness check: the injected fault must actually break THIS row's upgrade write, \
+                 otherwise the rest of this test proves nothing (got {upgrade:?})"
             );
+            {
+                let fault = rusqlite::Connection::open(&path).expect("open a fault connection");
+                fault
+                    .execute_batch("DROP TRIGGER fault_the_upgrade;")
+                    .expect("disarm the injected write fault");
+            }
             assert_eq!(
                 store
                     .upload_marker("faulted-upgrade")
