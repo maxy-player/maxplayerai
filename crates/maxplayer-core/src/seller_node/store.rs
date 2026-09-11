@@ -2068,6 +2068,7 @@ impl SellerStore {
         created_at_unix: i64,
         expires_at_unix: i64,
         now_unix: i64,
+        now_ms: i64,
     ) -> Result<DeliveryJournal, StoreError> {
         // Started BEFORE the lock, so the wait for it can be measured rather than assumed away.
         let called_at = std::time::Instant::now();
@@ -2124,8 +2125,17 @@ impl SellerStore {
         // attempt caused: six existing tests, every one of them working in a synthetic timebase,
         // had live deliveries refused as long expired. One clock base plus the elapsed wait is what
         // makes this both atomic and correct.
-        let deciding_now = now_unix.saturating_add(called_at.elapsed().as_secs() as i64);
-        if deadline.is_some_and(|deadline| deadline <= deciding_now) {
+        //
+        // R2A: and it is carried in MILLISECONDS, because the same expression in whole seconds
+        // floors twice — once in the caller's own sample, once in the elapsed wait — and each floor
+        // discards up to 999ms of the very interval being measured. Sampled at 100.900 with a
+        // 0.200s wait, second arithmetic computes 100 and admits a delivery whose offer expired at
+        // 101; the real instant, 101.100, is past it. `now_ms` is the caller's own sample at
+        // millisecond precision on that same base, so this stays one coherent clock and simply
+        // stops throwing away the subsecond part. The deadline is a whole second, scaled here
+        // rather than truncating the instant down to meet it.
+        let deciding_ms = now_ms.saturating_add(called_at.elapsed().as_millis() as i64);
+        if deadline.is_some_and(|deadline| deadline.saturating_mul(1_000) <= deciding_ms) {
             tx.commit()?;
             return Ok(DeliveryJournal::DeadlinePassed);
         }
@@ -3647,6 +3657,7 @@ mod tests {
                         1,
                         10_000,
                         1,
+                        1_000,
                     )
                 });
                 let fail = scope.spawn(|| {
@@ -3733,6 +3744,7 @@ mod tests {
                     1,
                     10_000,
                     1,
+                    1_000,
                 )
                 .expect("the delivery lands")
                 .enqueued(),
@@ -3778,6 +3790,83 @@ mod tests {
     ///
     /// RED ON REVERT: judge the deadline by the caller's `now_unix` argument instead of the clock
     /// read inside the transaction, and this late result is enqueued ⇒ this fails.
+    /// R2A — THE SUBSECOND CARRY, which is the verdict's own arithmetic run as a test.
+    ///
+    /// Deadline 101. The caller samples at **100.900** — live, with 100ms to spare. It then waits
+    /// ~150ms for the write lock a conflicting transaction is holding, so the durable write decides
+    /// at **101.050**, past the offer. Whole-second arithmetic floors twice — the sample down to
+    /// 100 and the wait down to 0 — computes 100, and enqueues a result the buyer's offer no longer
+    /// accepts.
+    ///
+    /// Nothing here depends on the wall clock: the decision is the caller's own millisecond sample
+    /// plus a REAL monotonic lock wait, so the crossing is exact and repeatable while the
+    /// contention is genuine.
+    ///
+    /// RED ON REVERT: restore `now_unix.saturating_add(called_at.elapsed().as_secs())` and this
+    /// returns `Enqueued`.
+    #[test]
+    fn a_subsecond_crossing_during_the_lock_wait_enqueues_nothing() {
+        let path = temp_db("subsecond-carry-crossing");
+        let _ = std::fs::remove_file(&path);
+        let store = SellerStore::open(&path).expect("open");
+        let job = "carry";
+        insert_job(&store, job, JobState::Executing);
+        let mut offer = sample_offer(&format!("offer-{job}"));
+        offer.deadline_unix = 101;
+        store.record_offer(&offer, 100).expect("record the offer");
+        let sampled_at_ms = 100_900;
+        assert!(
+            sampled_at_ms < offer.deadline_unix * 1_000,
+            "harness check: the offer must be LIVE at the caller's sample, or this proves nothing \
+             about a crossing"
+        );
+
+        let outcome = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let holder = rusqlite::Connection::open(&path).expect("open the blocking writer");
+                holder
+                    .execute_batch("BEGIN EXCLUSIVE;")
+                    .expect("hold the write lock");
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                holder.execute_batch("COMMIT;").expect("release the lock");
+            });
+            // Let the conflicting transaction take the lock first, leaving ~150ms of real wait —
+            // longer than the 100ms the caller had left, and far under the whole second that
+            // second-granularity arithmetic needs before it notices anything at all.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            store
+                .deliver_and_enqueue(
+                    job,
+                    &"b".repeat(40),
+                    crate::gateway::PaymentMode::Sat,
+                    &result(),
+                    100,
+                    100 + 10_000,
+                    100,
+                    sampled_at_ms,
+                )
+                .expect("the write completes rather than erroring")
+        });
+
+        assert_eq!(
+            outcome,
+            DeliveryJournal::DeadlinePassed,
+            "a crossing measured in hundreds of milliseconds is still a crossing"
+        );
+        assert_eq!(
+            store.job_state(job).expect("state"),
+            Some(JobState::Executing),
+            "and the job is not marked delivered"
+        );
+        assert!(
+            store
+                .pending_outbox(100)
+                .expect("read the outbox")
+                .is_empty(),
+            "nothing was queued for the buyer"
+        );
+    }
+
     #[test]
     fn a_deadline_crossed_while_waiting_for_the_store_lock_enqueues_nothing() {
         let path = temp_db("deadline-crossed-under-contention");
@@ -3785,11 +3874,19 @@ mod tests {
         let store = SellerStore::open(&path).expect("open");
         let job = "latecomer";
         insert_job(&store, job, JobState::Executing);
+        // Sit down at the START of a wall second before sampling. `now_unix` floors, so a sample
+        // taken at X.950 leaves this test only 50ms of margin before its own premise expires — and
+        // under a loaded full-suite run that is how the harness check, not the property, decided
+        // the result. Anchoring the sample makes the margin the whole second it was meant to be.
+        while crate::seller_node::wall_clock_ms() % 1_000 >= 100 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         let now = crate::seller_node::now_unix();
         let mut offer = sample_offer(&format!("offer-{job}"));
-        // Live when the writer starts, expired a second later — the writer will spend longer than
-        // that waiting for the lock.
-        offer.deadline_unix = now + 1;
+        // Live when the writer starts, expired while it waits — the writer spends materially longer
+        // than that on the lock, so the crossing survives scheduling slop rather than sitting on the
+        // edge of it.
+        offer.deadline_unix = now + 2;
         store.record_offer(&offer, now).expect("record the offer");
 
         let outcome = std::thread::scope(|scope| {
@@ -3798,7 +3895,7 @@ mod tests {
                 holder
                     .execute_batch("BEGIN EXCLUSIVE;")
                     .expect("hold the write lock");
-                std::thread::sleep(std::time::Duration::from_millis(2_500));
+                std::thread::sleep(std::time::Duration::from_millis(3_500));
                 holder.execute_batch("COMMIT;").expect("release the lock");
             });
             // Let the conflicting transaction take the lock first.
@@ -3817,6 +3914,7 @@ mod tests {
                     now,
                     now + 10_000,
                     now,
+                    now * 1_000,
                 )
                 .expect("the write completes rather than erroring")
         });
@@ -4730,12 +4828,12 @@ mod tests {
         store.mark_executing(&job, 3).expect("exec");
 
         assert!(store
-            .deliver_and_enqueue(&job, "ref-1", crate::gateway::PaymentMode::Sat, &result(), 4, 999, 5)
+            .deliver_and_enqueue(&job, "ref-1", crate::gateway::PaymentMode::Sat, &result(), 4, 999, 5, 5 * 1_000)
             .expect("deliver").enqueued());
         assert_eq!(store.job_state(&job).expect("state"), Some(JobState::Delivered));
         // Replay: no second delivery, no second result enqueue.
         assert!(!store
-            .deliver_and_enqueue(&job, "ref-1", crate::gateway::PaymentMode::Sat, &result(), 4, 999, 6)
+            .deliver_and_enqueue(&job, "ref-1", crate::gateway::PaymentMode::Sat, &result(), 4, 999, 6, 6 * 1_000)
             .expect("replay").enqueued());
         assert_eq!(
             store.outbox_row(&format!("result:{job}")).expect("row").expect("exists").0,
@@ -6321,7 +6419,7 @@ mod free_lane_tests {
                 .expect("award");
             assert!(
                 store
-                    .deliver_and_enqueue(job, "ref", mode, &wire_draft(crate::gateway::JOB_RESULT_KIND), 3, 9_999, 3)
+                    .deliver_and_enqueue(job, "ref", mode, &wire_draft(crate::gateway::JOB_RESULT_KIND), 3, 9_999, 3, 3 * 1_000)
                     .expect("deliver").enqueued(),
                 "the delivery row must be written for BOTH modes — ruling 3"
             );

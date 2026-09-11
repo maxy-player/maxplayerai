@@ -147,6 +147,21 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+/// The same wall clock as `now_unix`, in MILLISECONDS.
+///
+/// R2A. `now_unix` floors to the second, and a deadline decision that adds a second-floored wait
+/// to a second-floored sample loses the subsecond carry twice over: sampled at 100.900 with a
+/// 0.200s wait, the real instant is 101.100 but the arithmetic yields 100, and a delivery the offer
+/// no longer accepts is enqueued against deadline 101. Callers that judge a deadline sample THIS,
+/// and derive their second-granularity row timestamps from the same read, so the two can never
+/// disagree about which instant the caller meant.
+pub(crate) fn wall_clock_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 /// The persistent seller node: exclusive lock + durable store + serialized wallet/identity actors.
 pub struct SellerNode {
     home: MaxplayerHome,
