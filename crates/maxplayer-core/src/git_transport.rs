@@ -27,11 +27,21 @@
 //!   intended URL ([`same_destination`]) and builds NO request on a mismatch. The header can only
 //!   ever travel to the intended destination. The push side additionally opens the workdir through
 //!   the layout gate ([`crate::seller_git::open_plain_workdir_repo`]).
-//! - **Object-sourced push with remote read-back (C6):** [`push_branch_with_header`] pushes the
-//!   gated commit OBJECT (`<oid>:refs/heads/<branch>`), never a local ref name a surviving job
-//!   process could move under the push, requires the remote's status report to name exactly that
-//!   ref, and then reads the remote's advertisement over a new connection and requires the ref to
-//!   point at the gated oid. It never re-resolves the local branch.
+//! - **Object-sourced push, answered by the remote's own ACK (C6):** [`push_branch_with_header`]
+//!   pushes the gated commit OBJECT (`<oid>:refs/heads/<branch>`), never a local ref name a
+//!   surviving job process could move under the push, and requires the remote's status report to
+//!   name exactly that ref with no error. That per-ref ACK is the whole answer: silence, a report
+//!   for another ref, or a rejection all fail. No advertisement is re-read after the push. It never
+//!   re-resolves the local branch.
+//! - **Authorization minted per WIRE REQUEST:** an operation carries an [`AuthMinter`], not a
+//!   finished header. [`HttpStream::send`] calls it immediately before each request is put on the
+//!   wire, handing it the repo-root URL that request is about to reach — so the advertisement leg,
+//!   the pack POST and any later attempt each present their own token, signed after whatever lock
+//!   or wait preceded them, and a minter can refuse a destination it did not authorize. No token
+//!   lifetime is extended to cover the gap. Automatic redirects are DISABLED on both clients
+//!   ([`client_default`], [`client_short`]): a redirect is a destination the minter never saw and
+//!   the binding checks never ran on, so a 3xx fails the leg instead of silently forwarding the
+//!   token (and, on a 307/308, the pack) to wherever it points.
 //! - **Key hygiene:** the seller/buyer secret is used ONLY in-process to sign the NIP-98 event.
 //!   It is never placed on argv, never in child env, and never spawns a subprocess.
 //!
@@ -41,7 +51,7 @@
 use std::cell::RefCell;
 use std::io::{self, Read, Write};
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use git2::transport::{Service, SmartSubtransport, SmartSubtransportStream, Transport};
@@ -85,13 +95,35 @@ impl From<TransportRefuse> for TransportError {
     }
 }
 
+/// Mints a NIP-98 `Authorization` header for ONE wire request, at the moment that request is made.
+///
+/// The argument is the repo-root URL the request is about to reach — the same `u` the token is
+/// signed over — so the minter both signs freshly and gets to REFUSE a destination it did not
+/// authorize. Returning `Err` fails that leg; nothing is sent unauthorized.
+///
+/// Why a minter and not a header: the seller delivery push waits behind this seat's one delivery
+/// lock, and libgit2 builds a fresh stream for every leg and every attempt. A header minted before
+/// that wait is already aging when the relay checks its `created_at`; a minter called from
+/// [`HttpStream::send`] signs after the wait, once per request, without widening the token's window.
+pub type AuthMinter = Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
+
+/// An [`AuthMinter`] that returns one already-minted header for every leg.
+///
+/// This is the READ-leg shape (fetch, ls-remote, preflight): those operations are a single short
+/// exchange with no lock in front of them, so their token is minted once by [`header_for`] exactly
+/// as before and this adapter hands the same bytes to each leg. The delivery push does NOT use it.
+pub fn static_auth(header: String) -> AuthMinter {
+    Arc::new(move |_destination: &str| Ok(header.clone()))
+}
+
 /// What the https subtransport needs for the legs of ONE operation on ONE thread. Set by
 /// [`with_context`] immediately before a push/fetch/connect and cleared right after; the registered
 /// https factory snapshots it into [`NostrHttp`].
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct LegContext {
-    /// NIP-98 `Authorization` header, or `None` for a public/anonymous https remote.
-    header: Option<String>,
+    /// Mints the NIP-98 `Authorization` header for each leg, or `None` for a public/anonymous https
+    /// remote (no header at all).
+    mint: Option<AuthMinter>,
     /// When true, use the SHORT-timeout HTTP client (the buyer money-path fetch: a hung fetch must
     /// fail CLOSED before authorize_pay burns budget).
     short: bool,
@@ -209,8 +241,8 @@ fn ensure_registered() -> Result<(), TransportError> {
             }
             git2::transport::register("https", |remote| {
                 let context = CONTEXT.with(|cell| cell.borrow().clone());
-                let (header, short, intended_url) = match context {
-                    Some(context) => (context.header, context.short, Some(context.intended_url)),
+                let (mint, short, intended_url) = match context {
+                    Some(context) => (context.mint, context.short, Some(context.intended_url)),
                     // No operation context: no destination is bound, so `action` refuses every
                     // leg. Fail closed rather than send a request nobody named.
                     None => (None, false, None),
@@ -219,7 +251,7 @@ fn ensure_registered() -> Result<(), TransportError> {
                     remote,
                     true,
                     NostrHttp {
-                        header,
+                        mint,
                         short,
                         intended_url,
                     },
@@ -275,7 +307,10 @@ fn destination_parts(url: &str) -> Option<(String, String, String)> {
 
 /// Whether `actual` names the destination the caller intended. Normalizes only the scheme case, the
 /// host case, and one trailing slash; the path must match exactly. Unparseable input never matches.
-fn same_destination(intended: &str, actual: &str) -> bool {
+///
+/// `pub(crate)` so a caller that builds an [`AuthMinter`] applies the SAME comparison the transport
+/// applies — one rule for "is this the destination we named", never two that can drift.
+pub(crate) fn same_destination(intended: &str, actual: &str) -> bool {
     match (destination_parts(intended), destination_parts(actual)) {
         (Some(intended), Some(actual)) => intended == actual,
         _ => false,
@@ -419,11 +454,14 @@ pub fn push_branch(
 /// `<gated_oid>:refs/heads/<branch>`, so the bytes on the wire are that object's graph no matter
 /// where the local branch points during the push (C6). After the push:
 /// 1. the remote's status report must name exactly `refs/heads/<branch>` with no error message;
-/// 2. the remote's advertisement is read over a new connection (same header context) and
-///    `refs/heads/<branch>` must point at `gated_oid`.
+/// 2. that ACK is the whole answer — no advertisement is read back afterwards. A remote that
+///    reports nothing for our ref has not said yes, and is refused on the spot.
 ///
 /// The local branch is never re-resolved. The workdir is opened through the layout gate
 /// ([`crate::seller_git::open_plain_workdir_repo`]) and every leg is bound to `remote_url`.
+///
+/// `header` is minted ONCE by the caller and presented on every leg. The delivery push wants the
+/// opposite — see [`push_branch_with_minter`], which this delegates to.
 pub fn push_branch_with_header(
     workdir: &Path,
     remote_url: &str,
@@ -431,10 +469,34 @@ pub fn push_branch_with_header(
     gated_oid: &str,
     header: Option<String>,
 ) -> Result<String, TransportError> {
+    push_branch_with_minter(
+        workdir,
+        remote_url,
+        branch,
+        gated_oid,
+        header.map(static_auth),
+    )
+}
+
+/// [`push_branch_with_header`] with the authorization minted PER WIRE REQUEST instead of once up
+/// front: `mint` is called from [`HttpStream::send`] immediately before each request, with the
+/// repo-root URL that request is about to reach.
+///
+/// This is the delivery-push entry point. The push waits behind the seat's one delivery lock and
+/// libgit2 opens a fresh stream per leg, so the advertisement and the pack POST each sign their own
+/// token after that wait, and the minter sees — and may refuse — the destination each one names.
+/// `None` is the public/anonymous https case: no header on any leg.
+pub fn push_branch_with_minter(
+    workdir: &Path,
+    remote_url: &str,
+    branch: &str,
+    gated_oid: &str,
+    mint: Option<AuthMinter>,
+) -> Result<String, TransportError> {
     assert_allowed_repo_locator(remote_url)?;
     ensure_registered()?;
     let repo = open_delivery_repo(workdir)?;
-    push_gated_object(&repo, remote_url, branch, gated_oid, header)
+    push_gated_object(&repo, remote_url, branch, gated_oid, mint)
 }
 
 /// Open the committed workdir a delivery is pushed from, through the layout gate. A layout refusal
@@ -466,15 +528,15 @@ fn gated_commit(repo: &Repository, gated_oid: &str) -> Result<Oid, TransportErro
 }
 
 /// The push proper, on an already-opened repository: bind the remote, push the OBJECT `gated_oid`
-/// to `refs/heads/<branch>`, check the status report, then read the remote back. Split from
-/// [`push_branch_with_header`] so the object-sourced push can be exercised against a local bare
-/// repository, which the transport allowlist refuses on the public entry point.
+/// to `refs/heads/<branch>`, and require the remote's own status report to ACK exactly that ref.
+/// Split from [`push_branch_with_header`] so the object-sourced push can be exercised against a
+/// local bare repository, which the transport allowlist refuses on the public entry point.
 fn push_gated_object(
     repo: &Repository,
     remote_url: &str,
     branch: &str,
     gated_oid: &str,
-    header: Option<String>,
+    mint: Option<AuthMinter>,
 ) -> Result<String, TransportError> {
     let gated = gated_commit(repo, gated_oid)?.to_string();
     let target_ref = delivery_ref(branch);
@@ -501,16 +563,20 @@ fn push_gated_object(
     options.remote_callbacks(callbacks);
 
     let context = LegContext {
-        header,
+        mint,
         short: false,
         intended_url: remote_url.to_owned(),
     };
-    with_context(context.clone(), || {
+    with_context(context, || {
         remote.push(&[refspec.as_str()], Some(&mut options))
     })?;
     drop(options);
+    // The remote's per-ref ACK is the whole answer. Reading the advertisement back afterwards added
+    // no authority the ACK does not already carry — it is the same server answering the same
+    // question a second time — while costing a second authorized connection to the delivery remote
+    // after the bytes had already landed. What makes the ACK sufficient is that silence is refused:
+    // `require_status_report` fails on no status, on a status for another ref, and on a rejection.
     require_status_report(&reports.borrow(), &target_ref)?;
-    attest_remote_branch(&mut remote, context, &target_ref, &gated)?;
     Ok(gated)
 }
 
@@ -539,45 +605,6 @@ fn require_status_report(
     }
 }
 
-/// Remote attestation: open a NEW connection to the remote under the same header context, read its
-/// current ref advertisement, and require `target_ref` to point at `gated_oid`. One scoped token
-/// serves both the push and this read-back (the relay is method-agnostic and does not dedup the
-/// event id). The local branch is not consulted.
-fn attest_remote_branch(
-    remote: &mut Remote<'_>,
-    context: LegContext,
-    target_ref: &str,
-    gated_oid: &str,
-) -> Result<(), TransportError> {
-    let heads = with_context(context, || {
-        let connection = remote.connect_auth(Direction::Push, None, None)?;
-        let heads = connection
-            .list()?
-            .iter()
-            .map(|head| (head.name().to_owned(), head.oid().to_string()))
-            .collect::<Vec<_>>();
-        Ok(heads)
-    })?;
-    check_remote_attestation(&heads, target_ref, gated_oid)
-}
-
-/// The attestation comparison on an advertisement: `target_ref` present and equal to `gated_oid`.
-fn check_remote_attestation(
-    heads: &[(String, String)],
-    target_ref: &str,
-    gated_oid: &str,
-) -> Result<(), TransportError> {
-    match heads.iter().find(|(name, _)| name == target_ref) {
-        Some((_, oid)) if oid == gated_oid => Ok(()),
-        Some((_, oid)) => Err(TransportError::Rejected(format!(
-            "remote attestation failed: {target_ref} is at {oid}, not at the pushed {gated_oid}"
-        ))),
-        None => Err(TransportError::Rejected(format!(
-            "remote attestation failed: {target_ref} is absent from the remote after the push"
-        ))),
-    }
-}
-
 /// Fetch `refspecs` from `remote_url` into `repo` in-process. `auth` supplies NIP-98 for relay-git
 /// reads; `short_timeout` selects the fail-closed money-path client (buyer verify) vs the default
 /// long client (seller base fetch). Tags are never downloaded (mirrors `--no-tags`).
@@ -602,7 +629,7 @@ pub fn fetch_refspecs(
     options.download_tags(AutotagOption::None);
 
     let context = LegContext {
-        header,
+        mint: header.map(static_auth),
         short: short_timeout,
         intended_url: remote_url.to_owned(),
     };
@@ -642,7 +669,7 @@ pub fn list_remote(
     let mut remote = bound_remote(&repo, remote_url)?;
 
     let context = LegContext {
-        header,
+        mint: header.map(static_auth),
         short: false,
         intended_url: remote_url.to_owned(),
     };
@@ -693,7 +720,7 @@ fn map_git_error(error: git2::Error) -> TransportError {
 /// and uses the short- or long-timeout client per the operation's timeout class. Every leg is bound
 /// to `intended_url`: [`Self::action`] refuses any other URL before a request exists.
 struct NostrHttp {
-    header: Option<String>,
+    mint: Option<AuthMinter>,
     short: bool,
     /// The repo-root URL the caller named, from the operation context. `None` when the transport was
     /// created outside any [`with_context`]; then every leg is refused.
@@ -752,9 +779,13 @@ impl SmartSubtransport for NostrHttp {
         let (name, is_post) = service_parts(service);
         let full_url = service_url(url, name, is_post);
         Ok(Box::new(HttpStream {
-            header: self.header.clone(),
+            mint: self.mint.clone(),
             short: self.short,
             url: full_url,
+            // The repo ROOT this leg belongs to, kept beside the service URL: it is what the token
+            // is signed over (`u`) and what the minter is shown, so the minter judges the same
+            // destination `action` just bound rather than a service path derived from it.
+            destination: url.to_owned(),
             service: name,
             is_post,
             sent: false,
@@ -772,9 +803,10 @@ impl SmartSubtransport for NostrHttp {
 /// then reads the response; we buffer the writes and fire the HTTP request lazily on the first read
 /// (the standard buffer-then-send pattern for stateless smart HTTP).
 struct HttpStream {
-    header: Option<String>,
+    mint: Option<AuthMinter>,
     short: bool,
     url: String,
+    destination: String,
     service: &'static str,
     is_post: bool,
     sent: bool,
@@ -803,7 +835,18 @@ impl HttpStream {
         };
         // identity encoding: never hand libgit2 a gzip stream it did not negotiate.
         request = request.header("Accept-Encoding", "identity");
-        if let Some(header) = &self.header {
+        // Mint HERE, not when the operation was set up: this is the last instruction before the
+        // request leaves, so whatever the operation waited on — the delivery lock, an earlier leg,
+        // a previous attempt — is already behind us and the token's window starts now. libgit2
+        // builds a fresh stream per leg and per attempt, so every request on the wire gets its own.
+        // A minter that refuses this destination fails the leg with nothing sent.
+        if let Some(mint) = &self.mint {
+            let header = mint(&self.destination).map_err(|error| {
+                io::Error::other(format!(
+                    "authorize {} leg to {}: {error}",
+                    self.service, self.destination
+                ))
+            })?;
             request = request.header("Authorization", header);
         }
         let response = request
@@ -1129,7 +1172,7 @@ mod tests {
     fn action_refuses_a_leg_to_any_other_destination() {
         let intended = "https://relay.example/git/o/r.git";
         let transport = NostrHttp {
-            header: Some("Nostr token".to_owned()),
+            mint: Some(static_auth("Nostr token".to_owned())),
             short: false,
             intended_url: Some(intended.to_owned()),
         };
@@ -1160,7 +1203,7 @@ mod tests {
         );
         // A transport created outside any operation context has no destination: nothing passes.
         let unbound = NostrHttp {
-            header: Some("Nostr token".to_owned()),
+            mint: Some(static_auth("Nostr token".to_owned())),
             short: false,
             intended_url: None,
         };
@@ -1248,7 +1291,7 @@ mod tests {
         // The local branch was neither consulted nor touched.
         assert_eq!(repo.refname_to_id("refs/heads/job").expect("local ref"), b);
 
-        // A repeat push of the same object (the resume path) is accepted and attested again.
+        // A repeat push of the same object (the resume path) is accepted and ACKed again.
         let again = push_gated_object(&repo, &remote_url, "job", &a.to_string(), None)
             .expect("re-push the gated object");
         assert_eq!(again, a.to_string());
@@ -1280,78 +1323,72 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // The remote read-back refuses when the remote's ref disagrees with what was pushed: here a
-    // second client moves the remote ref to B after our push of A completed.
-    // Red-on-revert: make `check_remote_attestation` return Ok and this passes vacuously.
+    // With the read-back gone, the remote's per-ref ACK is the only thing standing between "the
+    // push returned" and "the delivery landed", so the parser that reads it is load-bearing. These
+    // are the shapes a remote can answer with; every one that is not an explicit success for OUR
+    // ref must fail.
+    // Red-on-revert: relax `require_status_report` to accept an empty report and this goes red.
     #[test]
-    fn attestation_refuses_a_remote_whose_ref_moved_after_the_push() {
-        let root = temp_root("c6-attest");
-        let (workdir, a, b) = workdir_with_moved_branch(&root);
-        let bare = root.join("remote.git");
-        Repository::init_bare(&bare).expect("bare remote");
-        let remote_url = bare.to_str().expect("utf8").to_owned();
-        let repo = crate::seller_git::open_plain_workdir_repo(&workdir).expect("open workdir");
-        push_gated_object(&repo, &remote_url, "job", &a.to_string(), None).expect("push A");
+    fn the_per_ref_ack_is_the_only_accepted_answer() {
+        let target = "refs/heads/job";
 
-        // A second client moves the remote ref to B.
-        {
-            let other = Repository::open(&workdir).expect("second client");
-            let mut other_remote = other.remote_anonymous(&remote_url).expect("remote");
-            other_remote
-                .push(&["+refs/heads/job:refs/heads/job"], None)
-                .expect("move the remote ref to B");
-        }
-        assert_eq!(
-            Repository::open_bare(&bare)
-                .expect("bare")
-                .refname_to_id("refs/heads/job")
-                .expect("remote ref"),
-            b
-        );
-
-        // The read-back that follows a push of A must refuse: the remote disagrees with the push.
-        let mut remote = bound_remote(&repo, &remote_url).expect("bound remote");
-        let context = LegContext {
-            header: None,
-            short: false,
-            intended_url: remote_url.clone(),
-        };
-        let err = attest_remote_branch(&mut remote, context, "refs/heads/job", &a.to_string())
-            .expect_err("the remote disagrees");
+        // Silence is not consent: a remote that reports nothing for our ref has not accepted it.
         assert!(
-            matches!(&err, TransportError::Rejected(m) if m.contains("remote attestation failed")),
-            "{err}"
+            matches!(
+                require_status_report(&[], target),
+                Err(TransportError::Transport(_))
+            ),
+            "an empty status report must fail"
         );
-        assert!(
-            err.to_string().contains(&b.to_string()),
-            "names the oid the remote holds: {err}"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
 
-    #[test]
-    fn attestation_comparison_requires_the_ref_at_the_gated_oid() {
-        let a = "a".repeat(40);
-        let b = "b".repeat(40);
-        let agrees = vec![
-            ("HEAD".to_owned(), a.clone()),
-            ("refs/heads/job".to_owned(), a.clone()),
-        ];
-        check_remote_attestation(&agrees, "refs/heads/job", &a).expect("agrees");
-        let moved = vec![("refs/heads/job".to_owned(), b.clone())];
-        assert!(matches!(
-            check_remote_attestation(&moved, "refs/heads/job", &a),
-            Err(TransportError::Rejected(_))
-        ));
-        let absent = vec![("refs/heads/other".to_owned(), a.clone())];
-        assert!(matches!(
-            check_remote_attestation(&absent, "refs/heads/job", &a),
-            Err(TransportError::Rejected(_))
-        ));
-        assert!(matches!(
-            check_remote_attestation(&[], "refs/heads/job", &a),
-            Err(TransportError::Rejected(_))
-        ));
+        // An ACK for somebody else's ref is not an ACK for ours — and the error names what we did
+        // get, so an operator is not left guessing.
+        let other = require_status_report(&[("refs/heads/other".to_owned(), None)], target)
+            .expect_err("a report for another ref must fail");
+        assert!(other.to_string().contains("refs/heads/other"), "{other}");
+
+        // A rejection is a rejection even when our ref is named.
+        let rejected = require_status_report(
+            &[(
+                target.to_owned(),
+                Some("pre-receive hook declined".to_owned()),
+            )],
+            target,
+        )
+        .expect_err("a rejection must fail");
+        assert!(
+            matches!(&rejected, TransportError::Rejected(m) if m.contains("pre-receive hook declined")),
+            "{rejected}"
+        );
+
+        // A remote that ACKs our ref AND rejects it in the same report is not an acceptance.
+        assert!(
+            require_status_report(
+                &[
+                    (target.to_owned(), None),
+                    (target.to_owned(), Some("denied".to_owned())),
+                ],
+                target,
+            )
+            .is_err(),
+            "a contradictory report must fail"
+        );
+
+        // We push exactly one refspec, so exactly one ACK for exactly our ref is the only shape
+        // that means "the delivery landed". A remote that also claims to have updated refs we never
+        // pushed is not answering our question, and is refused too.
+        let extra = require_status_report(
+            &[
+                ("refs/heads/other".to_owned(), None),
+                (target.to_owned(), None),
+            ],
+            target,
+        )
+        .expect_err("a report naming refs we did not push must fail");
+        assert!(extra.to_string().contains("refs/heads/other"), "{extra}");
+
+        // The one accepted shape.
+        require_status_report(&[(target.to_owned(), None)], target).expect("exact report");
     }
 
     #[test]
