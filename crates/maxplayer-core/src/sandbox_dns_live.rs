@@ -73,6 +73,20 @@ const NON_DNS_PORT: &str = "8080";
 
 const RESOLVER_IMAGE: &str = "mxdns-resolver:local";
 const PROBE_IMAGE: &str = "mxdns-probe:local";
+/// A disposable smart-HTTP Git endpoint, served over TLS because the product's own transport
+/// allowlist refuses `http://`, `file://` and bare paths (`delivery_transport.rs:83-88`). Reached
+/// ONLY by the DNS name below, so the delivery legs resolve through the resolver file the launch
+/// wrote.
+const GIT_IMAGE: &str = "mxgit-https:local";
+const GIT_NAME: &str = "gitsrv.gate.test";
+const GIT_HOST_V4: &str = "203.0.113.20";
+const GIT_CT: &str = "mxdns-gate-git";
+/// The pinned product sandbox image with a binary built from THIS source laid over it. The stock
+/// image ships 0.5.8 from a different commit, which would answer a question about 0.5.8 rather than
+/// about the source under test.
+const DELIVERY_IMAGE: &str = "mxsandbox-6f5a7e7:local";
+/// Branch names the delivery gate uses on the fixture remote.
+const GIT_BASE_BRANCH: &str = "main";
 /// The container runtime the payload must actually run under. The whole DNS problem this module
 /// exists for — docker's embedded resolver at `127.0.0.11` never answering — is a gVisor property,
 /// so a result measured under `runc` is not a result about it.
@@ -128,6 +142,7 @@ impl Infra {
             "dnsmasq -k -p 53 --no-resolv --no-hosts --bind-interfaces \
              --listen-address={RESOLVER_V4} --listen-address={RESOLVER_V6} \
              --address=/{DNS_NAME}/{PUB_HOST_V4} --address=/{DNS_NAME}/{PUB_HOST_V6} \
+             --address=/{GIT_NAME}/{GIT_HOST_V4} \
              --txt-record={txt} & \
              while :; do nc -l -p {NON_DNS_PORT} >/dev/null 2>&1; done"
         );
@@ -148,6 +163,13 @@ impl Infra {
             ]);
             assert!(ok, "could not start listener {name}: {err}");
         }
+        // The Git endpoint lives on the public net, at an address only the fixture resolver knows.
+        let (ok, _, err) = docker(&[
+            "run", "--detach", "--name", GIT_CT, "--network", PUB_NET, "--ip", GIT_HOST_V4,
+            GIT_IMAGE,
+        ]);
+        assert!(ok, "could not start the git endpoint: {err}");
+
         // The resolver has to be answering before any gate queries it; dnsmasq binds in well under a
         // second, but "well under" is not "before".
         for attempt in 0..30 {
@@ -165,7 +187,7 @@ impl Infra {
     }
 
     fn down() {
-        for name in [RESOLVER_CT, OTHER_CT, PUB_CT] {
+        for name in [RESOLVER_CT, OTHER_CT, PUB_CT, GIT_CT] {
             docker(&["rm", "--force", "--volumes", name]);
         }
         // Holders and job containers are named by the product, from the job id. Only ids this gate
@@ -213,6 +235,98 @@ fn config_on(network: &str, dns_servers: Vec<String>) -> SandboxConfig {
         container_delivery_token: None,
         container_delivery_token_cap_secs: None,
     }
+}
+
+/// The same seat config, but launching the product sandbox image instead of the probe image.
+fn config_with_image(image: &str, dns_servers: Vec<String>) -> SandboxConfig {
+    let mut cfg = config(dns_servers);
+    cfg.image = Some(image.to_owned());
+    cfg
+}
+
+/// Run a git query against the fixture remote, from the SERVER side.
+fn git_server(args: &str) -> (bool, String, String) {
+    docker(&["exec", GIT_CT, "sh", "-c", &format!("git --git-dir=/srv/git/repo.git {args}")])
+}
+
+/// Seed the fixture remote with exactly one base commit, and do not return until the endpoint
+/// actually serves smart-HTTP over TLS. Returns the base oid.
+///
+/// System `git` here is FIXTURE construction, on the server side of the wire. The client side --
+/// the thing under test -- is the product's own in-process libgit2, running inside the contained
+/// job container.
+fn seed_git_fixture() -> String {
+    let script = format!(
+        "set -e; \
+         git config --global user.email fixture@gate.test; \
+         git config --global user.name fixture; \
+         rm -rf /srv/git/repo.git /tmp/seed; \
+         git init --bare -q /srv/git/repo.git; \
+         git --git-dir=/srv/git/repo.git symbolic-ref HEAD refs/heads/{GIT_BASE_BRANCH}; \
+         git init -q /tmp/seed; cd /tmp/seed; \
+         echo base > BASE.txt; git add -A; git commit -q -m base; \
+         git branch -M {GIT_BASE_BRANCH}; \
+         git push -q /srv/git/repo.git {GIT_BASE_BRANCH}; \
+         git rev-parse HEAD"
+    );
+    let (ok, out, err) = docker(&["exec", GIT_CT, "sh", "-c", &script]);
+    assert!(ok, "could not seed the git fixture: {out}\n{err}");
+    let oid = out.lines().last().unwrap_or_default().trim().to_owned();
+    assert_eq!(oid.len(), 40, "the seed did not yield a commit oid: {out}\n{err}");
+
+    // Serving over TLS is a separate readiness fact from the repository existing.
+    let probe = format!(
+        "git -c http.sslVerify=false ls-remote https://127.0.0.1/repo.git refs/heads/{GIT_BASE_BRANCH}"
+    );
+    for attempt in 0..40 {
+        let (ok, out, _) = docker(&["exec", GIT_CT, "sh", "-c", &probe]);
+        if ok && out.contains(&oid) {
+            return oid;
+        }
+        assert!(attempt < 39, "the git endpoint never served {oid} over TLS: {out}");
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    oid
+}
+
+/// Launch a real argv (not a shell probe) in the contained namespace, with environment and the
+/// exchange-directory mount, through the product's own launch builder -- the same
+/// `launch_with_mounts` entry the seller's delivery path uses.
+fn run_delivery(
+    policy: &SandboxPolicy,
+    prepared_uid: u32,
+    prepared_gid: u32,
+    workdir: &Path,
+    netns: Option<&str>,
+    resolv: Option<&Path>,
+    command: &[String],
+    env: &[(String, String)],
+    mounts: &[(std::path::PathBuf, String)],
+) -> (bool, String, String) {
+    let launch = policy
+        .launch_with_mounts(
+            command,
+            &JobLaunch {
+                workdir,
+                env,
+                uid: prepared_uid,
+                gid: prepared_gid,
+                netns,
+                resolv_conf: resolv,
+            },
+            mounts,
+        )
+        .expect("the policy must build a launch");
+    let out = Command::new(&launch.program)
+        .args(&launch.args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("the launch must spawn");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).trim().to_owned(),
+        String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+    )
 }
 
 fn identity() -> DeliveryAgentIdentity {
