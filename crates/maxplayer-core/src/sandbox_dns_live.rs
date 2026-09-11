@@ -77,6 +77,11 @@ const PROBE_IMAGE: &str = "mxdns-probe:local";
 /// allowlist refuses `http://`, `file://` and bare paths (`delivery_transport.rs:83-88`). Reached
 /// ONLY by the DNS name below, so the delivery legs resolve through the resolver file the launch
 /// wrote.
+///
+/// TLS verification stays ON everywhere in this module. The endpoint is issued a certificate by a
+/// throwaway CA minted per run ([`fixture_tls`]), and every client is given that CA through its own
+/// supported trust input. `GIT_SSL_NO_VERIFY` and `http.sslVerify=false` are NOT used: an endpoint
+/// nobody authenticates is not the acceptance this gate exists to produce.
 const GIT_IMAGE: &str = "mxgit-https:local";
 const GIT_NAME: &str = "gitsrv.gate.test";
 const GIT_HOST_V4: &str = "203.0.113.20";
@@ -85,6 +90,8 @@ const GIT_CT: &str = "mxdns-gate-git";
 /// image ships 0.5.8 from a different commit, which would answer a question about 0.5.8 rather than
 /// about the source under test.
 const DELIVERY_IMAGE: &str = "mxsandbox-6f5a7e7:local";
+/// Where the delivery image keeps its trust store (Debian layout, read back out of the image).
+const SYSTEM_CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
 /// Branch names the delivery gate uses on the fixture remote.
 const GIT_BASE_BRANCH: &str = "main";
 /// The container runtime the payload must actually run under. The whole DNS problem this module
@@ -163,9 +170,13 @@ impl Infra {
             ]);
             assert!(ok, "could not start listener {name}: {err}");
         }
-        // The Git endpoint lives on the public net, at an address only the fixture resolver knows.
+        // The Git endpoint lives on the public net, at an address only the fixture resolver knows,
+        // and serves the per-run fixture certificate. This is a FRESH container of this gate's own
+        // (`GIT_CT`); no pre-existing container in the VM is reused, reconfigured or touched.
+        let tls = fixture_tls();
         let (ok, _, err) = docker(&[
             "run", "--detach", "--name", GIT_CT, "--network", PUB_NET, "--ip", GIT_HOST_V4,
+            "--volume", &format!("{}:/srv/tls:ro", tls.display()),
             GIT_IMAGE,
         ]);
         assert!(ok, "could not start the git endpoint: {err}");
@@ -244,9 +255,257 @@ fn config_with_image(image: &str, dns_servers: Vec<String>) -> SandboxConfig {
     cfg
 }
 
+/// How many HTTP requests the endpoint has SERVED so far, from its own log. A TLS handshake the
+/// endpoint aborts never reaches the request handler, so this counter not moving across a run is
+/// the endpoint's own statement that the client never got past verification. (Python's
+/// `socketserver` drops a failed `wrap_socket` as an ordinary `OSError` without logging it, so the
+/// absence of a request line is the signal available here, not an error line.)
+fn endpoint_requests_served() -> usize {
+    let (_, out, err) = docker(&["logs", GIT_CT]);
+    format!("{out}\n{err}")
+        .lines()
+        .filter(|line| line.contains("HTTP/1.1"))
+        .count()
+}
+
+/// Ask the endpoint for the seeded base from OUTSIDE containment, over a connection whose
+/// certificate is verified against the fixture CA. Used as a liveness check either side of the
+/// negative control, so "refused" can be told apart from "dead".
+fn endpoint_answers_trusted_client(base_oid: &str) -> bool {
+    const LIVENESS_CT: &str = "mxdns-gate-git-live";
+    docker(&["rm", "--force", "--volumes", LIVENESS_CT]);
+    let (ok, _, err) = docker(&[
+        "run", "--detach", "--name", LIVENESS_CT, "--network", SVC_NET, "--dns", RESOLVER_V4,
+        "--volume", &format!("{}:/srv/tls:ro", tls_dir().display()),
+        "--entrypoint", "sh", PROBE_IMAGE, "-c", "sleep 120",
+    ]);
+    assert!(ok, "could not start the liveness container: {err}");
+    let (ok, _, err) = docker(&["network", "connect", PUB_NET, LIVENESS_CT]);
+    assert!(ok, "could not attach {PUB_NET} to the liveness container: {err}");
+    let (ok, out, _) = docker(&[
+        "exec", LIVENESS_CT, "sh", "-c",
+        &format!(
+            "git -c http.sslCAInfo=/srv/tls/ca.pem ls-remote https://{GIT_NAME}/repo.git \
+             refs/heads/{GIT_BASE_BRANCH}"
+        ),
+    ]);
+    docker(&["rm", "--force", "--volumes", LIVENESS_CT]);
+    ok && out.contains(base_oid)
+}
+
 /// Run a git query against the fixture remote, from the SERVER side.
 fn git_server(args: &str) -> (bool, String, String) {
     docker(&["exec", GIT_CT, "sh", "-c", &format!("git --git-dir=/srv/git/repo.git {args}")])
+}
+
+/// Where this run's throwaway PKI lives on the host running the gate.
+fn tls_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join("mxdns-gate").join("tls")
+}
+
+/// Mint a throwaway CA and a certificate for [`GIT_NAME`], valid for one day, and build the trust
+/// input each client needs. Returns the directory holding `cert.pem`, `key.pem`, `ca.pem` and
+/// `bundle.pem`.
+///
+/// Why a CA at all: the order requires TLS verification to REMAIN ENABLED, so the fixture endpoint
+/// has to be authenticatable rather than merely encrypted. `bundle.pem` is the delivery image's own
+/// `ca-certificates.crt` with this CA APPENDED — the public roots are not replaced or removed, one
+/// throwaway issuer is added, and it exists only inside this VM for the life of the run.
+///
+/// The SANs cover the DNS name the contained job uses, the endpoint's address, and loopback (the
+/// server's own readiness probe), so no client anywhere in this module needs its verification
+/// relaxed to talk to it.
+fn fixture_tls() -> std::path::PathBuf {
+    let dir = tls_dir();
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a tls directory");
+    let path = dir.display().to_string();
+
+    let script = format!(
+        "set -e; cd {path}; \
+         printf 'subjectAltName=DNS:{GIT_NAME},IP:{GIT_HOST_V4},IP:127.0.0.1\\n\
+         basicConstraints=CA:FALSE\\nextendedKeyUsage=serverAuth\\n' > ext.cnf; \
+         openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.pem -days 1 \
+           -subj '/CN=mxdns gate throwaway CA' >/dev/null 2>&1; \
+         openssl req -newkey rsa:2048 -nodes -keyout key.pem -out srv.csr \
+           -subj '/CN={GIT_NAME}' >/dev/null 2>&1; \
+         openssl x509 -req -in srv.csr -CA ca.pem -CAkey ca.key -CAcreateserial -out cert.pem \
+           -days 1 -extfile ext.cnf >/dev/null 2>&1; \
+         chmod 0644 cert.pem ca.pem; chmod 0600 key.pem ca.key"
+    );
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(&script)
+        .output()
+        .expect("openssl must run");
+    assert!(
+        out.status.success(),
+        "could not mint the fixture PKI: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The delivery image's own trust store, with this run's CA appended. Read out of the image
+    // rather than assumed, so the bundle the container verifies against is the one it shipped.
+    let (ok, roots, err) = docker(&[
+        "run", "--rm", "--entrypoint", "cat", DELIVERY_IMAGE, SYSTEM_CA_BUNDLE,
+    ]);
+    assert!(ok, "could not read {SYSTEM_CA_BUNDLE} out of {DELIVERY_IMAGE}: {err}");
+    let fixture_ca = std::fs::read_to_string(dir.join("ca.pem")).expect("the fixture CA");
+    std::fs::write(dir.join("bundle.pem"), format!("{roots}\n{fixture_ca}"))
+        .expect("the combined bundle");
+    // The image's roots WITHOUT this run's CA — the negative control's trust store. A gate that
+    // only ever runs with the right CA cannot tell verification from indifference.
+    std::fs::write(dir.join("roots.pem"), &roots).expect("the roots-only bundle");
+    dir
+}
+
+/// Where the fixture PKI is mounted inside the delivery container.
+const CONTAINER_TLS_DIR: &str = "/maxplayer-tls";
+
+/// What one contained delivery produced, kept together so a caller can run the SAME path twice and
+/// compare. `_workdir` is held because dropping it removes the job directory the assertions read.
+struct DeliveryRun {
+    ok: bool,
+    out: String,
+    err: String,
+    outcome: Option<crate::delivery_orchestrator::Phase1Outcome>,
+    io_dir: std::path::PathBuf,
+    job: String,
+    branch: String,
+    holder: String,
+    _workdir: Workdir,
+    /// Held because [`PreparedLaunch`](crate::seller_exec::PreparedLaunch) OWNS the containment:
+    /// dropping it removes the netns holder synchronously (`sandbox_netns.rs:103`), and the
+    /// assertions below read that holder back out of docker.
+    _prepared: crate::seller_exec::PreparedLaunch,
+}
+
+/// Drive one `maxplayer __deliver phase1` inside containment, through the product's own launch
+/// builder — holder namespace, written resolver file, seller uid/gid, host-owned exchange mount.
+///
+/// `ca_file` names the trust store the container is handed through `SSL_CERT_FILE`, and it is the
+/// ONLY thing the caller varies between the accepted run and the negative control: `bundle.pem`
+/// (image roots + this run's CA) must deliver, `roots.pem` (image roots alone) must not. TLS
+/// verification is never disabled in either run.
+async fn contained_delivery(
+    job_name: &str,
+    remote: &str,
+    base_oid: &str,
+    ca_file: &str,
+) -> DeliveryRun {
+    use crate::delivery_orchestrator as orch;
+
+    let workdir = Workdir::new(job_name);
+    let job = workdir.job();
+    let config = config_with_image(
+        DELIVERY_IMAGE,
+        vec![RESOLVER_V4.to_owned(), RESOLVER_V6.to_owned()],
+    );
+    let policy = SandboxPolicy::from_config(Some(&config)).expect("a docker policy");
+
+    // The SAME preparation the delivery path performs: containment, holder, resolver file, uid/gid
+    // and the agent argv the orchestrator will drive inside the container.
+    let agent_argv = delivery_agent_argv();
+    let prepared = crate::seller_exec::prepare_launch(
+        &agent_argv,
+        &policy,
+        workdir.path(),
+        &identity(),
+        Duration::from_secs(900),
+    )
+    .await
+    .expect("containment must be established");
+    let holder = prepared.holder_name.clone().expect("a holder");
+    let resolv = prepared.resolv_conf.clone().expect("a resolver file");
+    // The endpoint lives on the public net; without a route "unreachable" and "denied" are the same
+    // failure, and neither would be a statement about DNS.
+    attach_public(&holder);
+
+    // The host-owned exchange directory, outside the workdir, exactly as the daemon places it.
+    let io_dir = std::env::temp_dir().join("mxdns-gate").join(format!("io-{job}"));
+    orch::create_exchange_dir(&io_dir).expect("an exchange directory");
+
+    let branch = format!("maxplayer/{job}");
+    let inputs = orch::Phase1Inputs {
+        job_hash: "cd".repeat(32),
+        seller_pubkey_hex: identity().seller_pubkey_hex().to_owned(),
+        base: Some(orch::Phase1BaseOwned {
+            clone_url: remote.to_owned(),
+            branch: GIT_BASE_BRANCH.to_owned(),
+            oid: base_oid.to_owned(),
+        }),
+        delivery_branch: branch.clone(),
+        message: "delivery: live DNS/Git gate".to_owned(),
+        author_date_unix: 1_760_000_000,
+        agent_argv: prepared.effective_command.clone(),
+        workdir: std::path::PathBuf::from(crate::seller_exec::CONTAINER_WORKDIR),
+        out_dir: std::path::PathBuf::from(orch::CONTAINER_EXCHANGE_DIR),
+        prompt: "write the deliverable".to_owned(),
+        deadline_unix: (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock after the epoch")
+            .as_secs())
+            + 600,
+        max_agent_attempts: 1,
+        agent_env_names: prepared.env.iter().map(|(key, _)| key.clone()).collect(),
+        relay_url: remote.to_owned(),
+        // A non-relay https remote takes no header — the same arm the host selects.
+        push_token: orch::PushTokenSource::None,
+        handoff_nonce: "ef".repeat(16),
+    };
+    orch::write_phase1_inputs(&io_dir.join(orch::PHASE1_INPUTS_FILE), &inputs)
+        .expect("the inputs file must be written");
+
+    let mut launch_env = prepared.env.clone();
+    launch_env.push((
+        orch::CONTAINER_DELIVERY_ENV.to_owned(),
+        orch::CONTAINER_DELIVERY_ENV_VALUE.to_owned(),
+    ));
+    // Trust, not bypass: a CA file rides in on the standard `SSL_CERT_FILE` input, from a read-only
+    // mount. Certificate verification stays ENABLED, so the endpoint the contained job pushes to
+    // must actually authenticate as `gitsrv.gate.test`.
+    launch_env.push((
+        "SSL_CERT_FILE".to_owned(),
+        format!("{CONTAINER_TLS_DIR}/{ca_file}"),
+    ));
+
+    let orchestrator: Vec<String> = vec![
+        orch::CONTAINER_ORCHESTRATOR_BIN.to_owned(),
+        "__deliver".to_owned(),
+        "phase1".to_owned(),
+        format!("{}/{}", orch::CONTAINER_EXCHANGE_DIR, orch::PHASE1_INPUTS_FILE),
+    ];
+    let (ok, out, err) = run_delivery(
+        &policy,
+        prepared.uid,
+        prepared.gid,
+        workdir.path(),
+        Some(&holder),
+        Some(resolv.as_path()),
+        &orchestrator,
+        &launch_env,
+        &[
+            (io_dir.clone(), orch::CONTAINER_EXCHANGE_DIR.to_owned()),
+            // `:ro` rides on the destination because the mount list is rendered straight into
+            // `-v host:dest` (`seller_exec.rs:899-901`); the job must not be able to edit the
+            // trust store it is verified against.
+            (tls_dir(), format!("{CONTAINER_TLS_DIR}:ro")),
+        ],
+    );
+    // The outcome file is written on EVERY exit, so it carries the reason when the run failed.
+    let outcome = orch::read_outcome(&io_dir).ok().flatten();
+    DeliveryRun {
+        ok,
+        out,
+        err,
+        outcome,
+        io_dir,
+        job,
+        branch,
+        holder,
+        _workdir: workdir,
+        _prepared: prepared,
+    }
 }
 
 /// Seed the fixture remote with exactly one base commit, and do not return until the endpoint
@@ -274,9 +533,12 @@ fn seed_git_fixture() -> String {
     let oid = out.lines().last().unwrap_or_default().trim().to_owned();
     assert_eq!(oid.len(), 40, "the seed did not yield a commit oid: {out}\n{err}");
 
-    // Serving over TLS is a separate readiness fact from the repository existing.
+    // Serving over TLS is a separate readiness fact from the repository existing. The probe
+    // VERIFIES the certificate against the fixture CA — a readiness check that accepted any
+    // certificate would also accept a broken one.
     let probe = format!(
-        "git -c http.sslVerify=false ls-remote https://127.0.0.1/repo.git refs/heads/{GIT_BASE_BRANCH}"
+        "git -c http.sslCAInfo=/srv/tls/ca.pem ls-remote https://127.0.0.1/repo.git \
+         refs/heads/{GIT_BASE_BRANCH}"
     );
     for attempt in 0..40 {
         let (ok, out, _) = docker(&["exec", GIT_CT, "sh", "-c", &probe]);
@@ -961,10 +1223,17 @@ fn delivery_agent_argv() -> Vec<String> {
 ///   server side, not from the job's own repository;
 /// - `KERNEL.txt` inside the pushed tree carries the delivery container's own gVisor banner.
 ///
-/// FIXTURE ACCOMMODATIONS, named so they are not mistaken for product behaviour: the endpoint serves
-/// a self-signed certificate, so the launch environment carries `GIT_SSL_NO_VERIFY` — the product
-/// honours git's own variable (`git_transport.rs:130`) and nothing in the product is changed to
-/// accept it; and the remote is anonymous `https`, so the push token source is
+/// TLS VERIFICATION IS ON for every leg. The endpoint presents a certificate issued by this run's
+/// throwaway CA ([`fixture_tls`]) for the name the job dials, and the delivery container is handed
+/// that CA through `SSL_CERT_FILE` — the standard trust input the product's own env allowlist
+/// already carries (`delivery_orchestrator.rs:1208-1212`) and which its rustls client honours
+/// through native-root loading. `GIT_SSL_NO_VERIFY` is NOT set and `http.sslVerify` is NOT
+/// disabled anywhere in this module: a push accepted by an unauthenticated endpoint would not be
+/// evidence of secure delivery, which is the only thing this gate exists to produce.
+///
+/// FIXTURE ACCOMMODATIONS, named so they are not mistaken for product behaviour: the issuer is a
+/// per-run CA added ALONGSIDE the image's public roots (never replacing them) and discarded with
+/// the run; and the remote is anonymous `https`, so the push token source is
 /// [`PushTokenSource::None`], the same arm the host takes for a non-relay remote. No credential, no
 /// external repository and no relay is involved.
 #[tokio::test]
@@ -987,6 +1256,7 @@ async fn functional_g_contained_job_fetches_and_pushes_an_exact_commit_over_dns(
     docker(&["rm", "--force", "--volumes", CONTROL_CT]);
     let (ok, _, err) = docker(&[
         "run", "--detach", "--name", CONTROL_CT, "--network", SVC_NET, "--dns", RESOLVER_V4,
+        "--volume", &format!("{}:/srv/tls:ro", tls_dir().display()),
         "--entrypoint", "sh", PROBE_IMAGE, "-c", "sleep 600",
     ]);
     assert!(ok, "could not start the control container: {err}");
@@ -994,7 +1264,11 @@ async fn functional_g_contained_job_fetches_and_pushes_an_exact_commit_over_dns(
     assert!(ok, "could not attach {PUB_NET} to the control container: {err}");
     let (ok, control, control_err) = docker(&[
         "exec", CONTROL_CT, "sh", "-c",
-        &format!("git -c http.sslVerify=false ls-remote {remote} refs/heads/{GIT_BASE_BRANCH}"),
+        // The control verifies the certificate too, against the same fixture CA: a control that
+        // accepted any certificate could not tell a live endpoint from a broken one.
+        &format!(
+            "git -c http.sslCAInfo=/srv/tls/ca.pem ls-remote {remote} refs/heads/{GIT_BASE_BRANCH}"
+        ),
     ]);
     docker(&["rm", "--force", "--volumes", CONTROL_CT]);
     assert!(ok, "the unfiltered control could not reach the endpoint: {control}\n{control_err}");
@@ -1003,95 +1277,13 @@ async fn functional_g_contained_job_fetches_and_pushes_an_exact_commit_over_dns(
         "the control did not see the seeded base {base_oid}: {control}"
     );
 
-    let workdir = Workdir::new("gitgate");
-    let job = workdir.job();
-    let config = config_with_image(
-        DELIVERY_IMAGE,
-        vec![RESOLVER_V4.to_owned(), RESOLVER_V6.to_owned()],
-    );
-    let policy = SandboxPolicy::from_config(Some(&config)).expect("a docker policy");
-
-    // The SAME preparation the delivery path performs: containment, holder, resolver file, uid/gid
-    // and the agent argv the orchestrator will drive inside the container.
-    let agent_argv = delivery_agent_argv();
-    let prepared = crate::seller_exec::prepare_launch(
-        &agent_argv,
-        &policy,
-        workdir.path(),
-        &identity(),
-        Duration::from_secs(900),
-    )
-    .await
-    .expect("containment must be established");
-    let holder = prepared.holder_name.clone().expect("a holder");
-    let resolv = prepared.resolv_conf.clone().expect("a resolver file");
-    // The endpoint lives on the public net; without a route "unreachable" and "denied" are the same
-    // failure, and neither would be a statement about DNS.
-    attach_public(&holder);
-
-    // The host-owned exchange directory, outside the workdir, exactly as the daemon places it.
-    let io_dir = std::env::temp_dir().join("mxdns-gate").join(format!("io-{job}"));
-    orch::create_exchange_dir(&io_dir).expect("an exchange directory");
-
-    let branch = format!("maxplayer/{job}");
-    let inputs = orch::Phase1Inputs {
-        job_hash: "cd".repeat(32),
-        seller_pubkey_hex: identity().seller_pubkey_hex().to_owned(),
-        base: Some(orch::Phase1BaseOwned {
-            clone_url: remote.clone(),
-            branch: GIT_BASE_BRANCH.to_owned(),
-            oid: base_oid.clone(),
-        }),
-        delivery_branch: branch.clone(),
-        message: "delivery: live DNS/Git gate".to_owned(),
-        author_date_unix: 1_760_000_000,
-        agent_argv: prepared.effective_command.clone(),
-        workdir: std::path::PathBuf::from(crate::seller_exec::CONTAINER_WORKDIR),
-        out_dir: std::path::PathBuf::from(orch::CONTAINER_EXCHANGE_DIR),
-        prompt: "write the deliverable".to_owned(),
-        deadline_unix: (std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("a clock after the epoch")
-            .as_secs())
-            + 600,
-        max_agent_attempts: 1,
-        agent_env_names: prepared.env.iter().map(|(key, _)| key.clone()).collect(),
-        relay_url: remote.clone(),
-        // A non-relay https remote takes no header — the same arm the host selects.
-        push_token: orch::PushTokenSource::None,
-        handoff_nonce: "ef".repeat(16),
-    };
-    orch::write_phase1_inputs(&io_dir.join(orch::PHASE1_INPUTS_FILE), &inputs)
-        .expect("the inputs file must be written");
-
-    let mut launch_env = prepared.env.clone();
-    launch_env.push((
-        orch::CONTAINER_DELIVERY_ENV.to_owned(),
-        orch::CONTAINER_DELIVERY_ENV_VALUE.to_owned(),
-    ));
-    // Fixture accommodation, not a product change: the disposable endpoint is self-signed.
-    launch_env.push(("GIT_SSL_NO_VERIFY".to_owned(), "1".to_owned()));
-
-    let orchestrator: Vec<String> = vec![
-        orch::CONTAINER_ORCHESTRATOR_BIN.to_owned(),
-        "__deliver".to_owned(),
-        "phase1".to_owned(),
-        format!("{}/{}", orch::CONTAINER_EXCHANGE_DIR, orch::PHASE1_INPUTS_FILE),
-    ];
-    let (ok, out, err) = run_delivery(
-        &policy,
-        prepared.uid,
-        prepared.gid,
-        workdir.path(),
-        Some(&holder),
-        Some(resolv.as_path()),
-        &orchestrator,
-        &launch_env,
-        &[(io_dir.clone(), orch::CONTAINER_EXCHANGE_DIR.to_owned())],
-    );
-    // The outcome file is written on EVERY exit, so it carries the reason when the run failed.
-    let outcome = orch::read_outcome(&io_dir).ok().flatten();
-    assert!(ok, "the container delivery failed: {out}\n{err}\noutcome={outcome:?}");
+    // The accepted run: the container trusts the image's public roots PLUS this run's CA, and
+    // nothing anywhere relaxes verification.
+    let run = contained_delivery("gitgate", &remote, &base_oid, "bundle.pem").await;
+    let (out, err, outcome) = (run.out.clone(), run.err.clone(), &run.outcome);
+    let (job, branch, holder, io_dir) =
+        (run.job.clone(), run.branch.clone(), run.holder.clone(), run.io_dir.clone());
+    assert!(run.ok, "the container delivery failed: {out}\n{err}\noutcome={outcome:?}");
 
     // The runtime identity of the container that did the git work, from docker's own view. The
     // delivery container is not removed on exit, so this is read from the container that ran.
@@ -1151,5 +1343,68 @@ async fn functional_g_contained_job_fetches_and_pushes_an_exact_commit_over_dns(
     println!("delivery kernel record={}", kernel.replace('\n', " | "));
     println!("remote {branch} = {delivered}, parent {parent} = seeded base");
 
+    // NEGATIVE CONTROL — the same path, the same fixtures, ONE difference: the container trusts the
+    // image's public roots alone, without this run's CA. If certificate verification were disabled
+    // anywhere on the delivery path, this run would deliver exactly like the one above, and the
+    // result above would say nothing about secure delivery. It must fail, and the remote must be
+    // untouched.
+    let served_before = endpoint_requests_served();
+    let untrusted = contained_delivery("gitgate-untrusted", &remote, &base_oid, "roots.pem").await;
+    assert!(
+        !untrusted.ok,
+        "a certificate signed by an UNTRUSTED issuer was accepted — TLS verification is not in \
+         force on this path: {}\n{}\noutcome={:?}",
+        untrusted.out, untrusted.err, untrusted.outcome
+    );
+    let (moved, _, _) = git_server(&format!("rev-parse --verify refs/heads/{}", untrusted.branch));
+    assert!(
+        !moved,
+        "the untrusted run still moved {} on the remote",
+        untrusted.branch
+    );
+    assert!(
+        orch::read_delivery_oid(&untrusted.io_dir).is_err(),
+        "the untrusted run reported a delivery oid"
+    );
+    // It must fail for the RIGHT reason. "Something went wrong" would also be produced by a dead
+    // fixture or an unresolvable name, neither of which is a statement about verification, so the
+    // cause is pinned from three sides rather than from the client's message text (the transport
+    // renders `error sending request for url (...)` without the rustls cause behind it):
+    //
+    // 1. the failure is on the fetch leg against THIS endpoint, by name — so the name resolved and
+    //    the job got far enough to dial it;
+    // 2. the ENDPOINT's own log carries the aborted handshake for that attempt;
+    // 3. the endpoint is still serving to a client that trusts the fixture CA, AFTER the refusal —
+    //    so the refusal was not a dead fixture.
+    let why = untrusted
+        .outcome
+        .as_ref()
+        .map(|outcome| outcome.detail.clone())
+        .unwrap_or_default()
+        + &untrusted.err;
+    assert!(
+        why.contains(GIT_NAME),
+        "the untrusted run did not fail against {GIT_NAME}: {why}"
+    );
+    let served_after = endpoint_requests_served();
+    assert_eq!(
+        served_after, served_before,
+        "the endpoint SERVED the untrusted job a request — the connection got past the handshake, \
+         so the failure was not certificate verification"
+    );
+    assert!(
+        endpoint_answers_trusted_client(&base_oid),
+        "the endpoint stopped serving, so the refusal above is not attributable to the trust store"
+    );
+    println!(
+        "negative control (roots without the fixture CA): refused, status={:?}",
+        untrusted.outcome.as_ref().map(|outcome| outcome.status)
+    );
+    println!(
+        "negative control: endpoint served {served_before} requests before and {served_after} after; \
+         still live to a client trusting the fixture CA"
+    );
+
     let _ = std::fs::remove_dir_all(&io_dir);
+    let _ = std::fs::remove_dir_all(&untrusted.io_dir);
 }
