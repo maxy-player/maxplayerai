@@ -51,6 +51,74 @@ pub struct FixtureOptions {
     /// Answer every smart-HTTP request with `302` + this `Location` instead of serving git — for
     /// asserting what a client does with a redirect it was never authorized to follow.
     pub redirect_to: Option<String>,
+    /// Hold the FIRST request here until the test releases it, instead of for a guessed duration.
+    ///
+    /// A delay is a bet that the other party got scheduled in time; this is an appointment. The
+    /// fixture parks the first request and tells the test it has parked ([`RequestGate::wait_held`]);
+    /// the test does whatever it needed the pause for and then opens the gate
+    /// ([`RequestGate::release`]). Nothing in between depends on a clock.
+    pub hold_first_request: Option<Arc<RequestGate>>,
+}
+
+/// A one-shot appointment between the fixture and the test: the fixture parks a request and waits;
+/// the test observes that it is parked and decides when it continues.
+#[derive(Default)]
+pub struct RequestGate {
+    /// `(request is parked, gate is open)` under one mutex, so both transitions are observed in the
+    /// same critical section.
+    state: Mutex<(bool, bool)>,
+    changed: std::sync::Condvar,
+}
+
+impl RequestGate {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Held side: announce that something is parked here, then block until the test opens the
+    /// gate. Bounded so a mistake in a test fails as a test rather than hanging the suite.
+    ///
+    /// Used by the fixture to hold a request, and by tests that need to hold anything else at a
+    /// chosen instruction — a signer that takes its time, for one — without a sleep.
+    pub fn park(&self) {
+        let mut state = self.state.lock().expect("gate");
+        state.0 = true;
+        self.changed.notify_all();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !state.1 {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!remaining.is_zero(), "a held request was never released");
+            let (next, _) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .expect("gate wait");
+            state = next;
+        }
+    }
+
+    /// Test side: block until a request is actually parked in the fixture. Returning means the
+    /// server has read that request's head — its `Authorization` is already recorded — and is not
+    /// going to answer it until [`Self::release`].
+    pub fn wait_held(&self) {
+        let mut state = self.state.lock().expect("gate");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !state.0 {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!remaining.is_zero(), "no request ever reached the gate");
+            let (next, _) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .expect("gate wait");
+            state = next;
+        }
+    }
+
+    /// Test side: let the held request — and every request after it — proceed.
+    pub fn release(&self) {
+        let mut state = self.state.lock().expect("gate");
+        state.1 = true;
+        self.changed.notify_all();
+    }
 }
 
 /// Auth-gated smart-HTTP git server bound to `127.0.0.1:<ephemeral>`.
@@ -58,8 +126,53 @@ pub struct GitHttpAuthServer {
     addr: SocketAddr,
     mount: String,
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
+    concurrency: Arc<Concurrency>,
     shutdown: Arc<AtomicBool>,
     accept_thread: Option<JoinHandle<()>>,
+}
+
+/// How many authorized requests this server was serving AT ONCE, at the high-water mark.
+///
+/// The wire's own answer to "did two deliveries upload at the same time?". A lock held only until
+/// the caller stops waiting leaves an abandoned upload running, and the next delivery's
+/// `git-receive-pack` overlaps it — which is visible right here, at the server, as a peak above one.
+#[derive(Default)]
+struct Concurrency {
+    live: Mutex<(usize, usize)>,
+}
+
+impl Concurrency {
+    fn enter(&self) {
+        let mut live = self.live.lock().expect("concurrency");
+        live.0 += 1;
+        live.1 = live.1.max(live.0);
+    }
+
+    fn leave(&self) {
+        let mut live = self.live.lock().expect("concurrency");
+        live.0 -= 1;
+    }
+
+    fn peak(&self) -> usize {
+        self.live.lock().expect("concurrency").1
+    }
+}
+
+/// Counts one authorized request as in-flight for as long as this server is working on it — through
+/// every early return in [`handle_connection`], including a held one.
+struct InFlight<'a>(&'a Concurrency);
+
+impl<'a> InFlight<'a> {
+    fn enter(concurrency: &'a Concurrency) -> Self {
+        concurrency.enter();
+        Self(concurrency)
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.leave();
+    }
 }
 
 impl GitHttpAuthServer {
@@ -79,16 +192,20 @@ impl GitHttpAuthServer {
             .expect("nonblocking listener");
         let addr = listener.local_addr().expect("listener addr");
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let concurrency = Arc::new(Concurrency::default());
         let shutdown = Arc::new(AtomicBool::new(false));
 
         let repo: PathBuf = repo.to_path_buf();
         let mount_bg = mount.to_owned();
         let requests_bg = Arc::clone(&requests);
+        let concurrency_bg = Arc::clone(&concurrency);
         let shutdown_bg = Arc::clone(&shutdown);
         let options = Arc::new(options);
         // The delay is a one-shot: it exists to separate the first leg from the rest in time, not to
         // slow every leg of the test.
         let delay_spent = Arc::new(AtomicBool::new(false));
+        // The gate is a one-shot for the same reason: it parks the FIRST request, not every one.
+        let gate_spent = Arc::new(AtomicBool::new(false));
         let accept_thread = std::thread::spawn(move || {
             while !shutdown_bg.load(Ordering::SeqCst) {
                 match listener.accept() {
@@ -97,8 +214,10 @@ impl GitHttpAuthServer {
                         let repo = repo.clone();
                         let mount = mount_bg.clone();
                         let requests = Arc::clone(&requests_bg);
+                        let concurrency = Arc::clone(&concurrency_bg);
                         let options = Arc::clone(&options);
                         let delay_spent = Arc::clone(&delay_spent);
+                        let gate_spent = Arc::clone(&gate_spent);
                         std::thread::spawn(move || {
                             let _ = handle_connection(
                                 stream,
@@ -106,8 +225,10 @@ impl GitHttpAuthServer {
                                 &repo,
                                 &mount,
                                 &requests,
+                                &concurrency,
                                 &options,
                                 &delay_spent,
+                                &gate_spent,
                             );
                         });
                     }
@@ -123,6 +244,7 @@ impl GitHttpAuthServer {
             addr,
             mount: mount.to_owned(),
             requests,
+            concurrency,
             shutdown,
             accept_thread: Some(accept_thread),
         }
@@ -137,6 +259,11 @@ impl GitHttpAuthServer {
     pub fn requests(&self) -> Vec<RecordedRequest> {
         self.requests.lock().expect("requests lock").clone()
     }
+
+    /// The most requests this server was serving simultaneously. See [`Concurrency`].
+    pub fn peak_concurrent_requests(&self) -> usize {
+        self.concurrency.peak()
+    }
 }
 
 impl Drop for GitHttpAuthServer {
@@ -148,7 +275,10 @@ impl Drop for GitHttpAuthServer {
     }
 }
 
-fn self_signed_tls_config() -> ServerConfig {
+/// `pub` so the h2 fixture (`tests/h2_no_hidden_replay.rs`) serves the SAME certificate this one
+/// does: the client's trust decision is then identical, and the only thing that differs between the
+/// two fixtures is the protocol they negotiate.
+pub fn self_signed_tls_config() -> ServerConfig {
     // SAN content is irrelevant to the tests (clients connect with GIT_SSL_NO_VERIFY),
     // but keep it honest for 127.0.0.1 anyway.
     let certified =
@@ -170,8 +300,10 @@ fn handle_connection(
     repo: &Path,
     mount: &str,
     requests: &Mutex<Vec<RecordedRequest>>,
+    concurrency: &Concurrency,
     options: &FixtureOptions,
     delay_spent: &AtomicBool,
+    gate_spent: &AtomicBool,
 ) -> std::io::Result<()> {
     // macOS: sockets accepted from a nonblocking listener inherit O_NONBLOCK — undo it.
     stream.set_nonblocking(false)?;
@@ -239,6 +371,10 @@ fn handle_connection(
         );
     }
 
+    // From here on this server is WORKING on an authorized request; the count stands until the
+    // response is finished, however this function leaves.
+    let _in_flight = InFlight::enter(concurrency);
+
     if expects_continue {
         tls.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
         tls.flush()?;
@@ -250,6 +386,13 @@ fn handle_connection(
     if let Some(delay) = options.first_response_delay {
         if !delay_spent.swap(true, Ordering::SeqCst) {
             std::thread::sleep(delay);
+        }
+    }
+
+    // Same position, but held until the test says so rather than for a guessed duration.
+    if let Some(gate) = &options.hold_first_request {
+        if !gate_spent.swap(true, Ordering::SeqCst) {
+            gate.park();
         }
     }
 

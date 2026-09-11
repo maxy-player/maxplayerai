@@ -116,6 +116,19 @@ pub fn static_auth(header: String) -> AuthMinter {
     Arc::new(move |_destination: &str| Ok(header.clone()))
 }
 
+/// Asked once more, at the last instruction before a request goes out: is this operation still the
+/// one allowed to transmit?
+///
+/// Minting is not the same instant as sending. The delivery push's minter calls the signer actor and
+/// can WAIT there — for a saturated queue, for a busy actor — and a bounded wait that returns a
+/// token is a bound on the wait, not permission to put it on the wire. In between, the operation's
+/// owner can have timed out, been cancelled, or been dropped, and the job can have lost the delivery
+/// lock to somebody else. Checking only before signing answers the question at the wrong moment.
+///
+/// `Err` fails the leg with nothing sent. `None` is the honest default for operations that have no
+/// owner to lose: the read legs, and any public remote pushing without a token at all.
+pub type AuthorityCheck = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
+
 /// What the https subtransport needs for the legs of ONE operation on ONE thread. Set by
 /// [`with_context`] immediately before a push/fetch/connect and cleared right after; the registered
 /// https factory snapshots it into [`NostrHttp`].
@@ -124,6 +137,9 @@ struct LegContext {
     /// Mints the NIP-98 `Authorization` header for each leg, or `None` for a public/anonymous https
     /// remote (no header at all).
     mint: Option<AuthMinter>,
+    /// Re-asked after the mint and immediately before each request is transmitted; `None` for
+    /// operations with no owner to lose. See [`AuthorityCheck`].
+    authority: Option<AuthorityCheck>,
     /// When true, use the SHORT-timeout HTTP client (the buyer money-path fetch: a hung fetch must
     /// fail CLOSED before authorize_pay burns budget).
     short: bool,
@@ -201,6 +217,24 @@ fn no_redirects() -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::none()
 }
 
+/// The same argument one layer lower, for the replay reqwest performs BY ITSELF.
+///
+/// The workspace enables reqwest's `http2` feature (root `Cargo.toml`), so this client offers h2 by
+/// ALPN, and reqwest installs a default retry policy that treats a remote `GOAWAY(NO_ERROR)` or
+/// `RST_STREAM(REFUSED_STREAM)` as a protocol nack and REPLAYS the request — cloning method, URI,
+/// body AND headers. That clone happens inside `Client::execute`, below [`HttpStream::send`]: the
+/// minter is never called again, so the replayed attempt carries the token minted before the wait,
+/// and the pack body goes out a second time under an authorization nobody re-checked.
+///
+/// A peer can delay and then refuse a stream, which makes the replayed token arbitrarily older than
+/// the one leg it was signed for — the exact property the minter exists to prevent. So this client
+/// never replays: every attempt on the wire is one libgit2 asked for, and libgit2 builds a fresh
+/// stream (and takes a fresh mint) for each of its own retries. HTTP/2 itself is untouched, here and
+/// everywhere else in the workspace; only the hidden reattempt is removed.
+fn no_hidden_replay() -> reqwest::retry::Builder {
+    reqwest::retry::never()
+}
+
 /// Long-running client for pushes and seller base fetches (large packs are legitimate).
 fn client_default() -> &'static reqwest::blocking::Client {
     static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
@@ -209,6 +243,7 @@ fn client_default() -> &'static reqwest::blocking::Client {
             .connect_timeout(Duration::from_secs(15))
             .timeout(DEFAULT_HTTP_LEG_TIMEOUT)
             .redirect(no_redirects())
+            .retry(no_hidden_replay())
             .danger_accept_invalid_certs(accept_invalid_certs())
             .build()
             .expect("build reqwest blocking client")
@@ -223,6 +258,7 @@ fn client_short() -> &'static reqwest::blocking::Client {
             .connect_timeout(BUYER_FETCH_LEG_TIMEOUT)
             .timeout(BUYER_FETCH_LEG_TIMEOUT)
             .redirect(no_redirects())
+            .retry(no_hidden_replay())
             .danger_accept_invalid_certs(accept_invalid_certs())
             .build()
             .expect("build reqwest blocking client (short)")
@@ -255,17 +291,23 @@ fn ensure_registered() -> Result<(), TransportError> {
             }
             git2::transport::register("https", |remote| {
                 let context = CONTEXT.with(|cell| cell.borrow().clone());
-                let (mint, short, intended_url) = match context {
-                    Some(context) => (context.mint, context.short, Some(context.intended_url)),
+                let (mint, authority, short, intended_url) = match context {
+                    Some(context) => (
+                        context.mint,
+                        context.authority,
+                        context.short,
+                        Some(context.intended_url),
+                    ),
                     // No operation context: no destination is bound, so `action` refuses every
                     // leg. Fail closed rather than send a request nobody named.
-                    None => (None, false, None),
+                    None => (None, None, false, None),
                 };
                 Transport::smart(
                     remote,
                     true,
                     NostrHttp {
                         mint,
+                        authority,
                         short,
                         intended_url,
                     },
@@ -490,6 +532,7 @@ pub fn push_branch_with_header(
         branch,
         gated_oid,
         header.map(static_auth),
+        None,
     )
 }
 
@@ -501,17 +544,22 @@ pub fn push_branch_with_header(
 /// libgit2 opens a fresh stream per leg, so the advertisement and the pack POST each sign their own
 /// token after that wait, and the minter sees — and may refuse — the destination each one names.
 /// `None` is the public/anonymous https case: no header on any leg.
+///
+/// `authority` is asked again after that mint and before the request is transmitted (see
+/// [`AuthorityCheck`]): minting can WAIT on a busy signer, and the caller that owned this push may
+/// be gone by the time the token is in hand.
 pub fn push_branch_with_minter(
     workdir: &Path,
     remote_url: &str,
     branch: &str,
     gated_oid: &str,
     mint: Option<AuthMinter>,
+    authority: Option<AuthorityCheck>,
 ) -> Result<String, TransportError> {
     assert_allowed_repo_locator(remote_url)?;
     ensure_registered()?;
     let repo = open_delivery_repo(workdir)?;
-    push_gated_object(&repo, remote_url, branch, gated_oid, mint)
+    push_gated_object(&repo, remote_url, branch, gated_oid, mint, authority)
 }
 
 /// Open the committed workdir a delivery is pushed from, through the layout gate. A layout refusal
@@ -552,6 +600,7 @@ fn push_gated_object(
     branch: &str,
     gated_oid: &str,
     mint: Option<AuthMinter>,
+    authority: Option<AuthorityCheck>,
 ) -> Result<String, TransportError> {
     let gated = gated_commit(repo, gated_oid)?.to_string();
     let target_ref = delivery_ref(branch);
@@ -579,6 +628,7 @@ fn push_gated_object(
 
     let context = LegContext {
         mint,
+        authority,
         short: false,
         intended_url: remote_url.to_owned(),
     };
@@ -645,6 +695,9 @@ pub fn fetch_refspecs(
 
     let context = LegContext {
         mint: header.map(static_auth),
+        // A read leg owns nothing another job can take: no delivery lock, no push authority. There
+        // is no owner to lose, so there is nothing to re-check.
+        authority: None,
         short: short_timeout,
         intended_url: remote_url.to_owned(),
     };
@@ -685,6 +738,7 @@ pub fn list_remote(
 
     let context = LegContext {
         mint: header.map(static_auth),
+        authority: None,
         short: false,
         intended_url: remote_url.to_owned(),
     };
@@ -736,6 +790,7 @@ fn map_git_error(error: git2::Error) -> TransportError {
 /// to `intended_url`: [`Self::action`] refuses any other URL before a request exists.
 struct NostrHttp {
     mint: Option<AuthMinter>,
+    authority: Option<AuthorityCheck>,
     short: bool,
     /// The repo-root URL the caller named, from the operation context. `None` when the transport was
     /// created outside any [`with_context`]; then every leg is refused.
@@ -795,6 +850,7 @@ impl SmartSubtransport for NostrHttp {
         let full_url = service_url(url, name, is_post);
         Ok(Box::new(HttpStream {
             mint: self.mint.clone(),
+            authority: self.authority.clone(),
             short: self.short,
             url: full_url,
             // The repo ROOT this leg belongs to, kept beside the service URL: it is what the token
@@ -819,6 +875,7 @@ impl SmartSubtransport for NostrHttp {
 /// (the standard buffer-then-send pattern for stateless smart HTTP).
 struct HttpStream {
     mint: Option<AuthMinter>,
+    authority: Option<AuthorityCheck>,
     short: bool,
     url: String,
     destination: String,
@@ -863,6 +920,18 @@ impl HttpStream {
                 ))
             })?;
             request = request.header("Authorization", header);
+        }
+        // Minting may have WAITED — the delivery push signs inside an actor with a queue. A token in
+        // hand is not permission to transmit: while we were waiting, this operation's owner may have
+        // timed out, been cancelled or been dropped, and the delivery lock may already belong to the
+        // next job. Ask once more here, with nothing between this answer and the wire.
+        if let Some(authority) = &self.authority {
+            authority().map_err(|error| {
+                io::Error::other(format!(
+                    "refusing to send {} leg to {}: {error}",
+                    self.service, self.destination
+                ))
+            })?;
         }
         let response = request
             .send()
@@ -1199,6 +1268,7 @@ mod tests {
         let intended = "https://relay.example/git/o/r.git";
         let transport = NostrHttp {
             mint: Some(static_auth("Nostr token".to_owned())),
+            authority: None,
             short: false,
             intended_url: Some(intended.to_owned()),
         };
@@ -1230,6 +1300,7 @@ mod tests {
         // A transport created outside any operation context has no destination: nothing passes.
         let unbound = NostrHttp {
             mint: Some(static_auth("Nostr token".to_owned())),
+            authority: None,
             short: false,
             intended_url: None,
         };
@@ -1304,7 +1375,7 @@ mod tests {
         let remote_url = bare.to_str().expect("utf8").to_owned();
 
         let repo = crate::seller_git::open_plain_workdir_repo(&workdir).expect("open workdir");
-        let pushed = push_gated_object(&repo, &remote_url, "job", &a.to_string(), None)
+        let pushed = push_gated_object(&repo, &remote_url, "job", &a.to_string(), None, None)
             .expect("push the gated object");
         assert_eq!(pushed, a.to_string(), "the returned oid is the gated one");
 
@@ -1318,7 +1389,7 @@ mod tests {
         assert_eq!(repo.refname_to_id("refs/heads/job").expect("local ref"), b);
 
         // A repeat push of the same object (the resume path) is accepted and ACKed again.
-        let again = push_gated_object(&repo, &remote_url, "job", &a.to_string(), None)
+        let again = push_gated_object(&repo, &remote_url, "job", &a.to_string(), None, None)
             .expect("re-push the gated object");
         assert_eq!(again, a.to_string());
         let _ = std::fs::remove_dir_all(&root);
@@ -1335,7 +1406,7 @@ mod tests {
         Repository::init_bare(&bare).expect("bare remote");
         let remote_url = bare.to_str().expect("utf8").to_owned();
         for bad in ["", "abc", &a.to_string()[..39], &"f".repeat(40)] {
-            let err = push_gated_object(&repo, &remote_url, "job", bad, None)
+            let err = push_gated_object(&repo, &remote_url, "job", bad, None, None)
                 .expect_err("refused");
             assert!(matches!(err, TransportError::Io(_)), "{bad:?}: {err}");
         }

@@ -185,7 +185,7 @@ fn every_wire_leg_mints_its_own_token_after_whatever_the_push_waited_on() {
     let (minter, minted) =
         recording_minter(&url, &delivery_ref(branch), nostr_sdk::Keys::generate());
 
-    let pushed = push_branch_with_minter(&workdir, &url, branch, &oid, Some(minter)).expect("push");
+    let pushed = push_branch_with_minter(&workdir, &url, branch, &oid, Some(minter), None).expect("push");
     assert_eq!(pushed, oid, "the returned oid is the gated one");
 
     // What the minter was asked for.
@@ -323,7 +323,7 @@ fn a_redirect_is_refused_and_the_token_never_follows_it() {
     let (minter, minted) =
         recording_minter(&url, &delivery_ref(branch), nostr_sdk::Keys::generate());
 
-    let err = push_branch_with_minter(&workdir, &url, branch, &oid, Some(minter))
+    let err = push_branch_with_minter(&workdir, &url, branch, &oid, Some(minter), None)
         .expect_err("a redirected leg must fail the push");
 
     // The observation first: nothing reached the redirect target.
@@ -382,7 +382,7 @@ fn a_leg_the_minter_refuses_is_never_put_on_the_wire() {
         nostr_sdk::Keys::generate(),
     );
 
-    let err = push_branch_with_minter(&workdir, &url, branch, &oid, Some(minter))
+    let err = push_branch_with_minter(&workdir, &url, branch, &oid, Some(minter), None)
         .expect_err("the minter must refuse this destination");
 
     let requests = relay.requests();
@@ -443,7 +443,7 @@ fn a_ref_the_remote_declines_fails_the_push() {
     let (minter, _minted) =
         recording_minter(&url, &delivery_ref(branch), nostr_sdk::Keys::generate());
 
-    let err = push_branch_with_minter(&workdir, &url, branch, &oid, Some(minter))
+    let err = push_branch_with_minter(&workdir, &url, branch, &oid, Some(minter), None)
         .expect_err("a declined ref must fail the push");
     assert!(
         matches!(&err, TransportError::Rejected(message) if message.contains(&delivery_ref(branch))),
@@ -490,6 +490,7 @@ async fn the_wrapper_delivers_the_approved_object_after_the_local_branch_moved()
         branch.to_owned(),
         approved.clone(),
         Some(minter),
+        None,
     )
     .await
     .expect("push through the production wrapper");

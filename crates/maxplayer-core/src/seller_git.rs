@@ -510,24 +510,32 @@ pub fn push_branch_with_header(
         branch,
         gated_oid,
         header.map(git_transport::static_auth),
+        None,
     )
 }
 
 /// [`push_branch_with_header`] with the NIP-98 authorization minted per wire request rather than
 /// once up front (see [`git_transport::AuthMinter`]). The delivery push uses this: it is called from
 /// a blocking thread after the seat's delivery lock was acquired, and each leg signs then.
+///
+/// `authority` is re-asked after each mint and before that request is transmitted (see
+/// [`git_transport::AuthorityCheck`]): the mint itself can wait on the signer actor, and the caller
+/// that owned this push may be gone — cancelled, timed out, dropped — by the time it returns.
 pub fn push_branch_with_minter(
     workdir: &Path,
     remote_url: &str,
     branch: &str,
     gated_oid: &str,
     mint: Option<git_transport::AuthMinter>,
+    authority: Option<git_transport::AuthorityCheck>,
 ) -> Result<String, SellerGitError> {
     assert_allowed_repo_locator(remote_url)?;
     if branch.trim().is_empty() {
         return Err(SellerGitError::Io("branch must be non-empty".into()));
     }
-    let oid = git_transport::push_branch_with_minter(workdir, remote_url, branch, gated_oid, mint)?;
+    let oid = git_transport::push_branch_with_minter(
+        workdir, remote_url, branch, gated_oid, mint, authority,
+    )?;
     eprintln!("seller push path=inprocess remote={remote_url} branch={branch} ok");
     Ok(oid)
 }
@@ -891,16 +899,22 @@ pub fn neutralize_push_config(workdir: &Path) -> Result<(), SellerGitError> {
 /// [`git_transport::AuthMinter`]. That is why it is a minter and not a header: this call is what
 /// sits behind the seat's delivery lock, so a header minted by the caller would have aged across
 /// the whole wait before the first byte moved.
+///
+/// `authority` is the same question asked one step later: after the mint returned and before that
+/// request is transmitted (see [`git_transport::AuthorityCheck`]). The blocking thread this runs on
+/// OUTLIVES the future that spawned it — dropping the future does not stop the thread — so the
+/// thread has to find out for itself that its owner is gone.
 pub async fn neutralize_then_push_off_runtime(
     workdir: PathBuf,
     remote_url: String,
     branch: String,
     gated_oid: String,
     mint: Option<git_transport::AuthMinter>,
+    authority: Option<git_transport::AuthorityCheck>,
 ) -> Result<String, SellerGitError> {
     off_runtime(move || {
         neutralize_push_config(&workdir)?;
-        push_branch_with_minter(&workdir, &remote_url, &branch, &gated_oid, mint)
+        push_branch_with_minter(&workdir, &remote_url, &branch, &gated_oid, mint, authority)
     })
     .await
 }
