@@ -324,6 +324,43 @@ fn payload_runtime(job: &str) -> (String, String) {
     (runtime.to_owned(), network.to_owned())
 }
 
+/// Prove, against the RUNNING container, that the payload really executed under `runsc` inside the
+/// holder's namespace. Three independent facts, because any one alone is forgeable by a
+/// misconfiguration:
+///
+/// 1. docker's own view of the job's runtime,
+/// 2. the payload's own kernel banner (`runsc` reports a gVisor kernel; `runc` reports the host's),
+/// 3. the job's `NetworkMode` resolving to the holder container — without which a "reachable"
+///    result would just mean the job never joined the namespace the rules are in.
+///
+/// Every gate that launches a payload calls this. A gate that does not is a runc-era row and does
+/// not count as a `runsc` result.
+fn prove_runsc(job: &str, holder: &str, out: &str) {
+    let (runtime, network) = payload_runtime(job);
+    assert_eq!(
+        runtime, RUNTIME,
+        "the payload ran under {runtime}, not {RUNTIME} — these are not gVisor results"
+    );
+    let kern = field(out, "KERN");
+    assert!(
+        kern.contains("gVisor"),
+        "the payload's own kernel does not identify as gVisor ({kern}) — docker reported \
+         runtime={runtime}, and the two must agree before any result here is a gVisor result"
+    );
+    // `NetworkMode` reports the RESOLVED container id, not the name the argv asked for, so the
+    // holder name is resolved to its id before comparing. Comparing against the name fails even
+    // when the join is correct.
+    let (ok, holder_id, err) = docker(&["inspect", "--format", "{{.Id}}", holder]);
+    assert!(ok, "could not resolve the holder's id: {err}");
+    assert_eq!(
+        network,
+        format!("container:{holder_id}"),
+        "the payload did not join the holder's namespace (holder {holder} = {holder_id})"
+    );
+    println!("payload runtime={runtime} network={network}");
+    println!("payload kernel banner={kern}");
+}
+
 fn probe_script() -> String {
     format!(
         "set -u; \
@@ -339,17 +376,32 @@ fn probe_script() -> String {
     )
 }
 
-/// **Gate A.** A seat with configured private resolvers launches a contained job that resolves a name
-/// over both families, from inside the namespace, through the file the launch wrote — and the same
-/// namespace denies every private destination that is not one of those resolvers on port 53.
+/// What one full gate-A launch observed. Produced once by [`gate_a_scenario`] and then asserted on
+/// by two SEPARATE tests, because the two questions have different standing:
 ///
-/// The whole chain is the product's: `prepare_launch` → `sandbox_dns::resolve` → the resolver file →
-/// `establish` → the sidecar → both-family readback → `SandboxPolicy::launch`.
-#[tokio::test]
-#[ignore = "needs docker, the netfilter image and the two fixture images"]
-async fn a_contained_job_resolves_over_private_v4_and_v6_and_the_rest_of_that_space_stays_denied() {
-    let _infra = Infra::up();
-    let workdir = Workdir::new("gatea");
+/// - **Functional DNS** (resolver bytes, read-only mount, both-family resolution) — the thing this
+///   lane is authorized to finish and certify.
+/// - **Network protection** (other-private and non-53 denial) — a PREEXISTING defect, established
+///   at base `a0e7c3f` as well as at `6f5a7e7`, tracked as its own OPEN item and NOT this lane's to
+///   fix, chase, or convert into a pass.
+///
+/// They are split into two tests rather than one so that membership is explicit in the runner
+/// output: the functional gates can complete and be reported green WITHOUT the deny assertions
+/// being deleted, weakened, or silently absorbed into a passing test. The deny assertions still
+/// exist, still run, and still fail under `runsc`.
+struct GateA {
+    out: String,
+    err: String,
+    host_sha: String,
+    v4_rules: String,
+    v6_rules: String,
+}
+
+/// One full product launch: `prepare_launch` → `sandbox_dns::resolve` → the resolver file →
+/// `establish` → the sidecar → both-family readback → `SandboxPolicy::launch`, with the runtime
+/// identity of the resulting payload proven before a single probe result is believed.
+async fn gate_a_scenario(tag: &str) -> GateA {
+    let workdir = Workdir::new(tag);
 
     // The unfiltered control FIRST, contemporaneous with the gate and on the same fixtures: every
     // destination below is reachable when nothing is enforcing. A later denial is then attributable
@@ -399,7 +451,10 @@ async fn a_contained_job_resolves_over_private_v4_and_v6_and_the_rest_of_that_sp
     let v6_rules = readback(&holder, Family::V6);
     assert!(v6_rules.contains(RESOLVER_V6), "no v6 resolver exception in the kernel:\n{v6_rules}");
 
-    let (_, out, err) = run_payload(
+    // Named `payload_err`, not `err`: the holder-id lookup below also binds an `err`, and a plain
+    // `err` here would be shadowed by it — handing every functional failure message the stderr of
+    // `docker inspect` instead of the stderr of the payload that actually failed.
+    let (_, out, payload_err) = run_payload(
         &policy,
         prepared.uid,
         prepared.gid,
@@ -408,37 +463,28 @@ async fn a_contained_job_resolves_over_private_v4_and_v6_and_the_rest_of_that_sp
         Some(resolv.as_path()),
         &probe_script(),
     );
-    // The runtime binding, asserted against the RUNNING container before anything else is read from
-    // it. Every other assertion below is a claim about a gVisor job, and none of them means that
-    // unless this one holds.
-    let (runtime, network) = payload_runtime(&workdir.job());
-    assert_eq!(
-        runtime, RUNTIME,
-        "the payload ran under {runtime}, not {RUNTIME} — these are not gVisor results"
-    );
-    let kern = field(&out, "KERN");
-    assert!(
-        kern.contains("gVisor"),
-        "the payload's own kernel does not identify as gVisor ({kern}) — docker reported \
-         runtime={runtime}, and the two must agree before any result here is a gVisor result"
-    );
-    // The payload must be IN the namespace the rules are in. Without this, a reachable denied
-    // address would be explained by the job never having joined the holder at all, which is a
-    // different defect with a different fix.
-    //
-    // `NetworkMode` reports the RESOLVED container id, not the name the argv asked for, so the
-    // holder name is resolved to its id before comparing. Comparing against the name fails even
-    // when the join is correct.
-    let (ok, holder_id, err) = docker(&["inspect", "--format", "{{.Id}}", &holder]);
-    assert!(ok, "could not resolve the holder's id: {err}");
-    assert_eq!(
-        network,
-        format!("container:{holder_id}"),
-        "the payload did not join the holder's namespace (holder {holder} = {holder_id})"
-    );
-    println!("payload runtime={runtime} network={network}");
-    println!("payload kernel banner={kern}");
+    // The runtime binding, asserted against the RUNNING container before anything else is read
+    // from it. Every assertion made by either caller is a claim about a gVisor job, and none of
+    // them means that unless this holds.
+    prove_runsc(&workdir.job(), &holder, &out);
     println!("--- iptables readback of the namespace the payload is in ---\n{v4_rules}");
+
+    GateA { out, err: payload_err, host_sha, v4_rules, v6_rules }
+}
+
+/// **Gate A — FUNCTIONAL membership.** A seat with configured private resolvers launches a contained
+/// job that resolves a name over both families, from inside the namespace, through the exact file
+/// the launch wrote, mounted read-only.
+///
+/// This is the DNS functional contract and nothing else. It deliberately makes NO claim about
+/// whether the namespace denies anything; see
+/// [`known_open_preexisting_defect_other_private_and_non53_must_be_denied`] for that, which is a
+/// separate OPEN item on its own track.
+#[tokio::test]
+#[ignore = "needs docker, the netfilter image and the two fixture images"]
+async fn functional_a_contained_job_resolves_over_private_v4_and_v6_through_the_written_file() {
+    let _infra = Infra::up();
+    let GateA { out, err, host_sha, .. } = gate_a_scenario("gatea-fn").await;
 
     assert_eq!(field(&out, "SHA"), host_sha, "the job's resolver file is not the one written: {out}\n{err}");
     assert_eq!(field(&out, "RO"), "yes", "the resolver file must be mounted read-only: {out}");
@@ -446,6 +492,27 @@ async fn a_contained_job_resolves_over_private_v4_and_v6_and_the_rest_of_that_sp
     assert_eq!(field(&out, "V4T"), PUB_HOST_V4, "private v4 DNS must answer: {out}\n{err}");
     assert_eq!(field(&out, "V6T"), PUB_HOST_V6, "private v6 DNS must answer: {out}\n{err}");
     assert_eq!(field(&out, "PUB"), "reach", "a public destination must stay allowed: {out}");
+}
+
+/// **Gate A — KNOWN-OPEN SECURITY membership. This test is EXPECTED TO FAIL under `runsc`.**
+///
+/// The contained namespace must deny other private destinations and non-53 ports on the resolver.
+/// Under `runc` it does (measured). Under `runsc` it does not: both probes reach, while the kernel
+/// readback shows the DROP rules installed. That failure is PREEXISTING — reproduced identically at
+/// base `a0e7c3f`, which predates all DNS work — so it is a runtime/enforcement defect, not a
+/// regression from `6f5a7e7`.
+///
+/// It is recorded here, still asserting, on purpose. The order that authorized finishing the
+/// functional gates also forbids converting this to a pass or hiding it by removing assertions, and
+/// forbids this lane from repairing or attributing it. So it stays red and stays cited.
+#[tokio::test]
+#[ignore = "KNOWN OPEN: fails under runsc (preexisting enforcement defect, tracked separately)"]
+async fn known_open_preexisting_defect_other_private_and_non53_must_be_denied() {
+    let _infra = Infra::up();
+    let GateA { out, v4_rules, v6_rules, .. } = gate_a_scenario("gatea-sec").await;
+
+    // Printed so a failure carries its own disproof of "the rules were never installed".
+    println!("--- v4 rules in force ---\n{v4_rules}\n--- v6 rules in force ---\n{v6_rules}");
     assert_eq!(field(&out, "PRIV"), "deny", "another private address must be denied: {out}");
     assert_eq!(field(&out, "NON53"), "deny", "a non-53 port on the resolver must be denied: {out}");
 }
@@ -590,8 +657,11 @@ async fn a_truncated_udp_answer_falls_back_to_tcp_53_inside_containment() {
     // `+noedns` caps the UDP buffer at 512 bytes, so a ~750-byte TXT answer sets TC and dig retries
     // over TCP by itself. `+ignore` on the second query proves the UDP answer really was truncated
     // rather than the whole thing having fitted.
+    // The KERN banner is emitted here too so this gate proves its own runtime rather than
+    // inheriting gate A's claim.
     let script = format!(
-        "V4=$(dig +noedns +time=2 +tries=1 TXT {BIG_NAME} @{RESOLVER_V4} 2>&1); \
+        "echo KERN=$(dmesg 2>/dev/null | head -1 | tr -d '\\n'); \
+         V4=$(dig +noedns +time=2 +tries=1 TXT {BIG_NAME} @{RESOLVER_V4} 2>&1); \
          case \"$V4\" in *'retrying in TCP'*) echo TC4=yes;; *) echo TC4=no;; esac; \
          echo \"$V4\" | grep -c '\"' | sed 's/^/ANS4=/'; \
          T4=$(dig +noedns +tcp +time=2 +tries=1 +short TXT {BIG_NAME} @{RESOLVER_V4} 2>&1); \
@@ -606,6 +676,7 @@ async fn a_truncated_udp_answer_falls_back_to_tcp_53_inside_containment() {
         Some(resolv.as_path()),
         &script,
     );
+    prove_runsc(&workdir.job(), &holder, &out);
     assert_eq!(field(&out, "TC4"), "yes", "the v4 UDP answer was not truncated: {out}\n{err}");
     assert_ne!(field(&out, "ANS4"), "0", "the v4 TCP retry returned nothing: {out}\n{err}");
     assert_ne!(field(&out, "TCP4"), "0", "an explicit TCP/53 query was refused: {out}\n{err}");
