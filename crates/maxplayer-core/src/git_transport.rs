@@ -25,7 +25,7 @@
 use std::cell::RefCell;
 use std::io::{self, Read, Write};
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use git2::transport::{Service, SmartSubtransport, SmartSubtransportStream, Transport};
@@ -68,10 +68,33 @@ impl From<TransportRefuse> for TransportError {
     }
 }
 
+/// Mints the NIP-98 `Authorization` header for ONE HTTP request to `destination` (the repo-root
+/// URL the leg is about to talk to), returning the header or a refusal string.
+///
+/// The transport calls this at EVERY HTTP leg and EVERY retry — never once per operation. That is
+/// the property the delivery push needs: a push serialized behind a lock can sit for minutes before
+/// its first byte, and a token minted before the wait is already aging when the relay checks it
+/// (NIP-98 verifiers bound `created_at` to a narrow window). Minting at the leg means the wait, the
+/// lock and any retry each get authorization made for THAT request, with no token lifetime extended
+/// anywhere to compensate.
+///
+/// The closure also SEES the destination it is signing for, so a caller can bind the token to its
+/// job's one delivery remote and refuse anything else — a redirected or rewritten leg gets no
+/// header at all rather than a valid token for the wrong repo.
+pub type AuthMinter = Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
+
+/// Wrap an already-built header as a minter that presents the SAME header on every leg — the
+/// pre-existing behaviour for read legs (fetch / ls-remote), which are short, unserialized, and
+/// whose token is built immediately before the first byte. Push legs use a real minter instead.
+pub fn static_auth(header: String) -> AuthMinter {
+    Arc::new(move |_destination: &str| Ok(header.clone()))
+}
+
 thread_local! {
-    /// NIP-98 `Authorization` header for the operation running on THIS thread. Set immediately
-    /// before a push/fetch/connect and cleared right after; the registered https factory reads it.
-    static AUTH_HEADER: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// NIP-98 authorization MINTER for the operation running on THIS thread. Set immediately
+    /// before a push/fetch/connect and cleared right after; the registered https factory reads it
+    /// and calls it once per HTTP request.
+    static AUTH_MINT: RefCell<Option<AuthMinter>> = const { RefCell::new(None) };
     /// When true, the operation on this thread uses the SHORT-timeout HTTP client (the buyer
     /// money-path fetch: a hung fetch must fail CLOSED before authorize_pay burns budget).
     static SHORT_TIMEOUT: RefCell<bool> = const { RefCell::new(false) };
@@ -176,9 +199,9 @@ fn ensure_registered() -> Result<(), TransportError> {
                 })?;
             }
             git2::transport::register("https", |remote| {
-                let header = AUTH_HEADER.with(|cell| cell.borrow().clone());
+                let mint = AUTH_MINT.with(|cell| cell.borrow().clone());
                 let short = SHORT_TIMEOUT.with(|cell| *cell.borrow());
-                Transport::smart(remote, true, NostrHttp { header, short })
+                Transport::smart(remote, true, NostrHttp { mint, short })
             })
             .map_err(|error| format!("register https subtransport: {}", error.message()))?;
         }
@@ -188,13 +211,13 @@ fn ensure_registered() -> Result<(), TransportError> {
     .map_err(TransportError::Io)
 }
 
-/// Run `body` with the NIP-98 header and timeout-class bound to this thread, clearing both
+/// Run `body` with the NIP-98 minter and timeout-class bound to this thread, clearing both
 /// afterward so no stray auth/timeout leaks into an unrelated later operation on the same thread.
-fn with_context<T>(header: Option<String>, short: bool, body: impl FnOnce() -> T) -> T {
-    AUTH_HEADER.with(|cell| *cell.borrow_mut() = header);
+fn with_context<T>(mint: Option<AuthMinter>, short: bool, body: impl FnOnce() -> T) -> T {
+    AUTH_MINT.with(|cell| *cell.borrow_mut() = mint);
     SHORT_TIMEOUT.with(|cell| *cell.borrow_mut() = short);
     let result = body();
-    AUTH_HEADER.with(|cell| *cell.borrow_mut() = None);
+    AUTH_MINT.with(|cell| *cell.borrow_mut() = None);
     SHORT_TIMEOUT.with(|cell| *cell.borrow_mut() = false);
     result
 }
@@ -223,18 +246,52 @@ pub fn nip98_authorization_header_with_keys(
     remote_url: &str,
     keys: &nostr_sdk::Keys,
 ) -> Result<String, TransportError> {
+    nip98_authorization_header_scoped_with_keys(remote_url, keys, None)
+}
+
+/// Build the NIP-98 header, optionally SCOPED to one ref.
+///
+/// With `scope_ref = Some("refs/heads/…")` the signed event carries exactly one extra `ref` tag, so
+/// the token authorizes a write to THAT ref on THAT repo and nothing else; a relay that reads the
+/// tag refuses the same token presented for another ref. With `None` the event is byte-identical to
+/// the historical unscoped token (no `ref` tag), so read legs and any relay that ignores the tag see
+/// no change — this adds a narrower token, it does not change relay policy or token lifetime.
+pub fn nip98_authorization_header_scoped_with_keys(
+    remote_url: &str,
+    keys: &nostr_sdk::Keys,
+    scope_ref: Option<&str>,
+) -> Result<String, TransportError> {
     use base64::Engine as _;
+    use nostr_sdk::JsonUtil;
     use nostr_sdk::nips::nip98::{HttpData, HttpMethod};
     use nostr_sdk::prelude::{EventBuilder, Url};
-    use nostr_sdk::JsonUtil;
 
     let url = Url::parse(remote_url)
         .map_err(|error| TransportError::Io(format!("invalid remote url: {error}")))?;
-    let event = EventBuilder::http_auth(HttpData::new(url, HttpMethod::POST))
+    let mut builder = EventBuilder::http_auth(HttpData::new(url, HttpMethod::POST));
+    if let Some(scope) = scope_ref {
+        if scope.trim().is_empty() {
+            return Err(TransportError::Auth("empty ref scope".into()));
+        }
+        builder = builder.tag(nostr_sdk::Tag::custom(
+            nostr_sdk::TagKind::custom("ref"),
+            [scope.to_owned()],
+        ));
+    }
+    let event = builder
         .sign_with_keys(keys)
         .map_err(|error| TransportError::Auth(format!("nip98 sign failed: {error}")))?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(event.as_json());
     Ok(format!("Nostr {encoded}"))
+}
+
+/// The one destination ref a delivery branch is pushed to.
+///
+/// [`push_exact_oid`] (the refspec) and the token scope (the caller that builds the minter) BOTH
+/// derive the ref name here, so the ref a token authorizes and the ref the push writes cannot drift
+/// apart in a later edit.
+pub fn delivery_ref(branch: &str) -> String {
+    format!("refs/heads/{branch}")
 }
 
 /// Resolve the NIP-98 header for a leg: `Some` header only when a key is supplied AND the remote is
@@ -296,7 +353,7 @@ pub fn push_branch_with_header(
     let mut options = PushOptions::new();
     options.remote_callbacks(callbacks);
 
-    let push_result = with_context(header, false, || {
+    let push_result = with_context(header.map(static_auth), false, || {
         remote.push(&[refspec.as_str()], Some(&mut options))
     });
     drop(options);
@@ -315,6 +372,117 @@ pub fn push_branch_with_header(
         return Err(TransportError::Io(format!("unexpected commit oid {oid:?}")));
     }
     Ok(oid)
+}
+
+/// Push the EXACT commit `approved_oid` to `refs/heads/<branch>` on `remote_url`, minting a fresh
+/// ref-scoped authorization at every HTTP leg (`mint`; `None` = unauthenticated public https).
+///
+/// Three properties this has and [`push_branch_with_header`] does not:
+/// - **Gated OID.** The refspec's source is the approved commit BY VALUE (`<oid>:refs/heads/<b>`),
+///   never the local branch name. A local ref that moves between the gate and the push — a late
+///   snapshot, a retry that re-commits, any concurrent writer in the workdir — cannot change what
+///   ships: either the approved commit is delivered or the push fails.
+/// - **Fresh auth per leg.** `mint` is called by the subtransport at each request and each retry,
+///   so a push that waited behind the delivery lock does not present a token minted before the wait.
+/// - **Mandatory per-ref status.** The remote's report-status for THIS ref must be present and must
+///   be a success. A rejection fails; a remote that reports nothing for our ref fails too — silence
+///   is never read as acceptance. There is no post-push remote read-back: the report-status IS the
+///   remote's answer, and re-reading the ref afterwards proves nothing it did not already say.
+///
+/// Returns the delivered OID (the approved one, lowercased).
+pub fn push_exact_oid(
+    workdir: &Path,
+    remote_url: &str,
+    branch: &str,
+    approved_oid: &str,
+    mint: Option<AuthMinter>,
+) -> Result<String, TransportError> {
+    assert_allowed_repo_locator(remote_url)?;
+    ensure_registered()?;
+
+    if branch.trim().is_empty() {
+        return Err(TransportError::Io("branch must be non-empty".into()));
+    }
+    let oid_hex = approved_oid.trim().to_ascii_lowercase();
+    if oid_hex.len() != 40 || !oid_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(TransportError::Io(format!(
+            "approved oid must be 40 hex chars, got {approved_oid:?}"
+        )));
+    }
+
+    let repo = Repository::open(workdir)
+        .map_err(|error| TransportError::Io(format!("open workdir repo: {error}")))?;
+    // The approved commit must exist here as a COMMIT before any byte goes out: a push of an oid the
+    // workdir cannot produce is a local defect, not a remote refusal.
+    let oid = git2::Oid::from_str(&oid_hex)
+        .map_err(|error| TransportError::Io(format!("parse approved oid: {error}")))?;
+    repo.find_commit(oid).map_err(|error| {
+        TransportError::Io(format!(
+            "approved oid {oid_hex} is not a commit here: {error}"
+        ))
+    })?;
+
+    let destination_ref = delivery_ref(branch);
+    let refspec = format!("{oid_hex}:{destination_ref}");
+
+    let statuses: std::rc::Rc<RefCell<Vec<(String, Option<String>)>>> =
+        std::rc::Rc::new(RefCell::new(Vec::new()));
+    let mut remote = repo
+        .remote_anonymous(remote_url)
+        .map_err(|error| TransportError::Io(format!("anonymous remote: {error}")))?;
+    let mut callbacks = RemoteCallbacks::new();
+    {
+        let statuses = statuses.clone();
+        callbacks.push_update_reference(move |refname, status| {
+            statuses
+                .borrow_mut()
+                .push((refname.to_owned(), status.map(str::to_owned)));
+            Ok(())
+        });
+    }
+    let mut options = PushOptions::new();
+    options.remote_callbacks(callbacks);
+
+    let push_result = with_context(mint, false, || {
+        remote.push(&[refspec.as_str()], Some(&mut options))
+    });
+    drop(options);
+    push_result.map_err(map_git_error)?;
+
+    let statuses = statuses.borrow();
+    push_verdict(&destination_ref, &statuses)?;
+    Ok(oid_hex)
+}
+
+/// The per-ref verdict: did the remote say, for OUR ref, that it accepted the update?
+///
+/// Three failures, one success. A rejection message fails. A report that never mentions our ref
+/// fails — including the case where the remote reported some OTHER ref, which is a wrong-ref answer,
+/// not an answer about us. Only an explicit success status for our exact ref passes. Silence is
+/// never acceptance, which is why no post-push read-back is needed to tell the difference.
+fn push_verdict(
+    destination_ref: &str,
+    statuses: &[(String, Option<String>)],
+) -> Result<(), TransportError> {
+    match statuses
+        .iter()
+        .find(|(refname, _)| refname == destination_ref)
+    {
+        Some((_, Some(message))) => Err(TransportError::Rejected(format!(
+            "{destination_ref}: {message}"
+        ))),
+        Some((_, None)) => Ok(()),
+        None => {
+            let seen: Vec<&str> = statuses
+                .iter()
+                .map(|(refname, _)| refname.as_str())
+                .collect();
+            Err(TransportError::Rejected(format!(
+                "no per-ref status for {destination_ref} (remote reported {seen:?}); refusing to \
+                 treat silence as an accepted push"
+            )))
+        }
+    }
 }
 
 /// Fetch `refspecs` from `remote_url` into `repo` in-process. `auth` supplies NIP-98 for relay-git
@@ -342,7 +510,7 @@ pub fn fetch_refspecs(
     let mut options = FetchOptions::new();
     options.download_tags(AutotagOption::None);
 
-    let result = with_context(header, short_timeout, || {
+    let result = with_context(header.map(static_auth), short_timeout, || {
         remote.fetch(refspecs, Some(&mut options), None)
     });
     drop(options);
@@ -379,7 +547,7 @@ pub fn list_remote(
         .remote_anonymous(remote_url)
         .map_err(|error| TransportError::Io(format!("anonymous remote: {error}")))?;
 
-    let heads = with_context(header, false, || {
+    let heads = with_context(header.map(static_auth), false, || {
         remote.connect(direction)?;
         let list = remote
             .list()?
@@ -426,7 +594,7 @@ fn map_git_error(error: git2::Error) -> TransportError {
 /// rustls smart-HTTP subtransport that injects the NIP-98 header captured at construction time
 /// and uses the short- or long-timeout client per the operation's timeout class.
 struct NostrHttp {
-    header: Option<String>,
+    mint: Option<AuthMinter>,
     short: bool,
 }
 
@@ -461,7 +629,10 @@ impl SmartSubtransport for NostrHttp {
         let (name, is_post) = service_parts(service);
         let full_url = service_url(url, name, is_post);
         Ok(Box::new(HttpStream {
-            header: self.header.clone(),
+            mint: self.mint.clone(),
+            // The repo-root the relay verifies the token against, and what the minter is shown so it
+            // can refuse a leg aimed anywhere but this job's delivery remote.
+            destination: url.trim_end_matches('/').to_owned(),
             short: self.short,
             url: full_url,
             service: name,
@@ -481,7 +652,8 @@ impl SmartSubtransport for NostrHttp {
 /// then reads the response; we buffer the writes and fire the HTTP request lazily on the first read
 /// (the standard buffer-then-send pattern for stateless smart HTTP).
 struct HttpStream {
-    header: Option<String>,
+    mint: Option<AuthMinter>,
+    destination: String,
     short: bool,
     url: String,
     service: &'static str,
@@ -512,7 +684,13 @@ impl HttpStream {
         };
         // identity encoding: never hand libgit2 a gzip stream it did not negotiate.
         request = request.header("Accept-Encoding", "identity");
-        if let Some(header) = &self.header {
+        // FRESH authorization for THIS request. libgit2 builds a new stream per leg and per retry,
+        // and `send` runs once per stream, so every advertisement, every POST and every retry signs
+        // its own token at the moment it goes on the wire — none is inherited from an earlier leg.
+        if let Some(mint) = &self.mint {
+            let header = mint(&self.destination).map_err(|error| {
+                io::Error::other(format!("mint authorization for {}: {error}", self.url))
+            })?;
             request = request.header("Authorization", header);
         }
         let response = request
@@ -659,6 +837,125 @@ mod tests {
                 None
             ),
             Err(TransportError::Transport(_))
+        ));
+    }
+
+    fn decode(header: &str) -> nostr_sdk::Event {
+        use base64::Engine as _;
+        use nostr_sdk::JsonUtil;
+        let encoded = header.strip_prefix("Nostr ").expect("Nostr scheme");
+        let json = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("base64");
+        nostr_sdk::Event::from_json(&json).expect("event json")
+    }
+
+    fn ref_tags(event: &nostr_sdk::Event) -> Vec<String> {
+        event
+            .tags
+            .iter()
+            .filter(|t| t.kind() == nostr_sdk::TagKind::custom("ref"))
+            .filter_map(|t| t.content().map(str::to_owned))
+            .collect()
+    }
+
+    #[test]
+    fn scoped_header_carries_exactly_one_ref_tag_and_still_verifies() {
+        let keys = nostr_sdk::Keys::generate();
+        let remote = "https://relay.example/git/abcdef/repo.git";
+        let scope = delivery_ref("maxplayer/deadbeef");
+        let header = nip98_authorization_header_scoped_with_keys(remote, &keys, Some(&scope))
+            .expect("scoped header");
+
+        let event = decode(&header);
+        event.verify().expect("valid signature");
+        assert_eq!(event.kind.as_u16(), 27235);
+        assert_eq!(
+            ref_tags(&event),
+            vec![scope.clone()],
+            "exactly one ref tag, naming the ref this push writes"
+        );
+        // The destination binding is untouched by scoping.
+        let u = event
+            .tags
+            .iter()
+            .find(|t| t.kind() == nostr_sdk::TagKind::custom("u"))
+            .and_then(|t| t.content().map(str::to_owned))
+            .expect("u tag");
+        assert_eq!(u, remote);
+    }
+
+    #[test]
+    fn unscoped_header_has_no_ref_tag() {
+        // Backward compat: with no scope the token is the historical shape, so a relay that never
+        // read a ref tag sees exactly what it saw before.
+        let keys = nostr_sdk::Keys::generate();
+        let header = nip98_authorization_header_scoped_with_keys(
+            "https://relay.example/git/o/r.git",
+            &keys,
+            None,
+        )
+        .expect("header");
+        assert!(ref_tags(&decode(&header)).is_empty());
+    }
+
+    #[test]
+    fn delivery_ref_single_sources_scope_and_refspec() {
+        assert_eq!(
+            delivery_ref("maxplayer/abc12345"),
+            "refs/heads/maxplayer/abc12345"
+        );
+    }
+
+    #[test]
+    fn push_verdict_accepts_only_an_explicit_success_for_our_ref() {
+        let ours = delivery_ref("maxplayer/abc12345");
+
+        // Accepted: our ref, no rejection message.
+        push_verdict(&ours, &[(ours.clone(), None)]).expect("accepted");
+
+        // Rejected: the message rides the error.
+        let err = push_verdict(&ours, &[(ours.clone(), Some("non-fast-forward".into()))])
+            .expect_err("rejection must fail");
+        assert!(matches!(err, TransportError::Rejected(ref m) if m.contains("non-fast-forward")));
+
+        // Missing: the remote reported nothing at all for any ref.
+        assert!(matches!(
+            push_verdict(&ours, &[]),
+            Err(TransportError::Rejected(_))
+        ));
+
+        // Wrong ref: a success for SOMEONE ELSE's ref is not an answer about ours.
+        assert!(matches!(
+            push_verdict(&ours, &[(delivery_ref("maxplayer/99999999"), None)]),
+            Err(TransportError::Rejected(_))
+        ));
+    }
+
+    #[test]
+    fn push_exact_oid_refuses_bad_input_before_any_network() {
+        // Allowlist first: an `ext::` locator never reaches a remote.
+        assert!(matches!(
+            push_exact_oid(
+                std::path::Path::new("/nonexistent"),
+                "ext::sh -c evil",
+                "maxplayer/abc12345",
+                &"a".repeat(40),
+                None
+            ),
+            Err(TransportError::Transport(_))
+        ));
+
+        // A short/non-hex oid is refused as a local defect, not sent as a refspec.
+        assert!(matches!(
+            push_exact_oid(
+                std::path::Path::new("/nonexistent"),
+                "https://relay.example/git/o/r.git",
+                "maxplayer/abc12345",
+                "HEAD",
+                None
+            ),
+            Err(TransportError::Io(_))
         ));
     }
 

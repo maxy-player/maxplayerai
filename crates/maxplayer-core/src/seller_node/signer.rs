@@ -43,6 +43,9 @@ enum Command {
     /// confined to this task + the authenticated relay client — the push path never re-reads the key.
     HttpAuthHeader {
         remote_url: String,
+        /// `Some("refs/heads/…")` scopes the token to ONE ref, so the header authorizes exactly the
+        /// delivery ref this push writes and nothing else. `None` is the historical unscoped token.
+        scope_ref: Option<String>,
         reply: oneshot::Sender<Result<String, String>>,
     },
     /// NIP-44/NIP-17 unwrap of a kind-1059 gift-wrap addressed to the seller, decoded to its NUT-18
@@ -186,10 +189,42 @@ impl SignerHandle {
         let (reply, rx) = oneshot::channel();
         self.round_trip(
             "http_auth_header",
-            Command::HttpAuthHeader { remote_url, reply },
+            Command::HttpAuthHeader {
+                remote_url,
+                scope_ref: None,
+                reply,
+            },
             rx,
         )
         .await
+    }
+
+    /// Mint a ref-scoped NIP-98 header from a BLOCKING thread — the git push subtransport, which
+    /// runs off the async runtime and needs a fresh token at each HTTP leg and each retry.
+    ///
+    /// Blocking is what makes the actor usable from the leg itself: the alternative is minting one
+    /// token before the push and reusing it for every later leg, which is exactly the staleness
+    /// this removes. The key still never leaves the actor — only the signed header crosses back.
+    ///
+    /// Must be called from a blocking context (`spawn_blocking` or a plain thread), never from an
+    /// async task. Errors are strings because the caller is a transport callback, not a domain op.
+    pub fn http_auth_header_scoped_blocking(
+        &self,
+        remote_url: String,
+        scope_ref: String,
+    ) -> Result<String, String> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .blocking_send(Command::HttpAuthHeader {
+                remote_url,
+                scope_ref: Some(scope_ref),
+                reply,
+            })
+            .map_err(|_| {
+                "signer actor exited before the push leg could be authorized".to_owned()
+            })?;
+        rx.blocking_recv()
+            .map_err(|_| "signer actor dropped the push authorization reply".to_owned())?
     }
 
     /// Decode a gift-wrap to its NUT-18 payment through the actor (the NIP-44 decrypt needs the
@@ -257,10 +292,17 @@ pub fn spawn(home: &MaxplayerHome) -> Result<SignerHandle, HomeError> {
                         .map_err(|error| error.to_string());
                     let _ = reply.send(result);
                 }
-                Command::HttpAuthHeader { remote_url, reply } => {
-                    let result =
-                        crate::git_transport::nip98_authorization_header_with_keys(&remote_url, &keys)
-                            .map_err(|error| error.to_string());
+                Command::HttpAuthHeader {
+                    remote_url,
+                    scope_ref,
+                    reply,
+                } => {
+                    let result = crate::git_transport::nip98_authorization_header_scoped_with_keys(
+                        &remote_url,
+                        &keys,
+                        scope_ref.as_deref(),
+                    )
+                    .map_err(|error| error.to_string());
                     let _ = reply.send(result);
                 }
                 Command::UnwrapPaymentWrap { event, reply } => {

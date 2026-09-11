@@ -5872,27 +5872,50 @@ impl SellerNodeRunner {
             return;
         }
 
-        // Push under the seller's NIP-98 auth. The push authorization is signed THROUGH the signer
-        // actor (which owns the seller key), so the push path is NOT a third custody site — the key
-        // stays confined to the actor + the authenticated relay client, never re-read here. A
-        // public/anonymous https remote takes no header (auth applies to relay-git remotes only).
-        let push_header = if crate::delivery_transport::is_relay_git_locator(&seller.git_remote) {
-            match self.node.signer().http_auth_header(seller.git_remote.clone()).await {
-                Ok(Ok(header)) => Some(header),
-                Ok(Err(error)) => {
-                    opline!("seller node execute fail job_id={job_id}: push auth sign failed ({error})");
-                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
-                    return;
-                }
-                Err(error) => {
-                    opline!("seller node execute fail job_id={job_id}: signer actor gone ({error})");
-                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
-                    return;
-                }
+        // The commit this delivery is gated on, read ONCE here and carried by value from now on.
+        // Everything downstream names this oid instead of the branch, so a local ref that moves
+        // after this point — a late writer in the workdir, a retry that re-snapshots — cannot
+        // change which commit is delivered, signed for, or recorded.
+        let approved_oid = match seller_git::branch_commit_oid_off_runtime(
+            workdir.clone(),
+            branch.clone(),
+        )
+        .await
+        {
+            Ok(oid) => oid,
+            Err(error) => {
+                opline!("seller node execute fail job_id={job_id}: resolve delivery commit failed ({error})");
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
+                return;
             }
-        } else {
-            None
         };
+
+        // Push authorization is minted PER HTTP LEG, inside the push, by this closure — not once
+        // before it. The push waits for the delivery lock and can retry a leg, and a token signed
+        // before that wait is already aging when the relay checks it; minting at the leg means the
+        // lock wait, the advertisement and the pack POST each carry authorization made for that
+        // request, with no token lifetime extended to cover the gap.
+        //
+        // The signer actor still owns the key (the closure round-trips to it and receives only the
+        // signed header), the token is scoped to the ONE ref this push writes, and the closure
+        // refuses to sign for any destination but this job's delivery remote — so a leg pointed
+        // elsewhere gets no header rather than a valid token for the wrong repo.
+        let push_mint: Option<crate::git_transport::AuthMinter> =
+            if crate::delivery_transport::is_relay_git_locator(&seller.git_remote) {
+                let signer = self.node.signer().clone();
+                let bound_remote = seller.git_remote.clone();
+                let scope_ref = crate::git_transport::delivery_ref(&branch);
+                Some(std::sync::Arc::new(move |destination: &str| {
+                    if destination.trim_end_matches('/') != bound_remote.trim_end_matches('/') {
+                        return Err(format!(
+                            "refusing to authorize a push leg to {destination}: this delivery is bound to {bound_remote}"
+                        ));
+                    }
+                    signer.http_auth_header_scoped_blocking(bound_remote.clone(), scope_ref.clone())
+                }))
+            } else {
+                None
+            };
         // #562: serialize the delivery push to this seat's ONE delivery remote, bounded so a hung
         // push frees the lock instead of starving every later delivery. Concurrent awarded jobs push
         // per-job branches to the same repo, and concurrent git-receive-pack to one repo is what the
@@ -5902,11 +5925,12 @@ impl SellerNodeRunner {
             &self.delivery_push_lock,
             DELIVERY_PUSH_TIMEOUT,
             || {
-                seller_git::push_branch_with_header_off_runtime(
+                seller_git::push_exact_oid_off_runtime(
                     workdir.clone(),
                     seller.git_remote.clone(),
                     branch.clone(),
-                    push_header,
+                    approved_oid.clone(),
+                    push_mint,
                 )
             },
         )

@@ -491,6 +491,45 @@ pub fn push_branch_with_header(
     Ok(oid)
 }
 
+/// Resolve the commit `branch` points at in `workdir` (full hex) — the delivery's APPROVED oid,
+/// read once at the gate so everything downstream (the push refspec, the receipt) names one commit
+/// by value instead of re-reading a ref that may have moved.
+pub fn branch_commit_oid(workdir: &Path, branch: &str) -> Result<String, SellerGitError> {
+    if branch.trim().is_empty() {
+        return Err(SellerGitError::Io("branch must be non-empty".into()));
+    }
+    let repo = Repository::open(workdir)
+        .map_err(|error| SellerGitError::Io(format!("open workdir: {error}")))?;
+    let oid = repo
+        .revparse_single(&format!("refs/heads/{branch}"))
+        .and_then(|object| object.peel_to_commit())
+        .map(|commit| commit.id().to_string())
+        .map_err(|error| SellerGitError::Io(format!("resolve {branch}: {error}")))?;
+    Ok(oid)
+}
+
+/// Push the EXACT `approved_oid` to `branch` on `remote_url`, with a fresh ref-scoped NIP-98 token
+/// minted at every HTTP leg and retry (`mint`). The durable seller node builds `mint` around its
+/// signer actor, so the key stays in the actor and each leg is authorized for that leg.
+///
+/// A local ref that moves after the gate cannot change what ships, the remote's per-ref status must
+/// say accepted, and there is NO post-push read-back. Returns the delivered oid.
+pub fn push_exact_oid_with_minter(
+    workdir: &Path,
+    remote_url: &str,
+    branch: &str,
+    approved_oid: &str,
+    mint: Option<git_transport::AuthMinter>,
+) -> Result<String, SellerGitError> {
+    assert_allowed_repo_locator(remote_url)?;
+    if branch.trim().is_empty() {
+        return Err(SellerGitError::Io("branch must be non-empty".into()));
+    }
+    let oid = git_transport::push_exact_oid(workdir, remote_url, branch, approved_oid, mint)?;
+    eprintln!("seller push path=inprocess remote={remote_url} branch={branch} oid={oid} ok");
+    Ok(oid)
+}
+
 /// Boot-time WRITE-auth probe: connect to `remote_url` in the PUSH direction and read the
 /// receive-pack ref advertisement (the auth-gated leg) WITHOUT transferring a pack or mutating the
 /// remote. Surfaces a broken write path — missing/invalid credential, unannounced/unreachable
@@ -616,6 +655,29 @@ pub async fn push_branch_with_header_off_runtime(
     header: Option<String>,
 ) -> Result<String, SellerGitError> {
     off_runtime(move || push_branch_with_header(&workdir, &remote_url, &branch, header)).await
+}
+
+/// Off-runtime [`branch_commit_oid`].
+pub async fn branch_commit_oid_off_runtime(
+    workdir: PathBuf,
+    branch: String,
+) -> Result<String, SellerGitError> {
+    off_runtime(move || branch_commit_oid(&workdir, &branch)).await
+}
+
+/// Off-runtime [`push_exact_oid_with_minter`] — the delivery push that reaches the network. Runs on
+/// a blocking thread, which is also where the minter's signer round-trip happens.
+pub async fn push_exact_oid_off_runtime(
+    workdir: PathBuf,
+    remote_url: String,
+    branch: String,
+    approved_oid: String,
+    mint: Option<git_transport::AuthMinter>,
+) -> Result<String, SellerGitError> {
+    off_runtime(move || {
+        push_exact_oid_with_minter(&workdir, &remote_url, &branch, &approved_oid, mint)
+    })
+    .await
 }
 
 /// Run one blocking git operation on a blocking thread. A panic inside libgit2 surfaces as an error

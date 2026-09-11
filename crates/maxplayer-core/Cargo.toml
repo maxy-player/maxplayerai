@@ -99,6 +99,12 @@ toml = "0.8"
 name = "relay_git_http_auth"
 required-features = ["git-delivery"]
 
+# The delivery push's authorization freshness, OID gating and per-ref status handling, driven over
+# the local git-over-HTTPS fixture — gated like above (it needs the in-process transport).
+[[test]]
+name = "relay_push_fresh_auth"
+required-features = ["git-delivery"]
+
 # #610 regression: the transport must ignore ambient git config (insteadOf) — gated like above.
 [[test]]
 name = "git_config_isolation"
