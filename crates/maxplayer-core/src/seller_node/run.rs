@@ -1709,7 +1709,10 @@ mod resume_action_tests {
 /// by design: a legit push finishes in seconds, so this never false-strands a slow-but-live push
 /// (which would be the very strand bug #562 is about). The `whole-op > per-leg` ordering that keeps
 /// this safe is no longer prose-only: the `const _` assert below binds the two clocks at COMPILE time.
-const DELIVERY_PUSH_TIMEOUT: Duration = Duration::from_secs(150);
+///
+/// `pub` alongside [`serialized_bounded_push`]: an out-of-process test drives the real wrapper with
+/// the real bound rather than a stand-in for it.
+pub const DELIVERY_PUSH_TIMEOUT: Duration = Duration::from_secs(150);
 
 /// #563: make the two-clock ordering a COMPILE-TIME invariant instead of the cross-file prose above.
 /// git2 has no whole-operation timeout, so `DELIVERY_PUSH_TIMEOUT` is the ONLY whole-op bound on the
@@ -1733,7 +1736,7 @@ const _: () = assert!(
 /// the operator log — the LEG-1 detail) from the bounded-timeout firing, so both route to the SINGLE
 /// `delivery_failed` handling while logging distinctly (never a new state).
 #[derive(Debug)]
-enum DeliveryPushErr {
+pub enum DeliveryPushErr {
     /// The push itself failed; the inner error carries the transport reason (409 / auth / io).
     Push(seller_git::SellerGitError),
     /// The push did not settle within [`DELIVERY_PUSH_TIMEOUT`] (seconds); the lock was released.
@@ -1746,7 +1749,13 @@ enum DeliveryPushErr {
 /// (lock, timeout, push) so the serialization + timeout are unit-testable WITHOUT a relay. The lock is
 /// held ONLY across the push and released the instant it settles or times out. The push oid is stable
 /// (invariant 2), so ORDERING pushes never duplicates a delivery — this is exactly-once.
-async fn serialized_bounded_push<Fut>(
+///
+/// `pub` so a test can drive THIS wrapper — not a re-creation of it — against a real git remote from
+/// its own process. The delivery-push auth question ("when is the waiting delivery's token signed?")
+/// is only answerable through the real lock, and the fixture that answers it needs a process whose
+/// TLS trust it can stage before anything else builds the shared HTTP client
+/// (`tests/delivery_push_contention.rs`).
+pub async fn serialized_bounded_push<Fut>(
     lock: &tokio::sync::Mutex<()>,
     timeout: Duration,
     push: impl FnOnce() -> Fut,
@@ -1764,6 +1773,11 @@ where
     // into the sign/enqueue tail.
 }
 
+// The same wrapper under CONTENTION — real signer actor, real HTTPS remote, and the question of
+// WHEN the waiting delivery's token is signed — lives in `tests/delivery_push_contention.rs`. It
+// needs its own process: the transport's HTTP client is built once per process, so a test whose
+// remote has a self-signed certificate must stage its TLS trust before any other test touches that
+// client. What stays here is the pure (lock, timeout, push) unit.
 #[cfg(test)]
 mod serialized_bounded_push_tests {
     use super::{serialized_bounded_push, DeliveryPushErr};
@@ -7219,11 +7233,16 @@ impl SellerNodeRunner {
             // leaves, so every request carries its own fresh token and none of them needs a longer
             // life than the round-trip it is on.
             let push_deadline = std::time::Instant::now() + DELIVERY_PUSH_TIMEOUT;
+            // Authority ends when this delivery's turn ends. A push the bound abandoned may still
+            // have a blocking thread parked inside libgit2; flipping this is what stops that thread
+            // from minting a token for a request nobody is waiting for any more.
+            let push_authority = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
             let push_mint: Option<crate::git_transport::AuthMinter> =
                 if crate::delivery_transport::is_relay_git_locator(&seller.git_remote) {
                     let signer = self.node.signer().clone();
                     let intended = seller.git_remote.clone();
                     let scope = push_ref.clone();
+                    let authority = push_authority.clone();
                     Some(std::sync::Arc::new(move |destination: &str| {
                         // Bind the token to the remote THIS job was told to deliver to, with the same
                         // comparison the transport uses. The transport already refuses a leg to any
@@ -7233,6 +7252,12 @@ impl SellerNodeRunner {
                             return Err(format!(
                                 "refusing to authorize a leg to {destination}: this delivery is bound to {intended}"
                             ));
+                        }
+                        if !authority.load(std::sync::atomic::Ordering::SeqCst) {
+                            return Err(
+                                "this delivery's push authority has ended; refusing to authorize another leg"
+                                    .to_owned(),
+                            );
                         }
                         if std::time::Instant::now() >= push_deadline {
                             return Err(
@@ -7277,6 +7302,11 @@ impl SellerNodeRunner {
                 },
             )
             .await;
+            // Whatever the outcome, this delivery is done asking for authorizations. On the timeout
+            // path that is the point: the bound released the lock and moved on, but the blocking
+            // thread can still be inside libgit2 waiting on a socket, and when it wakes it must not
+            // be able to sign a fresh token for a leg this job no longer owns.
+            push_authority.store(false, std::sync::atomic::Ordering::SeqCst);
             let commit = match push_outcome {
                 Ok(oid) => oid,
                 Err(DeliveryPushErr::Push(error)) => {

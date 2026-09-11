@@ -40,6 +40,19 @@ pub struct RecordedRequest {
     pub authorization: Option<String>,
 }
 
+/// Optional behaviours a test can ask the fixture for. Default = the plain auth-gated server every
+/// existing test uses; each knob is additive.
+#[derive(Clone, Default)]
+pub struct FixtureOptions {
+    /// Sleep this long before answering the FIRST request this server sees, so a test can put real
+    /// elapsed time between one leg and the next (a token minted once, up front, then visibly
+    /// predates the later legs).
+    pub first_response_delay: Option<Duration>,
+    /// Answer every smart-HTTP request with `302` + this `Location` instead of serving git — for
+    /// asserting what a client does with a redirect it was never authorized to follow.
+    pub redirect_to: Option<String>,
+}
+
 /// Auth-gated smart-HTTP git server bound to `127.0.0.1:<ephemeral>`.
 pub struct GitHttpAuthServer {
     addr: SocketAddr,
@@ -54,6 +67,11 @@ impl GitHttpAuthServer {
     /// `https://127.0.0.1:<port><mount>`; `mount` is the URL path of the repo, e.g.
     /// `/git/<owner>/base.git` for the relay-git shape.
     pub fn spawn(repo: &Path, mount: &str) -> Self {
+        Self::spawn_with(repo, mount, FixtureOptions::default())
+    }
+
+    /// [`GitHttpAuthServer::spawn`] with [`FixtureOptions`].
+    pub fn spawn_with(repo: &Path, mount: &str, options: FixtureOptions) -> Self {
         let tls_config = Arc::new(self_signed_tls_config());
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind fixture listener");
         listener
@@ -67,6 +85,10 @@ impl GitHttpAuthServer {
         let mount_bg = mount.to_owned();
         let requests_bg = Arc::clone(&requests);
         let shutdown_bg = Arc::clone(&shutdown);
+        let options = Arc::new(options);
+        // The delay is a one-shot: it exists to separate the first leg from the rest in time, not to
+        // slow every leg of the test.
+        let delay_spent = Arc::new(AtomicBool::new(false));
         let accept_thread = std::thread::spawn(move || {
             while !shutdown_bg.load(Ordering::SeqCst) {
                 match listener.accept() {
@@ -75,8 +97,18 @@ impl GitHttpAuthServer {
                         let repo = repo.clone();
                         let mount = mount_bg.clone();
                         let requests = Arc::clone(&requests_bg);
+                        let options = Arc::clone(&options);
+                        let delay_spent = Arc::clone(&delay_spent);
                         std::thread::spawn(move || {
-                            let _ = handle_connection(stream, tls_config, &repo, &mount, &requests);
+                            let _ = handle_connection(
+                                stream,
+                                tls_config,
+                                &repo,
+                                &mount,
+                                &requests,
+                                &options,
+                                &delay_spent,
+                            );
                         });
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -138,6 +170,8 @@ fn handle_connection(
     repo: &Path,
     mount: &str,
     requests: &Mutex<Vec<RecordedRequest>>,
+    options: &FixtureOptions,
+    delay_spent: &AtomicBool,
 ) -> std::io::Result<()> {
     // macOS: sockets accepted from a nonblocking listener inherit O_NONBLOCK — undo it.
     stream.set_nonblocking(false)?;
@@ -176,11 +210,14 @@ fn handle_connection(
         .filter(|value| !value.trim().is_empty())
         .cloned();
 
-    requests.lock().expect("requests lock").push(RecordedRequest {
-        method: method.clone(),
-        target: target.clone(),
-        authorization: authorization.clone(),
-    });
+    requests
+        .lock()
+        .expect("requests lock")
+        .push(RecordedRequest {
+            method: method.clone(),
+            target: target.clone(),
+            authorization: authorization.clone(),
+        });
 
     let expects_continue = headers
         .get("expect")
@@ -207,6 +244,25 @@ fn handle_connection(
         tls.flush()?;
     }
     let body = read_body(&mut tls, &headers, &buf[head_end + 4..])?;
+
+    // Held AFTER the request (and its Authorization) was recorded, so the recording timestamps the
+    // token as minted, and whatever the client sends next is genuinely later.
+    if let Some(delay) = options.first_response_delay {
+        if !delay_spent.swap(true, Ordering::SeqCst) {
+            std::thread::sleep(delay);
+        }
+    }
+
+    if let Some(location) = &options.redirect_to {
+        let header = format!("Location: {location}");
+        return respond(
+            &mut tls,
+            "302 Found",
+            &[header.as_str()],
+            "text/plain",
+            b"moved\n",
+        );
+    }
 
     // Smart-HTTP v0/v2: pass the client's Git-Protocol offer through to the backend.
     let git_protocol = headers.get("git-protocol").cloned();
@@ -280,7 +336,13 @@ fn advertise(
     }
     let out = cmd.output()?;
     if !out.status.success() {
-        return respond(tls, "500 Internal Server Error", &[], "text/plain", b"backend failed\n");
+        return respond(
+            tls,
+            "500 Internal Server Error",
+            &[],
+            "text/plain",
+            b"backend failed\n",
+        );
     }
     let mut payload = pkt_line(&format!("# service={service}\n"));
     payload.extend_from_slice(b"0000");
@@ -314,14 +376,16 @@ fn rpc(
         cmd.env("GIT_PROTOCOL", protocol);
     }
     let mut child = cmd.spawn()?;
-    child
-        .stdin
-        .take()
-        .expect("piped stdin")
-        .write_all(body)?; // drop closes the pipe → backend sees EOF
+    child.stdin.take().expect("piped stdin").write_all(body)?; // drop closes the pipe → backend sees EOF
     let out = child.wait_with_output()?;
     if !out.status.success() {
-        return respond(tls, "500 Internal Server Error", &[], "text/plain", b"backend failed\n");
+        return respond(
+            tls,
+            "500 Internal Server Error",
+            &[],
+            "text/plain",
+            b"backend failed\n",
+        );
     }
     respond(
         tls,

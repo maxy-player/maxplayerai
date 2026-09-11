@@ -129,6 +129,21 @@ required-features = ["git-delivery"]
 name = "push_destination_binding"
 required-features = ["git-delivery"]
 
+# WHEN the delivery push token is signed, and whether a redirect can carry it away. The fixture
+# holds its first response, so "each leg mints its own" is measured in elapsed time; a second
+# endpoint proves an unfollowed redirect receives nothing. Gated like above.
+[[test]]
+name = "relay_push_fresh_auth"
+required-features = ["git-delivery"]
+
+# Two deliveries, one seat lock, one remote: does the delivery that WAITED sign its token after the
+# wait? Drives the production `serialized_bounded_push` with the real signer actor and the HTTPS
+# fixture. Its own process, because the transport's HTTP client (and its TLS trust) is built once
+# per process. Gated like above.
+[[test]]
+name = "delivery_push_contention"
+required-features = ["git-delivery"]
+
 # The container reap against a REAL zombie-leader survivor: a thread group whose leader exited while a
 # sibling thread lives. `#[ignore]`d, because it runs the production reaper, which SIGKILLs every
 # process but pid 1 and itself. It must be the only process tree of a fresh container; run it through

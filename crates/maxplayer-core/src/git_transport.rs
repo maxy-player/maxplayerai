@@ -189,6 +189,18 @@ where
     })
 }
 
+/// Every request this module makes is a request some check already authorized: the allowlist ran on
+/// the locator, [`bound_remote`] compared the resolved remote, [`NostrHttp::action`] compared the
+/// URL libgit2 handed over, and the [`AuthMinter`] was shown that same destination. A redirect the
+/// HTTP client follows on its own has passed NONE of them: reqwest keeps the `Authorization` header
+/// across a same-origin hop (it strips it only when host or effective port changes), and a 307/308
+/// replays the body — so an unfollowed 3xx is the difference between "the relay moved the route"
+/// and "the token and the pack went somewhere nobody authorized". Both clients therefore follow
+/// nothing: a 3xx is surfaced to [`HttpStream::send`] as a non-success status and fails the leg.
+fn no_redirects() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::none()
+}
+
 /// Long-running client for pushes and seller base fetches (large packs are legitimate).
 fn client_default() -> &'static reqwest::blocking::Client {
     static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
@@ -196,6 +208,7 @@ fn client_default() -> &'static reqwest::blocking::Client {
         reqwest::blocking::Client::builder()
             .connect_timeout(Duration::from_secs(15))
             .timeout(DEFAULT_HTTP_LEG_TIMEOUT)
+            .redirect(no_redirects())
             .danger_accept_invalid_certs(accept_invalid_certs())
             .build()
             .expect("build reqwest blocking client")
@@ -209,6 +222,7 @@ fn client_short() -> &'static reqwest::blocking::Client {
         reqwest::blocking::Client::builder()
             .connect_timeout(BUYER_FETCH_LEG_TIMEOUT)
             .timeout(BUYER_FETCH_LEG_TIMEOUT)
+            .redirect(no_redirects())
             .danger_accept_invalid_certs(accept_invalid_certs())
             .build()
             .expect("build reqwest blocking client (short)")
@@ -308,9 +322,10 @@ fn destination_parts(url: &str) -> Option<(String, String, String)> {
 /// Whether `actual` names the destination the caller intended. Normalizes only the scheme case, the
 /// host case, and one trailing slash; the path must match exactly. Unparseable input never matches.
 ///
-/// `pub(crate)` so a caller that builds an [`AuthMinter`] applies the SAME comparison the transport
-/// applies — one rule for "is this the destination we named", never two that can drift.
-pub(crate) fn same_destination(intended: &str, actual: &str) -> bool {
+/// `pub` so a caller that builds an [`AuthMinter`] applies the SAME comparison the transport
+/// applies — one rule for "is this the destination we named", never two that can drift — and so an
+/// out-of-process test can build a minter with that same rule rather than a lookalike.
+pub fn same_destination(intended: &str, actual: &str) -> bool {
     match (destination_parts(intended), destination_parts(actual)) {
         (Some(intended), Some(actual)) => intended == actual,
         _ => false,
@@ -853,6 +868,17 @@ impl HttpStream {
             .send()
             .map_err(|error| io::Error::other(format!("http request: {error}")))?;
         let status = response.status();
+        if status.is_redirection() {
+            // Unfollowed by construction (`no_redirects`). Name it plainly: the hop was never
+            // checked by the allowlist, `bound_remote` or `action`, and the minter never saw it.
+            return Err(io::Error::other(format!(
+                "http status {} for {}: redirects are refused; the destination this operation \
+                 authorized is {}",
+                status.as_u16(),
+                self.url,
+                self.destination
+            )));
+        }
         if !status.is_success() {
             return Err(io::Error::other(format!(
                 "http status {} for {}",
