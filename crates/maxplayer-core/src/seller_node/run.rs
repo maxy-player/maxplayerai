@@ -2621,17 +2621,29 @@ mod delivery_push_leg_tests {
     // must carry the LATER reading.
     // Red-on-revert: mint before calling `serialized_bounded_push` (v0.5.8's shape) and the second
     // token's `created_at` is 0 ⇒ this fails.
+    //
+    // The BARRIER here carries as much weight as the assertion. This test first tried to give the
+    // leading delivery the permit with a bare `yield_now()`, which guarantees nothing: the semaphore
+    // hands the permit to whichever task reaches `acquire` first, so on a runtime whose second worker
+    // is not polled promptly the QUEUED delivery took the gate first, minted at clock 0, and failed a
+    // freshness test for a reason that had nothing to do with freshness — and passed under load,
+    // which is worse than failing. The leading delivery now announces custody from INSIDE the gate,
+    // and tokio's semaphore is FIFO, so ours provably waits on every scheduling.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_upload_token_is_minted_after_the_push_lock_is_acquired() {
         let gate = Arc::new(Semaphore::new(1));
         let recorder = Recorder::default();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel::<()>();
+        let queued = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let first = {
             let (gate, recorder) = (gate.clone(), recorder.clone());
             tokio::spawn(async move {
                 let stage = stage_cell();
                 serialized_bounded_push(&gate, Duration::from_secs(30), &stage, |permit| async move {
+                    // Inside the gate: the delivery ahead of ours HOLDS the permit from here.
+                    acquired_tx.send(()).expect("announce custody of the gate");
                     // The delivery ahead of ours holds the permit while time passes on the wire.
                     release_rx.await.expect("released");
                     recorder.clock.fetch_add(300, Ordering::SeqCst);
@@ -2642,12 +2654,14 @@ mod delivery_push_leg_tests {
             })
         };
 
-        // Give the first delivery the permit, then queue ours behind it.
-        tokio::task::yield_now().await;
+        // The gate is HELD before ours exists — not "probably held after a yield".
+        acquired_rx.await.expect("the first delivery took the permit");
+        assert_eq!(gate.available_permits(), 0, "the delivery ahead of ours holds the gate");
         let second = {
-            let (gate, recorder) = (gate.clone(), recorder.clone());
+            let (gate, recorder, queued) = (gate.clone(), recorder.clone(), queued.clone());
             tokio::spawn(async move {
                 let stage = stage_cell();
+                queued.store(true, Ordering::SeqCst);
                 serialized_bounded_push(&gate, Duration::from_secs(30), &stage, |permit| {
                     mint_upload_mint_attest(
                         true,
@@ -2672,7 +2686,15 @@ mod delivery_push_leg_tests {
             })
         };
 
-        tokio::task::yield_now().await;
+        // Ours has reached the gate and is waiting on it; it cannot mint without the permit, and the
+        // permit is not free. Bounded so a genuinely stuck task fails loudly instead of hanging.
+        let reached_the_gate = tokio::time::timeout(Duration::from_secs(5), async {
+            while !queued.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(reached_the_gate.is_ok(), "the queued delivery never reached the gate");
         assert!(
             recorder.mints().is_empty(),
             "nothing may be minted while the delivery is still waiting for the lock"
