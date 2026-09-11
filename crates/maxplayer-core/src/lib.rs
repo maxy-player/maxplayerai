@@ -101,6 +101,11 @@ pub mod sandbox_dns;
 /// compiles only under `cfg(test)` with the feature combination `prepare_launch` needs.
 #[cfg(all(test, feature = "acp", feature = "wallet"))]
 mod sandbox_dns_live;
+/// The live egress ATTRIBUTION gate: `#[ignore]`d numeric-IP probes that ask whether a contained
+/// gVisor payload reaches denied destinations, so the same file can be run against the DNS patch and
+/// against its base to tell a regression from a preexisting condition. HARNESS ONLY.
+#[cfg(all(test, feature = "acp", feature = "wallet"))]
+mod sandbox_egress_live;
 /// Host-side network containment for a docker job (#797): which destinations a job may reach, and
 /// the `iptables` rules that enforce it on the two chains container traffic actually splits across.
 ///
