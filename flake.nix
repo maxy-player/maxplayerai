@@ -18,42 +18,6 @@
         "x86_64-linux"
       ];
       forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
-
-      # Package versions are DERIVED from the Cargo manifest that owns each package —
-      # never re-typed as a literal here, where they drift silently from the crates.
-      # `version.workspace = true` parses (builtins.fromTOML) as an ATTRSET, not a
-      # string: that is the inheritance marker, and it resolves against the manifest
-      # of the workspace the crate is a member of. A plain string is a crate that
-      # pins its own version and must NOT be resolved against any workspace.
-      readManifest = path: builtins.fromTOML (builtins.readFile path);
-      cargoVersion =
-        { manifest, workspaceManifest }:
-        let
-          declared = (readManifest manifest).package.version;
-        in
-        if builtins.isString declared then
-          declared
-        else
-          (readManifest workspaceManifest).workspace.package.version;
-
-      # `maxplayer` and `maxplayer-relay-write-policy` are both members of the ROOT
-      # workspace and both inherit its [workspace.package] version.
-      maxplayerVersion = cargoVersion {
-        manifest = ./crates/maxplayer/Cargo.toml;
-        workspaceManifest = ./Cargo.toml;
-      };
-      writePolicyVersion = cargoVersion {
-        manifest = ./crates/maxplayer-relay-write-policy/Cargo.toml;
-        workspaceManifest = ./Cargo.toml;
-      };
-      # buzz-relay lives in the ISOLATED nested crates/buzz workspace AND opts out of
-      # inheriting it (`version = "…"` in its own [package]: it ships on its own release
-      # cadence). Resolving it against crates/buzz/Cargo.toml would be wrong; the helper
-      # takes the crate's own string and never looks at the workspace manifest.
-      buzzRelayVersion = cargoVersion {
-        manifest = ./crates/buzz/crates/buzz-relay/Cargo.toml;
-        workspaceManifest = ./crates/buzz/Cargo.toml;
-      };
     in
     {
       packages = forAllSystems (
@@ -77,7 +41,10 @@
           # Args common to every `maxplayer` build.
           maxplayerArgs = {
             pname = "maxplayer";
-            version = maxplayerVersion;
+            # From crates/maxplayer/Cargo.toml: `version.workspace = true` inherits root [workspace.package].
+            version = let m = builtins.fromTOML (builtins.readFile ./crates/maxplayer/Cargo.toml); in
+              if builtins.isString m.package.version then m.package.version
+              else (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
             src = self;
 
             # Vendor all dependencies hermetically from the committed
@@ -136,7 +103,10 @@
           # `lib.getExe` in `nixosModules.relay` resolves `meta.mainProgram`.
           relay-write-policy = pkgs.rustPlatform.buildRustPackage {
             pname = "maxplayer-relay-write-policy";
-            version = writePolicyVersion;
+            # From crates/maxplayer-relay-write-policy/Cargo.toml: `version.workspace = true` inherits root [workspace.package].
+            version = let m = builtins.fromTOML (builtins.readFile ./crates/maxplayer-relay-write-policy/Cargo.toml); in
+              if builtins.isString m.package.version then m.package.version
+              else (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
             src = self;
             cargoLock.lockFile = ./Cargo.lock;
             cargoBuildFlags = [
@@ -169,7 +139,10 @@
           # dev-deps from the lock, this can return to hermetic cargoLock + one aws-creds outputHash.
           maxplayer-relay = buzzRustPlatform.buildRustPackage {
             pname = "maxplayer-relay";
-            version = buzzRelayVersion;
+            # From crates/buzz/crates/buzz-relay/Cargo.toml: it pins its own [package].version, not the nested workspace's.
+            version = let m = builtins.fromTOML (builtins.readFile ./crates/buzz/crates/buzz-relay/Cargo.toml); in
+              if builtins.isString m.package.version then m.package.version
+              else (builtins.fromTOML (builtins.readFile ./crates/buzz/Cargo.toml)).workspace.package.version;
             src = ./crates/buzz;
             # cargoHash of buzz's full vendored dep set (crates.io + the 2 public git sources:
             # rust-s3/aws-creds build dep + mesh-llm dev-deps). Recompute if crates/buzz/Cargo.lock changes.
