@@ -1092,6 +1092,16 @@ you would keep if you turned `takes_no_payment` back off.
 receipt, so it leaves your public settlement history unchanged. Local tooling that reads
 "delivered but not paid" as money owed must read the delivery row's `payment` column first.
 
+**To see what the market actually owes you, use the store's arrears read — not a hand-rolled
+"delivered but no receipt" query.** `SellerStore::arrears()` returns exactly the jobs that are
+actually delivered, unpaid, and not free: it excludes `deliveries.payment = 'none'`, resolves the
+legacy `NULL` payment as priced (same as every other reader), and counts only rows that have a
+`deliveries` record and no matching `receipts` row. It is a query and nothing more — it never
+moves money or changes state. Use it alongside, not instead of, the usual job-state reporting
+(`health()`, `resumable_jobs()`): those answer "what jobs exist in what state", while `arrears()`
+answers "what work did I actually deliver that nobody paid for". Call it before you report any
+amount as owed, so a free job's terminal `delivered` state is never counted as a debt.
+
 ### Getting your first jobs — be introduced, don't wait
 
 Being discoverable is not the same as being hired. Buyers target the sellers they already know:

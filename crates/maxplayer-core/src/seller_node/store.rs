@@ -142,6 +142,24 @@ impl JobFeeAccrual {
     }
 }
 
+/// One seller-store job that the market owes money for: it was ACTUALLY DELIVERED (a `deliveries`
+/// row exists for it) and it is UNPAID (no `receipts` row resolves it), and it is not a free job.
+/// This is the supported read for "how much is owed to me?" — the query operator arrears tooling
+/// should call rather than hand-rolling `delivered AND no receipt`, which forgets
+/// `deliveries.payment` and counts every free job's terminal `delivered` state as a debt.
+///
+/// Returned by [`SellerStore::arrears`]. `deliveries.job_id` is the PRIMARY KEY and `receipts` is
+/// probed with an anti-join, so the result is 1:1 with delivery rows — the query cannot fan out and
+/// invent debt that was never owed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArrearsJob {
+    pub job_id: String,
+    /// The delivery record's own reference (`deliveries.result_ref`), the seller-authored snapshot
+    /// that was published.
+    pub result_ref: String,
+    pub delivered_at_unix: i64,
+}
+
 /// Lifecycle of one remittance attempt. `Planned` and `Spending` are the two states under which
 /// money may be moving — together the one in-flight row: at most ONE row may be in flight at a time
 /// (enforced by a partial unique index AND by [`SellerStore::plan_remittance`]), which is what makes
@@ -1903,6 +1921,49 @@ impl SellerStore {
             .optional()?
             .is_some();
         Ok(found)
+    }
+
+    /// Jobs the market owes money for: actually delivered AND unpaid AND not free — the supported
+    /// seller-store arrears read. This is what operator arrears tooling should call instead of
+    /// hand-rolling "delivered but no receipt", which cannot see `deliveries.payment` and would
+    /// count every free job's terminal `delivered` state as a debt.
+    ///
+    /// Rules (issue #975):
+    /// - `deliveries.payment = 'none'` is EXCLUDED — a free job is not owed money.
+    /// - `payment = 'sat'` AND the legacy `NULL` both resolve PRICED (`payment_mode_from_column`'s
+    ///   fail-closed default), so a legacy row counts.
+    /// - Only rows with a `deliveries` row (actually delivered) and NO `receipts` row (unpaid) count.
+    /// - Delivered-and-paid, non-delivered, and non-delivered jobs are excluded.
+    ///
+    /// Cardinality: the join is `deliveries` (whose `job_id` is the PRIMARY KEY, so one row per job)
+    /// anti-joined against `receipts` via `NOT EXISTS` on the same `job_id` key. `receipts.job_id`
+    /// is the only join column and it is not unique on its own, but because we only test for
+    /// EXISTENCE and never join receipt rows through to the output, a single delivered job appears
+    /// at most once regardless of how many receipt rows it has. The anti-join therefore cannot fan
+    /// out: one delivered unpaid job yields exactly one [`ArrearsJob`].
+    ///
+    /// A query and nothing more — nothing here moves money, changes state, or writes a row.
+    pub fn arrears(&self) -> Result<Vec<ArrearsJob>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT d.job_id, d.result_ref, d.delivered_at_unix
+             FROM deliveries d
+             WHERE (d.payment IS NULL OR d.payment != 'none')
+               AND NOT EXISTS (SELECT 1 FROM receipts r WHERE r.job_id = d.job_id)
+             ORDER BY d.delivered_at_unix ASC, d.job_id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ArrearsJob {
+                job_id: row.get(0)?,
+                result_ref: row.get(1)?,
+                delivered_at_unix: row.get(2)?,
+            })
+        })?;
+        let mut jobs = Vec::new();
+        for row in rows {
+            jobs.push(row?);
+        }
+        Ok(jobs)
     }
 
     /// What the platform fee has come to: the all-time total, how much of it is remitted /
@@ -5401,6 +5462,252 @@ mod free_lane_tests {
             "no new terminal state was added — deliveries.payment carries the fact instead: {ddl}"
         );
         drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- seller-store arrears query (issue #975) ---------------------------------------------
+
+    /// Drive a job through the real write path to a DELIVERED terminal record. `mode` is the
+    /// payment mode the offer and delivery are journaled under (`Sat` for paid, `None` for free).
+    fn deliver(store: &SellerStore, job: &str, mode: PaymentMode) {
+        store.record_offer(&offer_row(job, mode), 1).expect("record offer");
+        store
+            .claim_and_enqueue(
+                job,
+                job,
+                if mode.is_free() { None } else { Some("creqA") },
+                &wire_draft(crate::gateway::JOB_CLAIM_KIND),
+                1,
+                9_999,
+                1,
+            )
+            .expect("claim");
+        store.record_award(&format!("award-{job}"), job, &"b".repeat(64), 2).expect("award");
+        assert!(
+            store
+                .deliver_and_enqueue(
+                    job,
+                    "ref",
+                    mode,
+                    &wire_draft(crate::gateway::JOB_RESULT_KIND),
+                    3,
+                    9_999,
+                    3,
+                )
+                .expect("deliver"),
+            "{job} must deliver"
+        );
+    }
+
+    /// Settle a delivered PRICED job the only way the store does: a real receipt write that marks
+    /// `jobs.state = 'paid'`.
+    fn settle(store: &SellerStore, job: &str) {
+        store
+            .collect_receipt(
+                &format!("receipt-{job}"),
+                job,
+                21,
+                ReceiptFees { mint_fee_sats: 1, fee_bps: 1000, fee_sats: 2 },
+                4,
+            )
+            .expect("collect");
+    }
+
+    /// The job_ids the supported arrears method reports, in the order it reports them.
+    fn arrears_ids(store: &SellerStore) -> Vec<String> {
+        store
+            .arrears()
+            .expect("arrears")
+            .into_iter()
+            .map(|a| a.job_id)
+            .collect()
+    }
+
+    /// Insert a LEGACY delivery row: a priced job delivered BEFORE `deliveries.payment` existed,
+    /// so `payment` is NULL and every reader must resolve it to PRICED, never free.
+    fn legacy_delivery(path: &std::path::Path, job: &str) {
+        let conn = Connection::open(path).expect("reopen raw");
+        conn.execute(
+            "INSERT INTO jobs (job_id, offer_id, state, created_at_unix, updated_at_unix)
+             VALUES (?1, ?2, 'delivered', 1, 1)",
+            params![job, format!("offer-{job}")],
+        )
+        .expect("insert legacy job");
+        conn.execute(
+            "INSERT INTO deliveries (job_id, result_ref, delivered_at_unix, payment)
+             VALUES (?1, 'legacy-ref', 1, NULL)",
+            [job],
+        )
+        .expect("insert legacy delivery");
+        drop(conn);
+    }
+
+    /// A FREE job is delivered but never owed money — `payment='none'` must keep it out of arrears.
+    ///
+    /// NON-VACUOUS: if the query forgot the `payment` filter and counted every delivered-unpaid
+    /// row as owed, the free job would appear here and the set would shift; if it wrongly excluded
+    /// ALL unpaid rows, the priced job would vanish. Both are caught by the exact-set assertion.
+    #[test]
+    fn arrears_excludes_free_jobs() {
+        let path = temp_db("arrears-free");
+        let _ = std::fs::remove_file(&path);
+        let store = SellerStore::open(&path).expect("open");
+        deliver(&store, "free-job", PaymentMode::None);
+        deliver(&store, "priced-job", PaymentMode::Sat);
+        assert_eq!(
+            arrears_ids(&store),
+            vec!["priced-job".to_owned()],
+            "only the priced delivered-unpaid job is owed; the free job is not debt"
+        );
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A LEGACY `payment = NULL` delivery is a priced job (the fail-closed default), so it counts.
+    ///
+    /// NON-VACUOUS: if a reader resolved NULL as free (or as anything to exclude), the legacy job
+    /// would disappear from the result and the exact-set assertion would fail.
+    #[test]
+    fn arrears_includes_legacy_null_as_priced() {
+        let path = temp_db("arrears-legacy");
+        let _ = std::fs::remove_file(&path);
+        let store = SellerStore::open(&path).expect("open");
+        deliver(&store, "priced-job", PaymentMode::Sat);
+        legacy_delivery(&path, "legacy-job");
+        assert_eq!(
+            arrears_ids(&store),
+            vec!["legacy-job".to_owned(), "priced-job".to_owned()],
+            "legacy NULL and explicit 'sat' both resolve PRICED and both count"
+        );
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A delivered job that HAS a receipt is paid — not arrears.
+    ///
+    /// NON-VACUOUS: if the query dropped the anti-join against `receipts` (or forgot to exclude
+    /// paid), the settled job would appear as owed and the exact-set assertion would fail.
+    #[test]
+    fn arrears_excludes_paid_jobs() {
+        let path = temp_db("arrears-paid");
+        let _ = std::fs::remove_file(&path);
+        let store = SellerStore::open(&path).expect("open");
+        deliver(&store, "paid-job", PaymentMode::Sat);
+        settle(&store, "paid-job");
+        deliver(&store, "unpaid-job", PaymentMode::Sat);
+        assert_eq!(
+            arrears_ids(&store),
+            vec!["unpaid-job".to_owned()],
+            "the settled job is excluded; only the delivered-unpaid job is owed"
+        );
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A job that never reached an actual delivery is not owed money at all.
+    ///
+    /// NON-VACUOUS: the method is anchored on the `deliveries` table, so a claimed/awarded job with
+    /// no delivery row (and thus no publication) cannot be reported as an unpaid delivery. If the
+    /// method instead walked `jobs` and treated any non-`paid` terminal state as owed, this awarded
+    /// job would leak in and the exact-set assertion would fail.
+    #[test]
+    fn arrears_excludes_non_delivered_jobs() {
+        let path = temp_db("arrears-nondelivered");
+        let _ = std::fs::remove_file(&path);
+        let store = SellerStore::open(&path).expect("open");
+        // A job claimed and awarded but never delivered — no `deliveries` row exists.
+        store.record_offer(&offer_row("not-delivered", PaymentMode::Sat), 1).expect("record offer");
+        store
+            .claim_and_enqueue(
+                "not-delivered",
+                "not-delivered",
+                Some("creq"),
+                &wire_draft(crate::gateway::JOB_CLAIM_KIND),
+                1,
+                9_999,
+                1,
+            )
+            .expect("claim");
+        store.record_award("award-not-delivered", "not-delivered", &"b".repeat(64), 2).expect("award");
+        deliver(&store, "delivered-job", PaymentMode::Sat);
+        assert_eq!(
+            arrears_ids(&store),
+            vec!["delivered-job".to_owned()],
+            "an awarded-but-never-delivered job owes nothing"
+        );
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Mixed rows return EXACT IDs and counts.
+    #[test]
+    fn arrears_mixed_rows_return_exact_ids_and_counts() {
+        let path = temp_db("arrears-mixed");
+        let _ = std::fs::remove_file(&path);
+        let store = SellerStore::open(&path).expect("open");
+        deliver(&store, "free-job", PaymentMode::None);
+        deliver(&store, "priced-unpaid", PaymentMode::Sat);
+        legacy_delivery(&path, "legacy-unpaid");
+        deliver(&store, "priced-paid", PaymentMode::Sat);
+        settle(&store, "priced-paid");
+        store.record_offer(&offer_row("never-delivered", PaymentMode::Sat), 1).expect("record offer");
+        store
+            .claim_and_enqueue(
+                "never-delivered",
+                "never-delivered",
+                Some("creq"),
+                &wire_draft(crate::gateway::JOB_CLAIM_KIND),
+                1,
+                9_999,
+                1,
+            )
+            .expect("claim");
+        store.record_award("award-never", "never-delivered", &"b".repeat(64), 2).expect("award");
+
+        let ids = arrears_ids(&store);
+        assert_eq!(
+            ids,
+            vec!["legacy-unpaid".to_owned(), "priced-unpaid".to_owned()],
+            "exactly the delivered, unpaid, priced rows — free, paid and never-delivered excluded"
+        );
+        assert_eq!(ids.len(), 2, "exact count of owed jobs");
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The anti-join cannot fan out: a single delivered unpaid job yields exactly ONE row even when
+    /// other jobs carry MULTIPLE receipt rows, and `deliveries.job_id` being a PRIMARY KEY means one
+    /// delivery row per job.
+    ///
+    /// NON-VACUOUS: a naive cross `JOIN deliveries x receipts` would emit one output row per
+    /// (delivery × receipt) pair — so a delivered job sitting next to several receipts on other jobs
+    /// would be repeated and the count would inflate. The exact single-entry assertion catches that.
+    #[test]
+    fn arrears_does_not_fan_out_on_receipts() {
+        let path = temp_db("arrears-cardinality");
+        let _ = std::fs::remove_file(&path);
+        let store = SellerStore::open(&path).expect("open");
+        deliver(&store, "owed-job", PaymentMode::Sat);
+        // Several rows on OTHER jobs (a legacy/edge store could hold more than one receipt per job);
+        // none reference owed-job, so a loose join must not multiply owed-job out.
+        let conn = store.lock().expect("lock");
+        for i in 0..3 {
+            conn.execute(
+                "INSERT INTO receipts (receipt_id, job_id, amount_sats, received_at_unix)
+                 VALUES (?1, ?2, 21, 5)",
+                params![format!("receipt-{i}"), format!("other-job-{i}")],
+            )
+            .expect("insert receipt");
+        }
+        drop(conn);
+        let ids = arrears_ids(&store);
+        assert_eq!(
+            ids,
+            vec!["owed-job".to_owned()],
+            "one delivered unpaid job is reported exactly once, however many receipt rows sit beside it"
+        );
+        assert_eq!(ids.len(), 1, "count equals distinct owed jobs, not delivery x receipts");
+        drop(store);
         let _ = std::fs::remove_file(&path);
     }
 }
