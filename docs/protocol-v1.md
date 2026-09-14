@@ -96,10 +96,13 @@ replaces it on every beat. Every fact below is current as of that beat, EXCEPT `
 | `["t","maxplayer"]` | 1 | yes | Namespace |
 | `["v","1"]` | 1 | yes | Protocol major |
 | `["rate", sats]` | 1 | yes | Lowest price the seat accepts, in satoshis |
-| `["accepting", "y"` or `"n"]` | 1 | yes | Whether the seat intends to take new work |
-| `["queue_depth", n]` | 1 | yes | Jobs the seat currently holds in a non-terminal state |
+| `["accepting", "y"` or `"n"]` | 1 | yes | The seat is alive and serving. NOT a free-slot signal |
+| `["queue_depth", n]` | 1 | yes | Jobs the seat holds in `Awarded` or `Executing` — its live load |
 | `["accepted_mints", url, ...]` | 1 | yes | Every mint the seat accepts payment on |
+| `["takes_payment","none"]` | 0..1 | no | The seat takes NO payment. Absent is UNSTATED, never `"no"` |
 | `["agents", id, ...]` | 0..1 | no | Harnesses the seat can run |
+| `["admits_pool", "open"` or `"closed"]` | 0..1 | no | Whether the seat claims untargeted (open-pool) offers |
+| `["admits_targeted", "open"`, `"named"` or `"closed"]` | 0..1 | no | Who the seat admits on the targeted surface |
 | `["harness_family", family, ...]` | 0..1 | no | Harness families the seat serves |
 | `["harness_model", family, model]` | 0..N | no | One resolved model, paired to its family |
 | `["capabilities", token, ...]` | 0..1 | no | Capability tokens the seat proved |
@@ -110,11 +113,96 @@ The last five are the seat's capability. Section 4.5 defines them. They are five
 facts spelled differently: a reader that budgets for four will be one short.
 
 `accepted_mints` carries one or more mint URLs. A buyer can pay a seat only on a mint in this list.
+This holds for a `takes_payment=none` seat too: a seat that publishes no mints does not parse, so a
+seat that takes nothing still names a mint it will never be paid at.
+
+`takes_payment` states that the seat takes no payment at all. It carries exactly one value, `none`,
+and it is emitted only by a seat that takes nothing. An ABSENT tag is UNSTATED and MUST NOT be read
+as `"takes payment: yes"` — the same rule the admission pair states for its own absence. It is
+derived from the seat's effective seller configuration, like `admits_pool` and `admits_targeted`,
+and a seat MUST NOT let an operator state it directly.
+
+`rate` is NOT this statement and a reader MUST NOT substitute it. `rate` is the lowest price the
+seat accepts, so a seat at `rate 0` is saying it will take any amount INCLUDING nothing — which is
+not the same as saying it takes nothing, and a buyer holding no bitcoin cannot act on the first.
 
 `agents` names the harnesses the seat can run. An absent `agents` tag means the seat states no
 harness. It does not mean the seat can run none.
 
-`queue_depth` is a live count. It returns to `0` when the seat holds no non-terminal job.
+#### Admission
+
+`admits_pool` and `admits_targeted` state WHO the seat admits, one tag per surface. They exist
+because a seat that advertises, beats, and looks healthy can decline every offer a buyer sends, and
+nothing else on the wire says why.
+
+Both are derived from the seat's effective seller configuration at the moment it publishes. A seat
+MUST NOT let an operator state them directly. An advertisement an operator maintains by hand drifts
+from the behaviour it describes, and a tag that can disagree with the seat's own admission decision
+is worse than no tag.
+
+`admits_pool` answers the untargeted surface, and maps to `claim_open_pool`. It carries `open` when
+the seat claims untargeted offers and `closed` when it does not.
+
+The two tags share one vocabulary — `open`, `named`, `closed` — so a reader learns the words once.
+`named` appears on `admits_targeted` alone, because only the targeted surface has a third state. The
+tags describe different-sized state spaces; they do not describe them in different words.
+
+`admits_targeted` answers the surface of offers whose `p` tag names this seat. Admission there is
+the union of two independent controls — the buyers the operator named in `accept_offers_only_from`,
+and `accept_open_targeted` for a buyer it did not name — so the surface has three states and not
+two:
+
+| Value | Meaning | Derived from |
+|---|---|---|
+| `open` | Any buyer may target this seat | `accept_open_targeted = true` |
+| `named` | Only buyers this seat named | `accept_open_targeted = false`, and at least one usable entry in `accept_offers_only_from` |
+| `closed` | The targeted surface admits nobody | `accept_open_targeted = false`, and no usable entry |
+
+An entry in `accept_offers_only_from` is usable only if it can match a buyer pubkey as it arrives on
+the wire: 64 lowercase hex characters that are also a valid secp256k1 x-only key. An entry in any
+other form matches nobody, so a seat whose every entry is unusable publishes `closed` and not
+`named`.
+
+A seat publishing `named` states that a list exists. It MUST NOT publish the list. A reader learns
+that it may or may not be on it, which is what lets a buyer the operator chose to serve try the seat
+instead of reading a refusal that does not apply to it.
+
+**Both tags answer identity and nothing else.** A seat that admits a buyer still refuses an offer
+below its `rate`, still refuses one it has already aged out, and still declines when it cannot run
+the requested harness. A reader MUST NOT read `open` as a promise that any offer is claimable.
+
+Like `accepting`, these are the seat's own statement of intent. A reader MUST NOT treat either as a
+guarantee. The authoritative signal that a seat will take a job is that the seat claims one.
+
+**An absent tag means unknown. It does not mean `closed`.** A seat that
+predates these tags publishes neither, and so does an implementation that has not adopted them. A
+reader that resolved an absent tag to a refusal would stop using every such seat while its
+announcement said nothing to justify that. A reader that cannot determine a seat's policy SHOULD
+behave as it did before these tags existed.
+
+The two tags are read together. A seat that publishes one without the other, or a value outside the
+sets above, states no policy — a reader MUST NOT infer the missing or unrecognised half.
+
+These tags appear on the announcement ONLY. A reader MUST NOT expect them on a kind `3402` claim: a
+claim already demonstrates admission, because the seat sent it.
+
+`queue_depth` is a live count of the jobs occupying an execution slot: those in `Awarded` or
+`Executing`. Offers waiting unclaimed in the pool are not counted, and neither is a `Delivered` job
+awaiting payment. It returns to `0` when the seat holds no such job.
+
+`queue_depth` is NOT the count of occupied execution slots. A seat reserves a slot when it claims,
+before any award exists, and holds that reservation until the award arrives or the reservation
+lapses; those claim-time reservations are excluded from `queue_depth`. A seat with every slot
+reserved by unawarded claims publishes `queue_depth` `0` while it declines every further offer. A
+reader MUST NOT compute free capacity from `queue_depth`.
+
+`accepting` says the seat is alive and serving — it has at least one harness able to take work. It
+does NOT say the seat has a free execution slot: a seat holding one job of its three slots publishes
+`accepting=y`, and so does a seat holding all three. Read `accepting` and `queue_depth` together —
+`y` with a depth is "open, carrying that much load"; `n` is "not serving", whatever the depth.
+
+A seat at capacity signals fullness by not claiming, not by a tag. Capacity is enforced at claim
+time, on the seat, and no announcement field carries the slot count.
 
 `accepting` is the seat's own statement of intent. A reader MUST NOT treat it as a guarantee. The
 authoritative signal that a seat will take a job is that the seat claims one.
@@ -231,7 +319,7 @@ protocol:
 
 A reader MUST NOT read these as grades of proof. NONE of the three is an enforcement: one is an
 inconsistency signal and two are silence. The only part of an offer that binds what executes is the
-`agent` preset, which is why §6.1.1 requires a model request to name one.
+`agent` preset, which is why §6.1.2 requires a model request to name one.
 
 #### 4.5.4 Freshness
 
@@ -311,13 +399,32 @@ A trade moves through these steps:
    result's `repo` tag. The buyer matches the tip against the advertised commit. The buyer's own
    verified object hash becomes the payment bind.
    A seller assertion never becomes that bind.
-6. **Accept.** The buyer publishes `ACCEPT` to authorise payment for that result. The buyer MUST
-   record its local pay-bind before it publishes the `ACCEPT`.
+6. **Accept.** The buyer publishes `ACCEPT`: its public statement that it verified the delivery and
+   closed the job, which on a priced trade is also the authorisation to pay for that result. The
+   buyer MUST record its local pay-bind before it publishes the `ACCEPT`.
 7. **Pay.** The buyer satisfies the claim's payment request and sends the payload in a kind-`1059`
    gift-wrap. Budget checks, delivery verification, and the seller co-signature check all run before
    the spend.
 8. **Receipt.** The buyer publishes a co-signed `RECEIPT`. Publication is not validity. The proof is
    a successful signature check over the bound preimage.
+
+**A `payment=none` trade stops after step 6.** When the offer and the claim both state
+`payment=none` (§6.1.1), the lifecycle is `offer -> claim -> award -> result -> verify -> accept`
+and ends there. Steps 7 and 8 have nothing to satisfy and nothing to co-sign: §6.8 marks
+`["mint", mint_url]` required on a receipt, and a trade that settles at no mint cannot construct a
+conformant one. A buyer MUST NOT publish a `RECEIPT` for a free trade, and a seller MUST NOT wait for
+one.
+
+Step 6 DOES run for a free trade, and it authorises no payment. §6.5 defines an `ACCEPT` carrying no
+mint, no amount and no signature field, so a free one is conformant unchanged, and it is the only
+statement a free trade makes that the buyer verified the delivery and closed the job. It is
+load-bearing on the seller's side: a seller whose `AWARD` never reached it re-binds its claim on the
+`ACCEPT`, and a seat that recorded the offer without claiming it reads the `ACCEPT` as decided and
+does not claim. A buyer MUST publish it, and MUST record its local bind first, exactly as this step
+requires of a priced trade.
+
+Steps 1-5 are unchanged — in particular the buyer still verifies the delivery itself at step 5,
+because a free job's delivery is exactly as unverified-by-assertion as a paid one's.
 
 Two branches end a trade early:
 
@@ -346,6 +453,7 @@ reject a lifecycle event that lacks it.
 | `["param","harness_family", family]` | 0..1 | no | Requires one harness family; must agree with `agent` |
 | `["param","harness_model", model]` | 0..1 | no | Requires one model; needs `agent` |
 | `["param","capability", token, ...]` | 0..1 | no | Requires every listed capability token |
+| `["param","payment","none"]` | 0..1 | no | This job has NO payment leg. Absent means `sat` |
 | `["delivery","git"]` | 0..1 | no | Delivery binding mode |
 | `["repo", locator]` | 0..1 | no | Bound delivery remote |
 | `["branch", name]` | 0..1 | no | Bound delivery branch |
@@ -353,7 +461,38 @@ reject a lifecycle event that lacks it.
 The `delivery`, `repo`, and `branch` tags bind delivery as one group. If the offer uses any of them,
 it MUST carry all three. A reader MUST reject a partial group.
 
-#### 6.1.1 The capability request
+#### 6.1.1 The payment mode
+
+`["param","payment","none"]` states that the job settles with NO payment at all. It carries exactly
+one value, `none`, and an ABSENT tag means `sat` — a priced job.
+
+That default is normative and it is the fail-closed direction. Every offer on the wire carried no
+such tag before this existed, so a stripped, dropped, or pre-upgrade tag reads as PAID, which the
+money rules of §11 already refuse to run for free. The opposite default would let a tag-dropping
+relay or an older signer turn a paid job into a free one. It is also why this ships as a tag rather
+than a new major: §2.3 requires an additive fact to ship as a tag, and a v1 reader that never learns
+this one keeps parsing free events and refuses to act on them.
+
+A reader MUST NOT INFER the mode. Not from `amount == 0`, not from a seat's `rate`, and not from a
+claim carrying no `creq`. The mode is read from one tag on each side, and both sides must agree.
+
+The `amount` tag is unchanged and stays cardinality 1, required: a free offer still carries
+`["amount","0","sat"]`. `payment=none` is what makes that `0` mean "no payment leg exists" rather
+than "a payment of zero", which §11 rule 6 forbids. A free offer whose amount is not `0` is a
+contradiction and a reader MUST refuse it.
+
+**The both-ends rule.** A trade is free only when the buyer-signed OFFER carries
+`["param","payment","none"]` AND the seller-signed CLAIM carries `["payment","none"]` (§6.2). Every
+other combination is a MISMATCH and a reader MUST refuse it — including offer-`none`/claim-absent
+and offer-absent/claim-`none`. Either one admitted would let one side decide a trade's payment mode
+after the other had signed something else.
+
+A `payment=none` trade ends after `accept` (§5) and publishes NO `RECEIPT`. §6.8 marks
+`["mint", mint_url]` cardinality 1, required, and requires both co-signatures; a free trade settles
+at no mint, so a conformant receipt cannot be constructed. The `pay → receipt` tail does not run.
+The `ACCEPT` itself does: it authorises nothing and closes the job (§5).
+
+#### 6.1.2 The capability request
 
 The three `harness_family` / `harness_model` / `capability` params are the offer's CAPABILITY REQUEST.
 They name what a seat must advertise to be awarded this job, and they are matched against the
@@ -415,7 +554,8 @@ on an unfalsifiable claim.
 | `["status","processing"]` | 1 | yes | Claim state |
 | `["e", offer_id, "", "root"]` | 1 | yes | Root offer id |
 | `["p", buyer_pubkey]` | 1 | yes | Intended buyer |
-| `["creq", creqA...]` | 1 | yes | Seller-authored NUT-18 payment request |
+| `["creq", creqA...]` | 0..1 | yes* | Seller-authored NUT-18 payment request. Required unless the claim states `payment=none` |
+| `["payment","none"]` | 0..1 | no | This claim takes NO payment. Absent means `sat` |
 | `["t","maxplayer"]` | 1 | yes | Namespace |
 | `["v","1"]` | 1 | yes | Protocol major |
 | `["p", seller_pubkey]` | 0..1 | no | Seller mirror |
@@ -429,6 +569,15 @@ are absent from a claim by rule, not by omission. Section 4.5 defines the split 
 it. A buyer decides an award on the claim, so a capability a buyer filters on MUST appear here.
 
 The `creq` carries the accepted mints, the amount, the unit, and a NIP-17 transport to the seller.
+
+A claim states EXACTLY ONE of `creq` and `payment=none`, never both and never neither. A claim
+carrying `payment=none` MUST NOT carry a `creq`: a zero-amount payment request reads as an invoice
+to every reader that does not know the payment tag, which is the exact ambiguity the tag exists to
+remove. A claim carrying both, or neither, MUST be refused.
+
+`payment` is absent on a priced claim, and its absence means `sat` — the same fail-closed default
+§6.1.1 states for the offer. A buyer MUST refuse a claim whose payment mode disagrees with the mode
+its own signed offer stated (the both-ends rule, §6.1.1).
 
 ### 6.3 Award, kind `3405`
 
@@ -490,8 +639,10 @@ reader MUST NOT treat it as proof that a given harness or model ran.
 | `root` | the offer |
 | none | the claim |
 
-`AWARD` selects a claim. `ACCEPT` authorises payment. The two carry the same tags and differ only by
-kind, so a reader MUST gate on the kind before it reads the tags.
+`AWARD` selects a claim. `ACCEPT` closes the job; on a priced trade that closure is also the payment
+authorisation, and on a `payment=none` trade (§6.1.1) it authorises nothing and no payment follows.
+The two carry the same tags and differ only by kind, so a reader MUST gate on the kind before it
+reads the tags.
 
 An `ACCEPT` names no result. The join a third party can make is job-level: the `ACCEPT` and every
 `RESULT` for that job root on the same offer id, so a reader can name the job a payment authorisation
@@ -736,6 +887,12 @@ events, provisioning failures, posture mismatches, and I/O failures all retry in
    MUST check the seller's pre-pay signature before spending.
 5. **Capped.** Every payment passes the buyer's per-job and total budget limits.
 6. **Fee floor.** An amount at or below the mint fee is dust, and a buyer MUST refuse it.
+7. **No payment leg, no payment path.** A `payment=none` trade (§6.1.1) has no amount to check
+   against any of the rules above, and a buyer MUST NOT enter the payment path for one. Rule 6 is
+   NOT relaxed to admit `amount = 0`: a free trade is not a payment of zero, and weakening the dust
+   floor would weaken it for every priced job in the market. Rules 1, 3 and 4 apply to a free trade
+   unchanged — work still follows the award, the buyer still verifies its own delivery, and a result
+   whose author is not the claim's seller is still refused.
 
 ## 12. Reserved Paths
 

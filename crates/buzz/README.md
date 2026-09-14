@@ -34,8 +34,8 @@ Both families below are defined as consts in
 | `KIND_MOBEE_JOB_RESULT`   | 6109 | NIP-90 job-result range |
 | `KIND_MOBEE_JOB_FEEDBACK` | 7000 | NIP-90 feedback |
 
-**B. The mobee-core kind superset** (added per keeper:mobee ruling — smallest
-divergence, mirroring `crates/mobee-core/src/kinds.rs`):
+**B. The maxplayer-core kind superset** (added per keeper:mobee ruling — smallest
+divergence, mirroring `crates/maxplayer-core/src/kinds.rs`):
 
 | const | kind | note |
 |-------|------|------|
@@ -54,11 +54,12 @@ git-repo announcement mobee also emits are **already** scoped by the relay
 (`KIND_PROFILE` -> `UsersWrite`, `KIND_GIT_REPO_ANNOUNCEMENT` -> `ReposWrite`).
 
 > **Two flags for reviewers:**
-> 1. **Numbering mismatch (DVM vs mobee-core).** The fork uses NIP-90 DVM numbers
->    (5109/6109/7000); mobee-core uses the contiguous 3400-3406 block. Both are now
->    accepted. The brief's "3401-3405 + 31990" was close but off: mobee-core's block
->    runs to **3406** (ACCEPT #329 — omitting it would reject live pay-bind events),
->    and 31990 lives in `mobee-relay-write-policy`'s `DISCOVERY_KINDS`, not `kinds.rs`.
+> 1. **Numbering mismatch (DVM vs maxplayer-core).** The fork uses NIP-90 DVM numbers
+>    (5109/6109/7000); maxplayer-core owns the contiguous 3400-3407 block, of which this
+>    relay accepts 3400-3406. Both are now accepted. The brief's "3401-3405 + 31990" was
+>    close but off: the accepted trade block runs to **3406** (ACCEPT #329 — omitting it
+>    would reject live pay-bind events; 3407 REJECT is not accepted here), and 31990 lives
+>    in `mobee-relay-write-policy`'s `DISCOVERY_KINDS`, not `kinds.rs`.
 > 2. **Provenance.** Tonight's live trade posted its offer as kind **3401**, and
 >    weeks of testnut ran 3400-3406 — yet BOTH gudnuf branches define only the DVM
 >    numbers (no 3401). So the **deployed relay matches neither vendored branch**;
@@ -87,7 +88,7 @@ Also vendored (verbatim, DB artifacts the relay's schema layer needs):
 fresh-database schema; drift-checked against `migrations/0001_initial_schema.sql`).
 
 ### Dependency alignment
-- **nostr-sdk: no collision.** maxplayerai `mobee-core` pins `nostr-sdk 0.44.1`;
+- **nostr-sdk: no collision.** maxplayerai `maxplayer-core` declares `nostr-sdk 0.44.1`;
   this vendored relay resolves `nostr 0.44.x` / `nostr-sdk 0.44.1`. Both on 0.44.
 - sqlx 0.9, tokio 1, axum 0.8 resolve from the vendored `Cargo.lock`.
 
@@ -110,6 +111,28 @@ Added natively in `ingest.rs`: kind 1059 (NIP-17 gift wrap) must carry >=1 `p`
 tag and content <= 128 KB. The remainder of #397's write-policy is folded as
 native code by market-orch — this vendor does **not** add a namespace/`t`-tag
 predicate; the kind allowlist is the scoping.
+
+### Branch-scoped push tokens and their lifetime
+Two changes serve the maxplayer seller delivery push (see `NOTICE` item 4):
+
+1. **Scope (PR #929).** A NIP-98 push token may carry one `["ref", "<refname>"]` tag.
+   The pre-receive policy endpoint denies the push (403) unless every ref update
+   matches that name exactly — no glob, no prefix. A token with no `ref` tag behaves
+   as before.
+2. **Lifetime.** A SCOPED token that also carries a NIP-40 `["expiration", <unix>]`
+   tag is accepted while `now <= expiration`, up to a cap. UNSCOPED tokens keep the
+   ±60 s NIP-98 window, always. The cap is
+   `BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS` (default 21600 s = 6 h; the NixOS option is
+   `services.maxplayer.relay.scopedTokenMaxLifetimeSecs`), and the relay advertises the
+   effective value in its NIP-11 `limitation` object as
+   `scoped_token_max_lifetime_secs`.
+
+The seller mints one token on the host before a sandboxed job starts and pushes with
+it minutes later, so the ±60 s window cannot serve that push. The scope is what makes
+the longer life safe: a leaked scoped token can only write one branch of one repo.
+Ship the two together — a long-lived UNSCOPED token would be a push-anywhere
+credential. Work order:
+`docs/superpowers/briefs/2026-08-31-relay-scoped-token-lifetime.md`.
 
 ## Building
 

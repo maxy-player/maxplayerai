@@ -46,9 +46,11 @@ use crate::relay_auth::{self, AuthWait};
 use crate::seller::rate_gate_allows;
 use crate::seller_agents::AgentRegistry;
 use crate::seller_exec::{
-    compose_agent_prompt, delivery_message, job_workdir, run_agent_job, run_agent_with_retry,
-    seller_delivery_kind, seller_exec_metadata, unified_job_timeout, AgentRunTimeout, ExecError,
-    SandboxPolicy,
+    cleanup_job_container, compose_agent_prompt, delivery_message, job_container_name, job_id_of,
+    job_identity, job_workdir, prepare_launch, run_agent_job, run_agent_with_retry,
+    seller_delivery_kind,
+    seller_exec_metadata, unified_job_timeout, AgentRunTimeout, CleanupPolicy, ExecError,
+    JobContainer, JobLaunch, SandboxPolicy, CONTAINER_WORKDIR,
 };
 use crate::seller_roster::{ExecutionFailure, Fault, LiveRoster, MissingCapability, Unavailable};
 use crate::seller_git::{self, DeliveryAgentIdentity};
@@ -74,6 +76,22 @@ const RESULT_PUBLISH_WINDOW_SECS: i64 = 86_400;
 /// error detail — the operator log carries the specifics) but enough that the buyer learns the job
 /// failed instead of waiting on a delivery that will never come.
 const EXEC_FAILURE_FEEDBACK: &str = "seller could not complete the job (execution failed before delivery)";
+/// Buyer-facing reason when the requested harness is not available on this seat, so the job was
+/// never dispatched — a display-only mirror of the `capability_missing` reason_code (§10; the tag
+/// governs). Worded as NEVER STARTED, not as failed: the buyer's useful next move is another seat,
+/// where a retry here would only reproduce the same refusal.
+const CAPABILITY_MISSING_FEEDBACK: &str =
+    "seller could not start the job: the requested harness is not available on this seat";
+/// The reason code the dispatch-refusal arm of `execute_job` emits — a job that reached execution
+/// with no serving harness for the harness its buyer asked for (#821).
+///
+/// ⛔ **Named as a `pub(crate)` const rather than written inline so the BUYER side can assert on the
+/// very value this emitter uses.** That arm is POST-AWARD, so whatever code it emits must be a member
+/// of `buyer::is_releasable_failure_feedback`: a code outside that set leaves the buyer's reservation
+/// held until the deadline reconcile instead of freeing it on the feedback. Nothing related the emit
+/// site to that predicate before, so the label could move out of the releasable set with every test
+/// green — see `the_undispatchable_arms_reason_code_is_releasable`.
+pub(crate) const UNDISPATCHABLE_REASON_CODE: ReasonCode = ReasonCode::CapabilityMissing;
 /// Buyer-facing reason when execution succeeded but the delivery (snapshot/push/publish) failed —
 /// a display-only mirror of the `delivery_failed` reason_code (§10; the tag governs).
 const DELIVERY_FAILURE_FEEDBACK: &str =
@@ -353,14 +371,44 @@ enum SkipReason {
     /// re-surfacing; admitting it only parks an execution slot on work that will not be awarded.
     /// Distinct from [`Self::Lapsed`]: that is the offer's self-declared expiry, this is its age.
     TooOld,
-    /// The seller runs a populated `accept_offers_only_from` allowlist and this offer's author (the
-    /// buyer) is not on it — a hard fence (#482). Named (not silent) so the operator log records the
-    /// declined pubkey; no buyer feedback is emitted (a private seller does not advertise the fence).
+    /// The seller runs a populated `accept_offers_only_from` allowlist, this offer's author (the
+    /// buyer) is not on it, the offer TARGETS this seat, and `accept_open_targeted` is false — so no
+    /// control admits it. Named (not silent) so the operator log records the declined pubkey; no
+    /// buyer feedback is emitted (a private seller does not advertise why it declined a stranger).
+    ///
+    /// ⛔ NOT A FENCE OVER BOTH SURFACES SINCE #923. It used to be emitted for ANY unlisted buyer the
+    /// moment a list existed, targeted or not, ahead of `accept_open_targeted` and the rate gate. It
+    /// is now scoped to the targeted surface with the open route CLOSED: an untargeted offer is
+    /// answered by [`Self::RateGate`] and `claim_open_pool`, and an offer addressed to another seat
+    /// by the rate gate's target mismatch.
     NotAllowlisted,
+    /// A buyer this seat has not named targeted it directly, and the seat has not opted in to the
+    /// targeted-open surface (`accept_open_targeted = false`, the default).
+    ///
+    /// DELIBERATELY NOT FOLDED INTO [`Self::NotAllowlisted`], for the reason
+    /// [`Self::TakenElsewhere`] is not folded into [`Self::Settled`]: the two answer different
+    /// operator questions. `NotAllowlisted` means "this buyer is not on the list you wrote" and the
+    /// fix is to edit the list. This means "you named no buyers and you are not open to strangers"
+    /// — the operator has NO list to edit, so the same string would send them looking for one that
+    /// does not exist. It is also the line that makes the silent migration audible: a seat upgraded
+    /// past the three-knob change stops accepting targeted work with no config error, and this
+    /// reason is what tells its operator which knob restores it. Like the fence, it emits no buyer
+    /// feedback — a seat that is not open does not advertise why.
+    OpenTargetedRefused,
     /// Rate-gate refused: untargeted without open-pool opt-in, or below the seller's rate floor.
     RateGate,
     /// The offer asked for a harness this node does not run.
     AgentUnavailable,
+    /// §2.1: the offer states `payment=none` and this seat has not opted in to free work
+    /// (`[seller] takes_no_payment = false`, the default).
+    ///
+    /// DELIBERATELY NOT FOLDED INTO [`Self::RateGate`], for the reason [`Self::OpenTargetedRefused`]
+    /// is not folded into [`Self::NotAllowlisted`]: they answer different operator questions and
+    /// point at different knobs. `RateGate` means "this offer did not clear your price"; this means
+    /// "this offer names no price at all and you have not said you work for free". A seat at
+    /// `rate_sats = 0` clears the price floor for an `amount = 0` offer, so folding them would also
+    /// let the operator read a free refusal as a pricing one and go adjust a rate that is already 0.
+    FreeNotOffered,
     /// Every execution slot is busy — the node is fully loaded and does not claim (reserve-at-claim
     /// back-pressure; a loaded node is invisible to the market by simply not claiming). Emitted by
     /// [`SellerNodeRunner::on_offer`], never by the pure [`classify_offer`], because it depends on
@@ -391,8 +439,17 @@ impl SkipReason {
             Self::Lapsed => "offer deadline already passed (lapsed; never resurrected)",
             Self::TooOld => "offer authored too long ago (aged historical; not re-admitted from backfill)",
             Self::NotAllowlisted => "buyer not in accept_offers_only_from allowlist",
+            Self::OpenTargetedRefused => {
+                "targeted by a buyer this seat has not named, and accept_open_targeted=false \
+                 (set accept_open_targeted=true to accept strangers, or list the buyer in \
+                 accept_offers_only_from)"
+            }
             Self::RateGate => "rate-gate refused (untargeted without opt-in / below rate)",
             Self::AgentUnavailable => "requested agent harness not available on this node",
+            Self::FreeNotOffered => {
+                "free offer (payment=none) and this seat does not work for free (set [seller] \
+                 takes_no_payment=true, which also requires rate_sats=0, to opt in)"
+            }
             Self::SlotsBusy => "all execution slots busy (node fully loaded; not claiming)",
             Self::Settled => "offer already settled (co-signed receipt seen; terminal, never claimed)",
             Self::TakenElsewhere => {
@@ -759,6 +816,11 @@ fn already_handled_skip_line(job_id: &str, state: Option<super::store::JobState>
 /// cannot break the buyer/seller cosignature (audit N-4 / invariant 8). The specific realized mint is
 /// deliberately NOT in the preimage (the seller signs at delivery, before the buyer picks a mint); the
 /// accepted-mint SET is bound via this creq hash, so buyer/seller cosigs agree for ANY accepted mint.
+///
+/// `stored_creq = None` ⇒ a FREE job (§2.2): there are no payment terms to bind, so `creq_hash` is
+/// `None` — the SAME value the buyer's accept-bind records for a claim carrying no creq. Hashing a
+/// sentinel here instead would make the two sides sign different preimages for a trade that, by
+/// §3.4, never publishes a receipt at all — a silent disagreement nothing would ever surface.
 #[allow(clippy::too_many_arguments)]
 fn delivery_receipt_preimage(
     job_id: &str,
@@ -768,7 +830,7 @@ fn delivery_receipt_preimage(
     seller_pubkey: &str,
     commit_oid: &str,
     delivery_kind: &str,
-    stored_creq: &str,
+    stored_creq: Option<&str>,
 ) -> ReceiptPreimage {
     ReceiptPreimage {
         job_hash: job_hash_for_offer(job_id, task, amount),
@@ -780,7 +842,20 @@ fn delivery_receipt_preimage(
         delivery_integrity_hash: commit_oid.to_owned(),
         delivery_kind: delivery_kind.to_owned(),
         exec_metadata_commitment: EXEC_METADATA_COMMITMENT_EMPTY.to_owned(),
-        creq_hash: Some(gateway::creq_hash_hex(stored_creq)),
+        creq_hash: stored_creq.map(gateway::creq_hash_hex),
+    }
+}
+
+/// The claim-time creq's PAYMENT TERMS, separating a free claim from a priced one.
+///
+/// `SellerStore::job_creq` answers three states in one `Option` (see its doc): `None` = no claim,
+/// `Some("")` = a FREE claim, `Some(creq)` = a priced one. Every caller that wants TERMS rather than
+/// "did we claim" goes through here, so the empty-string sentinel is read in exactly one place.
+fn creq_terms(stored_creq: &str) -> Option<&str> {
+    if stored_creq.is_empty() {
+        None
+    } else {
+        Some(stored_creq)
     }
 }
 
@@ -1323,9 +1398,10 @@ fn offer_parse_refusal(error: &OfferParseError) -> String {
 
 /// The seller-receive classification on the node redeem path (finding S, ported from the daemon).
 #[derive(Debug)]
-enum RedeemDecision {
-    /// Receive succeeded — finalize a receipt for this redeemed amount.
-    Finalize(u64),
+enum RedeemDecision<T = u64> {
+    /// Receive succeeded — finalize a receipt for this redeemed payment (the amount, or the amount
+    /// with the mint fee beside it — whatever the adapter established).
+    Finalize(T),
     /// Idempotent re-see: already spent AND a COMPLETED receipt exists — we already collected and
     /// receipted it. No-op; never double-collect / re-receipt.
     IdempotentNoOp,
@@ -1351,12 +1427,12 @@ fn is_already_spent(error: &str) -> bool {
 /// indistinguishable, so fail closed); has_receipt read error ⇒ refuse. Any non-already-spent error
 /// also refuses. `has_receipt` is a closure so the store is read only on the already-spent branch and
 /// the decision is unit-testable without a mint.
-fn classify_redeem_outcome(
-    receive_result: Result<u64, String>,
+fn classify_redeem_outcome<T>(
+    receive_result: Result<T, String>,
     has_receipt: impl FnOnce() -> Result<bool, String>,
-) -> RedeemDecision {
+) -> RedeemDecision<T> {
     match receive_result {
-        Ok(amount) => RedeemDecision::Finalize(amount),
+        Ok(received) => RedeemDecision::Finalize(received),
         Err(error) if !is_already_spent(&error) => RedeemDecision::Refuse(error),
         Err(error) => match has_receipt() {
             Ok(true) => RedeemDecision::IdempotentNoOp,
@@ -1366,6 +1442,35 @@ fn classify_redeem_outcome(
             }
         },
     }
+}
+
+/// The platform fee (stage 1) owed on one collected payment: the product-set rate
+/// ([`crate::platform_fee::PLATFORM_FEE_BPS`]) applied to `amount_received`, which on this path is
+/// the offer's FACE — what the buyer paid (the adapter returns the face once net credit + mint fee
+/// reconcile to it). The mint's swap fee is NOT subtracted first: 10% of a 100-sat offer is 10 sats
+/// whether the mint kept 0 or 1 of them. This is the ONE place the constant is read; the arithmetic
+/// stays in the parameterised [`crate::platform_fee::fee_sats`]. Returns the rate in force and the
+/// sats it comes to, rounded down, so the caller journals both beside the receipt.
+///
+/// Called only after the redeem classified `Finalize`; nothing is computed or recorded for a payment
+/// that did not land. This returns numbers for the journal and moves no sat itself; what pays the
+/// accrued balance is the best-effort remittance the collect path starts AFTER the receipt is
+/// journaled `New` ([`SellerNodeRunner::remit_platform_fee_after_collect`]).
+fn platform_fee_at_collect(amount_received: u64) -> (u32, u64) {
+    let fee_bps = crate::platform_fee::PLATFORM_FEE_BPS;
+    (
+        fee_bps,
+        crate::platform_fee::fee_sats(amount_received, fee_bps),
+    )
+}
+
+/// The rule for when a collect starts a remittance attempt (stage 2a, addendum 1 rule 1): only a
+/// receipt journaled **New**. A replayed wrap (`Duplicate`) already paid the job once and must not
+/// pay the fee a second time; a failed write journaled nothing, so there is nothing new to remit.
+fn remit_follows_collect(
+    collected: &Result<super::store::Collected, super::store::StoreError>,
+) -> bool {
+    matches!(collected, Ok(super::store::Collected::New))
 }
 
 /// The seal-sender guard: a payment settles a job ONLY when the authenticated NIP-17 seal sender is
@@ -1604,7 +1709,10 @@ mod resume_action_tests {
 /// by design: a legit push finishes in seconds, so this never false-strands a slow-but-live push
 /// (which would be the very strand bug #562 is about). The `whole-op > per-leg` ordering that keeps
 /// this safe is no longer prose-only: the `const _` assert below binds the two clocks at COMPILE time.
-const DELIVERY_PUSH_TIMEOUT: Duration = Duration::from_secs(150);
+///
+/// `pub` alongside [`serialized_bounded_push`]: an out-of-process test drives the real wrapper with
+/// the real bound rather than a stand-in for it.
+pub const DELIVERY_PUSH_TIMEOUT: Duration = Duration::from_secs(150);
 
 /// #563: make the two-clock ordering a COMPILE-TIME invariant instead of the cross-file prose above.
 /// git2 has no whole-operation timeout, so `DELIVERY_PUSH_TIMEOUT` is the ONLY whole-op bound on the
@@ -1628,7 +1736,7 @@ const _: () = assert!(
 /// the operator log — the LEG-1 detail) from the bounded-timeout firing, so both route to the SINGLE
 /// `delivery_failed` handling while logging distinctly (never a new state).
 #[derive(Debug)]
-enum DeliveryPushErr {
+pub enum DeliveryPushErr {
     /// The push itself failed; the inner error carries the transport reason (409 / auth / io).
     Push(seller_git::SellerGitError),
     /// The push did not settle within [`DELIVERY_PUSH_TIMEOUT`] (seconds); the lock was released.
@@ -1641,29 +1749,135 @@ enum DeliveryPushErr {
 /// (lock, timeout, push) so the serialization + timeout are unit-testable WITHOUT a relay. The lock is
 /// held ONLY across the push and released the instant it settles or times out. The push oid is stable
 /// (invariant 2), so ORDERING pushes never duplicates a delivery — this is exactly-once.
-async fn serialized_bounded_push<Fut>(
-    lock: &tokio::sync::Mutex<()>,
+///
+/// `pub` so a test can drive THIS wrapper — not a re-creation of it — against a real git remote from
+/// its own process. The delivery-push auth question ("when is the waiting delivery's token signed?")
+/// is only answerable through the real lock, and the fixture that answers it needs a process whose
+/// TLS trust it can stage before anything else builds the shared HTTP client
+/// (`tests/delivery_push_contention.rs`).
+///
+/// # The turn ends when the WORK is quiescent, not when this call returns
+///
+/// Returning `TimedOut` says this delivery stopped waiting. It does not say the push stopped: the
+/// push runs on a blocking thread inside libgit2, and neither timing out nor dropping this future
+/// can interrupt a socket that thread is sitting on. If the lock were released at the moment this
+/// call returns, the next delivery would open `git-receive-pack` to the same repo while the previous
+/// upload was still on the wire — the exact concurrency the lock exists to prevent, reintroduced by
+/// the mechanism meant to stop one delivery starving the rest.
+///
+/// So the turn is owned by the WORK. The push is spawned holding an owned guard, and that guard is
+/// released on the push's own completion, on whichever thread reaches it. This call stops waiting at
+/// `timeout`; the lock stays taken until the upload is actually finished.
+///
+/// That is bounded, not open-ended, and it is bounded by the clock that already bounds it: the
+/// transport client caps a single request at `git_transport::DEFAULT_HTTP_LEG_TIMEOUT` INCLUDING the
+/// body transfer, and the caller revokes push authority as soon as this returns, so no leg after the
+/// in-flight one is ever transmitted. The longest the lock can be held past this call is therefore
+/// one leg.
+///
+/// A dropped caller is the same story with no return value: the spawned push keeps its own turn,
+/// finishes or is refused, and releases the lock itself.
+pub async fn serialized_bounded_push<Fut>(
+    lock: &std::sync::Arc<tokio::sync::Mutex<()>>,
     timeout: Duration,
     push: impl FnOnce() -> Fut,
 ) -> Result<String, DeliveryPushErr>
 where
-    Fut: std::future::Future<Output = Result<String, seller_git::SellerGitError>>,
+    Fut: std::future::Future<Output = Result<String, seller_git::SellerGitError>> + Send + 'static,
 {
-    let _guard = lock.lock().await;
-    match tokio::time::timeout(timeout, push()).await {
-        Ok(Ok(oid)) => Ok(oid),
-        Ok(Err(error)) => Err(DeliveryPushErr::Push(error)),
+    let guard = lock.clone().lock_owned().await;
+    let work = push();
+    // Spawned, not awaited in place: a future dropped mid-push would drop the guard while the
+    // blocking thread it started is still uploading. Here the guard travels WITH the work.
+    let running = tokio::spawn(async move {
+        let outcome = work.await;
+        drop(guard);
+        outcome
+    });
+    match tokio::time::timeout(timeout, running).await {
+        Ok(Ok(Ok(oid))) => Ok(oid),
+        Ok(Ok(Err(error))) => Err(DeliveryPushErr::Push(error)),
+        // The push task itself died (panic inside libgit2, or the runtime shutting down). Same
+        // handling as any other push failure; never a new state.
+        Ok(Err(join)) => Err(DeliveryPushErr::Push(seller_git::SellerGitError::Io(format!(
+            "delivery push task did not complete: {join}"
+        )))),
         Err(_elapsed) => Err(DeliveryPushErr::TimedOut(timeout.as_secs())),
     }
-    // `_guard` drops here — the lock is released the instant the push settles OR times out, never held
-    // into the sign/enqueue tail.
 }
 
+/// This delivery's permission to put a request on the wire, and the fact that permission ENDS.
+///
+/// Two separate things are true of a delivery push, and only the first one used to be modelled: the
+/// token has to be minted late (after the lock, per request), and the job has to still be entitled
+/// to send when the mint returns. Minting the delivery token calls the signer actor and can block
+/// there; a bounded block that returns a token is a bound on the wait, not a licence to transmit.
+///
+/// Revocation is by `Drop`, which is the only form that holds for the case that matters. An explicit
+/// `store(false)` at the end of the delivery arm runs on the paths that reach it — and the paths
+/// that DON'T reach it are exactly the dangerous ones: the delivery future cancelled at an await,
+/// the arm returning early on an error, the task aborted at shutdown. A guard cannot be skipped:
+/// unwind, early return and cancellation all drop it.
+///
+/// [`Self::check`] is what the transport asks immediately before each request leaves
+/// ([`crate::git_transport::AuthorityCheck`]), after the mint, with nothing in between.
+#[derive(Debug)]
+pub struct PushAuthority {
+    live: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl PushAuthority {
+    /// A live authority. It stays live until this value is dropped — no other call ends it.
+    pub fn new() -> Self {
+        Self {
+            live: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }
+    }
+
+    /// The question the transport asks before transmitting: is this delivery still allowed to send?
+    ///
+    /// The returned closure holds only a weak-by-value flag, never the delivery's state, so the push
+    /// thread can outlive the delivery arm and still get a truthful answer.
+    pub fn check(&self) -> crate::git_transport::AuthorityCheck {
+        let live = self.live.clone();
+        std::sync::Arc::new(move || {
+            if live.load(std::sync::atomic::Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err("this delivery's push authority has ended".to_owned())
+            }
+        })
+    }
+
+    /// True while this authority is live. For assertions and for the minter's own early refusal.
+    pub fn is_live(&self) -> bool {
+        self.live.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Default for PushAuthority {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for PushAuthority {
+    fn drop(&mut self) {
+        self.live
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+// The same wrapper under CONTENTION — real signer actor, real HTTPS remote, and the question of
+// WHEN the waiting delivery's token is signed — lives in `tests/delivery_push_contention.rs`. It
+// needs its own process: the transport's HTTP client is built once per process, so a test whose
+// remote has a self-signed certificate must stage its TLS trust before any other test touches that
+// client. What stays here is the pure (lock, timeout, push) unit.
 #[cfg(test)]
 mod serialized_bounded_push_tests {
-    use super::{serialized_bounded_push, DeliveryPushErr};
+    use super::{serialized_bounded_push, DeliveryPushErr, PushAuthority};
     use crate::seller_git::SellerGitError;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1701,21 +1915,27 @@ mod serialized_bounded_push_tests {
         );
     }
 
-    // #562 constraint (lead 37896): a hung push must NOT starve later deliveries — it times out,
-    // returns TimedOut (→ delivery_failed at the caller), and RELEASES the lock so the next delivery
-    // proceeds promptly rather than blocking behind the hung one.
+    // #562 constraint (lead 37896): a hung push must NOT starve later deliveries — it times out and
+    // returns TimedOut (→ delivery_failed at the caller), and the next delivery proceeds as soon as
+    // the hung push is actually finished rather than waiting out ITS full budget behind it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_hung_push_times_out_and_frees_the_lock() {
-        let lock = tokio::sync::Mutex::new(());
+    async fn a_hung_push_times_out_and_the_next_delivery_is_not_starved() {
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let started = std::time::Instant::now();
         let hung = serialized_bounded_push(&lock, Duration::from_millis(50), || async move {
-            tokio::time::sleep(Duration::from_secs(30)).await;
-            Ok::<_, SellerGitError>("never".to_string())
+            // Finishes well after the caller's bound, and well before the 30s a starved next
+            // delivery would have to wait if the turn were never handed on.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            Ok::<_, SellerGitError>("late".to_string())
         })
         .await;
         assert!(matches!(hung, Err(DeliveryPushErr::TimedOut(_))), "a hung push must time out");
-        // The lock is free again: the next push acquires it and completes promptly (not starved).
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "the caller must stop waiting at its own bound, not at the push's completion"
+        );
         let next = tokio::time::timeout(
-            Duration::from_secs(2),
+            Duration::from_secs(5),
             serialized_bounded_push(&lock, Duration::from_secs(5), || async move {
                 Ok::<_, SellerGitError>("next-oid".to_string())
             }),
@@ -1723,6 +1943,104 @@ mod serialized_bounded_push_tests {
         .await
         .expect("the next delivery must not be starved behind the timed-out push");
         assert!(matches!(next, Ok(oid) if oid == "next-oid"));
+    }
+
+    // F3, the half a timeout does NOT cover: `TimedOut` says this delivery stopped waiting, not that
+    // its upload stopped. While the abandoned push is still on the wire the turn must still be its
+    // own — otherwise the next delivery opens a second concurrent `git-receive-pack` to the same
+    // repo, which is exactly what the lock exists to prevent.
+    //
+    // Red-on-revert: await the push in place instead of spawning it with an owned guard (the r2
+    // shape) and the guard drops at `timeout`, the second push starts while the first is still
+    // running, and `overlapped` is true.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_timed_out_push_keeps_the_turn_until_its_upload_is_finished() {
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let first_running = Arc::new(AtomicBool::new(false));
+        let overlapped = Arc::new(AtomicBool::new(false));
+
+        let abandoned = {
+            let first_running = first_running.clone();
+            serialized_bounded_push(&lock, Duration::from_millis(50), move || async move {
+                first_running.store(true, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                first_running.store(false, Ordering::SeqCst);
+                Ok::<_, SellerGitError>("first".to_string())
+            })
+            .await
+        };
+        assert!(
+            matches!(abandoned, Err(DeliveryPushErr::TimedOut(_))),
+            "the first delivery must stop waiting at its bound"
+        );
+        assert!(
+            first_running.load(Ordering::SeqCst),
+            "the abandoned push must still be running — otherwise this test proves nothing"
+        );
+
+        let second = {
+            let first_running = first_running.clone();
+            let overlapped = overlapped.clone();
+            serialized_bounded_push(&lock, Duration::from_secs(5), move || async move {
+                if first_running.load(Ordering::SeqCst) {
+                    overlapped.store(true, Ordering::SeqCst);
+                }
+                Ok::<_, SellerGitError>("second".to_string())
+            })
+            .await
+        };
+        assert!(matches!(second, Ok(oid) if oid == "second"));
+        assert!(
+            !overlapped.load(Ordering::SeqCst),
+            "a second delivery must never upload while the abandoned one is still on the wire"
+        );
+    }
+
+    // F3: authority ends by DROP, so it ends on the paths that never run another statement — here,
+    // a delivery future cancelled at an await. Red-on-revert: end authority with an explicit
+    // `store(false)` after the push (the r2 shape) and this check still answers Ok after the
+    // cancellation, which is a blocking push thread still entitled to transmit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_a_delivery_ends_its_push_authority() {
+        let escaped = Arc::new(std::sync::Mutex::new(None));
+        let handle = {
+            let escaped = escaped.clone();
+            tokio::spawn(async move {
+                let authority = PushAuthority::new();
+                // What the transport holds: it outlives the delivery arm by construction, because
+                // the blocking push thread does.
+                *escaped.lock().expect("not poisoned") = Some(authority.check());
+                assert!(authority.is_live(), "authority is live while the delivery runs");
+                // The cancellation point. This never returns.
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                drop(authority);
+            })
+        };
+        // Let the task reach the await, then cancel it exactly as a dropped delivery would be.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        handle.abort();
+        let _ = handle.await;
+
+        let check = escaped.lock().expect("not poisoned").clone().expect("published");
+        let refused = check().expect_err("a cancelled delivery must not still authorize a request");
+        assert!(
+            refused.contains("authority has ended"),
+            "the refusal must name the ended authority, got {refused:?}"
+        );
+    }
+
+    // F3: the answer must be re-asked AFTER the mint. A signer that blocks is the whole hazard — the
+    // wait can outlast the delivery that started it, and a token in hand is not permission to send.
+    #[tokio::test]
+    async fn authority_answers_the_state_at_the_moment_it_is_asked() {
+        let authority = PushAuthority::new();
+        let check = authority.check();
+        assert!(check().is_ok(), "live before");
+        drop(authority);
+        assert!(
+            check().is_err(),
+            "a check taken while authority was live must refuse once it has ended"
+        );
     }
 }
 
@@ -1748,6 +2066,10 @@ fn offer_row(job_id: &str, buyer_pubkey: &str, offer: &ParsedOffer) -> super::st
         // offer without it), so it is always `Some` here. It becomes `None` only for a row written
         // before the column existed.
         output: Some(offer.output.clone()),
+        // §1.1, journaled for the same reason as the two fields above: the delivery record this
+        // job eventually writes must state the mode the OFFER was posted under, and execution can
+        // be a restart away from here.
+        payment_mode: offer.payment_mode,
     }
 }
 
@@ -1763,14 +2085,56 @@ fn offer_row(job_id: &str, buyer_pubkey: &str, offer: &ParsedOffer) -> super::st
 /// wallet-gated unit tests do not run under `cargo test -p maxplayer-core` (the `wallet` feature is
 /// off by default there), so a tooth that lives only here is invisible to the repo's declared check
 /// set. See `crates/maxplayer/tests/seller_declared_output.rs`.
-pub fn job_prompt(offer: &super::store::Offer, git_remote: &str, deadline_unix: u64) -> String {
+pub fn job_prompt(
+    offer: &super::store::Offer,
+    git_remote: &str,
+    deadline_unix: u64,
+    memory_section: Option<&str>,
+) -> String {
     compose_agent_prompt(
         &offer.task,
         git_remote,
         deadline_unix,
         offer.output.as_deref(),
-        None,
+        memory_section,
     )
+}
+
+/// The rendered read-on-start memory section for a seller at `home_root`, or `None` when there is
+/// nothing to inject (#828).
+///
+/// This is the impure half of the prompt seam, kept OUT of [`job_prompt`] on purpose. `job_prompt`
+/// stays pure over the stored row — the property its doc above exists to protect — and the one read
+/// that touches the filesystem lives here, where a test can drive it with a real directory.
+///
+/// **It only ever READS.** It must never call `seller_memory::ensure_memory_dir`: that seeds a
+/// NON-EMPTY index (it links `operator-notes.md`), and `memory_enabled` defaults to TRUE, so seeding
+/// from this path would flip every existing seller from inert to injecting on its next job without
+/// any operator writing a word. Creating memory stays an operator act.
+///
+/// **It degrades and never propagates.** `read_on_start_section` REFUSES an index over
+/// [`MAX_MEMORY_INDEX_BYTES`](crate::seller_memory::MAX_MEMORY_INDEX_BYTES) with `InvalidData`, and
+/// an unreadable file is an error too. Neither may fail a job: this is diagnostic/economic context
+/// that never feeds the pay gate, the journal or the receipt bind, so a job that would otherwise
+/// have been delivered and PAID must not die over it. An error is logged and read as "no memory".
+pub fn job_memory_section(
+    home_root: &std::path::Path,
+    config: &crate::home::SellerMemoryConfig,
+) -> Option<String> {
+    if !config.memory_enabled {
+        return None;
+    }
+    let dir = crate::seller_memory::memory_dir(home_root);
+    match crate::seller_memory::read_on_start_section(
+        &dir,
+        config.read_on_start_template_path.as_deref(),
+    ) {
+        Ok(section) => section,
+        Err(error) => {
+            opline!("seller node memory read skipped ({error}); running the job without memory");
+            None
+        }
+    }
 }
 
 /// #591: how a job's delivery workdir is provisioned — a from-scratch empty repo, or a clone of a
@@ -2057,9 +2421,24 @@ async fn contribution_result_envelope_tags(
 /// Decide whether to claim `offer`, applying the always-on money-safety gates in the legacy order:
 /// a lapsed offer is refused BEFORE its deadline is re-derived (never resurrect a stale offer with a
 /// fresh `now + timeout`), then the #604 offer-age gate (a long-aged historical the backfill keeps
-/// re-surfacing is refused so it cannot park a slot on work that will not be awarded), then the
-/// buyer-allowlist fence (#482), then the targeting/rate gate, then the harness the offer asked for.
+/// re-surfacing is refused so it cannot park a slot on work that will not be awarded), then buyer
+/// eligibility, then the targeting/rate gate, then the harness the offer asked for.
 /// Pure over (offer, config, registry, buyer, now, offer_created_at).
+///
+/// Buyer eligibility is ONE clause over three ADDITIVE, INDEPENDENT controls (#923), and no control
+/// is inferred from another being empty or populated. On the TARGETED surface admission is the UNION
+/// `buyer_is_named || accept_open_targeted`: `accept_offers_only_from` is an always-admits set of
+/// buyers the operator chose, and `accept_open_targeted` ADDITIONALLY admits a buyer it did not name.
+/// The untargeted (open-pool) surface is left wholly to `claim_open_pool` in the rate gate, so all
+/// three controls stay separately switchable.
+///
+/// ⛔ THE ALLOWLIST IS AN ADMIT-LIST FOR TARGETED WORK, NEVER A VETO OVER THE OPT-IN BESIDE IT. Until
+/// #923 the populated-allowlist fence returned BEFORE the targeted opt-in was consulted, so a
+/// populated list made `accept_open_targeted` INERT on both surfaces: an operator could not keep
+/// trusted buyers while temporarily opening a public route, and the config said one thing while the
+/// seat did another. Restoring that precedence re-breaks #923 — the order is asserted, not left to
+/// reading. Widening admission BEYOND these three controls is a defect, not an improvement: every
+/// clause here is a permission grant an operator cannot take back once a stranger has claimed.
 ///
 /// The harness gate is a CLAIM-time decision, not a delivery-time one: a node that cannot run the
 /// requested harness never parks a claim at all, so the buyer's offer stays visible to a seller
@@ -2088,16 +2467,50 @@ fn classify_offer(
     if now_unix.saturating_sub(offer_created_at) > MAX_OFFER_ADMIT_AGE_SECS {
         return ClaimDecision::Skip(SkipReason::TooOld);
     }
-    // Private-seller fence (#482): a populated `accept_offers_only_from` claims ONLY from a named
-    // buyer. Empty/absent ⇒ accept-all (unchanged). Consulted after the lapsed refusal but before
-    // the rate/harness gates, so a stranger's offer is declined outright; the caller names the
-    // declined pubkey in the skip log (this pure fn cannot, and stays silent to the buyer).
-    if !seller.accept_offers_only_from.is_empty()
-        && !seller.accept_offers_only_from.iter().any(|allowed| allowed == buyer_pubkey)
+    // Buyer-eligibility, in two independent clauses. Consulted after the lapsed refusal but before
+    // the rate/harness gates, so an ineligible buyer's offer is declined outright; the caller names
+    // the declined pubkey in the skip log (this pure fn cannot, and stays silent to the buyer).
+    let buyer_is_named = seller.accept_offers_only_from.iter().any(|allowed| allowed == buyer_pubkey);
+    // TARGETED surface (#923): admit on the UNION of the two controls that govern it — a buyer the
+    // operator NAMED, or `accept_open_targeted` for one it did not. Neither cancels the other, so
+    // toggling the public route leaves the private fallback intact and vice versa.
+    //
+    // ⛔ SCOPED TO OFFERS WHOSE `p` TAG IS THIS SEAT. That scope is what leaves the untargeted
+    // (open-pool) surface wholly to `claim_open_pool` in the rate gate below — the third, separate
+    // control. An offer targeting ANOTHER seat is refused there, never admitted here.
+    if offer.seller_pubkey.as_deref() == Some(seller_pubkey)
+        && !buyer_is_named
+        && !seller.accept_open_targeted
     {
-        return ClaimDecision::Skip(SkipReason::NotAllowlisted);
+        // TWO refusals over one condition, DELIBERATELY NOT FOLDED: an operator who wrote a list
+        // must be sent to the list, and one who wrote none must be sent to the flag. The same string
+        // would send the second operator hunting a list that does not exist.
+        return ClaimDecision::Skip(if seller.accept_offers_only_from.is_empty() {
+            SkipReason::OpenTargetedRefused
+        } else {
+            SkipReason::NotAllowlisted
+        });
     }
-    if rate_gate_allows(offer, seller_pubkey, seller.rate_sats, seller.claim_open_pool).is_err() {
+    // §2.1 — the payment-mode gate, checked BEFORE the rate gate so the operator gets the refusal
+    // that names their knob. `rate_gate_allows` refuses the same offer for the same reason; this
+    // arm exists only to keep "you have not opted in to free work" distinguishable from "this offer
+    // did not clear your price", which is not a distinction a single `is_err()` can carry.
+    //
+    // ⛔ NOTE WHAT IS *NOT* HERE: no check of `offer.amount`, no check of `seller.rate_sats`. Mode
+    // is read from the offer's tag and nothing else (§2.0). A zero-rate seat that never opted in
+    // refuses a free offer here even though the price floor would have admitted it.
+    if offer.payment_mode.is_free() && !seller.takes_no_payment {
+        return ClaimDecision::Skip(SkipReason::FreeNotOffered);
+    }
+    if rate_gate_allows(
+        offer,
+        seller_pubkey,
+        seller.rate_sats,
+        seller.claim_open_pool,
+        seller.takes_no_payment,
+    )
+    .is_err()
+    {
         return ClaimDecision::Skip(SkipReason::RateGate);
     }
     if !agents.serves(offer.requested_agent.as_deref()) {
@@ -2106,6 +2519,61 @@ fn classify_offer(
     ClaimDecision::Claim {
         deadline_unix: crate::seller::job_deadline_unix(offer, seller, now_unix),
     }
+}
+
+/// The boot siren for a seat whose config can claim NOTHING: no buyer named, and neither open
+/// surface opted in to. Returns the operator line, or `None` when at least one route in exists.
+///
+/// ⛔ THIS EXISTS BECAUSE THE THREE-KNOB MIGRATION IS SILENT, AND THE SILENCE IS THE HAZARD, NOT THE
+/// STRICTNESS. Before the split, an empty `accept_offers_only_from` meant accept-all on the targeted
+/// surface; after it, that same config accepts no one. Every already-deployed seller with no
+/// allowlist — including outside operators running our releases — stops accepting targeted work the
+/// moment it upgrades, and nothing about it is an error: the config still parses, the node still
+/// boots, the relay subscription is still live, and the seat still advertises. It simply never
+/// claims again. The strict default is intended and stays; a seat going quiet without saying so is
+/// not, so this is REQUIRED rather than advisory.
+///
+/// Pure over the config so it is testable without a relay, a home lock or a boot. The caller emits.
+fn unreachable_seat_warning(seller: &crate::home::SellerConfig) -> Option<String> {
+    // Counted, never `is_empty()`. An entry is matched byte-for-byte against a wire pubkey, so one
+    // that cannot be a wire pubkey is not a narrow route in — it is no route, while still fencing
+    // everyone else out. Keying this on emptiness silenced the siren for exactly the seat it exists
+    // to catch: a list of typos claims nothing and looked configured.
+    let usable_buyers = seller
+        .accept_offers_only_from
+        .iter()
+        .filter(|entry| crate::home::buyer_pubkey_is_reachable(entry))
+        .count();
+    if usable_buyers > 0 {
+        return None;
+    }
+    // With NO list, either open flag is a way in. With a populated one the fence shuts both
+    // surfaces, so the flags cannot rescue a list that matches nobody.
+    if seller.accept_offers_only_from.is_empty()
+        && (seller.accept_open_targeted || seller.claim_open_pool)
+    {
+        return None;
+    }
+    if !seller.accept_offers_only_from.is_empty() {
+        return Some(format!(
+            "seller node WARNING: this seat can claim NOTHING as configured — all {} entr(y/ies) in \
+             [seller] accept_offers_only_from are unusable, and a populated allowlist fences out \
+             everyone else on BOTH surfaces, so no offer can reach this seat at all. {}. Correct \
+             the entries, or remove them. THREE ROUTES BACK IN: {}.",
+            seller.accept_offers_only_from.len(),
+            crate::home::USABLE_BUYER_ENTRY,
+            crate::home::ROUTES_BACK_IN
+        ));
+    }
+    Some(format!(
+        "seller node WARNING: this seat can claim NOTHING as configured — it names no buyers \
+         (accept_offers_only_from is empty), does not accept targeted offers from buyers it has not \
+         named (accept_open_targeted=false), and does not claim the open pool \
+         (claim_open_pool=false). It will advertise and stay connected, but never claim a job. If \
+         this seat used to serve, an upgrade closed the targeted surface that an empty allowlist \
+         used to leave open. THREE ROUTES BACK IN: {}.",
+        crate::home::ROUTES_BACK_IN
+    ))
 }
 
 /// Resolve + report the harness registry at boot: one PASS/FAIL line per configured preset, then
@@ -2169,6 +2637,309 @@ fn harness_fault_for(error: &ExecError) -> Option<ExecutionFailure> {
         ExecError::DeadlineExceeded => Some(ExecutionFailure::DeadlineExceeded),
         ExecError::Agent(_) => Some(ExecutionFailure::Harness(Fault::Unproven)),
         ExecError::Policy(_) => None,
+    }
+}
+
+/// What a container-delivered job hands back to `execute_job`: the pushed commit, the branch it is
+/// on, and the agent's report for the seller-claimed exec-metadata block.
+struct ContainerDelivery {
+    commit: String,
+    branch: String,
+    usage: Option<crate::driver::UsageMetadata>,
+    last_agent_message: Option<String>,
+    wall_time_ms: u64,
+}
+
+/// Why a container delivery failed, shaped for the feedback and harness attribution the host path
+/// emits for the equivalent failure (see `fail_container_delivery`). Details never carry a token.
+#[derive(Debug)]
+enum ContainerDeliveryFailure {
+    /// Before any agent ran, or an unclassified I/O failure: config, exchange dir, inputs,
+    /// containment, launch. `execution_failed`, no harness fault.
+    Setup(String),
+    /// The agent run failed inside the container; the `ExecError` shape drives `harness_fault_for`.
+    Agent(ExecError),
+    /// The gate saw no execution. `no_sentinel`, harness unproven.
+    NoSentinel(String),
+    /// The snapshot failed otherwise. `execution_failed`, harness unproven.
+    Snapshot(String),
+    /// Token refused or absent, push failed, oid unreadable, tamper evidence. `delivery_failed`.
+    Delivery(String),
+    /// The container outlived its bound and was killed. `execution_failed`, deadline fault.
+    Timeout(String),
+}
+
+/// The host-owned exchange directory for `job_id`: `$MAXPLAYER_HOME/seller-delivery/<job_id>`.
+/// Beside, never inside, the job workdir (`seller-jobs/<job_id>`), which is the agent-writable
+/// mount. It holds the inputs file and, in the fresh-after-agent mode, the token file — both mode
+/// `0600` in a `0700` directory. Only this seller uid on the host, and the container's processes
+/// (which run as the same uid), can read it; the inputs are deleted before the agent exists.
+fn container_exchange_dir(home_root: &std::path::Path, job_id: &str) -> std::path::PathBuf {
+    home_root.join("seller-delivery").join(job_id)
+}
+
+/// A fresh 32-byte random nonce as hex, for the agent-done marker hand-off.
+fn random_nonce_hex() -> Result<String, String> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).map_err(|error| format!("nonce entropy unavailable: {error}"))?;
+    Ok(hex::encode(bytes))
+}
+
+#[cfg(test)]
+mod container_delivery_tests {
+    use super::*;
+
+    // The exchange directory is a sibling tree of the job workdirs (`seller-jobs/<job_id>`, per
+    // `seller_exec::job_workdir`), never inside one.
+    #[test]
+    fn exchange_dir_is_outside_the_job_workdir() {
+        let root = std::path::Path::new("/home/s/.maxplayer");
+        let io = container_exchange_dir(root, "abc123");
+        let workdir = root.join("seller-jobs").join("abc123");
+        assert_eq!(io, std::path::PathBuf::from("/home/s/.maxplayer/seller-delivery/abc123"));
+        assert!(!io.starts_with(&workdir), "the exchange dir must not be under the mount");
+        assert!(!workdir.starts_with(&io));
+    }
+
+    // The nonce is 32 random bytes as hex, and differs per call.
+    #[test]
+    fn nonce_is_64_hex_chars_and_fresh() {
+        let a = random_nonce_hex().expect("entropy");
+        let b = random_nonce_hex().expect("entropy");
+        assert_eq!(a.len(), 64);
+        assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+    }
+
+    use crate::home::ContainerDeliveryToken;
+    use crate::relay_info::{long_lived_verdict, ScopedTokenSupport};
+    use crate::seller_exec::{
+        ContainerDeliveryPolicy, DEFAULT_CONTAINER_DELIVERY_TOKEN_CAP_SECS as DEFAULT_CAP,
+    };
+
+    /// The uid of an ordinary seller seat's container.
+    const NON_ROOT_UID: u32 = 1000;
+    /// A seat whose daemon — and so whose container — runs as root.
+    const ROOT_UID: u32 = 0;
+
+    const RELAY_GIT_REMOTE: &str = "https://relay.example/git/abc/m0123.git";
+
+    fn policy(token: ContainerDeliveryToken) -> Option<ContainerDeliveryPolicy> {
+        Some(ContainerDeliveryPolicy {
+            token,
+            token_cap_secs: DEFAULT_CAP,
+        })
+    }
+
+    /// The host delivery path reads NOTHING over the network. A gate that probed here would add an
+    /// HTTP GET to every seller boot for a feature the seat does not use.
+    #[test]
+    fn container_delivery_off_reads_no_relay_document() {
+        assert_eq!(
+            container_delivery_token_gate("wss://relay.example", RELAY_GIT_REMOTE, None)
+                .expect("gate"),
+            TokenModeGate::Skip(None)
+        );
+    }
+
+    /// ⛔ THE FLIPPED DEFAULT MUST NOT ADD A NETWORK READ TO BOOT. A docker seat that never named
+    /// `container_delivery` now delivers from its container, so it reaches this gate where it used
+    /// to skip it — and it must still come out `Skip`, because the default token mode is
+    /// `fresh-after-agent`, which depends on no relay feature. Resolved through `from_config_as`, the
+    /// resolution a booting seat makes, so the default itself is under test rather than a hand-built
+    /// policy. The uid is pinned to a non-root seat: the docker default applies only there, and this
+    /// test must not depend on who runs the test binary.
+    ///
+    /// RED ON REVERT: default `container_delivery_token` to `long-lived` and this returns `Probe`.
+    #[test]
+    fn the_defaulted_docker_seat_still_reads_no_relay_document_at_boot() {
+        use crate::home::{SandboxConfig, SandboxMode};
+        use crate::seller_exec::SandboxPolicy;
+
+        let defaulted = SandboxConfig { mode: SandboxMode::Docker, ..Default::default() };
+        let policy =
+            SandboxPolicy::from_config_as(Some(&defaulted), NON_ROOT_UID).expect("docker policy");
+        let delivery = policy
+            .container_delivery()
+            .expect("a docker seat that never named the key delivers from the container");
+        assert_eq!(delivery.token, ContainerDeliveryToken::FreshAfterAgent);
+        assert_eq!(
+            container_delivery_token_gate("wss://relay.example", RELAY_GIT_REMOTE, Some(delivery))
+                .expect("gate"),
+            TokenModeGate::Skip(None),
+            "the new default must not put an HTTP GET on the boot path"
+        );
+    }
+
+    /// The ONE boot line an operator reads the delivery path off. Every state of the switch, in both
+    /// modes, and each line names the path AND the reason — a seat whose path moved on upgrade has
+    /// to be able to say which config state moved it.
+    #[test]
+    fn the_boot_line_names_the_delivery_path_and_the_reason() {
+        use crate::home::{SandboxConfig, SandboxMode};
+
+        let docker = |switch| SandboxConfig {
+            mode: SandboxMode::Docker,
+            container_delivery: switch,
+            ..Default::default()
+        };
+        let launcher = |switch| SandboxConfig {
+            mode: SandboxMode::Launcher,
+            container_delivery: switch,
+            ..Default::default()
+        };
+
+        // docker + absent ⇒ CONTAINER, and the line says the default is what decided it.
+        let line = delivery_path_line(Some(&docker(None)), NON_ROOT_UID);
+        assert!(line.contains("CONTAINER"), "{line}");
+        assert!(line.contains("default"), "the reason is the default: {line}");
+        assert!(line.contains("container_delivery = false"), "names the way back: {line}");
+
+        // docker + true ⇒ CONTAINER, and the line credits the config, not the default.
+        let line = delivery_path_line(Some(&docker(Some(true))), NON_ROOT_UID);
+        assert!(line.contains("CONTAINER"), "{line}");
+        assert!(line.contains("container_delivery = true"), "{line}");
+        assert!(!line.contains("default for"), "an explicit true is not the default: {line}");
+
+        // docker + false ⇒ HOST, named as the opt-out it is.
+        let line = delivery_path_line(Some(&docker(Some(false))), NON_ROOT_UID);
+        assert!(line.contains("HOST"), "{line}");
+        assert!(line.contains("container_delivery = false"), "{line}");
+
+        // launcher, in every state ⇒ HOST, and the reason is the mode rather than the switch.
+        for config in [launcher(None), launcher(Some(false))] {
+            let line = delivery_path_line(Some(&config), NON_ROOT_UID);
+            assert!(line.contains("HOST"), "{line}");
+            assert!(line.contains("launcher"), "the reason is the mode: {line}");
+        }
+
+        // No `[sandbox]` section at all ⇒ HOST.
+        let line = delivery_path_line(None, NON_ROOT_UID);
+        assert!(line.contains("HOST"), "{line}");
+        assert!(line.contains("no [sandbox] section"), "{line}");
+
+        // A ROOT seat (container uid 0) + absent ⇒ HOST, and the line says root decided it and how
+        // to opt in. Root + true ⇒ CONTAINER, credited to the config, with the root warning kept.
+        // RED ON REVERT: the line had no uid and called root + absent the docker default.
+        let line = delivery_path_line(Some(&docker(None)), ROOT_UID);
+        assert!(line.contains("HOST"), "{line}");
+        assert!(line.contains("root"), "the reason is the uid: {line}");
+        assert!(line.contains("container_delivery = true"), "names the opt-in: {line}");
+        assert!(!line.contains('\n'), "one line: {line}");
+        let line = delivery_path_line(Some(&docker(Some(true))), ROOT_UID);
+        assert!(line.contains("CONTAINER"), "{line}");
+        assert!(line.contains("container_delivery = true"), "{line}");
+        assert!(line.contains("root"), "the warning stays: {line}");
+        assert!(!line.contains('\n'), "one line: {line}");
+        // Root changes nothing for the opt-out or for a launcher seat.
+        assert!(delivery_path_line(Some(&docker(Some(false))), ROOT_UID).contains("HOST"));
+        assert!(delivery_path_line(Some(&launcher(None)), ROOT_UID).contains("launcher"));
+
+        // Every line is one operator line: it names the seat and carries no newline.
+        for config in [Some(docker(None)), Some(docker(Some(false))), Some(launcher(None)), None] {
+            let line = delivery_path_line(config.as_ref(), NON_ROOT_UID);
+            assert!(line.starts_with("seller node delivery path: "), "{line}");
+            assert!(!line.contains('\n'), "one line, never two: {line}");
+        }
+    }
+
+    /// `fresh-after-agent` needs no relay feature, so it must never be blocked — and must never even
+    /// ask. RED ON REVERT: probe in both modes and this returns `Probe`.
+    #[test]
+    fn fresh_after_agent_reads_no_relay_document() {
+        assert_eq!(
+            container_delivery_token_gate(
+                "wss://relay.example",
+                RELAY_GIT_REMOTE,
+                policy(ContainerDeliveryToken::FreshAfterAgent),
+            )
+            .expect("gate"),
+            TokenModeGate::Skip(None)
+        );
+    }
+
+    /// `long-lived` asks the server that CHECKS the token — the relay-git remote's own origin — and
+    /// carries the seat's configured cap into the comparison.
+    #[test]
+    fn long_lived_probes_the_relay_git_origin_with_the_configured_cap() {
+        assert_eq!(
+            container_delivery_token_gate(
+                "wss://events.example",
+                RELAY_GIT_REMOTE,
+                policy(ContainerDeliveryToken::LongLived),
+            )
+            .expect("gate"),
+            TokenModeGate::Probe {
+                origin: "https://relay.example/".to_owned(),
+                cap_secs: DEFAULT_CAP,
+            }
+        );
+    }
+
+    /// A plain https remote takes no NIP-98 header, so there is no scoped token to gate. Inert, and
+    /// said out loud rather than passed in silence.
+    #[test]
+    fn long_lived_on_a_byo_https_remote_is_inert_and_says_so() {
+        let gate = container_delivery_token_gate(
+            "wss://relay.example",
+            "https://github.com/owner/repo.git",
+            policy(ContainerDeliveryToken::LongLived),
+        )
+        .expect("gate");
+        let TokenModeGate::Skip(Some(line)) = gate else {
+            panic!("a byo remote must skip with an operator line, got {gate:?}");
+        };
+        assert!(line.contains("long-lived"), "names the mode: {line}");
+        assert!(line.contains("no scoped token"), "says why it is inert: {line}");
+    }
+
+    /// The authority is the server that CHECKS the token, so an unusable event-relay url cannot
+    /// change the answer when the seat pushes to relay-git.
+    #[test]
+    fn the_relay_git_remote_outranks_the_event_relay_url() {
+        assert_eq!(
+            container_delivery_token_gate(
+                "not-even-a-url",
+                RELAY_GIT_REMOTE,
+                policy(ContainerDeliveryToken::LongLived),
+            )
+            .expect("gate"),
+            TokenModeGate::Probe {
+                origin: "https://relay.example/".to_owned(),
+                cap_secs: DEFAULT_CAP,
+            }
+        );
+    }
+
+    /// The refusal an operator actually sees for a relay that does not implement Requirement B: it
+    /// names the mode, names the working mode, and renders through `NodeError`.
+    #[test]
+    fn the_boot_refusal_names_the_mode_and_the_way_forward() {
+        let refusal = long_lived_verdict(&ScopedTokenSupport::Absent, DEFAULT_CAP)
+            .refusal()
+            .expect("an absent field refuses");
+        let rendered =
+            NodeError::ContainerDeliveryToken(format!("https://relay.example/ — {refusal}"))
+                .to_string();
+        assert!(
+            rendered.starts_with("seller node container-delivery token mode refused:"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("long-lived"), "{rendered}");
+        assert!(rendered.contains("fresh-after-agent"), "{rendered}");
+        assert!(rendered.contains("scoped_token_max_lifetime_secs"), "{rendered}");
+    }
+
+    /// An unreachable relay is UNKNOWN, and unknown refuses in `long-lived`. Fail closed: nothing
+    /// proves the relay honours the expiration tag, so the seat must not mint one.
+    #[test]
+    fn an_unreachable_relay_refuses_in_long_lived_mode() {
+        let verdict = long_lived_verdict(
+            &ScopedTokenSupport::Unknown("connection refused".to_owned()),
+            DEFAULT_CAP,
+        );
+        assert!(!verdict.is_supported());
+        assert!(verdict.refusal().is_some());
     }
 }
 
@@ -2733,6 +3504,193 @@ async fn probe_one_harness(
     ))
 }
 
+/// How long the boot gate waits for the relay's NIP-11 document. Short on purpose: the answer is one
+/// small JSON document from a host the seat already talks to, and the gate stands between the
+/// operator and a seat that will refuse either way.
+const RELAY_TOKEN_POLICY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The ONE boot line that names this seat's delivery path and the reason for it.
+///
+/// ⛔ WHY THIS LINE EXISTS. Container delivery is the DEFAULT for a docker seat, so a seat that
+/// upgrades changes where its git runs without anyone changing its config. That must not be silent:
+/// the operator has to be able to read the path off a boot scroll, and has to be told which of the
+/// three states of `[sandbox] container_delivery` decided it. `maxplayer doctor` reports the same
+/// answer in its `relay token policy` row.
+///
+/// Pure, and it reads the CONFIG rather than the resolved policy, so it can name the reason. The
+/// policy keeps only the verdict: `Some(false)` and a launcher seat both resolve to `None`, and the
+/// operator needs to know which one this seat is.
+///
+/// `container_uid` is the uid the container runs as (`job_identity`). Under root the docker default
+/// does not apply — the absent key is the HOST path, and the line says why and how to opt in — and
+/// an explicit opt-in is honoured with a warning on the same line.
+fn delivery_path_line(
+    sandbox: Option<&crate::home::SandboxConfig>,
+    container_uid: u32,
+) -> String {
+    use crate::home::SandboxMode;
+
+    let Some(sandbox) = sandbox else {
+        return "seller node delivery path: HOST — this seat has no [sandbox] section, so there is \
+                no container to run the git steps in"
+            .to_owned();
+    };
+    let root = container_uid == 0;
+    match (sandbox.mode, sandbox.container_delivery) {
+        (SandboxMode::Docker, None) if root => "seller node delivery path: HOST — this seat's \
+                                                daemon runs as root (uid 0), so its container \
+                                                would run the job as root, where the boundary \
+                                                between the job and the delivery orchestrator is \
+                                                weakest. Container delivery is therefore NOT the \
+                                                default for a root seat. Set [sandbox] \
+                                                container_delivery = true to opt in, or run the \
+                                                seller as a non-root user."
+            .to_owned(),
+        (SandboxMode::Docker, Some(true)) if root => "seller node delivery path: CONTAINER — one \
+                                                      container runs the agent and every git step. \
+                                                      This seat sets [sandbox] container_delivery = \
+                                                      true. WARNING: the daemon runs as root (uid \
+                                                      0), so the job is root inside that container \
+                                                      and the boundary between the job and the \
+                                                      delivery orchestrator is weakest; run the \
+                                                      seller as a non-root user."
+            .to_owned(),
+        (SandboxMode::Docker, None) => "seller node delivery path: CONTAINER — one container runs \
+                                        the agent and every git step. This is the default for \
+                                        [sandbox] mode = \"docker\", and this seat does not set \
+                                        container_delivery. Set container_delivery = false for the \
+                                        host path."
+            .to_owned(),
+        (SandboxMode::Docker, Some(true)) => "seller node delivery path: CONTAINER — one container \
+                                              runs the agent and every git step. This seat sets \
+                                              [sandbox] container_delivery = true."
+            .to_owned(),
+        (SandboxMode::Docker, Some(false)) => "seller node delivery path: HOST — the host clones, \
+                                               commits and pushes. This seat sets [sandbox] \
+                                               container_delivery = false, which opts out of the \
+                                               docker default."
+            .to_owned(),
+        (SandboxMode::Launcher, _) => "seller node delivery path: HOST — the host clones, commits \
+                                       and pushes. [sandbox] mode = \"launcher\" creates no \
+                                       container, so container delivery cannot apply to this seat."
+            .to_owned(),
+    }
+}
+
+/// What the boot gate must do about `[sandbox] container_delivery_token`, decided from config alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TokenModeGate {
+    /// Nothing to prove, and NO network read: container delivery is off, the mode is
+    /// `fresh-after-agent` (which needs no relay feature), or the seat pushes to a remote that takes
+    /// no scoped token at all. Carries an operator line when the reason is worth saying out loud.
+    Skip(Option<String>),
+    /// `long-lived`: read the NIP-11 document at `origin` and refuse to boot unless the relay
+    /// advertises a scoped-token cap of at least `cap_secs`.
+    Probe { origin: String, cap_secs: u64 },
+}
+
+/// The pure half of the `long-lived` boot gate: which relay to ask, and whether to ask at all.
+///
+/// Separated from the fetch so every branch — including "do not touch the network" — is testable
+/// with no relay and no home. `delivery` is [`SandboxPolicy::container_delivery`].
+fn container_delivery_token_gate(
+    relay_url: &str,
+    git_remote: &str,
+    delivery: Option<crate::seller_exec::ContainerDeliveryPolicy>,
+) -> Result<TokenModeGate, NodeError> {
+    use crate::home::ContainerDeliveryToken;
+
+    // The host delivery path — a launcher seat, or `container_delivery = false` — asks nothing.
+    let Some(delivery) = delivery else {
+        return Ok(TokenModeGate::Skip(None));
+    };
+    // `fresh-after-agent` mints a 60 s token AFTER the agent exits and works with the relay as
+    // deployed today. It depends on no relay feature, so this mode reads NOTHING over the network.
+    if delivery.token != ContainerDeliveryToken::LongLived {
+        return Ok(TokenModeGate::Skip(None));
+    }
+    // A public/anonymous https remote takes no NIP-98 header at all (`deliver_via_container` sets
+    // `PushTokenSource::None` for it), so there is no scoped token whose lifetime could matter. Said
+    // out loud: an operator who set `long-lived` must learn that the setting does nothing here.
+    if !crate::delivery_transport::is_relay_git_locator(git_remote) {
+        return Ok(TokenModeGate::Skip(Some(
+            "seller node: [sandbox] container_delivery_token = \"long-lived\" has no effect on this \
+             seat — its git remote is not relay-git, so the container pushes with no scoped token"
+                .to_owned(),
+        )));
+    }
+    let origin = crate::relay_info::scoped_token_authority(relay_url, git_remote).map_err(|error| {
+        NodeError::ContainerDeliveryToken(format!(
+            "[sandbox] container_delivery_token = \"long-lived\" needs a relay whose NIP-11 document \
+             can be read, and this seat's relay url cannot be turned into one ({error})"
+        ))
+    })?;
+    Ok(TokenModeGate::Probe {
+        origin,
+        cap_secs: delivery.token_cap_secs,
+    })
+}
+
+/// Refuse to boot a `long-lived` container-delivery seat whose relay does not advertise that it
+/// honours a scoped token's NIP-40 `expiration` tag (relay Requirement B).
+///
+/// ⛔ WHY THIS RUNS BEFORE THE FIRST HARNESS. Without it the seat learns the answer as an HTTP 401 on
+/// the PUSH — the last step of a paid job, after the agent ran and the buyer already committed the
+/// sats at award. Measured on the deployed relay on 2026-09-03 (`tests/relay_canary.rs`): the ref
+/// scope is enforced, the expiration tag is NOT honoured. So a config flip to `long-lived` against
+/// today's relay fails every job at its most expensive moment, and it must fail at boot instead.
+///
+/// This is a SECOND gate, not a replacement: `long_lived_expiration` still refuses an over-cap token
+/// at mint time. This one moves the same refusal earlier and adds the relay's own answer to it.
+///
+/// Fails CLOSED. An absent field, a cap smaller than the seat's own, an unreachable relay and an
+/// unreadable document all refuse. `fresh-after-agent` reads nothing and can never be blocked here.
+///
+/// `maxplayer doctor` reports the same answer in its `relay token policy` row, and `--skip-doctor`
+/// bypasses that row. It does NOT bypass this one: the doctor row exists so an operator can see the
+/// answer before flipping the switch, and this gate exists so the flip cannot ship a seat that fails
+/// every job on its push.
+async fn gate_container_delivery_token_mode(
+    home: &MaxplayerHome,
+    sandbox: &SandboxPolicy,
+) -> Result<(), NodeError> {
+    // No `[seller]` block means no delivery remote to push to; `boot_agent_registry` above is what
+    // refuses that seat. A second refusal here would only hide that message.
+    let Some(seller) = home.config.seller.as_ref() else {
+        return Ok(());
+    };
+    let gate = container_delivery_token_gate(
+        &home.config.relay_url,
+        &seller.git_remote,
+        sandbox.container_delivery(),
+    )?;
+    let (origin, cap_secs) = match gate {
+        TokenModeGate::Skip(line) => {
+            if let Some(line) = line {
+                opline!("{line}");
+            }
+            return Ok(());
+        }
+        TokenModeGate::Probe { origin, cap_secs } => (origin, cap_secs),
+    };
+    let support =
+        crate::relay_info::fetch_scoped_token_support(&origin, RELAY_TOKEN_POLICY_TIMEOUT).await;
+    let verdict = crate::relay_info::long_lived_verdict(&support, cap_secs);
+    match verdict.refusal() {
+        Some(refusal) => Err(NodeError::ContainerDeliveryToken(format!(
+            "{origin} — {refusal}"
+        ))),
+        None => {
+            opline!(
+                "seller node: relay {origin} advertises {} — [sandbox] container_delivery_token = \
+                 \"long-lived\" is usable on this seat (configured cap {cap_secs} s)",
+                support
+            );
+            Ok(())
+        }
+    }
+}
+
 /// Probe EVERY configured harness before anything goes on the wire.
 ///
 /// Local compute only — no sats, no mint, no award ([`probe_one_harness`] runs the harness in a
@@ -2750,6 +3708,18 @@ pub async fn probe_configured_harnesses(
     // under a pass-through fallback would prove a harness the awarded job will never run under.
     let sandbox = SandboxPolicy::from_config(home.config.sandbox.as_ref())
         .map_err(|error| NodeError::Sandbox(error.to_string()))?;
+    // Say WHERE this seat's git runs, and why, before the token gate reads anything. Container
+    // delivery is the default for a docker seat, so an upgrade moves the path with no config change;
+    // this line is what stops that being silent. Emitted every boot, not once: the condition is a
+    // standing state of the config, and a seat can be restarted long after the upgrade.
+    opline!(
+        "{}",
+        delivery_path_line(home.config.sandbox.as_ref(), job_identity().0)
+    );
+    // Track B, `long-lived` token mode only: prove the relay honours a scoped token's expiration tag
+    // BEFORE any harness runs, or refuse to boot. Reads nothing over the network in the default
+    // `fresh-after-agent` mode. See `gate_container_delivery_token_mode`.
+    gate_container_delivery_token_mode(home, &sandbox).await?;
     // #647 credential-containment scope (P2): every KNOWN model-credential variable is contained by
     // the proxy. What can still cross RAW is an operator-added `[sandbox] forward_env` variable the
     // daemon cannot recognize — it may be a credential, and the daemon has no way to know. Say so
@@ -2780,11 +3750,25 @@ pub async fn probe_configured_harnesses(
     #[cfg(feature = "acp")]
     if sandbox.sandbox_network().is_some() {
         match crate::sandbox_netns::reap_orphans(identity.seller_pubkey_hex()).await {
-            Ok(reaped) if !reaped.is_empty() => opline!(
-                "seller node: reaped {} containment holder(s) left by an earlier run of this seat",
-                reaped.len()
-            ),
-            Ok(_) => {}
+            Ok(report) => {
+                if !report.removed.is_empty() {
+                    opline!(
+                        "seller node: reaped {} containment holder(s) left by an earlier run of this seat",
+                        report.removed.len()
+                    );
+                }
+                // Still never a gate — see above. `reap_orphans` returns its per-holder failures
+                // (#905) instead of printing them, so they now reach the operator log this daemon
+                // already writes rather than raw process stderr. Reporting them, not acting on them,
+                // is the whole difference from the operator command, which exits nonzero on the same
+                // input.
+                for (holder, error) in &report.failed {
+                    opline!(
+                        "seller node: could not reap this seat's stale containment holder {holder} \
+                         ({error}) — harmless to this boot, but it will accumulate until it succeeds"
+                    );
+                }
+            }
             Err(error) => opline!(
                 "seller node: could not reap this seat's stale containment holders ({error}) — \
                  harmless to this boot, but they will accumulate until it succeeds"
@@ -2815,6 +3799,35 @@ pub fn proven_serving_indices(verdicts: &[HarnessProbeVerdict]) -> Vec<usize> {
         .collect()
 }
 
+/// The operator lines for a pre-advertise probe: one FAILED line per harness that did not prove,
+/// then a serving `n/m` count.
+///
+/// ⛔ THIS EXISTS BECAUSE A PARTIAL FAILURE USED TO NARROW THE ROSTER IN SILENCE. The FAILED lines
+/// used to live inside the `proven_serving_indices(..).is_empty()` branch, so they printed only when
+/// NOTHING proved and the seat refused to boot. A seat with at least one prover booted, dropped the
+/// rest, and advertised the survivors — with no line naming which harnesses dropped, or why. The
+/// roster narrowing is what determines the kind-30340 announcement, so the log was silent about the
+/// thing that changed what the seat advertised (#773).
+///
+/// Pure over the verdicts so it is testable without a relay, a home lock or a boot. The caller emits.
+fn pre_advertise_probe_lines(verdicts: &[HarnessProbeVerdict]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for verdict in verdicts {
+        if let Err((reason, _)) = &verdict.result {
+            let label = verdict.name.as_deref().unwrap_or("<unlabelled>");
+            lines.push(format!(
+                "seller node pre-advertise probe FAILED {label}: {reason}"
+            ));
+        }
+    }
+    let proven = proven_serving_indices(verdicts).len();
+    lines.push(format!(
+        "seller node pre-advertise probe: serving {proven}/{} configured harness(es)",
+        verdicts.len()
+    ));
+    lines
+}
+
 /// Prove-before-advertise: publish discoverability and boot serving ONLY the harnesses that proved
 /// they can deliver.
 ///
@@ -2833,18 +3846,32 @@ pub async fn boot_advertising_only_proven(
     mut home: MaxplayerHome,
     verdicts: Vec<HarnessProbeVerdict>,
 ) -> Result<SellerNodeRunner, NodeError> {
+    // Report every verdict BEFORE the gate, so a seat that boots with a narrowed roster still names
+    // every harness that dropped — the kind-30340 announcement reads that roster. Emitted on every
+    // outcome, not only the all-failed refusal: a mixed probe used to narrow and advertise in
+    // silence (#773). Composition is in `pre_advertise_probe_lines`; the caller emits.
+    for line in pre_advertise_probe_lines(&verdicts) {
+        opline!("{line}");
+    }
     if proven_serving_indices(&verdicts).is_empty() {
-        for verdict in &verdicts {
-            if let Err((reason, _)) = &verdict.result {
-                let label = verdict.name.as_deref().unwrap_or("<unlabelled>");
-                opline!("seller node pre-advertise probe FAILED {label}: {reason}");
-            }
-        }
         return Err(NodeError::NoProvenHarness(format!(
             "none of {} configured harness(es) produced a probe artifact; refusing to advertise \
              (fix the harness/launcher, then restart)",
             verdicts.len()
         )));
+    }
+
+    // Say it BEFORE the wire work, so an operator watching a boot scroll past sees it whether or not
+    // the relay legs succeed — a seat that will never claim is worth knowing about even if boot then
+    // fails for an unrelated reason. Emitted every boot, not once: the condition is a standing state
+    // of the config, not an event, and a seat can be restarted long after the upgrade that closed it.
+    if let Some(warning) = home
+        .config
+        .seller
+        .as_ref()
+        .and_then(unreachable_seat_warning)
+    {
+        opline!("{warning}");
     }
 
     // Take the home lock BEFORE anything reaches the relay. The publish below is the first thing this
@@ -2939,7 +3966,11 @@ pub struct SellerNodeRunner {
     /// `git-receive-pack` to one repo is what the relay 409s (the multi-slot delivery hazard). Held
     /// ONLY across the push (execution stays parallel) and bounded by [`DELIVERY_PUSH_TIMEOUT`], so a
     /// hung push releases it rather than starving every later delivery behind the lock.
-    delivery_push_lock: tokio::sync::Mutex<()>,
+    ///
+    /// `Arc` because the turn belongs to the push, not to the delivery arm that started it: the
+    /// guard is owned and travels with the spawned push, so it is released when the upload is
+    /// actually finished rather than when the arm stops waiting. See [`serialized_bounded_push`].
+    delivery_push_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     /// #541: relay-derived set of SETTLED offer ids (a co-signed kind-3400 receipt has been seen).
     /// Read before any claim to skip a terminal offer that re-appears via backfill or redelivery.
     /// Populated by [`Self::on_receipt`] from the live receipt subscription and its boot/reconnect
@@ -2954,6 +3985,207 @@ pub struct SellerNodeRunner {
     /// #747: how this node is asked to leave the selling role, so it can publish its terminal
     /// `accepting=n` beat before exiting. See [`shutdown`] and [`Self::shutdown_handle`].
     shutdown: shutdown::ShutdownChannel,
+    /// Stage 2a, addendum 2 §3: single-flight for the platform-fee remittance. The collect path's
+    /// thread and the loop's retry tick both reach the one remit entry point; whichever finds the
+    /// slot taken skips. See [`crate::fee_remit::RemitFlight`].
+    remit_flight: crate::fee_remit::RemitFlight,
+    /// Stage 2a, addendum 2 §2: the ONE backoff for this node's remittance attempts, shared by the
+    /// retry tick (which sleeps by it) and the collect path's thread (whose outcome also moves it, so
+    /// a success on either path resets it). See [`crate::fee_remit::RemitBackoff`].
+    remit_pacing: Arc<Mutex<crate::fee_remit::RemitBackoff>>,
+    /// Stage 2a, addendum 3 §3: the collect thread's outcome moved the shared backoff, so the
+    /// loop's LIVE retry timer must follow — a success pulls the pending sleep back to base, a
+    /// failure pushes a too-short deadline out. The thread `notify_one`s; the loop has a `select!`
+    /// arm on `notified()` that re-arms the `Sleep` ([`rearm_deadline`]).
+    remit_pacing_changed: Arc<tokio::sync::Notify>,
+    /// Stage 2a, addendum 3 RULING 2: raised the moment serving ends. No remittance attempt may
+    /// START after it (collect path or tick); the one already in flight — a melt whose proofs may
+    /// be with the mint, which is never cancelled — is DRAINED with a bounded wait
+    /// ([`Self::drain_remit_in_flight`]) before `run` returns.
+    remit_closed: std::sync::atomic::AtomicBool,
+    /// Test seam for addendum 2 gate 2e: how many retry-tick attempts this node has STARTED. Read
+    /// after the loop returned to prove none started after it.
+    #[cfg(test)]
+    remit_retry_started: Arc<std::sync::atomic::AtomicUsize>,
+    /// Test seam for addendum 3 gate 2e (strengthened): scripted effects for the node's attempts in
+    /// place of the live LNURL + wallet, so a test can hold a PENDING payment across a shutdown.
+    #[cfg(test)]
+    remit_effects_for_test: Mutex<Option<RemitEffectsFactory>>,
+    /// Test seam: a shorter drain bound than [`REMIT_DRAIN_BOUND`], so the "abandoned at the bound"
+    /// branch is exercised without waiting a minute.
+    #[cfg(test)]
+    remit_drain_bound_for_test: Mutex<Option<Duration>>,
+}
+
+/// How long a requested shutdown waits for a remittance attempt already in flight before it gives
+/// up waiting and lets `run` return (addendum 3 RULING 2). The attempt is never cancelled — its
+/// proofs may already be with the mint — only the WAIT is bounded; a melt still running past this
+/// finishes on its own thread and its planned row is reconciled at the next start.
+pub const REMIT_DRAIN_BOUND: Duration = Duration::from_secs(60);
+
+/// Builds the effects one remittance attempt runs against. Only a test ever installs one; the
+/// live node passes `None` and the thread builds [`crate::fee_remit::LiveEffects`].
+type RemitEffectsFactory =
+    Arc<dyn Fn() -> Box<dyn crate::fee_remit::RemitEffects + Send> + Send + Sync>;
+
+/// One remittance attempt, on a remittance thread: the live entry point, or the test's scripted
+/// effects through the same decision logic.
+fn run_remit_attempt(
+    store: &super::store::SellerStore,
+    home: MaxplayerHome,
+    trigger: crate::fee_remit::RemitTrigger,
+    factory: Option<RemitEffectsFactory>,
+) -> crate::fee_remit::RemitReport {
+    match factory {
+        Some(factory) => {
+            let mut effects = factory();
+            crate::fee_remit::remit_best_effort(store, effects.as_mut(), trigger, now_unix())
+        }
+        None => crate::fee_remit::remit_live_best_effort(store, home, trigger, now_unix()),
+    }
+}
+
+/// At what volume [`remit_outcome_lines`] wants its lines logged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemitLogVolume {
+    /// `opline_verbose!`: the steady state, not for a quiet log.
+    Verbose,
+    /// `opline!`.
+    Normal,
+}
+
+/// The ONE logging policy for a node remittance attempt, whichever path ran it (addendum 3 §3; the
+/// collect path and the retry tick used to log differently), as PURE text so the policy is tested
+/// by counting lines. A node whose payout host is down retries for hours, and the retry must not
+/// become the log — **every attempt logs at most ONE line, the first failure included** (addendum 4
+/// §2.1):
+///
+/// - Steady state (nothing owed, or under the destination's minimum) is one verbose-only line.
+/// - A payment is one line.
+/// - The FIRST failure of a streak is one line carrying the attempt's detail — destination, the
+///   balance it saw, its own lines and its error — folded in, and the backoff it starts.
+/// - Every later failure in the streak is one line — streak, cause, next attempt — and the
+///   transition into the 30-minute cap is said on that same line, never a second one.
+/// - A payment that ends a streak is one line saying how many attempts failed and how long the fee
+///   sat owed.
+///
+/// `next` is the delay the caller re-armed the tick with, when it knows it (the tick's own path);
+/// the collect path does not own the timer, so it names the computed delay the re-arm draws from.
+pub(crate) fn remit_outcome_lines(
+    path: &str,
+    report: &crate::fee_remit::RemitReport,
+    pacing: &crate::fee_remit::Pacing,
+    next: Option<Duration>,
+    computed: Duration,
+) -> (RemitLogVolume, Vec<String>) {
+    use crate::fee_remit::Pacing;
+    let when = match next {
+        Some(next) => format!("in {}s (computed {}s)", next.as_secs(), computed.as_secs()),
+        None => format!(
+            "on the retry tick, re-armed to within {}s",
+            computed.as_secs()
+        ),
+    };
+    let line = match pacing {
+        Pacing::Idle => {
+            return (
+                RemitLogVolume::Verbose,
+                vec![format!(
+                    "seller node platform fee {path}: {}; next check {when}",
+                    report.summary()
+                )],
+            );
+        }
+        Pacing::Paid => format!("seller node platform fee {path}: {}", report.summary()),
+        Pacing::FirstFailure => {
+            // The whole first failure on ONE line: what it was trying to pay, to where, what it saw
+            // (the attempt's own lines, joined), and the error — then the backoff it starts.
+            let detail = if report.lines.is_empty() {
+                "no detail printed".to_owned()
+            } else {
+                report
+                    .lines
+                    .iter()
+                    .map(|line| line.trim())
+                    .filter(|line| !line.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            };
+            format!(
+                "seller node platform fee {path}: {} — streak 1; destination {}; attempt detail: {detail}; retrying with backoff (base {}s, doubling to a {}s cap, full jitter): next attempt {when}",
+                report.summary(),
+                crate::platform_fee::PLATFORM_FEE_ADDRESS,
+                crate::fee_remit::RETRY_BASE.as_secs(),
+                crate::fee_remit::RETRY_CAP.as_secs()
+            )
+        }
+        Pacing::RepeatFailure {
+            streak,
+            entered_cap,
+        } => {
+            let cap_note = if *entered_cap {
+                format!(
+                    "; backoff has reached the {}s cap and stays there until a remittance succeeds",
+                    computed.as_secs()
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                "seller node platform fee {path}: still failing (streak {streak}: {}); next attempt {when}{cap_note}",
+                report.summary()
+            )
+        }
+        Pacing::Recovered {
+            failed_attempts,
+            owed_for_secs,
+        } => format!(
+            "seller node platform fee {path}: RECOVERED — {} — after {failed_attempts} failed attempt(s) over {owed_for_secs}s; backoff reset to base",
+            report.summary()
+        ),
+    };
+    (RemitLogVolume::Normal, vec![line])
+}
+
+/// Emit [`remit_outcome_lines`] to the node log at the volume it asks for.
+fn log_remit_outcome(
+    path: &str,
+    report: &crate::fee_remit::RemitReport,
+    pacing: &crate::fee_remit::Pacing,
+    next: Option<Duration>,
+    computed: Duration,
+) {
+    let (volume, lines) = remit_outcome_lines(path, report, pacing, next, computed);
+    for line in lines {
+        match volume {
+            RemitLogVolume::Verbose => opline_verbose!("{line}"),
+            RemitLogVolume::Normal => opline!("{line}"),
+        }
+    }
+}
+
+/// Where the live retry timer should fire after a SHARED outcome (a collect-path attempt) moved the
+/// backoff (addendum 3 §3): a success (`streak == 0`) resets the pending sleep to the freshly drawn
+/// base-streak delay however far away it was; a failure never shortens a deadline — it extends a
+/// too-short one to the drawn delay and keeps a longer one. Either way the result is never before
+/// `boot_floor` — boot plus [`crate::fee_remit::RETRY_BASE`] — so a collect success in the node's
+/// first seconds cannot pull the FIRST retry under 30 s after boot (addendum 3 RULING 1, held under
+/// re-arm by addendum 4 §2.2). Pure, so the rule is tested against a real `Sleep` under a paused
+/// clock.
+pub(crate) fn rearm_deadline(
+    current_deadline: tokio::time::Instant,
+    now: tokio::time::Instant,
+    streak: u32,
+    drawn: Duration,
+    boot_floor: tokio::time::Instant,
+) -> tokio::time::Instant {
+    let proposed = now + drawn;
+    let deadline = if streak == 0 {
+        proposed
+    } else {
+        proposed.max(current_deadline)
+    };
+    deadline.max(boot_floor)
 }
 
 impl SellerNodeRunner {
@@ -3079,11 +4311,128 @@ impl SellerNodeRunner {
             agents,
             slots,
             capacity_skip_pending: std::sync::atomic::AtomicBool::new(false),
-            delivery_push_lock: tokio::sync::Mutex::new(()),
+            delivery_push_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             terminal_offers: TerminalOffers::new(TERMINAL_OFFERS_CAP, TERMINAL_AUTHORS_PER_OFFER),
             fed_under_rate_offers: FedUnderRateOffers::new(FED_UNDER_RATE_OFFERS_CAP),
             shutdown: shutdown::ShutdownChannel::new(),
+            remit_flight: crate::fee_remit::RemitFlight::new(),
+            remit_pacing: Arc::new(Mutex::new(crate::fee_remit::RemitBackoff::new())),
+            remit_pacing_changed: Arc::new(tokio::sync::Notify::new()),
+            remit_closed: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            remit_retry_started: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            remit_effects_for_test: Mutex::new(None),
+            #[cfg(test)]
+            remit_drain_bound_for_test: Mutex::new(None),
         })
+    }
+
+    /// Test seam (addendum 3 gate 2e): run the node's remittance attempts against scripted effects
+    /// instead of the live LNURL host and wallet, and bound the shutdown drain. Called BEFORE
+    /// [`Self::run`].
+    #[cfg(test)]
+    fn remit_effects_for_test(&self, factory: RemitEffectsFactory, drain_bound: Option<Duration>) {
+        *self
+            .remit_effects_for_test
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(factory);
+        *self
+            .remit_drain_bound_for_test
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = drain_bound;
+    }
+
+    /// The effects factory a remittance thread should use: the test's, or none (live).
+    fn remit_effects_factory(&self) -> Option<RemitEffectsFactory> {
+        #[cfg(test)]
+        {
+            self.remit_effects_for_test
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+        #[cfg(not(test))]
+        {
+            None
+        }
+    }
+
+    /// How long [`Self::drain_remit_in_flight`] waits: [`REMIT_DRAIN_BOUND`], or the test's bound.
+    fn remit_drain_bound(&self) -> Duration {
+        #[cfg(test)]
+        {
+            if let Some(bound) = *self
+                .remit_drain_bound_for_test
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+            {
+                return bound;
+            }
+        }
+        REMIT_DRAIN_BOUND
+    }
+
+    /// Addendum 3 RULING 2 — shutdown DRAINS, it does not kill. Called once serving has ended and
+    /// [`Self::remit_closed`] is raised (so nothing new can start): waits for the remittance attempt
+    /// in flight, if any, to finish — a melt whose proofs may already be with the mint must not be
+    /// cancelled mid-flight, which would risk the seller's sats; a slow exit is the lesser harm.
+    /// The wait is bounded by [`Self::remit_drain_bound`]: if it elapses, one incident line says
+    /// exactly what was abandoned, and the persisted row makes the outcome recoverable at the next
+    /// start (reconciliation, made safe by ownership: the next start is a new owner; a row still
+    /// `planned` it may release once the lease has run out or the invoice's quote is terminal; a
+    /// row already `spending` it never releases — it settles when the mint reports the bound quote
+    /// PAID and otherwise holds, on no clock, however long the lease has been over — addendum 6
+    /// §1.2).
+    async fn drain_remit_in_flight(&self) {
+        if !self.remit_flight.in_flight() {
+            return;
+        }
+        let bound = self.remit_drain_bound();
+        opline!(
+            "seller node platform fee: shutdown with a remittance attempt in flight — waiting up to {}ms for it to finish (a melt whose proofs may be with the mint is never cancelled)",
+            bound.as_millis()
+        );
+        let started = tokio::time::Instant::now();
+        loop {
+            if !self.remit_flight.in_flight() {
+                opline!(
+                    "seller node platform fee: the in-flight remittance attempt finished after {}ms; nothing of the remittance is left running",
+                    started.elapsed().as_millis()
+                );
+                return;
+            }
+            if started.elapsed() >= bound {
+                opline!(
+                    "seller node platform fee: INCIDENT — a remittance attempt is still in flight after the {}ms drain bound; abandoning the wait, not the attempt: its thread finishes on its own, and the row it journaled (if any) is reconciled at the next start — a row already admitted and SPENDING, bound to its quote, is settled if the mint reports that quote PAID and otherwise HELD for an operator; a row still PLANNED is released on lease expiry, by its owner, or on a terminal quote, and then re-planned",
+                    bound.as_millis()
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Test seam (addendum 2 gate 2e): shorten the retry tick's bounds so a test can watch several
+    /// attempts start without sleeping 30 s, and hand back the started-attempts counter. Called
+    /// BEFORE [`Self::run`], which consumes the runner; the loop reads its first delay from the
+    /// pacing when it starts.
+    #[cfg(test)]
+    fn remit_retry_bounds_for_test(
+        &self,
+        base: Duration,
+        cap: Duration,
+    ) -> Arc<std::sync::atomic::AtomicUsize> {
+        *self.remit_pacing_lock() = crate::fee_remit::RemitBackoff::with_bounds(base, cap);
+        Arc::clone(&self.remit_retry_started)
+    }
+
+    /// The pacing, poison-proof: a thread that panicked while holding it must not take the retry
+    /// tick down with it.
+    fn remit_pacing_lock(&self) -> std::sync::MutexGuard<'_, crate::fee_remit::RemitBackoff> {
+        self.remit_pacing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// The seller public key (hex).
@@ -3226,6 +4575,7 @@ impl SellerNodeRunner {
             let offer = ParsedOffer {
                 task: row.task.clone(),
                 output: String::new(),
+                payment_mode: row.payment_mode,
                 amount: row.amount_sats,
                 unit: row.unit.clone(),
                 deadline_unix: row.deadline_unix as u64,
@@ -3402,7 +4752,14 @@ impl SellerNodeRunner {
     /// cover for those. Belt AND braces, never a replacement.
     async fn run_loop(self: Arc<Self>) -> Result<(), NodeError> {
         let served = Arc::clone(&self).serve().await;
+        // Addendum 3 RULING 2: serving has ended — no remittance attempt may start from here on
+        // (the flag is checked by both node paths), the seat retracts, and then the attempt already
+        // in flight (if any) is drained with a bounded wait. `run` returning means nothing of this
+        // PR's is still running, or one INCIDENT line above said exactly what was abandoned.
+        self.remit_closed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.publish_retraction().await;
+        self.drain_remit_in_flight().await;
         served
     }
 
@@ -3501,6 +4858,35 @@ impl SellerNodeRunner {
             tokio::time::interval(Duration::from_secs(wrap_backfill_interval_secs));
         let mut heartbeat_tick =
             tokio::time::interval(Duration::from_secs(heartbeat_interval_secs.max(1)));
+        // Stage 2a, addendum 2: the platform-fee remittance RETRY, on this loop's clock. The collect
+        // path's attempt is the fast path (the fee normally leaves within a second of the sale); this
+        // is the safety net behind it — a failed remittance retries with backoff for as long as the
+        // node runs, and stops SCHEDULING with the loop: a requested shutdown or a relay-pool close
+        // ends this `select!`, `run_loop` raises `remit_closed`, and the attempt in flight (if any)
+        // is drained with a bounded wait before `run` returns (addendum 3 RULING 2).
+        //
+        // A re-armed `Sleep` rather than an `interval`: the delay changes with every outcome
+        // (`RemitBackoff`), and `interval` fires immediately on first poll, which would make the whole
+        // fleet attempt at startup. The first attempt after boot waits the FULL base delay plus a
+        // jitter in [0, base] — [30 s, 60 s], never zero (addendum 3 RULING 1). `remit_retry_pending`
+        // holds the in-flight attempt's report channel; while it is `Some` the timer arm is disabled,
+        // so a slow attempt can never stack a second one. A collect-path outcome that moved the
+        // shared backoff re-arms this same timer through `remit_pacing_changed` (addendum 3 §3).
+        let auto_remit = self.node.home().config.platform_fee.auto_remit;
+        // RULING 1's floor, kept under every re-arm below (addendum 4 §2.2): no retry fires before
+        // boot + base (30 s shipped; the test seam shortens both together), whatever a collect-path
+        // outcome does to the shared backoff in the meantime.
+        let remit_boot_floor = tokio::time::Instant::now() + self.remit_pacing_lock().base();
+        let remit_retry = tokio::time::sleep(self.remit_pacing_lock().boot_delay());
+        tokio::pin!(remit_retry);
+        let mut remit_retry_pending: Option<
+            tokio::sync::oneshot::Receiver<crate::fee_remit::RemitReport>,
+        > = None;
+        if !auto_remit {
+            opline!(
+                "seller node platform fee: automatic remittance is OFF ([platform_fee] auto_remit = false) — neither the collect path nor the retry tick will attempt it; the fee still accrues and is owed, and `maxplayer seller fees remit --confirm` pays it by hand"
+            );
+        }
         // Watchdog liveness clocks: monotonic instant (staleness measure, robust to wall-clock jumps)
         // + unix stamp (resubscribe `since` cursor). Refreshed whenever the relay answers our liveness
         // probe. Seeded to "now" so a healthy node never trips before its first probe.
@@ -3563,6 +4949,52 @@ impl SellerNodeRunner {
                     self.start_due_harness_probes();
                     self.drain().await;
                     continue;
+                }
+                // Stage 2a, addendum 2: the remittance retry tick. Disabled while an attempt is in
+                // flight (the report arm below re-arms the timer when it lands) and for good when
+                // `auto_remit` is off — one flag, both paths (§4).
+                () = &mut remit_retry, if auto_remit && remit_retry_pending.is_none() => {
+                    remit_retry_pending = self.start_retry_remit();
+                    if remit_retry_pending.is_none() {
+                        // Skipped (an attempt is already in flight, or the thread could not start):
+                        // nothing to observe, so the pacing is unchanged; sleep another jittered
+                        // delay at the current streak.
+                        remit_retry.as_mut().reset(
+                            (tokio::time::Instant::now() + self.remit_pacing_lock().next_delay())
+                                .max(remit_boot_floor),
+                        );
+                    }
+                }
+                // The in-flight retry attempt reported (or its thread died): fold the outcome into
+                // the pacing, log it under the §5 discipline, and re-arm the timer by the new delay.
+                report = async { remit_retry_pending.as_mut().expect("armed only while pending").await },
+                    if remit_retry_pending.is_some() => {
+                    remit_retry_pending = None;
+                    let next = self.settle_retry_remit(report.ok());
+                    remit_retry
+                        .as_mut()
+                        .reset((tokio::time::Instant::now() + next).max(remit_boot_floor));
+                }
+                // Addendum 3 §3: a SHARED outcome (the collect thread's attempt) moved the backoff;
+                // make the live timer follow — a success pulls the pending sleep back to base, a
+                // failure pushes a too-short deadline out and never shortens a longer one.
+                () = self.remit_pacing_changed.notified(), if auto_remit => {
+                    let (streak, drawn) = {
+                        let pacing = self.remit_pacing_lock();
+                        (pacing.streak(), pacing.next_delay())
+                    };
+                    let deadline = rearm_deadline(
+                        remit_retry.deadline(),
+                        tokio::time::Instant::now(),
+                        streak,
+                        drawn,
+                        remit_boot_floor,
+                    );
+                    remit_retry.as_mut().reset(deadline);
+                    opline_verbose!(
+                        "seller node platform fee retry: timer re-armed after a collect-path outcome (streak {streak}); next check in {}ms",
+                        deadline.saturating_duration_since(tokio::time::Instant::now()).as_millis()
+                    );
                 }
                 // Re-ask the relay for stored payment wraps AND stored offers, so a silently-deaf 1059
                 // or offer subscription recovers without a restart (#560). Also the node's only
@@ -4240,9 +5672,16 @@ impl SellerNodeRunner {
             in_flight,
             roster.serving,
             seller.rate_sats,
+            // §4.1 — derived from the SAME `SellerConfig` `classify_offer` reads, in the same call,
+            // for the same reason the admission policy below is: the ad cannot drift from its gate.
+            seller.takes_no_payment,
             self.node.home().config.accepted_mints.clone(),
             roster.names.clone(),
             roster.capability(&self.node.home().config.seat),
+            // Derived from the SAME `SellerConfig` `classify_offer` reads, at announce time. An
+            // operator-set field would be a second place to state one fact, and the ad would drift
+            // from the gate that enforces it.
+            crate::home::AdmissionPolicy::from_seller_config(&seller),
         )
         .to_event_draft();
         self.publish_seat_announcement(draft, "heartbeat").await
@@ -4288,9 +5727,11 @@ impl SellerNodeRunner {
         let draft = crate::heartbeat::retraction_for_state(
             self.live_in_flight("retraction"),
             seller.rate_sats,
+            seller.takes_no_payment,
             self.node.home().config.accepted_mints.clone(),
             roster.names.clone(),
             roster.capability(&self.node.home().config.seat),
+            crate::home::AdmissionPolicy::from_seller_config(&seller),
         )
         .to_event_draft();
 
@@ -4325,14 +5766,15 @@ impl SellerNodeRunner {
         match self.node.store().jobs_in_flight() {
             Ok(count) => count,
             Err(error) => {
-                // Fail toward AVAILABLE, as this path always has, but say so: a silent read failure
-                // that parked the seat would be the same invisible-refusal shape as #313 itself.
-                // On the retraction path the fallback costs nothing either way — that beat says
+                // Fall back to publishing ZERO DEPTH, as this path always has, but say so: a silent
+                // read failure that inflated the count would be the same invisible shape as #313
+                // itself. The fallback moves `queue_depth` and nothing else — `accepting` comes from
+                // `anything_serving` on the live beat, and on the retraction path that beat says
                 // `accepting=n` whatever the count is (`retraction_for_state` passes
-                // `anything_serving = false` as a literal), so only `queue_depth` is affected.
+                // `anything_serving = false` as a literal).
                 opline!(
                     "seller node {what}: in-flight count unavailable ({error}); \
-                     advertising as free this tick"
+                     publishing queue_depth=0 this tick"
                 );
                 0
             }
@@ -4574,10 +6016,12 @@ impl SellerNodeRunner {
         {
             ClaimDecision::Claim { deadline_unix } => deadline_unix,
             ClaimDecision::Skip(skip) => {
-                // Every skip is named, never silent. The allowlist fence additionally names the
-                // declined buyer (the other reasons are offer-intrinsic and need no identity).
+                // Every skip is named, never silent. The two buyer-eligibility refusals additionally
+                // name the declined buyer (the other reasons are offer-intrinsic and need no
+                // identity). Both are spelled out rather than left to the catch-all: a refusal the
+                // operator can only fix by knowing WHICH buyer was turned away is useless without it.
                 match skip {
-                    SkipReason::NotAllowlisted => opline!(
+                    SkipReason::NotAllowlisted | SkipReason::OpenTargetedRefused => opline!(
                         "seller node offer skip id={}: {} (buyer={})",
                         event.id,
                         skip.reason(),
@@ -4734,17 +6178,25 @@ impl SellerNodeRunner {
             return;
         }
 
-        let creq = match gateway::creq::build_seller_creq(
-            job_id,
-            offer.amount,
-            &offer.unit,
-            &self.node.home().config.accepted_mints,
-            seller_pubkey,
-        ) {
-            Ok(creq) => creq,
-            Err(error) => {
-                opline!("seller node offer skip id={job_id}: creq build failed ({error})");
-                return;
+        // §2.2 — in FREE mode NO creq is built and none is emitted. `build_seller_creq` would
+        // happily encode `amount = 0`, but every consumer of that request is a payment gate that
+        // refuses zero (§2.4, §2.5), so a zero creq would put an unpayable invoice on the wire that
+        // reads as an invoice to every un-upgraded buyer — the exact ambiguity the mode tag removes.
+        let creq = if offer.payment_mode.is_free() {
+            None
+        } else {
+            match gateway::creq::build_seller_creq(
+                job_id,
+                offer.amount,
+                &offer.unit,
+                &self.node.home().config.accepted_mints,
+                seller_pubkey,
+            ) {
+                Ok(creq) => Some(creq),
+                Err(error) => {
+                    opline!("seller node offer skip id={job_id}: creq build failed ({error})");
+                    return;
+                }
             }
         };
         // The claim advertises what this node can run, so the buyer's award filter can hold it to
@@ -4760,7 +6212,12 @@ impl SellerNodeRunner {
             job_id,
             buyer_pubkey,
             seller_pubkey,
-            &creq,
+            // Exactly one of the two payment statements, chosen by the OFFER's mode — never both
+            // and never neither (§2.2). A free claim carries `["payment","none"]` and no creq.
+            match creq.as_deref() {
+                Some(creq) => gateway::ClaimPayment::Sat(&creq),
+                None => gateway::ClaimPayment::None,
+            },
             &roster.names,
             // The claim holds the declared colour and emits none of it: `claim_draft` asks only for
             // the filterable tags. Passing it is not a leak, and passing a stub here instead would
@@ -4790,7 +6247,7 @@ impl SellerNodeRunner {
         match self.node.store().claim_and_enqueue(
             job_id,
             job_id,
-            &creq,
+            creq.as_deref(),
             &claim,
             now,
             now + CLAIM_PUBLISH_WINDOW_SECS,
@@ -5685,6 +7142,16 @@ impl SellerNodeRunner {
         // this node cannot serve fails the job rather than substituting another harness — the
         // claim gate should already have refused it, and quietly running the wrong agent is the
         // one outcome the registry exists to prevent.
+        //
+        // The reason_code is `capability_missing`, not `execution_failed` (#821): nothing ran here.
+        // `run_agent_job` is below this arm and is never reached, so there is no execution to have
+        // failed — the seat could not START. `execution_failed` reads as *tried and broke*, which
+        // attributes a fault to a run that never happened and points the buyer at a retry, when the
+        // only move that can succeed is a seat that serves this harness.
+        //
+        // ⛔ This is a LABEL, not a guard. It changes nothing about whether the job is paid: under
+        // award-is-payment the sats were committed at award, upstream of this arm. Never read this
+        // code as protecting money (see `ReasonCode::CapabilityMissing`).
         let requested_agent = offer.requested_agent.clone();
         let Some(selected) = self.agents.dispatch(requested_agent.as_deref()) else {
             opline!(
@@ -5692,7 +7159,7 @@ impl SellerNodeRunner {
                  this node (never substituted)",
                 requested_agent.as_deref().unwrap_or("<any>")
             );
-            self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK, None).await;
+            self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, UNDISPATCHABLE_REASON_CODE, CAPABILITY_MISSING_FEEDBACK, None).await;
             return;
         };
         let agent_command = selected.agent.argv.clone();
@@ -5719,212 +7186,355 @@ impl SellerNodeRunner {
         let seller_pubkey = self.seller_pubkey.to_hex();
         let identity = DeliveryAgentIdentity::for_seller(&seller_pubkey);
         let workdir = job_workdir(self.node.home(), job_id);
-        // #591: provision the delivery workdir from the job's STORED contribution pin. The pin was
-        // written at claim (pin ≤ offer ≤ claim), so it is present on BOTH the fresh-award and the
-        // restart/resume path — the same durable-facts re-read the rest of execute_job relies on. A
-        // recorded pin ⇒ clone the pinned base at base_oid (the fork tip the agent extends); no pin ⇒
-        // the empty-workdir default (a from-scratch job, unchanged). A pin read error is fatal here
-        // rather than a silent degrade to an empty workdir: no fund risk either way (buyer verify is
-        // fail-closed pre-pay), but a loud fail is recoverable whereas an empty-workdir mis-delivery
-        // hides the fault. Routing lives in `provision_delivery_workdir` so the real read→plan→init
-        // path is unit-testable.
-        let base_oid = match provision_delivery_workdir(
-            self.node.store(),
-            self.node.home(),
-            job_id,
-            workdir.clone(),
-            identity.clone(),
-        )
-        .await
-        {
-            Ok(base_oid) => base_oid,
-            Err(DeliveryWorkdirError::Refused(refusal)) => {
-                let (reason_code, reason_detail) = env_provision::refusal_feedback(&refusal);
-                opline!(
-                    "seller node execute fail job_id={job_id}: environment provisioning refused ({refusal:?})"
-                );
-                self.fail_job_with_feedback(
-                    job_id,
-                    &offer.buyer_pubkey,
-                    reason_code,
-                    EXEC_FAILURE_FEEDBACK,
-                    Some(reason_detail),
-                )
-                .await;
-                return;
-            }
-            Err(error) => {
-                opline!("seller node execute fail job_id={job_id}: workdir init failed ({error})");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK, None).await;
-                return;
-            }
-        };
-
-        // Run the agent under the job's remaining deadline, retrying a transient error while the
-        // deadline has room. The agent edits files in `workdir`; the node owns commit + push. The
-        // configured `[sandbox]` policy launches the command (pass-through when absent).
-        let deadline = offer.deadline_unix.max(0) as u64;
-        let prompt = job_prompt(&offer, &seller.git_remote, deadline);
-        // Resolve the sandbox executor before the run; a misconfigured `[sandbox]` fails the job
-        // rather than silently running the agent unsandboxed.
-        let sandbox = match SandboxPolicy::from_config(self.node.home().config.sandbox.as_ref()) {
-            Ok(sandbox) => sandbox,
-            Err(error) => {
-                opline!("seller node execute fail job_id={job_id}: sandbox config invalid ({error})");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK, None).await;
-                return;
-            }
-        };
-        let run_started = std::time::Instant::now();
-        let run_result = run_agent_with_retry(
-            deadline,
-            MAX_AGENT_ATTEMPTS,
-            || now_unix() as u64,
-            |_attempt| {
-                let job_timeout = unified_job_timeout(deadline, now_unix() as u64);
-                run_agent_job(
-                    &agent_command,
-                    &sandbox,
-                    &prompt,
-                    &workdir,
-                    &identity,
-                    AgentRunTimeout::JobDeadline(job_timeout),
-                )
-            },
-        )
-        .await;
-        let wall_time_ms = run_started.elapsed().as_millis() as u64;
-        let report = match run_result {
-            Ok(report) => report,
-            Err(error) => {
-                opline!("seller node execute fail job_id={job_id}: agent run failed ({error})");
-                self.drop_harness(harness, harness_fault_for(&error));
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK, None).await;
-                return;
-            }
-        };
-        // The agent's own account of the run, on the REAL job path and not only the probe: it was
-        // discarded here too, so a job that delivered nothing left the operator the same guess the
-        // probe used to. Logged whenever the agent said anything — one line per job, and it is the
-        // line that names a blocked host or an exhausted plan.
-        if let Some(quoted) = quoted_agent_message(report.last_agent_message.as_deref()) {
-            opline!("seller node execute job_id={job_id} agent last message: {quoted}");
-        }
-        let usage = report.usage;
-        // Refresh the advertised model from THIS run (#784). The boot probe answers for the moment
-        // the node started; an operator can re-point a harness at a different default while it runs,
-        // and an advertisement that sits behind the last restart is a claim the seat no longer keeps.
-        // A real run is the freshest evidence available, and it costs nothing to read here.
+        // Track B — container-side delivery, the DEFAULT for a docker seat. When it is on, ONE
+        // sandbox container runs the agent AND every git step (clone, gate, commit, push), and this
+        // host runs no git and drives no ACP for the job: it launches the container, hands it a
+        // branch-scoped push token, and reads back the pushed oid. When it is off, the host path
+        // below runs exactly as before. The config is read here — before any provisioning — because
+        // the host path's own `SandboxPolicy::from_config` below must keep its place and its failure
+        // ordering; a `container_delivery = true` under `launcher` mode reads as off here and is then
+        // refused by that same parse (and by the boot gate) as an invalid `[sandbox]`.
         //
-        // A `None` observation CLEARS rather than preserves, which is the roster's documented
-        // contract: a harness that stops reporting a model must stop advertising one, or the last
-        // value it ever gave outlives the truth. That is the drift this field exists to bound.
-        self.agents
-            .record_model(harness, usage.as_ref().and_then(|u| u.model.clone()));
-
-        // Snapshot the agent's final workdir tree into ONE delivery commit at the stored author date.
-        // §19: the snapshot writes the execution sentinel into the delivered tree, seeded from this
-        // job's job_hash (replay-resistant; the buyer holds the same value on its accept-bind). When
-        // the node observed no genuine execution — the quota-dead case, an empty / base-identical tree
-        // — the snapshot refuses `NoExecutionObserved` and writes no sentinel, which is mapped here to
-        // the `no_sentinel` refusal so the buyer learns delivery was refused for want of a sentinel
-        // (distinct from a crash). The gate, not an unconditional write, is the check.
-        let branch = format!("maxplayer/{}", &job_id[..8.min(job_id.len())]);
-        let message = delivery_message(&offer.task);
-        let job_hash = job_hash_for_offer(job_id, &offer.task, offer.amount_sats);
-        if let Err(error) = seller_git::snapshot_delivery_at_off_runtime(
-            workdir.clone(),
-            identity.clone(),
-            // #616: parent the delivery commit on the base the workdir was provisioned at. A
-            // contribution (Some(base_oid)) then descends from base_oid by construction; the buyer's
-            // descendant gate refuses a commit that doesn't. From-scratch (None) stays a root commit.
-            base_oid,
-            branch.clone(),
-            message,
-            author_date,
-            job_hash,
-        )
-        .await
-        {
-            // Harness-attributable: the agent returned success having left nothing to deliver. This
-            // is the site that fires on a quota-dead harness — its turn "completes", so the agent-run
-            // arm above sees no error at all — which is why the trigger cannot live at one site.
-            self.drop_harness(
-                harness,
-                Some(ExecutionFailure::Harness(Fault::Unproven)),
+        // `container_delivery_enabled` carries the default, the mode and the root posture together.
+        // Reading the field raw would answer "host path" for the commonest docker seat there is: one
+        // that never wrote the key. The uid is the one the container runs as (`docker run --user`):
+        // under root the absent key resolves to the host path.
+        let container_delivery = self
+            .node
+            .home()
+            .config
+            .sandbox
+            .as_ref()
+            .is_some_and(|sandbox| sandbox.container_delivery_enabled(job_identity().0));
+        let (commit, branch, usage, wall_time_ms) = if container_delivery {
+            let deadline = offer.deadline_unix.max(0) as u64;
+            let memory_section = job_memory_section(
+                &self.node.home().root,
+                &self.node.home().config.seller_memory,
             );
-            let (reason_code, feedback) = match error {
-                seller_git::SellerGitError::NoExecutionObserved(_) => {
-                    opline!(
-                        "seller node execute fail job_id={job_id}: delivery refused no_sentinel — {error}"
+            let prompt = job_prompt(&offer, &seller.git_remote, deadline, memory_section.as_deref());
+            match self
+                .deliver_via_container(
+                    job_id,
+                    &offer,
+                    &seller,
+                    &identity,
+                    &workdir,
+                    &agent_command,
+                    &prompt,
+                    deadline,
+                    author_date,
+                )
+                .await
+            {
+                Ok(delivered) => {
+                    if let Some(quoted) = quoted_agent_message(delivered.last_agent_message.as_deref()) {
+                        opline!("seller node execute job_id={job_id} agent last message: {quoted}");
+                    }
+                    // The container reported the model (#784), the same way the host driver did.
+                    self.agents.record_model(
+                        harness,
+                        delivered.usage.as_ref().and_then(|u| u.model.clone()),
                     );
-                    (ReasonCode::NoSentinel, NO_SENTINEL_FEEDBACK)
+                    (
+                        delivered.commit,
+                        delivered.branch,
+                        delivered.usage,
+                        delivered.wall_time_ms,
+                    )
                 }
-                _ => {
-                    opline!(
-                        "seller node execute fail job_id={job_id}: delivery snapshot failed ({error})"
-                    );
-                    (ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK)
-                }
-            };
-            self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, reason_code, feedback, None)
-                .await;
-            return;
-        }
-
-        // Push under the seller's NIP-98 auth. The push authorization is signed THROUGH the signer
-        // actor (which owns the seller key), so the push path is NOT a third custody site — the key
-        // stays confined to the actor + the authenticated relay client, never re-read here. A
-        // public/anonymous https remote takes no header (auth applies to relay-git remotes only).
-        let push_header = if crate::delivery_transport::is_relay_git_locator(&seller.git_remote) {
-            match self.node.signer().http_auth_header(seller.git_remote.clone()).await {
-                Ok(Ok(header)) => Some(header),
-                Ok(Err(error)) => {
-                    opline!("seller node execute fail job_id={job_id}: push auth sign failed ({error})");
-                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
-                    return;
-                }
-                Err(error) => {
-                    opline!("seller node execute fail job_id={job_id}: signer actor gone ({error})");
-                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
+                Err(failure) => {
+                    self.fail_container_delivery(job_id, &offer.buyer_pubkey, harness, failure)
+                        .await;
                     return;
                 }
             }
         } else {
-            None
-        };
-        // #562: serialize the delivery push to this seat's ONE delivery remote, bounded so a hung
-        // push frees the lock instead of starving every later delivery. Concurrent awarded jobs push
-        // per-job branches to the same repo, and concurrent git-receive-pack to one repo is what the
-        // relay 409s (surfaced as terminal delivery_failed before this). Serializing removes the race;
-        // the push oid is stable (invariant 2), so ordering never duplicates a delivery.
-        let commit = match serialized_bounded_push(
-            &self.delivery_push_lock,
-            DELIVERY_PUSH_TIMEOUT,
-            || {
-                seller_git::push_branch_with_header_off_runtime(
-                    workdir.clone(),
-                    seller.git_remote.clone(),
-                    branch.clone(),
-                    push_header,
-                )
-            },
-        )
-        .await
-        {
-            Ok(oid) => oid,
-            Err(DeliveryPushErr::Push(error)) => {
-                opline!("seller node execute fail job_id={job_id}: git push failed ({error})");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
-                return;
+            // #591: provision the delivery workdir from the job's STORED contribution pin. The pin was
+            // written at claim (pin ≤ offer ≤ claim), so it is present on BOTH the fresh-award and the
+            // restart/resume path — the same durable-facts re-read the rest of execute_job relies on. A
+            // recorded pin ⇒ clone the pinned base at base_oid (the fork tip the agent extends); no pin ⇒
+            // the empty-workdir default (a from-scratch job, unchanged). A pin read error is fatal here
+            // rather than a silent degrade to an empty workdir: no fund risk either way (buyer verify is
+            // fail-closed pre-pay), but a loud fail is recoverable whereas an empty-workdir mis-delivery
+            // hides the fault. Routing lives in `provision_delivery_workdir` so the real read→plan→init
+            // path is unit-testable.
+            let base_oid = match provision_delivery_workdir(
+                self.node.store(),
+                self.node.home(),
+                job_id,
+                workdir.clone(),
+                identity.clone(),
+            )
+            .await
+            {
+                Ok(base_oid) => base_oid,
+                Err(DeliveryWorkdirError::Refused(refusal)) => {
+                    let (reason_code, reason_detail) = env_provision::refusal_feedback(&refusal);
+                    opline!(
+                        "seller node execute fail job_id={job_id}: environment provisioning refused ({refusal:?})"
+                    );
+                    self.fail_job_with_feedback(
+                        job_id,
+                        &offer.buyer_pubkey,
+                        reason_code,
+                        EXEC_FAILURE_FEEDBACK,
+                        Some(reason_detail),
+                    )
+                    .await;
+                    return;
+                }
+                Err(error) => {
+                    opline!("seller node execute fail job_id={job_id}: workdir init failed ({error})");
+                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK, None).await;
+                    return;
+                }
+            };
+
+            // Run the agent under the job's remaining deadline, retrying a transient error while the
+            // deadline has room. The agent edits files in `workdir`; the node owns commit + push. The
+            // configured `[sandbox]` policy launches the command (pass-through when absent).
+            let deadline = offer.deadline_unix.max(0) as u64;
+            // #828: operator-authored context (brand guidelines, house style) loads with the job. Inert
+            // for a seller that has never written a MEMORY.md, and it never blocks a job — see
+            // `job_memory_section`.
+            let memory_section = job_memory_section(
+                &self.node.home().root,
+                &self.node.home().config.seller_memory,
+            );
+            let prompt = job_prompt(&offer, &seller.git_remote, deadline, memory_section.as_deref());
+            // Resolve the sandbox executor before the run; a misconfigured `[sandbox]` fails the job
+            // rather than silently running the agent unsandboxed.
+            let sandbox = match SandboxPolicy::from_config(self.node.home().config.sandbox.as_ref()) {
+                Ok(sandbox) => sandbox,
+                Err(error) => {
+                    opline!("seller node execute fail job_id={job_id}: sandbox config invalid ({error})");
+                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK, None).await;
+                    return;
+                }
+            };
+            let run_started = std::time::Instant::now();
+            let run_result = run_agent_with_retry(
+                deadline,
+                MAX_AGENT_ATTEMPTS,
+                || now_unix() as u64,
+                |_attempt| {
+                    let job_timeout = unified_job_timeout(deadline, now_unix() as u64);
+                    run_agent_job(
+                        &agent_command,
+                        &sandbox,
+                        &prompt,
+                        &workdir,
+                        &identity,
+                        AgentRunTimeout::JobDeadline(job_timeout),
+                    )
+                },
+            )
+            .await;
+            let wall_time_ms = run_started.elapsed().as_millis() as u64;
+            let report = match run_result {
+                Ok(report) => report,
+                Err(error) => {
+                    opline!("seller node execute fail job_id={job_id}: agent run failed ({error})");
+                    self.drop_harness(harness, harness_fault_for(&error));
+                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK, None).await;
+                    return;
+                }
+            };
+            // The agent's own account of the run, on the REAL job path and not only the probe: it was
+            // discarded here too, so a job that delivered nothing left the operator the same guess the
+            // probe used to. Logged whenever the agent said anything — one line per job, and it is the
+            // line that names a blocked host or an exhausted plan.
+            if let Some(quoted) = quoted_agent_message(report.last_agent_message.as_deref()) {
+                opline!("seller node execute job_id={job_id} agent last message: {quoted}");
             }
-            Err(DeliveryPushErr::TimedOut(secs)) => {
-                // Timeout lands in the SAME delivery_failed handling (lead 37896 — no new state); the
-                // lock is already released, so later deliveries are not starved behind this one.
-                opline!("seller node execute fail job_id={job_id}: git push exceeded {secs}s (delivery-push lock released; treated as delivery_failed)");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
-                return;
-            }
+            let usage = report.usage;
+            // Refresh the advertised model from THIS run (#784). The boot probe answers for the moment
+            // the node started; an operator can re-point a harness at a different default while it runs,
+            // and an advertisement that sits behind the last restart is a claim the seat no longer keeps.
+            // A real run is the freshest evidence available, and it costs nothing to read here.
+            //
+            // A `None` observation CLEARS rather than preserves, which is the roster's documented
+            // contract: a harness that stops reporting a model must stop advertising one, or the last
+            // value it ever gave outlives the truth. That is the drift this field exists to bound.
+            self.agents
+                .record_model(harness, usage.as_ref().and_then(|u| u.model.clone()));
+
+            // Snapshot the agent's final workdir tree into ONE delivery commit at the stored author date.
+            // §19: the snapshot writes the execution sentinel into the delivered tree, seeded from this
+            // job's job_hash (replay-resistant; the buyer holds the same value on its accept-bind). When
+            // the node observed no genuine execution — the quota-dead case, an empty / base-identical tree
+            // — the snapshot refuses `NoExecutionObserved` and writes no sentinel, which is mapped here to
+            // the `no_sentinel` refusal so the buyer learns delivery was refused for want of a sentinel
+            // (distinct from a crash). The gate, not an unconditional write, is the check.
+            let branch = format!("maxplayer/{}", &job_id[..8.min(job_id.len())]);
+            // Single source for the delivery ref. The branch-scoped push token (below) is minted for
+            // THIS refname, and the push refspec `push_branch_with_header` builds is
+            // `<gated oid>:refs/heads/{branch}` — the destination derives from `branch`, so the token
+            // scope and the ref actually pushed cannot drift apart. The relay (PR #929) demands the
+            // scope be fully qualified (`refs/heads/…`); a bare branch name is rejected.
+            let push_ref = crate::git_transport::delivery_ref(&branch);
+            let message = delivery_message(&offer.task);
+            let job_hash = job_hash_for_offer(job_id, &offer.task, offer.amount_sats);
+            // The gated commit. The push below sends THIS object and reads the remote back against
+            // it, so the delivered commit is the one the gate produced, whatever the local branch
+            // says at push time (C6).
+            let gated_oid = match seller_git::snapshot_delivery_at_off_runtime(
+                workdir.clone(),
+                identity.clone(),
+                // #616: parent the delivery commit on the base the workdir was provisioned at. A
+                // contribution (Some(base_oid)) then descends from base_oid by construction; the buyer's
+                // descendant gate refuses a commit that doesn't. From-scratch (None) stays a root commit.
+                base_oid,
+                branch.clone(),
+                message,
+                author_date,
+                job_hash,
+            )
+            .await
+            {
+                Ok(oid) => oid,
+                Err(error) => {
+                    // Harness-attributable: the agent returned success having left nothing to deliver.
+                    // This is the site that fires on a quota-dead harness — its turn "completes", so the
+                    // agent-run arm above sees no error at all — which is why the trigger cannot live at
+                    // one site.
+                    self.drop_harness(
+                        harness,
+                        Some(ExecutionFailure::Harness(Fault::Unproven)),
+                    );
+                    let (reason_code, feedback) = match error {
+                        seller_git::SellerGitError::NoExecutionObserved(_) => {
+                            opline!(
+                                "seller node execute fail job_id={job_id}: delivery refused no_sentinel — {error}"
+                            );
+                            (ReasonCode::NoSentinel, NO_SENTINEL_FEEDBACK)
+                        }
+                        _ => {
+                            opline!(
+                                "seller node execute fail job_id={job_id}: delivery snapshot failed ({error})"
+                            );
+                            (ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK)
+                        }
+                    };
+                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, reason_code, feedback, None)
+                        .await;
+                    return;
+                }
+            };
+
+            // Push under the seller's NIP-98 auth. The authorization is signed THROUGH the signer
+            // actor (which owns the seller key), so the push path is NOT a third custody site — the key
+            // stays confined to the actor + the authenticated relay client, never re-read here. A
+            // public/anonymous https remote takes no header (auth applies to relay-git remotes only).
+            //
+            // A MINTER, not a header: what follows is a wait. This push queues behind this seat's one
+            // delivery lock, and behind the lock libgit2 opens a fresh stream for the advertisement,
+            // another for the pack POST, and another for any attempt after that. A token minted here
+            // would have to cover all of it — it would be oldest exactly when the relay finally checks
+            // it. Handing the push a closure instead moves signing to the instant before each request
+            // leaves, so every request carries its own fresh token and none of them needs a longer
+            // life than the round-trip it is on.
+            let push_deadline = std::time::Instant::now() + DELIVERY_PUSH_TIMEOUT;
+            // Authority ends when this delivery's turn ends — by DROP, so it also ends on the paths
+            // that never reach the bottom of this arm: an early return, a panic, or this whole
+            // delivery future being cancelled at an await. A push the bound abandoned may still have
+            // a blocking thread parked inside libgit2; this is what stops that thread from minting a
+            // token, and from transmitting one it already holds, for a request nobody is waiting for
+            // any more. See [`PushAuthority`].
+            let push_authority = PushAuthority::new();
+            let push_check = push_authority.check();
+            let push_mint: Option<crate::git_transport::AuthMinter> =
+                if crate::delivery_transport::is_relay_git_locator(&seller.git_remote) {
+                    let signer = self.node.signer().clone();
+                    let intended = seller.git_remote.clone();
+                    let scope = push_ref.clone();
+                    let authority = push_authority.check();
+                    Some(std::sync::Arc::new(move |destination: &str| {
+                        // Bind the token to the remote THIS job was told to deliver to, with the same
+                        // comparison the transport uses. The transport already refuses a leg to any
+                        // other destination; refusing to SIGN for one as well means a redirected or
+                        // rewritten leg cannot even obtain a token to carry.
+                        if !crate::git_transport::same_destination(&intended, destination) {
+                            return Err(format!(
+                                "refusing to authorize a leg to {destination}: this delivery is bound to {intended}"
+                            ));
+                        }
+                        // Before signing. The transport asks the SAME authority again after this
+                        // returns, because the signer call below can block and the answer can change
+                        // while it does.
+                        authority().map_err(|ended| {
+                            format!("{ended}; refusing to authorize another leg")
+                        })?;
+                        if std::time::Instant::now() >= push_deadline {
+                            return Err(
+                                "this delivery's push deadline has passed; refusing to authorize another leg"
+                                    .to_owned(),
+                            );
+                        }
+                        // Scoped to this job's ref, and bounded by what is left of the push budget so
+                        // a slow signer cannot park the thread holding the delivery lock.
+                        signer.http_auth_header_blocking(
+                            destination.to_owned(),
+                            Some(scope.clone()),
+                            push_deadline,
+                        )
+                    }))
+                } else {
+                    None
+                };
+            // #562: serialize the delivery push to this seat's ONE delivery remote, bounded so a hung
+            // push frees the lock instead of starving every later delivery. Concurrent awarded jobs push
+            // per-job branches to the same repo, and concurrent git-receive-pack to one repo is what the
+            // relay 409s (surfaced as terminal delivery_failed before this). Serializing removes the race;
+            // the push oid is stable (invariant 2), so ordering never duplicates a delivery.
+            // Gate the workdir layout and REPLACE its `.git/config` BEFORE pushing, so an `insteadOf`
+            // the agent planted cannot redirect the seller's token to a host it chose
+            // (tests/hostile_local_git_config.rs); the transport also binds every leg to
+            // `seller.git_remote`. Safe here: the job container has already exited, so no agent
+            // process is alive to re-plant the redirect between the rewrite and the push. Both run in
+            // one blocking op inside `neutralize_then_push_off_runtime`, which pushes the gated object
+            // and returns the oid the remote ACKed.
+            let push_outcome = {
+                let workdir = workdir.clone();
+                let remote = seller.git_remote.clone();
+                let branch = branch.clone();
+                let gated = gated_oid.clone();
+                serialized_bounded_push(&self.delivery_push_lock, DELIVERY_PUSH_TIMEOUT, move || {
+                    seller_git::neutralize_then_push_off_runtime(
+                        workdir,
+                        remote,
+                        branch,
+                        gated,
+                        push_mint,
+                        Some(push_check),
+                    )
+                })
+                .await
+            };
+            // Whatever the outcome, this delivery is done asking for authorizations. On the timeout
+            // path that is the point: the bound stopped waiting and moved on, but the blocking
+            // thread can still be inside libgit2 waiting on a socket, and when it wakes it must not
+            // be able to sign a fresh token — or send one it is already holding — for a leg this job
+            // no longer owns. `drop` rather than a flag store: the same end on every path out of this
+            // arm, including the ones that never execute another statement here.
+            drop(push_authority);
+            let commit = match push_outcome {
+                Ok(oid) => oid,
+                Err(DeliveryPushErr::Push(error)) => {
+                    opline!("seller node execute fail job_id={job_id}: git push failed ({error})");
+                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
+                    return;
+                }
+                Err(DeliveryPushErr::TimedOut(secs)) => {
+                    // Timeout lands in the SAME delivery_failed handling (lead 37896 — no new state); the
+                    // lock is already released, so later deliveries are not starved behind this one.
+                    opline!("seller node execute fail job_id={job_id}: git push exceeded {secs}s (delivery-push lock released; treated as delivery_failed)");
+                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
+                    return;
+                }
+            };
+            (commit, branch, usage, wall_time_ms)
         };
 
         // #552: arm the durable pushed-delivery marker IMMEDIATELY after the push (arm-state-after-
@@ -5952,7 +7562,7 @@ impl SellerNodeRunner {
             &seller_pubkey,
             &commit,
             delivery_kind.as_str(),
-            &stored_creq,
+            creq_terms(&stored_creq),
         );
         let seller_sig = match self.node.signer().sign_receipt_hash(preimage.digest_hex()).await {
             Ok(Ok(sig)) => sig,
@@ -6018,6 +7628,10 @@ impl SellerNodeRunner {
         match self.node.store().deliver_and_enqueue(
             job_id,
             &commit,
+            // §3.2 — the mode the JOB was posted under, read off the journaled offer row, not
+            // inferred from the amount. `offer` came from the store precisely because execution can
+            // be a restart away from the claim.
+            offer.payment_mode,
             &draft,
             now,
             now + RESULT_PUBLISH_WINDOW_SECS,
@@ -6050,6 +7664,430 @@ impl SellerNodeRunner {
             }
         }
         self.drain().await;
+    }
+
+    /// Task B2: deliver `job_id` through ONE sandbox container that runs the agent AND all git. The
+    /// host runs no git here — it computes the delivery facts, prepares containment exactly as the
+    /// agent launch does, writes the orchestrator's inputs (mode `0600`, in a host-owned exchange
+    /// directory outside the workdir), launches `maxplayer __deliver phase1`, keeps the container
+    /// alive-checked, hands off the push token per `[sandbox] container_delivery_token`, and reads back
+    /// the pushed oid plus the orchestrator's outcome. Publishing, co-signing and settlement stay in
+    /// `execute_job`, unchanged.
+    ///
+    /// Token hand-off (who can read the token, and when):
+    /// - `fresh-after-agent`: this host mints a fresh 60 s scoped token only after the container's
+    ///   `agent-done` marker — which carries a nonce only the orchestrator learned from the deleted
+    ///   inputs file — has been verified, and writes it `0600` into the exchange directory. By then
+    ///   the agent and every other process in the container are dead.
+    /// - `long-lived`: this host mints once, before launch, with `expiration = deadline + margin`,
+    ///   refusing when that exceeds `container_delivery_token_cap_secs`; the token rides in the inputs
+    ///   file the orchestrator deletes before the agent exists.
+    /// Either way the token is scoped to `refs/heads/<delivery branch>`, so a leak pushes nothing
+    /// but the seller's own delivery branch.
+    ///
+    /// Liveness is "container alive": the `docker run` client is polled once a second, and the
+    /// container is killed past `deadline + PUSH_MARGIN_SECS + CONTAINER_EXIT_GRACE_SECS`.
+    #[allow(clippy::too_many_arguments)]
+    async fn deliver_via_container(
+        &self,
+        job_id: &str,
+        offer: &super::store::Offer,
+        seller: &home::SellerConfig,
+        identity: &DeliveryAgentIdentity,
+        workdir: &std::path::Path,
+        agent_command: &[String],
+        prompt: &str,
+        deadline: u64,
+        author_date: i64,
+    ) -> Result<ContainerDelivery, ContainerDeliveryFailure> {
+        use crate::delivery_orchestrator as orch;
+        use crate::home::ContainerDeliveryToken;
+        use ContainerDeliveryFailure as Fail;
+
+        let sandbox = SandboxPolicy::from_config(self.node.home().config.sandbox.as_ref())
+            .map_err(|error| Fail::Setup(format!("sandbox config invalid ({error})")))?;
+        let Some(delivery_policy) = sandbox.container_delivery() else {
+            return Err(Fail::Setup("container delivery is not enabled for this seat".into()));
+        };
+
+        // The delivery facts, exactly as the host path computes them. The base is PLANNED from the
+        // stored pin, not provisioned: the clone runs inside the container (`run_phase1`).
+        let branch = format!("maxplayer/{}", &job_id[..8.min(job_id.len())]);
+        let push_ref = crate::git_transport::delivery_ref(&branch);
+        let message = delivery_message(&offer.task);
+        let job_hash = job_hash_for_offer(job_id, &offer.task, offer.amount_sats);
+        let pin = self
+            .node
+            .store()
+            .contribution_pin(job_id)
+            .map_err(|error| Fail::Setup(format!("contribution pin read failed ({error})")))?;
+        let base = match plan_delivery_workdir(pin, job_id) {
+            DeliveryWorkdirPlan::Empty => None,
+            DeliveryWorkdirPlan::ContributionClone {
+                clone_url,
+                base_branch,
+                base_oid,
+                ..
+            } => Some(orch::Phase1BaseOwned {
+                clone_url,
+                branch: base_branch,
+                oid: base_oid,
+            }),
+        };
+
+        // The bind sources must exist before docker sees them: a missing source is created
+        // root-owned and the container's uid cannot write it. The workdir is EMPTY here — no git.
+        std::fs::create_dir_all(workdir)
+            .map_err(|error| Fail::Setup(format!("create workdir {}: {error}", workdir.display())))?;
+        let io_dir = container_exchange_dir(&self.node.home().root, job_id);
+        orch::create_exchange_dir(&io_dir).map_err(|error| Fail::Setup(error.to_string()))?;
+
+        // Containment (#797) and the credential proxy (#647), exactly as the agent launch prepares
+        // them. The proxy is a host process; the container reaches it over the network. The
+        // placeholders must outlive the push, hence the margin on the lifetime.
+        let job_lifetime = unified_job_timeout(deadline, now_unix().max(0) as u64)
+            + Duration::from_secs(orch::PUSH_MARGIN_SECS);
+        let prepared = prepare_launch(agent_command, &sandbox, workdir, identity, job_lifetime)
+            .await
+            .map_err(|error| Fail::Setup(format!("container launch preparation failed ({error})")))?;
+
+        // The push token source. A public/anonymous https remote takes no header (as on the host).
+        let push_token = if !crate::delivery_transport::is_relay_git_locator(&seller.git_remote) {
+            orch::PushTokenSource::None
+        } else {
+            match delivery_policy.token {
+                ContainerDeliveryToken::FreshAfterAgent => orch::PushTokenSource::FreshAfterAgent {
+                    wait_secs: orch::FRESH_TOKEN_WAIT_SECS,
+                },
+                ContainerDeliveryToken::LongLived => {
+                    // §7(b): refuse an over-cap token HERE, not at push time.
+                    let expiry = orch::long_lived_expiration(
+                        deadline,
+                        now_unix().max(0) as u64,
+                        delivery_policy.token_cap_secs,
+                    )
+                    .map_err(|error| Fail::Delivery(error.to_string()))?;
+                    let header = self
+                        .mint_push_header(&seller.git_remote, &push_ref, Some(expiry))
+                        .await?;
+                    orch::PushTokenSource::LongLived { header }
+                }
+            }
+        };
+        let nonce = random_nonce_hex().map_err(Fail::Setup)?;
+        let fresh_mode = matches!(push_token, orch::PushTokenSource::FreshAfterAgent { .. });
+
+        let inputs = orch::Phase1Inputs {
+            job_hash,
+            seller_pubkey_hex: identity.seller_pubkey_hex().to_owned(),
+            base,
+            delivery_branch: branch.clone(),
+            message,
+            author_date_unix: author_date,
+            agent_argv: prepared.effective_command.clone(),
+            workdir: std::path::PathBuf::from(CONTAINER_WORKDIR),
+            out_dir: std::path::PathBuf::from(orch::CONTAINER_EXCHANGE_DIR),
+            prompt: prompt.to_owned(),
+            deadline_unix: deadline,
+            max_agent_attempts: MAX_AGENT_ATTEMPTS,
+            // C4: names only. The orchestrator hands the agent these (values from the container
+            // environment), the runtime baseline, and the git identity — nothing else.
+            agent_env_names: prepared.env.iter().map(|(key, _)| key.clone()).collect(),
+            relay_url: seller.git_remote.clone(),
+            push_token,
+            handoff_nonce: nonce.clone(),
+        };
+        orch::write_phase1_inputs(&io_dir.join(orch::PHASE1_INPUTS_FILE), &inputs)
+            .map_err(|error| Fail::Setup(error.to_string()))?;
+
+        // ONE container, the orchestrator as its command, through the SAME argv builder as the agent
+        // launch (mounts, uid, network, cap-drop, init) plus the exchange directory.
+        let orchestrator = vec![
+            orch::CONTAINER_ORCHESTRATOR_BIN.to_owned(),
+            "__deliver".to_owned(),
+            "phase1".to_owned(),
+            format!("{}/{}", orch::CONTAINER_EXCHANGE_DIR, orch::PHASE1_INPUTS_FILE),
+        ];
+        // The container gate: the orchestrator refuses to run phase1 — and so to reap — unless the
+        // host set this on the `docker run`. It is the LAUNCH's environment, not the agent's: the
+        // orchestrator hands the agent only `agent_env_names` (above) plus its baseline, so the
+        // variable never reaches the job.
+        let mut launch_env = prepared.env.clone();
+        launch_env.push((
+            orch::CONTAINER_DELIVERY_ENV.to_owned(),
+            orch::CONTAINER_DELIVERY_ENV_VALUE.to_owned(),
+        ));
+        let job = JobLaunch {
+            workdir,
+            env: &launch_env,
+            uid: prepared.uid,
+            gid: prepared.gid,
+            netns: prepared.holder_name.as_deref(),
+            // The same resolver file the agent launch gets, for the same reason: this container runs
+            // real git operations, and under gVisor docker's embedded resolver never answers.
+            resolv_conf: prepared.resolv_conf.as_deref(),
+        };
+        let launch = sandbox
+            .launch_with_mounts(
+                &orchestrator,
+                &job,
+                &[(io_dir.clone(), orch::CONTAINER_EXCHANGE_DIR.to_owned())],
+            )
+            .map_err(|error| Fail::Setup(format!("container argv: {error}")))?;
+        // Adopted BEFORE the spawn: `docker run` can fail after creating the container.
+        let container = JobContainer::adopt(job_container_name(&job_id_of(workdir)));
+        let started = Instant::now();
+        let mut child = std::process::Command::new(&launch.program)
+            .args(&launch.args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .map_err(|error| Fail::Setup(format!("spawn {}: {error}", launch.program)))?;
+        opline!(
+            "seller node execute job_id={job_id}: container delivery started container={} token={:?}",
+            container.name(),
+            delivery_policy.token
+        );
+
+        // Liveness + hand-off loop. "Alive" is the `docker run` client still running; the marker is
+        // the orchestrator's word that the agent is dead and the commit is gated.
+        let hard_deadline = deadline
+            .saturating_add(orch::PUSH_MARGIN_SECS)
+            .saturating_add(orch::CONTAINER_EXIT_GRACE_SECS);
+        let mut marker: Option<orch::AgentDoneMarker> = None;
+        let mut last_alive_line = Instant::now();
+        let exit: Result<std::process::ExitStatus, Fail> = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => {}
+                Err(error) => break Err(Fail::Setup(format!("wait on container: {error}"))),
+            }
+            // The deadline is checked BEFORE the marker read, never after it. The marker is a file
+            // the job can write while it lives, so the loop must not depend on that read returning
+            // for the deadline to be seen (the reader is non-blocking and capped; the order stands
+            // on its own). Every `break Err` in this loop lands on the same teardown as a timeout:
+            // the client is killed, the container is captured and removed, the exchange dir is gone.
+            if now_unix().max(0) as u64 > hard_deadline {
+                break Err(Fail::Timeout(format!(
+                    "container still running {}s past the job deadline; killed",
+                    orch::PUSH_MARGIN_SECS + orch::CONTAINER_EXIT_GRACE_SECS
+                )));
+            }
+            if marker.is_none() {
+                match orch::read_agent_done_marker(&io_dir, &nonce) {
+                    Ok(None) => {}
+                    Ok(Some(seen)) => {
+                        opline!(
+                            "seller node execute job_id={job_id}: agent done in container, gated commit={}",
+                            seen.expected_oid
+                        );
+                        if fresh_mode {
+                            // The agent is dead. Mint the 60 s scoped token NOW and hand it over,
+                            // owner-only, atomically.
+                            let header = match self
+                                .mint_push_header(&seller.git_remote, &push_ref, None)
+                                .await
+                            {
+                                Ok(header) => header,
+                                Err(failure) => break Err(failure),
+                            };
+                            if let Err(error) =
+                                orch::write_secret_file(&io_dir.join(orch::PUSH_TOKEN_FILE), &header)
+                            {
+                                break Err(Fail::Delivery(format!("token hand-off: {error}")));
+                            }
+                            opline!("seller node execute job_id={job_id}: fresh push token handed to the container");
+                        }
+                        marker = Some(seen);
+                    }
+                    // A forged, planted (FIFO, symlink, over-cap) or malformed marker: no token,
+                    // no delivery. The break lands on the teardown below.
+                    Err(error) => break Err(Fail::Delivery(error.to_string())),
+                }
+            }
+            if last_alive_line.elapsed() >= Duration::from_secs(300) {
+                opline!(
+                    "seller node execute job_id={job_id}: container alive, {}s elapsed",
+                    started.elapsed().as_secs()
+                );
+                last_alive_line = Instant::now();
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        };
+        if exit.is_err() {
+            // Kill the `docker run` CLIENT and reap it; the container itself is removed below by name.
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        // Evidence first, then remove — the same tail as the agent launch.
+        cleanup_job_container(
+            container,
+            workdir,
+            workdir.join(seller_git::SELLER_RUN_LOG),
+            prepared.forwarded_secrets.clone(),
+            CleanupPolicy::CaptureThenRemove,
+        )
+        .await;
+        // The container exited between two polls: the marker may not have been read yet.
+        if marker.is_none()
+            && let Ok(Some(seen)) = orch::read_agent_done_marker(&io_dir, &nonce)
+        {
+            marker = Some(seen);
+        }
+
+        let result = match exit {
+            Ok(status) => {
+                self.classify_container_outcome(job_id, &io_dir, status, marker.as_ref(), &branch, started)
+            }
+            Err(failure) => Err(failure),
+        };
+        // The exchange directory may still hold an unconsumed token file (a container that died
+        // between the hand-off and the read). Remove the whole directory; the token was 60 s anyway.
+        if let Err(error) = std::fs::remove_dir_all(&io_dir) {
+            opline!(
+                "seller node execute job_id={job_id}: could not remove the exchange dir {} ({error})",
+                io_dir.display()
+            );
+        }
+        // `prepared` — the proxy and the namespace — lives to here on purpose.
+        drop(prepared);
+        result
+    }
+
+    /// Read the orchestrator's outcome and oid after the container exited, and map them onto the
+    /// host's own outcome shape. Fails closed on a missing outcome, a missing marker, an oid that
+    /// differs from the gated one, or a "delivered" claim with a non-zero exit.
+    fn classify_container_outcome(
+        &self,
+        job_id: &str,
+        io_dir: &std::path::Path,
+        status: std::process::ExitStatus,
+        marker: Option<&crate::delivery_orchestrator::AgentDoneMarker>,
+        branch: &str,
+        started: Instant,
+    ) -> Result<ContainerDelivery, ContainerDeliveryFailure> {
+        use crate::delivery_orchestrator as orch;
+        use ContainerDeliveryFailure as Fail;
+        let outcome = orch::read_outcome(io_dir).map_err(|error| Fail::Delivery(error.to_string()))?;
+        let Some(outcome) = outcome else {
+            return Err(Fail::Setup(format!(
+                "container exited with {status} and wrote no outcome file"
+            )));
+        };
+        opline!(
+            "seller node execute job_id={job_id}: container outcome status={:?} exit={status} detail={}",
+            outcome.status,
+            outcome.detail
+        );
+        let detail = outcome.detail;
+        match outcome.status {
+            orch::Phase1Status::Delivered => {
+                let commit = orch::read_delivery_oid(io_dir)
+                    .map_err(|error| Fail::Delivery(error.to_string()))?;
+                let Some(marker) = marker else {
+                    return Err(Fail::Delivery("delivered without an agent-done marker".into()));
+                };
+                if marker.expected_oid != commit {
+                    return Err(Fail::Delivery(format!(
+                        "pushed oid {commit} differs from the gated oid {} in the marker",
+                        marker.expected_oid
+                    )));
+                }
+                if !status.success() {
+                    return Err(Fail::Delivery(format!(
+                        "outcome says delivered but the container exited with {status}"
+                    )));
+                }
+                let agent = outcome.agent.unwrap_or_default();
+                Ok(ContainerDelivery {
+                    commit,
+                    branch: branch.to_owned(),
+                    usage: agent.usage,
+                    last_agent_message: agent.last_agent_message,
+                    wall_time_ms: started.elapsed().as_millis() as u64,
+                })
+            }
+            orch::Phase1Status::ProvisionFailed | orch::Phase1Status::Aborted => {
+                Err(Fail::Setup(detail))
+            }
+            orch::Phase1Status::AgentFailed => Err(Fail::Agent(ExecError::Agent(detail))),
+            orch::Phase1Status::AgentUnavailable => Err(Fail::Agent(ExecError::Config(detail))),
+            orch::Phase1Status::DeadlineExceeded => Err(Fail::Agent(ExecError::DeadlineExceeded)),
+            orch::Phase1Status::NoSentinel => Err(Fail::NoSentinel(detail)),
+            orch::Phase1Status::SnapshotFailed => Err(Fail::Snapshot(detail)),
+            orch::Phase1Status::TokenUnavailable
+            | orch::Phase1Status::PushFailed
+            | orch::Phase1Status::Tampered => Err(Fail::Delivery(detail)),
+        }
+    }
+
+    /// Mint the branch-scoped NIP-98 push header through the signer actor (the seller key never
+    /// leaves it). `expiration_unix` is `Some` only for a long-lived token. The header is returned to
+    /// the caller for the hand-off and is never logged.
+    async fn mint_push_header(
+        &self,
+        remote: &str,
+        push_ref: &str,
+        expiration_unix: Option<i64>,
+    ) -> Result<String, ContainerDeliveryFailure> {
+        match self
+            .node
+            .signer()
+            .http_auth_header(remote.to_owned(), Some(push_ref.to_owned()), expiration_unix)
+            .await
+        {
+            Ok(Ok(header)) => Ok(header),
+            Ok(Err(error)) => Err(ContainerDeliveryFailure::Delivery(format!(
+                "push auth sign failed ({error})"
+            ))),
+            Err(error) => Err(ContainerDeliveryFailure::Delivery(format!(
+                "signer actor gone ({error})"
+            ))),
+        }
+    }
+
+    /// Fail a container-delivered job with the SAME feedback reason codes and harness attribution the
+    /// host path emits for the equivalent failure, so a buyer cannot tell the two paths apart.
+    async fn fail_container_delivery(
+        &self,
+        job_id: &str,
+        buyer_pubkey: &str,
+        harness: usize,
+        failure: ContainerDeliveryFailure,
+    ) {
+        use ContainerDeliveryFailure as Fail;
+        let (reason_code, feedback) = match failure {
+            Fail::Setup(detail) => {
+                opline!("seller node execute fail job_id={job_id}: container delivery setup failed ({detail})");
+                (ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK)
+            }
+            Fail::Agent(error) => {
+                opline!("seller node execute fail job_id={job_id}: agent run failed in container ({error})");
+                self.drop_harness(harness, harness_fault_for(&error));
+                (ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK)
+            }
+            Fail::NoSentinel(detail) => {
+                opline!("seller node execute fail job_id={job_id}: delivery refused no_sentinel — {detail}");
+                self.drop_harness(harness, Some(ExecutionFailure::Harness(Fault::Unproven)));
+                (ReasonCode::NoSentinel, NO_SENTINEL_FEEDBACK)
+            }
+            Fail::Snapshot(detail) => {
+                opline!("seller node execute fail job_id={job_id}: delivery snapshot failed in container ({detail})");
+                self.drop_harness(harness, Some(ExecutionFailure::Harness(Fault::Unproven)));
+                (ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK)
+            }
+            Fail::Delivery(detail) => {
+                opline!("seller node execute fail job_id={job_id}: container delivery failed ({detail})");
+                (ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK)
+            }
+            Fail::Timeout(detail) => {
+                opline!("seller node execute fail job_id={job_id}: container delivery timed out ({detail})");
+                self.drop_harness(harness, Some(ExecutionFailure::DeadlineExceeded));
+                (ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK)
+            }
+        };
+        self.fail_job_with_feedback(job_id, buyer_pubkey, reason_code, feedback, None).await;
     }
 
     /// Complete an interrupted delivery from its journaled pushed commit (#552), WITHOUT re-running
@@ -6104,7 +8142,7 @@ impl SellerNodeRunner {
             &seller_pubkey,
             commit,
             delivery_kind.as_str(),
-            &stored_creq,
+            creq_terms(&stored_creq),
         );
         let seller_sig = match self.node.signer().sign_receipt_hash(preimage.digest_hex()).await {
             Ok(Ok(sig)) => sig,
@@ -6159,6 +8197,7 @@ impl SellerNodeRunner {
         match self.node.store().deliver_and_enqueue(
             job_id,
             commit,
+            offer.payment_mode,
             &draft,
             now,
             now + RESULT_PUBLISH_WINDOW_SECS,
@@ -6292,6 +8331,10 @@ impl SellerNodeRunner {
         let parsed_offer = ParsedOffer {
             task: offer.task.clone(),
             output: String::new(),
+            // The redeem guard runs only for a PRICED job — a free trade has no payment to redeem —
+            // but the mode is carried from the stored row rather than assumed, so a free job that
+            // somehow reached here is judged as free, not as paid.
+            payment_mode: offer.payment_mode,
             amount: offer.amount_sats,
             unit: offer.unit.clone(),
             deadline_unix: offer.deadline_unix.max(0) as u64,
@@ -6358,17 +8401,25 @@ impl SellerNodeRunner {
 
         // Swap at the mint, then classify FAIL-CLOSED (never infer prior collection from the
         // breadcrumb — the only proof is a COMPLETED receipt read fail-closed).
+        // `amount_received` is the token FACE (== offer amount, what the buyer paid); the adapter
+        // returns it only once the mint's net credit plus the predicted mint fee reconcile to it.
+        // `mint_fee_sats` is that mint fee, carried beside the face so the receipt can show it.
         let receive_result = adapter
-            .receive(&token, &terms, &accepted_mints, &payload_mint)
+            .receive_detailed(&token, &terms, &accepted_mints, &payload_mint)
             .await
-            .map(|amount| amount.to_u64())
+            .map(|received| (received.face.to_u64(), received.mint_fee.to_u64()))
             .map_err(|error| error.to_string());
-        let amount_received = match classify_redeem_outcome(receive_result, || {
-            self.node.store().has_receipt(&job_id).map_err(|error| error.to_string())
+        let (amount_received, mint_fee_sats) = match classify_redeem_outcome(receive_result, || {
+            self.node
+                .store()
+                .has_receipt(&job_id)
+                .map_err(|error| error.to_string())
         }) {
-            RedeemDecision::Finalize(amount) => amount,
+            RedeemDecision::Finalize(received) => received,
             RedeemDecision::IdempotentNoOp => {
-                opline!("seller node wrap event={event_id}: idempotent no-op (already spent AND a completed receipt exists) for job {job_id}");
+                opline!(
+                    "seller node wrap event={event_id}: idempotent no-op (already spent AND a completed receipt exists) for job {job_id}"
+                );
                 return;
             }
             RedeemDecision::Refuse(reason) => {
@@ -6376,17 +8427,36 @@ impl SellerNodeRunner {
                 return;
             }
         };
+        // Platform fee: computed only NOW — after the redeem classified `Finalize` — on the FACE
+        // (what the buyer paid), at the product-set rate, and journaled in the receipt write below.
+        // `kept` is what the seller keeps once the mint's fee and the platform fee are both taken
+        // from the face; it is derived for the log and never stored. Accrued here; REMITTED
+        // automatically (stage 2a) — once the receipt is journaled `New` below, and only then, the
+        // node starts a best-effort attempt to pay the whole unremitted balance to the platform's
+        // Lightning address (`remit_platform_fee_after_collect`). That attempt runs on a thread of
+        // its own and cannot affect this collect: the receipt is written and the job marked paid
+        // before it starts, and a remittance that fails is logged and journaled, leaving the balance
+        // unremitted for the loop's retry tick (backoff, addendum 2) — and the next collect — to try.
+        let (fee_bps, fee_sats) = platform_fee_at_collect(amount_received);
+        let kept = crate::platform_fee::kept_sats(amount_received, mint_fee_sats, fee_sats);
         opline!(
-            "seller node collect ok: job_id={job_id} amount_received={amount_received} expected={expected} mint={mint_str}"
+            "seller node collect ok: job_id={job_id} amount_received={amount_received} expected={expected} mint={mint_str} mint_fee={mint_fee_sats} fee_sats={fee_sats} fee_bps={fee_bps} kept={kept}"
         );
 
         // Record the receipt AFTER the money landed (invariant 3 order) — deduped on the wrap id, so a
-        // replayed wrap marks the job paid at most once.
-        match self
-            .node
-            .store()
-            .collect_receipt(&event_id, &job_id, amount_received, now_unix())
-        {
+        // replayed wrap marks the job paid at most once. The fees ride in the same row.
+        let collected = self.node.store().collect_receipt(
+            &event_id,
+            &job_id,
+            amount_received,
+            super::store::ReceiptFees {
+                mint_fee_sats,
+                fee_bps,
+                fee_sats,
+            },
+            now_unix(),
+        );
+        match &collected {
             Ok(super::store::Collected::New) => {
                 // `event_id` is the kind-1059 payment gift-wrap — the id this collection is
                 // journaled and deduped under. It is NOT the co-signed kind-3400 receipt (the buyer
@@ -6404,6 +8474,172 @@ impl SellerNodeRunner {
                 opline!("seller node wrap event={event_id}: receipt write failed for job {job_id} ({error})")
             }
         }
+        // The automatic remittance (stage 2a): after a receipt journaled NEW, and only then — never
+        // on a replayed wrap, never on a failed write — so a duplicate wrap can never trigger a
+        // second payment. Best-effort and off this task: the job is already paid above.
+        if remit_follows_collect(&collected) {
+            self.remit_platform_fee_after_collect(&job_id);
+        }
+    }
+
+    /// Start the best-effort remittance of the accrued platform fee after a collect journaled a NEW
+    /// receipt — the mechanism that makes the fee a fee (stage 2a, addendum 1), and the fast path in
+    /// front of the retry tick (addendum 2). Everything about it is arranged so it cannot touch the
+    /// collect that triggered it:
+    ///
+    /// - It runs AFTER the receipt is written and the job is marked paid, on a plain OS thread of
+    ///   its own (the wallet's `*_blocking` wrappers refuse to run inside the Tokio runtime, and a
+    ///   20-second LNURL timeout must not stall the wrap loop). This method returns at once.
+    /// - It never propagates: `fee_remit::remit_live_best_effort` returns a report, not an error,
+    ///   and every line of it goes to the operator log. The house pattern is `fail_job`'s — a
+    ///   failure here is logged and journaled, never raised — the loop keeps serving.
+    /// - A failure leaves the balance unremitted; the loop's retry tick tries again on its backoff
+    ///   clock, and the next collect is one more trigger. Its outcome moves the same pacing the tick
+    ///   sleeps by, so a payment here resets the backoff and a failure here escalates it.
+    /// - Single-flight (addendum 2 §3): if an attempt is already in flight — the tick's, or an
+    ///   earlier collect's — this one SKIPS; the in-flight attempt pays the whole balance, this
+    ///   receipt's fee included, or the tick retries. The store's one-`planned`-row rule remains what
+    ///   makes a double payment impossible.
+    /// - `[platform_fee] auto_remit = false` turns this attempt off (and the tick's) and nothing
+    ///   else: the fee still accrues and stays owed; `maxplayer seller fees remit --confirm` pays it.
+    /// - Its outcome is logged under the ONE policy both paths share ([`log_remit_outcome`]) and,
+    ///   when it moved the backoff, re-arms the loop's live retry timer (addendum 3 §3).
+    /// - Once serving has ended (`remit_closed`) it does not start: the drain is waiting for the
+    ///   attempt in flight, and nothing new may join it (addendum 3 RULING 2).
+    fn remit_platform_fee_after_collect(&self, job_id: &str) {
+        if !self.node.home().config.platform_fee.auto_remit {
+            opline!(
+                "seller node platform fee (job_id={job_id}): automatic remittance is OFF ([platform_fee] auto_remit = false); the fee stays accrued and owed — `maxplayer seller fees remit --confirm` pays it by hand"
+            );
+            return;
+        }
+        if self.remit_closed.load(std::sync::atomic::Ordering::SeqCst) {
+            opline!(
+                "seller node platform fee remit (after job_id={job_id}): the node is shutting down; not starting an attempt — the fee stays accrued for the next start"
+            );
+            return;
+        }
+        let Some(permit) = self.remit_flight.try_acquire() else {
+            opline!(
+                "seller node platform fee remit (after job_id={job_id}): an attempt is already in flight; skipping — it pays the whole unremitted balance, and the retry tick covers a failure"
+            );
+            return;
+        };
+        let store = self.node.store().clone();
+        let home = self.node.home().clone();
+        let pacing = Arc::clone(&self.remit_pacing);
+        let pacing_changed = Arc::clone(&self.remit_pacing_changed);
+        let effects_factory = self.remit_effects_factory();
+        let owned_job_id = job_id.to_owned();
+        let spawned = std::thread::Builder::new()
+            .name("platform-fee-remit".to_owned())
+            .spawn(move || {
+                // The permit lives exactly as long as the attempt: dropped at the end of this
+                // closure, or on unwind if the attempt panics.
+                let _permit = permit;
+                let job_id = owned_job_id;
+                let report = run_remit_attempt(
+                    &store,
+                    home,
+                    crate::fee_remit::RemitTrigger::Collect,
+                    effects_factory,
+                );
+                let (pacing_change, computed) = {
+                    let mut guard = pacing
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let change = guard.observe(&report, now_unix());
+                    (change, guard.computed_delay())
+                };
+                log_remit_outcome(
+                    &format!("remit (after job_id={job_id})"),
+                    &report,
+                    &pacing_change,
+                    None,
+                    computed,
+                );
+                // The shared backoff moved (a payment or a failure): the loop re-arms its timer.
+                if pacing_change != crate::fee_remit::Pacing::Idle {
+                    pacing_changed.notify_one();
+                }
+            });
+        if let Err(error) = spawned {
+            opline!(
+                "seller node platform fee remit (after job_id={job_id}): could not start the remittance thread ({error}); the fee stays accrued for the retry tick to try"
+            );
+        }
+    }
+
+    /// The retry tick's attempt (stage 2a, addendum 2): one best-effort run of the remit entry point
+    /// under `RemitTrigger::Retry`, on a plain OS thread (same reason as the collect path's: the
+    /// wallet's blocking wrappers refuse a Tokio context, and a 20-second LNURL timeout must not
+    /// stall the loop). Returns the channel the report arrives on, or `None` when the tick SKIPPED:
+    /// an attempt is already in flight (single-flight, §3 — the tick does not queue behind it),
+    /// serving has ended (`remit_closed`), or the thread could not start. The loop re-arms the timer
+    /// either way.
+    ///
+    /// Lifecycle (addendum 3 RULING 2): the thread is owned by the node through the single-flight
+    /// permit it holds — when the loop ends with an attempt in flight, `run_loop` raises
+    /// `remit_closed` (so no new attempt can start) and DRAINS: it waits, bounded, for the permit to
+    /// drop before `run` returns. The receiver is dropped with the loop, so the thread's `send`
+    /// fails silently; its attempt is still journaled in the store.
+    fn start_retry_remit(
+        &self,
+    ) -> Option<tokio::sync::oneshot::Receiver<crate::fee_remit::RemitReport>> {
+        if self.remit_closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return None;
+        }
+        let permit = self.remit_flight.try_acquire()?;
+        let store = self.node.store().clone();
+        let home = self.node.home().clone();
+        let effects_factory = self.remit_effects_factory();
+        let (report_tx, report_rx) = tokio::sync::oneshot::channel();
+        let spawned = std::thread::Builder::new()
+            .name("platform-fee-remit-retry".to_owned())
+            .spawn(move || {
+                let _permit = permit;
+                let report = run_remit_attempt(
+                    &store,
+                    home,
+                    crate::fee_remit::RemitTrigger::Retry,
+                    effects_factory,
+                );
+                let _ = report_tx.send(report);
+            });
+        match spawned {
+            Ok(_) => {
+                #[cfg(test)]
+                self.remit_retry_started
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(report_rx)
+            }
+            Err(error) => {
+                opline!(
+                    "seller node platform fee retry: could not start the remittance thread ({error}); the fee stays accrued and the tick tries again"
+                );
+                None
+            }
+        }
+    }
+
+    /// Fold a finished retry attempt into the pacing and log it under the one policy both paths
+    /// share ([`log_remit_outcome`]). Returns the (jittered) delay to sleep before the next attempt.
+    ///
+    /// `None` means the attempt's thread ended without reporting (it panicked): that is a failure
+    /// for the pacing, and it is logged as one.
+    fn settle_retry_remit(&self, report: Option<crate::fee_remit::RemitReport>) -> Duration {
+        use crate::fee_remit::RemitReport;
+        let report = report.unwrap_or_else(|| RemitReport {
+            outcome: Err("the remittance thread ended without reporting (panicked)".to_owned()),
+            lines: Vec::new(),
+        });
+        let (pacing, next, computed) = {
+            let mut guard = self.remit_pacing_lock();
+            let pacing = guard.observe(&report, now_unix());
+            (pacing, guard.next_delay(), guard.computed_delay())
+        };
+        log_remit_outcome("retry", &report, &pacing, Some(next), computed);
+        next
     }
 
     /// Mark a job failed (best-effort; a fail-mark that itself errors is logged, never propagated —
@@ -6969,6 +9205,16 @@ mod slot_gate_tests {
 
 #[cfg(test)]
 mod tests {
+    use crate::seller_node::store::ReceiptFees;
+
+    /// The fee triple a test journals beside a receipt: (mint fee, platform bps, platform sats).
+    fn fees(mint_fee_sats: u64, fee_bps: u32, fee_sats: u64) -> ReceiptFees {
+        ReceiptFees {
+            mint_fee_sats,
+            fee_bps,
+            fee_sats,
+        }
+    }
     use super::*;
 
     const SELLER: &str = "aa";
@@ -7074,14 +9320,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A seat that is REACHABLE by an unnamed buyer, which is deliberately NOT the product default.
+    ///
+    /// `accept_open_targeted` is forced true here so the gate a given test is actually about — rate,
+    /// lapse, age, harness, slots — is the one that decides its outcome. Leave it at the product
+    /// default and every such test would skip on buyer eligibility instead, passing or failing for a
+    /// reason it never meant to exercise.
+    ///
+    /// ⛔ This fixture is therefore NOT evidence about the shipped default, and no test may cite it
+    /// as such. The default that ships is pinned by `open_targeted_is_off_by_default_on_the_wire`
+    /// (deserialization, the only thing an operator's `config.toml` actually goes through) and its
+    /// behavioural twin `default_seat_refuses_a_targeted_offer_from_an_unnamed_buyer`.
     fn seller_cfg(rate_sats: u64, claim_open_pool: bool) -> crate::home::SellerConfig {
         crate::home::SellerConfig {
+            takes_no_payment: false,
             agent_command: vec!["claude".to_owned()],
             rate_sats,
             git_remote: "https://example.invalid/repo.git".to_owned(),
             job_timeout_secs: None,
             agents: Vec::new(),
             claim_open_pool,
+            accept_open_targeted: true,
             accept_offers_only_from: Vec::new(),
             offer_backfill_secs: 0,
             contribution_enabled: true,
@@ -7102,6 +9361,7 @@ mod tests {
 
     fn offer(amount: u64, targeted_to: Option<&str>, deadline_unix: u64) -> ParsedOffer {
         ParsedOffer {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             task: "do the thing".to_owned(),
             output: String::new(),
             amount,
@@ -7167,6 +9427,12 @@ mod tests {
         const STRANGER: &str = "dead02"; // ≠ ALLOWED — the real foil, never vacuous-green
         let mut cfg = seller_cfg(2, false);
         cfg.accept_offers_only_from = vec![ALLOWED.to_owned()];
+        // #923: STATED, not inherited. This test is about the FENCE, so the targeted route must be
+        // shut for the fence to be the gate that decides. The fixture forces `accept_open_targeted`
+        // TRUE for reachability, and until #923 a populated allowlist made that flag inert — so this
+        // test used to read as a fence test while silently depending on the precedence bug. Now that
+        // the two controls are additive, leaving it inherited would assert the OPPOSITE of #923.
+        cfg.accept_open_targeted = false;
 
         // Listed buyer ⇒ still claims (same offer an empty allowlist would claim).
         assert_eq!(
@@ -7223,18 +9489,637 @@ mod tests {
         );
     }
 
-    // #482 BACKCOMPAT (the accept leg) — an empty/absent allowlist is accept-all: any buyer's in-rate
-    // offer still claims, exactly as before the fence existed. Bite: fire the fence on an empty list
-    // and this claim turns into a NotAllowlisted skip.
+    // THE DEFAULT SEAT IS CLOSED ON THE TARGETED SURFACE. This test replaces the #482-era
+    // `empty_allowlist_accepts_any_buyer`, which asserted the OPPOSITE — that an empty allowlist is
+    // accept-all — and whose precondition line ("default allowlist is empty") read the emptiness as
+    // if it carried the policy. It does not any more: emptiness means the operator named no buyers,
+    // and who else may reach the seat is decided by the two surface flags alone.
+    //
+    // The foil is the same offer from the same buyer at the same instant, with the ONE new flag
+    // flipped — so a gate that stopped consulting `accept_open_targeted` cannot pass this.
     #[test]
-    fn empty_allowlist_accepts_any_buyer() {
-        let cfg = seller_cfg(2, false);
-        assert!(cfg.accept_offers_only_from.is_empty(), "precondition: default allowlist is empty");
+    fn default_seat_refuses_a_targeted_offer_from_an_unnamed_buyer() {
+        let mut cfg = seller_cfg(2, false);
+        cfg.accept_open_targeted = false; // the SHIPPED default; the fixture deliberately differs
+        assert!(cfg.accept_offers_only_from.is_empty(), "precondition: no buyer is named");
+
+        assert_eq!(
+            classify_offer(&offer(5, Some(SELLER), NOW + 600), &cfg, &claude_only(), SELLER, "anybody99", NOW, NOW),
+            ClaimDecision::Skip(SkipReason::OpenTargetedRefused),
+            "a seat that named no buyers and did not open the targeted surface must refuse a stranger"
+        );
+        cfg.accept_open_targeted = true;
         assert_eq!(
             classify_offer(&offer(5, Some(SELLER), NOW + 600), &cfg, &claude_only(), SELLER, "anybody99", NOW, NOW),
             ClaimDecision::Claim { deadline_unix: NOW + 600 },
-            "with no allowlist, any buyer's in-rate offer claims"
+            "opting in to the targeted surface must let exactly that same offer through"
         );
+    }
+
+    // The refusal reports its OWN reason, not the allowlist fence's. An operator with no allowlist
+    // told "buyer not in accept_offers_only_from allowlist" goes looking for a list that does not
+    // exist; the two skips answer different questions and must stay distinguishable. Also pins that
+    // the line names the knob that restores service — this is the migration's only audible signal.
+    #[test]
+    fn the_closed_targeted_refusal_names_its_own_knob_not_the_allowlist() {
+        let refusal = SkipReason::OpenTargetedRefused.reason();
+        assert!(
+            refusal.contains("accept_open_targeted"),
+            "the refusal must name the knob that reopens the seat, got: {refusal}"
+        );
+        assert_ne!(
+            refusal,
+            SkipReason::NotAllowlisted.reason(),
+            "a closed seat and a fenced-out buyer must not share one string — they need different fixes"
+        );
+    }
+
+    // THE SHIPPED DEFAULT, read through the path an operator's `config.toml` actually takes. The
+    // fixture above forces this flag TRUE for test reachability, so nothing in this module's
+    // behavioural tests can attest the default; deserialization is the only thing that can.
+    #[test]
+    fn open_targeted_is_off_by_default_on_the_wire() {
+        let cfg: crate::home::SellerConfig = toml::from_str(
+            r#"
+            agent_command = ["claude"]
+            rate_sats = 2
+            git_remote = "https://example.invalid/repo.git"
+            "#,
+        )
+        .expect("a [seller] block with no open-surface keys must still parse");
+
+        assert!(
+            !cfg.accept_open_targeted,
+            "a config that never mentions accept_open_targeted must default to CLOSED"
+        );
+        // The foil: the field is genuinely wired to serde, not merely absent-and-false by accident.
+        let opted_in: crate::home::SellerConfig = toml::from_str(
+            r#"
+            agent_command = ["claude"]
+            rate_sats = 2
+            git_remote = "https://example.invalid/repo.git"
+            accept_open_targeted = true
+            "#,
+        )
+        .expect("an explicit opt-in must parse");
+        assert!(opted_in.accept_open_targeted, "an explicit true must survive deserialization");
+    }
+
+    // KNOB INDEPENDENCE, both directions. The whole point of three knobs is that no one of them is
+    // inferred from another, so each surface must be openable WITHOUT opening the other.
+    #[test]
+    fn the_two_open_surfaces_are_independent() {
+        // Targeted opt-in alone must NOT open the pool — the untargeted offer still needs
+        // `claim_open_pool`, and it is the rate gate (not the buyer gate) that says so.
+        let mut targeted_only = seller_cfg(2, false);
+        targeted_only.accept_open_targeted = true;
+        assert_eq!(
+            classify_offer(&offer(5, None, NOW + 600), &targeted_only, &claude_only(), SELLER, BUYER, NOW, NOW),
+            ClaimDecision::Skip(SkipReason::RateGate),
+            "accept_open_targeted must not silently enrol the seat in the open pool"
+        );
+
+        // Pool opt-in alone must NOT open the targeted surface, and must still claim the pool —
+        // `claim_open_pool` is UNCHANGED by the three-knob split.
+        let mut pool_only = seller_cfg(2, true);
+        pool_only.accept_open_targeted = false;
+        assert_eq!(
+            classify_offer(&offer(5, None, NOW + 600), &pool_only, &claude_only(), SELLER, BUYER, NOW, NOW),
+            ClaimDecision::Claim { deadline_unix: NOW + 600 },
+            "claim_open_pool must still claim an untargeted offer from an unnamed buyer, exactly as before"
+        );
+        assert_eq!(
+            classify_offer(&offer(5, Some(SELLER), NOW + 600), &pool_only, &claude_only(), SELLER, BUYER, NOW, NOW),
+            ClaimDecision::Skip(SkipReason::OpenTargetedRefused),
+            "claiming the open pool must not also invite strangers to target the seat directly"
+        );
+    }
+
+    // #923 — THE ALLOWLIST AND THE TARGETED OPT-IN ADMIT ADDITIVELY.
+    //
+    // ⛔ THIS REPLACES `a_populated_allowlist_wins_over_the_targeted_opt_in`, DELIBERATELY. That test
+    // ran on this exact fixture and asserted the OPPOSITE: that the stranger below reports
+    // `NotAllowlisted`, and that `accept_open_targeted` is "set, and deliberately INERT while a list
+    // exists". That assertion IS the defect #923 reports — it locked in a config whose `true` did
+    // nothing, so an operator could not keep trusted buyers while temporarily opening the public
+    // route, and the config file said one thing while the seat did another.
+    //
+    // Its stated fear was that flipping the clause order "silently dissolves the #482 fence". It does
+    // not, and that distinction is the whole of this change: #923 removes the list's VETO over the
+    // flag beside it, never the list's own refusal. The fence survives as the reject leg and is still
+    // asserted — by `allowlist_fences_out_an_unlisted_buyer`, and by every `accept_open_targeted =
+    // false` row of `the_three_admission_controls_are_additive_and_independent` below.
+    //
+    // RED ON REVERT: reinstate the standalone `!seller.accept_offers_only_from.is_empty() &&
+    // !buyer_is_named` early return in `classify_offer` (the pre-#923 clause 1). The stranger then
+    // reports `NotAllowlisted` and the first assertion fails.
+    #[test]
+    fn the_allowlist_and_the_targeted_opt_in_admit_additively() {
+        const ALLOWED: &str = "cafe01";
+        const STRANGER: &str = "dead02"; // ≠ ALLOWED — the foil, so neither leg is vacuous-green
+        let mut cfg = seller_cfg(2, false);
+        cfg.accept_offers_only_from = vec![ALLOWED.to_owned()];
+        cfg.accept_open_targeted = true; // set, and now EFFECTIVE alongside the list
+
+        assert_eq!(
+            classify_offer(&offer(5, Some(SELLER), NOW + 600), &cfg, &claude_only(), SELLER, STRANGER, NOW, NOW),
+            ClaimDecision::Claim { deadline_unix: NOW + 600 },
+            "accept_open_targeted must ADDITIONALLY admit an unnamed targeted buyer — a populated \
+             allowlist may not cancel it (#923)"
+        );
+        assert_eq!(
+            classify_offer(&offer(5, Some(SELLER), NOW + 600), &cfg, &claude_only(), SELLER, ALLOWED, NOW, NOW),
+            ClaimDecision::Claim { deadline_unix: NOW + 600 },
+            "the named buyer keeps its own route in — the private fallback is not traded away"
+        );
+    }
+
+    // THE #923 ADMISSION MATRIX — all eight combinations of the three controls, each probed on BOTH
+    // surfaces from BOTH a named and an unnamed buyer. Thirty-two expectations, transcribed as
+    // literal outcomes from the issue's truth table and NEVER computed from the gate's own predicate:
+    // a table derived from the implementation restates the bug whenever there is one.
+    //
+    // ⛔ A MATRIX, NOT THREE CASES, BECAUSE THE DEFECT WAS A PRECEDENCE BUG. Every control tested
+    // ALONE was already correct before #923 — an allowlist alone fenced, `accept_open_targeted` alone
+    // opened the targeted route, `claim_open_pool` alone claimed the pool. Only the COMBINATION was
+    // wrong. A suite of one-knob-at-a-time tests is fully green on the bug, which is how it shipped.
+    //
+    // ⛔ THIS IS AN ADMISSION CONTROL, SO THE ROWS THAT REFUSE CARRY THE SAME WEIGHT AS THE ROWS THAT
+    // ADMIT. Sixteen of the thirty-two expectations are refusals. A widening that admitted more than
+    // these three controls describe would pass every Claim row here and fail those.
+    //
+    // RED ON REVERT, two independent ways:
+    //  - drop the `offer.seller_pubkey.as_deref() == Some(seller_pubkey) &&` scope from the
+    //    eligibility clause in `classify_offer` ⇒ the (list, targeted-closed, pool-open) untargeted
+    //    rows turn from Claim into a buyer-eligibility refusal.
+    //  - reinstate the pre-#923 `!seller.accept_offers_only_from.is_empty() && !buyer_is_named` early
+    //    return ⇒ every populated-list row with an unnamed buyer turns into NotAllowlisted.
+    #[test]
+    fn the_three_admission_controls_are_additive_and_independent() {
+        const ALLOWED: &str = "cafe01";
+        const STRANGER: &str = "dead02";
+
+        let claim = ClaimDecision::Claim { deadline_unix: NOW + 600 };
+        let shut = ClaimDecision::Skip(SkipReason::OpenTargetedRefused); // no list to edit
+        let fenced = ClaimDecision::Skip(SkipReason::NotAllowlisted); // a list exists, buyer not on it
+        let no_pool = ClaimDecision::Skip(SkipReason::RateGate); // untargeted without claim_open_pool
+
+        // Columns are the four probes in order: named+targeted, stranger+targeted, named+untargeted,
+        // stranger+untargeted. With an EMPTY list nobody is named, so the first two columns of an
+        // empty-list row are identical by construction — that is a property of the fixture, not a
+        // duplicated assertion.
+        let matrix = [
+            (false, false, false, [&shut, &shut, &no_pool, &no_pool],
+             "no list, both routes closed ⇒ no work reaches this seat at all"),
+            (false, true, false, [&claim, &claim, &no_pool, &no_pool],
+             "no list, targeted route open ⇒ any buyer may target; the pool stays shut"),
+            (false, false, true, [&shut, &shut, &claim, &claim],
+             "no list, pool open ⇒ untargeted claims only; targeting still refused"),
+            (false, true, true, [&claim, &claim, &claim, &claim],
+             "no list, both routes open ⇒ both public surfaces serve"),
+            (true, false, false, [&claim, &fenced, &no_pool, &no_pool],
+             "list only ⇒ the named buyer targets and nobody else does (the #482 fence, intact)"),
+            (true, true, false, [&claim, &claim, &no_pool, &no_pool],
+             "list + targeted route ⇒ ADDITIVE: any buyer may target, and the pool is untouched"),
+            (true, false, true, [&claim, &fenced, &claim, &claim],
+             "list + pool ⇒ the pool is INDEPENDENT of the list, and targeting is still fenced"),
+            (true, true, true, [&claim, &claim, &claim, &claim],
+             "list + both routes ⇒ all three admissions serve at once"),
+        ];
+
+        // ⛔ COUNTED, because `zip` TRUNCATES SILENTLY. Add a fifth probe without a fifth expected
+        // outcome and the pair below still runs, still passes, and quietly stops testing the new
+        // probe — a green matrix that covers less than it says. The count is the only thing between
+        // that and a false all-clear, and this is an admission control.
+        let mut checked = 0usize;
+        for (populated, open_targeted, open_pool, expected, what) in matrix {
+            let mut cfg = seller_cfg(2, open_pool);
+            cfg.accept_open_targeted = open_targeted;
+            cfg.accept_offers_only_from =
+                if populated { vec![ALLOWED.to_owned()] } else { Vec::new() };
+
+            let probes = [
+                (ALLOWED, Some(SELLER), "the listed buyer, targeting this seat"),
+                (STRANGER, Some(SELLER), "an unlisted buyer, targeting this seat"),
+                (ALLOWED, None, "the listed buyer's UNTARGETED open-pool offer"),
+                (STRANGER, None, "an unlisted buyer's UNTARGETED open-pool offer"),
+            ];
+            for ((buyer, target, probe), want) in probes.into_iter().zip(expected) {
+                assert_eq!(
+                    &classify_offer(&offer(5, target, NOW + 600), &cfg, &claude_only(), SELLER, buyer, NOW, NOW),
+                    want,
+                    "accept_offers_only_from populated={populated} accept_open_targeted=\
+                     {open_targeted} claim_open_pool={open_pool} — {what}. Probe: {probe}"
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(
+            checked, 32,
+            "the matrix must run all 8 control settings x 4 probes — a short count means a row or a \
+             probe stopped being exercised"
+        );
+    }
+
+    // THE ADVERTISEMENT MUST SAY WHAT THE GATE DOES. This is the anti-drift binding, and it is the
+    // whole reason the advertised value is DERIVED rather than configured.
+    //
+    // ⛔ NOT VACUOUS, AND THE REASON IS STRUCTURAL: `AdmissionPolicy::from_seller_config` (home.rs)
+    // and `classify_offer` (this file) are independent code with no shared helper. This test asserts
+    // they agree. A test that read the advertisement back out of the gate — or that computed the
+    // expected decision from the policy enum — would prove only that one of them equals itself.
+    //
+    // The meaning of each advertised state is transcribed BY HAND below. That transcription is the
+    // spec's promise in code: `open` promises a stranger gets in, `named` promises the listed buyer
+    // gets in and a stranger does not, `closed` promises neither does.
+    //
+    // ⛔ THE ALLOWLIST ENTRIES HERE ARE REAL 64-HEX x-only KEYS, unlike the short fixtures the
+    // matrix above uses. `classify_offer` compares bytes and does not care — but
+    // `from_seller_config` asks `buyer_pubkey_is_reachable`, so a short fixture would derive
+    // `closed` for a list this gate honours and the two would disagree for a reason that is about
+    // the FIXTURE and not about either code path.
+    //
+    // RED ON REVERT: derive `named` from `accept_offers_only_from.is_empty()` instead of from the
+    // reachability predicate ⇒ the all-unusable row advertises `named` while the gate refuses the
+    // stranger AND has nobody to admit, and the `named` arm's first assertion fails.
+    #[test]
+    fn the_advertised_admission_matches_what_classify_offer_decides() {
+        use crate::home::{AdmissionPolicy, TargetedAdmission};
+
+        // A real secp256k1 x-only key (the generator's x), so it is BOTH reachable and matchable.
+        const LISTED: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        // 64 lowercase hex with no curve point: matchable by bytes, reachable by nobody.
+        const UNUSABLE: &str =
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        const STRANGER: &str = "dead02";
+
+        let allowlists: [&[&str]; 4] = [&[], &[LISTED], &[UNUSABLE], &[UNUSABLE, LISTED]];
+
+        let mut checked = 0usize;
+        for allowlist in allowlists {
+            for open_targeted in [false, true] {
+                for open_pool in [false, true] {
+                    let mut cfg = seller_cfg(2, open_pool);
+                    cfg.accept_open_targeted = open_targeted;
+                    cfg.accept_offers_only_from =
+                        allowlist.iter().map(|entry| (*entry).to_owned()).collect();
+
+                    let policy = AdmissionPolicy::from_seller_config(&cfg);
+
+                    // The promise each advertised state makes, written out rather than derived.
+                    let (listed_gets_in, stranger_gets_in) = match policy.targeted {
+                        TargetedAdmission::Open => (true, true),
+                        TargetedAdmission::Named => (true, false),
+                        TargetedAdmission::Closed => (false, false),
+                    };
+
+                    let admits = |buyer: &str, target: Option<&str>| {
+                        matches!(
+                            classify_offer(
+                                &offer(5, target, NOW + 600),
+                                &cfg,
+                                &claude_only(),
+                                SELLER,
+                                buyer,
+                                NOW,
+                                NOW
+                            ),
+                            ClaimDecision::Claim { .. }
+                        )
+                    };
+
+                    assert_eq!(
+                        admits(LISTED, Some(SELLER)),
+                        listed_gets_in,
+                        "admits_targeted={} promised {listed_gets_in} for the LISTED buyer, but the \
+                         gate disagreed (list={allowlist:?}, open_targeted={open_targeted})",
+                        policy.targeted.as_str()
+                    );
+                    assert_eq!(
+                        admits(STRANGER, Some(SELLER)),
+                        stranger_gets_in,
+                        "admits_targeted={} promised {stranger_gets_in} for a STRANGER, but the \
+                         gate disagreed (list={allowlist:?}, open_targeted={open_targeted})",
+                        policy.targeted.as_str()
+                    );
+                    assert_eq!(
+                        admits(STRANGER, None),
+                        policy.pool,
+                        "admits_pool={} disagreed with the gate on an UNTARGETED offer \
+                         (list={allowlist:?}, claim_open_pool={open_pool})",
+                        if policy.pool { "open" } else { "closed" }
+                    );
+                    checked += 3;
+                }
+            }
+        }
+        assert_eq!(
+            checked, 48,
+            "4 allowlists x 2 targeted x 2 pool x 3 probes — a short count means a case stopped \
+             being exercised"
+        );
+    }
+
+    // THE THIRD OFFER SHAPE, AND THE ONE THIS CHANGE COULD MOST EASILY HAVE OPENED. #923 narrows the
+    // buyer-eligibility clause to offers whose `p` tag is THIS seat, so an offer targeted at SOMEONE
+    // ELSE now bypasses that clause entirely and is refused only by the rate gate. Nothing in the
+    // suite exercised that shape through `classify_offer` before this test, on any config — so the
+    // narrowing was load-bearing and unproven, which is the pair a security-shaped diff must not
+    // ship. Swept over all eight control settings and both buyers: sixteen refusals, no exceptions.
+    //
+    // ⛔ DISCLOSED REASON CHANGE, NOT A DECISION CHANGE. Before #923 a populated allowlist reported
+    // `NotAllowlisted` for this shape, because the fence ran ahead of everything. It now reports the
+    // rate gate's refusal — which is exactly what a seat with an EMPTY allowlist already reported for
+    // the same offer. The refusal itself is identical either way; all seats now agree on the reason.
+    //
+    // RED ON REVERT: reinstate the pre-#923 `!seller.accept_offers_only_from.is_empty() &&
+    // !buyer_is_named` early return ⇒ the populated-list rows report NotAllowlisted, not RateGate.
+    #[test]
+    fn an_offer_targeted_at_another_seat_is_refused_under_every_control_setting() {
+        const ALLOWED: &str = "cafe01";
+        const STRANGER: &str = "dead02";
+        const OTHER_SEAT: &str = "beef03"; // ≠ SELLER — the offer is addressed elsewhere
+
+        let mut checked = 0usize;
+        for populated in [false, true] {
+            for open_targeted in [false, true] {
+                for open_pool in [false, true] {
+                    let mut cfg = seller_cfg(2, open_pool);
+                    cfg.accept_open_targeted = open_targeted;
+                    cfg.accept_offers_only_from =
+                        if populated { vec![ALLOWED.to_owned()] } else { Vec::new() };
+
+                    for buyer in [ALLOWED, STRANGER] {
+                        assert_eq!(
+                            classify_offer(&offer(5, Some(OTHER_SEAT), NOW + 600), &cfg, &claude_only(), SELLER, buyer, NOW, NOW),
+                            ClaimDecision::Skip(SkipReason::RateGate),
+                            "an offer addressed to another seat must never be claimed \
+                             (list_populated={populated} accept_open_targeted={open_targeted} \
+                             claim_open_pool={open_pool} buyer={buyer}) — opening a route for THIS \
+                             seat may not admit work addressed to a different one"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 16, "the sweep must cover all 8 control settings x 2 buyers");
+    }
+
+    // ROUND TRIP — the operator workflow #923 exists to enable: open a public route, then close it
+    // and be back to allowlist-only targeted work with the list never rewritten. Without this, the
+    // matrix above is satisfied by a gate that reaches the right states but cannot get back.
+    //
+    // ⛔ BOUNDED CLAIM: `classify_offer` is pure over `&SellerConfig`, so this attests the ADMISSION
+    // round trip and the in-memory list, not the config-file writeback. That the writeback preserves
+    // an operator's allowlist across a bare relaunch is a separate surface, already pinned by
+    // `sell_writeback_preserves_operator_accept_offers_only_from` in `crates/maxplayer/src/sell.rs`.
+    //
+    // RED ON REVERT: reinstate the pre-#923 `!seller.accept_offers_only_from.is_empty() &&
+    // !buyer_is_named` early return ⇒ the two flags-open assertions fail before the round trip runs.
+    #[test]
+    fn closing_both_open_routes_restores_allowlist_only_admission_with_the_list_intact() {
+        const ALLOWED: &str = "cafe01";
+        const STRANGER: &str = "dead02";
+        let mut cfg = seller_cfg(2, true); // claim_open_pool = true
+        cfg.accept_open_targeted = true;
+        cfg.accept_offers_only_from = vec![ALLOWED.to_owned()];
+        let list_before = cfg.accept_offers_only_from.clone();
+
+        // Both public routes open: the stranger reaches BOTH surfaces.
+        assert_eq!(
+            classify_offer(&offer(5, Some(SELLER), NOW + 600), &cfg, &claude_only(), SELLER, STRANGER, NOW, NOW),
+            ClaimDecision::Claim { deadline_unix: NOW + 600 },
+            "with the targeted route open, an unlisted buyer may target the seat"
+        );
+        assert_eq!(
+            classify_offer(&offer(5, None, NOW + 600), &cfg, &claude_only(), SELLER, STRANGER, NOW, NOW),
+            ClaimDecision::Claim { deadline_unix: NOW + 600 },
+            "with the pool open, an unlisted buyer's untargeted offer is claimable"
+        );
+
+        // Close both. Nothing reconstructs buyer identities, and the private fallback is immediate.
+        cfg.accept_open_targeted = false;
+        cfg.claim_open_pool = false;
+        assert_eq!(
+            cfg.accept_offers_only_from, list_before,
+            "toggling an open route must never rewrite or clear the allowlist"
+        );
+        assert_eq!(
+            classify_offer(&offer(5, Some(SELLER), NOW + 600), &cfg, &claude_only(), SELLER, ALLOWED, NOW, NOW),
+            ClaimDecision::Claim { deadline_unix: NOW + 600 },
+            "the listed buyer is served again the moment the public routes close"
+        );
+        assert_eq!(
+            classify_offer(&offer(5, Some(SELLER), NOW + 600), &cfg, &claude_only(), SELLER, STRANGER, NOW, NOW),
+            ClaimDecision::Skip(SkipReason::NotAllowlisted),
+            "closing the targeted route must fence the stranger out again"
+        );
+        assert_eq!(
+            classify_offer(&offer(5, None, NOW + 600), &cfg, &claude_only(), SELLER, ALLOWED, NOW, NOW),
+            ClaimDecision::Skip(SkipReason::RateGate),
+            "closing the pool refuses untargeted work even from the listed buyer — the pool is its \
+             own control, not a property of the list"
+        );
+    }
+
+    // A NAMED BUYER REACHES A CLOSED SEAT — the migration path an operator is told to take. Without
+    // this, every assertion above is satisfied by a gate that simply refuses everything.
+    #[test]
+    fn a_named_buyer_reaches_a_seat_with_the_targeted_surface_closed() {
+        const ALLOWED: &str = "cafe01";
+        let mut cfg = seller_cfg(2, false);
+        cfg.accept_offers_only_from = vec![ALLOWED.to_owned()];
+        cfg.accept_open_targeted = false;
+        assert_eq!(
+            classify_offer(&offer(5, Some(SELLER), NOW + 600), &cfg, &claude_only(), SELLER, ALLOWED, NOW, NOW),
+            ClaimDecision::Claim { deadline_unix: NOW + 600 },
+            "listing a buyer must be sufficient to keep working with the targeted surface closed"
+        );
+    }
+
+    // THE MIGRATION SIREN. The condition is exactly the config an already-deployed seller upgrades
+    // INTO: it had no allowlist (which used to mean accept-all) and never opted in to either surface,
+    // so after the split it claims nothing while looking entirely healthy. Fires there and nowhere
+    // else — each of the three routes in is checked to SILENCE it, so a warning that simply always
+    // fired (or a predicate that lost a clause) fails here rather than training operators to ignore it.
+    #[test]
+    fn the_unreachable_seat_warning_fires_on_exactly_the_closed_config() {
+        let closed = seller_cfg_closed();
+        let warning = unreachable_seat_warning(&closed).expect("a seat with no way in must warn");
+        assert!(
+            warning.contains("accept_open_targeted") && warning.contains("accept_offers_only_from"),
+            "the warning must name the knobs that restore service, got: {warning}"
+        );
+
+        // Route 1 — name a buyer. ⛔ A WIRE-FORM pubkey: the fixture here used to be `cafe01`,
+        // which is fenced-but-unmatchable and therefore NOT a way in. Asserting `None` against it
+        // pinned the bug as the specification.
+        let mut listed = seller_cfg_closed();
+        listed.accept_offers_only_from = vec!["a1".repeat(32)];
+        assert_eq!(unreachable_seat_warning(&listed), None, "a named buyer is a way in");
+
+        // Route 2 — open the targeted surface.
+        let mut open_targeted = seller_cfg_closed();
+        open_targeted.accept_open_targeted = true;
+        assert_eq!(unreachable_seat_warning(&open_targeted), None, "the targeted surface is a way in");
+
+        // Route 3 — claim the open pool.
+        let mut open_pool = seller_cfg_closed();
+        open_pool.claim_open_pool = true;
+        assert_eq!(unreachable_seat_warning(&open_pool), None, "the open pool is a way in");
+    }
+
+    /// ⛔ ASSERTED ON THE REMEDY CLAUSE ALONE, NEVER THE WHOLE STRING. The diagnosis already names
+    /// all three knobs — as the settings that are OFF — so `warning.contains("claim_open_pool")` is
+    /// satisfied by text that tells the operator nothing about how to fix it. The needle is present
+    /// in the WRONG ROLE, and splitting on the marker is what gives this test access to the claim
+    /// it is actually making.
+    /// Extraction only — deliberately NOT an assertion helper. Each branch keeps its own `#[test]`
+    /// and its own assertions, because the runner stops at the first failing assertion: folding the
+    /// two branches into one test would let whichever ran second go unexercised while the suite
+    /// still reported a failure for the right-looking reason.
+    fn remedy_clause_of(warning: &str) -> String {
+        warning
+            .split_once("THREE ROUTES BACK IN:")
+            .expect(
+                "the remedy must be delimited so it can be read apart from the diagnosis, which \
+                 names the same knobs as the settings that are OFF",
+            )
+            .1
+            .to_owned()
+    }
+
+    /// ⛔ ASSERTED ON THE REMEDY CLAUSE ALONE, NEVER THE WHOLE STRING. The diagnosis already names
+    /// all three knobs — as the settings that are OFF — so `warning.contains("claim_open_pool")` is
+    /// satisfied by text that tells the operator nothing about how to fix it. The needle is present
+    /// in the WRONG ROLE.
+    #[test]
+    fn the_empty_list_warning_offers_all_three_routes_back_in() {
+        let warning =
+            unreachable_seat_warning(&seller_cfg_closed()).expect("a closed seat must warn");
+        let remedy = remedy_clause_of(&warning);
+        for route in ["accept_offers_only_from", "accept_open_targeted", "claim_open_pool"] {
+            assert!(remedy.contains(route), "the remedy must offer `{route}`, got: {remedy}");
+        }
+    }
+
+    /// ⛔ THE BRANCH THAT WAS UNCOVERED, AND THE REASON THIS IS A SEPARATE TEST. The remedy used to
+    /// be spelled literally in each branch, and the only test that read one read the EMPTY branch:
+    /// deleting a route from the junk-list copy alone left the suite green. A mutation proves the
+    /// line it touched, never the claim it was chosen to represent — so each branch is asserted
+    /// where it lives, and both now read the one shared constant.
+    #[test]
+    fn the_junk_list_warning_offers_all_three_routes_back_in() {
+        let mut junk = seller_cfg_closed();
+        junk.accept_offers_only_from = vec!["cafe01".to_owned()];
+        let warning =
+            unreachable_seat_warning(&junk).expect("an all-unusable allowlist must warn");
+        let remedy = remedy_clause_of(&warning);
+        for route in ["accept_offers_only_from", "accept_open_targeted", "claim_open_pool"] {
+            assert!(remedy.contains(route), "the remedy must offer `{route}`, got: {remedy}");
+        }
+    }
+
+    /// The two branches must not drift apart again: whatever the diagnosis says, the remedy is the
+    /// SAME text in both. This is the assertion a shared constant makes cheap and two literals make
+    /// impossible — it fails the moment someone re-inlines either copy.
+    #[test]
+    fn both_unreachable_branches_share_one_remedy_text() {
+        let mut junk = seller_cfg_closed();
+        junk.accept_offers_only_from = vec!["cafe01".to_owned()];
+        let empty = remedy_clause_of(
+            &unreachable_seat_warning(&seller_cfg_closed()).expect("closed seat warns"),
+        );
+        let unusable =
+            remedy_clause_of(&unreachable_seat_warning(&junk).expect("junk allowlist warns"));
+        assert_eq!(empty, unusable, "both branches must offer the identical remedy");
+        assert!(!empty.is_empty(), "and it must not be vacuously equal by both being empty");
+    }
+
+    /// ⛔ THE EXPLANATION MUST NAME THE RULE THAT ACTUALLY REFUSED THE ENTRY. Every other test here
+    /// uses a fixture rejected for its SHAPE — `cafe01` is too short, `A1…` is capitalised — so none
+    /// of them can tell a shape-only message from a correct one. This one is rejected for its CURVE
+    /// and nothing else, which is the only fixture that puts the wording under test.
+    ///
+    /// ⛔ WHY IT MATTERS MORE THAN A WORDING NIT: an operator whose entries are all curve-invalid is
+    /// told every entry is unusable and handed a rule their entries already pass. A right diagnosis
+    /// with an unusable correction is worse than a vague one — they have a stated rule that
+    /// demonstrably fails on their input and no way to see why, because this string is their only
+    /// interface to the predicate.
+    ///
+    /// ⛔ THE PRECONDITION ASSERTS ARE THE TEST. Without them this passes on any junk fixture and
+    /// proves nothing about the curve wording — the same trap as picking a negative control by eye.
+    #[test]
+    fn the_unusable_list_explanation_names_the_curve_not_only_the_shape() {
+        let curve_rejected = "0123456789abcdef".repeat(4);
+        assert!(
+            crate::home::buyer_pubkey_is_wire_shaped(&curve_rejected),
+            "precondition: `{curve_rejected}` must be SHAPE-valid, or a shape-only message would be \
+             a correct explanation for it and this test asserts nothing"
+        );
+        assert!(
+            !crate::home::buyer_pubkey_is_reachable(&curve_rejected),
+            "precondition: `{curve_rejected}` must be refused for its CURVE, not its shape"
+        );
+
+        let mut junk = seller_cfg_closed();
+        junk.accept_offers_only_from = vec![curve_rejected.clone()];
+        let warning =
+            unreachable_seat_warning(&junk).expect("a curve-rejected allowlist must warn");
+
+        // Pinned twice, and both are needed: the first fails if this site re-inlines its own copy,
+        // the second fails if the shared constant is weakened back to shape-only. Either alone
+        // leaves one of the two ways this regressed still open.
+        assert!(
+            warning.contains(crate::home::USABLE_BUYER_ENTRY),
+            "the warning must read the SHARED criterion, not a local copy of it, got: {warning}"
+        );
+        assert!(
+            warning.contains("secp256k1"),
+            "the criterion must still name what rejected `{curve_rejected}`, got: {warning}"
+        );
+    }
+
+    /// ⛔ THE FENCE OPENS ON `is_empty()`, SO A LIST OF TYPOS ADMITS NOBODY AND SHUTS BOTH SURFACES.
+    /// The siren keyed on emptiness and therefore stayed silent for precisely the seat it exists to
+    /// catch. Asserted separately from the mixed case below: they are opposite outcomes, and the
+    /// runner stops at the first failing assertion.
+    #[test]
+    fn the_siren_fires_for_an_allowlist_that_can_never_match() {
+        let mut junk = seller_cfg_closed();
+        junk.accept_offers_only_from = vec!["cafe01".to_owned(), "A1".repeat(32)];
+        // Both open flags ON: the fence shuts them anyway, so they must not rescue the seat.
+        junk.accept_open_targeted = true;
+        junk.claim_open_pool = true;
+        let warning = unreachable_seat_warning(&junk)
+            .expect("a seat whose every allowlist entry is unusable can claim nothing");
+        assert!(
+            warning.contains("unusable"),
+            "the operator must be told the entries are the problem, got: {warning}"
+        );
+    }
+
+    /// The foil for the test above: ONE usable entry among unusable ones is a real route in, so the
+    /// siren must stay silent. Without this, a predicate that always fired would pass.
+    #[test]
+    fn the_siren_stays_silent_when_one_allowlist_entry_is_usable() {
+        let mut mixed = seller_cfg_closed();
+        mixed.accept_offers_only_from = vec!["cafe01".to_owned(), "a1".repeat(32)];
+        assert_eq!(
+            unreachable_seat_warning(&mixed),
+            None,
+            "one buyer that can actually match is a way in, whatever else is listed"
+        );
+    }
+
+    /// The fully-closed seat: the config an upgrading seller with no allowlist lands on. Written out
+    /// rather than derived from `seller_cfg`, which deliberately ships an OPEN targeted surface.
+    fn seller_cfg_closed() -> crate::home::SellerConfig {
+        let mut cfg = seller_cfg(2, false);
+        cfg.accept_open_targeted = false;
+        cfg.accept_offers_only_from = Vec::new();
+        cfg
     }
 
     // #482 ORDER — the fence is consulted AFTER the lapsed refusal: a dead offer from an unlisted
@@ -7531,6 +10416,110 @@ mod tests {
             settled.reason().contains("settled"),
             "the settled line must keep naming settlement: {}",
             settled.reason()
+        );
+    }
+
+    // ── FREE JOB LANE (§2.1) ───────────────────────────────────────────────────────────────────
+
+    fn free_offer(targeted_to: Option<&str>) -> ParsedOffer {
+        ParsedOffer {
+            payment_mode: crate::gateway::PaymentMode::None,
+            ..offer(0, targeted_to, NOW + 600)
+        }
+    }
+
+    fn free_seat(claim_open_pool: bool) -> crate::home::SellerConfig {
+        crate::home::SellerConfig {
+            takes_no_payment: true,
+            ..seller_cfg(0, claim_open_pool)
+        }
+    }
+
+    /// §2.1 — a `payment=none` offer reaches a seat that opted in, and NOTHING ELSE admits it.
+    ///
+    /// The middle case is the one with teeth: a seat at `rate_sats = 0` that never set
+    /// `takes_no_payment` clears the price floor for an `amount = 0` offer (the floor is `<`, not
+    /// `<=`), so without the mode gate every zero-rate seat in the market would start working for
+    /// free the moment the first free offer appeared. Delete the `FreeNotOffered` arm and only this
+    /// leg turns red.
+    #[test]
+    fn a_free_offer_is_claimed_only_by_a_seat_that_opted_in() {
+        assert_eq!(
+            classify_offer(&free_offer(Some(SELLER)), &free_seat(false), &claude_only(), SELLER, BUYER, NOW, NOW),
+            ClaimDecision::Claim { deadline_unix: NOW + 600 },
+            "an opted-in seat claims a free offer"
+        );
+        assert_eq!(
+            classify_offer(&free_offer(Some(SELLER)), &seller_cfg(0, false), &claude_only(), SELLER, BUYER, NOW, NOW),
+            ClaimDecision::Skip(SkipReason::FreeNotOffered),
+            "a ZERO-RATE seat that never opted in must still refuse — rate 0 means 'any amount >= 0', \
+             not 'I take nothing'"
+        );
+        assert_eq!(
+            classify_offer(&free_offer(Some(SELLER)), &seller_cfg(21, false), &claude_only(), SELLER, BUYER, NOW, NOW),
+            ClaimDecision::Skip(SkipReason::FreeNotOffered),
+            "a priced seat refuses a free offer, and the reason names the free knob rather than the rate"
+        );
+    }
+
+    /// The free refusal is its OWN operator string, distinct from the rate gate's.
+    ///
+    /// They answer different questions and point at different knobs: `RateGate` means "this offer
+    /// did not clear your price", and `FreeNotOffered` means "this offer names no price at all and
+    /// you have not said you work for free". One string covering both would send an operator to
+    /// adjust a `rate_sats` that is already 0.
+    #[test]
+    fn free_not_offered_is_not_folded_into_the_rate_gate() {
+        assert_ne!(
+            SkipReason::FreeNotOffered.reason(),
+            SkipReason::RateGate.reason(),
+            "the two refusals must not collapse to one operator string"
+        );
+        assert!(
+            SkipReason::FreeNotOffered.reason().contains("takes_no_payment"),
+            "the free refusal must name the knob that fixes it: {}",
+            SkipReason::FreeNotOffered.reason()
+        );
+    }
+
+    /// The earlier gates still run FIRST for a free offer: a lapsed deadline, a foreign target and
+    /// the open-pool opt-in are all judged before the payment mode is.
+    ///
+    /// Free-ness is not an admission override — §6 names admission as the ONLY control an operator
+    /// has left once the price floor is set aside.
+    #[test]
+    fn a_free_offer_does_not_bypass_the_admission_gates() {
+        let lapsed = ParsedOffer { deadline_unix: NOW - 1, ..free_offer(Some(SELLER)) };
+        assert_eq!(
+            classify_offer(&lapsed, &free_seat(false), &claude_only(), SELLER, BUYER, NOW, NOW),
+            ClaimDecision::Skip(SkipReason::Lapsed)
+        );
+        assert_eq!(
+            classify_offer(&free_offer(Some("cc")), &free_seat(true), &claude_only(), SELLER, BUYER, NOW, NOW),
+            ClaimDecision::Skip(SkipReason::RateGate),
+            "a free offer addressed to ANOTHER seat is refused by targeting, inside the rate gate"
+        );
+        assert_eq!(
+            classify_offer(&free_offer(None), &free_seat(false), &claude_only(), SELLER, BUYER, NOW, NOW),
+            ClaimDecision::Skip(SkipReason::RateGate),
+            "an untargeted free offer still needs claim_open_pool"
+        );
+        assert_eq!(
+            classify_offer(&free_offer(None), &free_seat(true), &claude_only(), SELLER, BUYER, NOW, NOW),
+            ClaimDecision::Claim { deadline_unix: NOW + 600 }
+        );
+    }
+
+    /// A PRICED offer is judged exactly as it always was by a free seat — the mode gate fires only
+    /// on the mode. Without this leg the gate above would also pass an implementation that refused
+    /// everything a free seat was offered.
+    #[test]
+    fn a_free_seat_still_judges_a_priced_offer_by_the_price_floor() {
+        assert_eq!(
+            classify_offer(&offer(5, Some(SELLER), NOW + 600), &free_seat(false), &claude_only(), SELLER, BUYER, NOW, NOW),
+            ClaimDecision::Claim { deadline_unix: NOW + 600 },
+            "a free seat floors at 0, so a priced offer clears it — it is a seat that takes no \
+             payment, not one that refuses money it is handed"
         );
     }
 
@@ -7887,7 +10876,7 @@ mod tests {
         let resumed = store.offer_row(&job).expect("offer row").expect("offer survives");
 
         // The exact call the execute path makes, over the exact row a resumed job reads.
-        let prompt = job_prompt(&resumed, "https://relay.example/git/abc.git", 2_000_000_000);
+        let prompt = job_prompt(&resumed, "https://relay.example/git/abc.git", 2_000_000_000, None);
         assert!(
             prompt.contains("application/json"),
             "the buyer's declared output type must reach the hired agent: {prompt}"
@@ -7900,7 +10889,7 @@ mod tests {
         // the other job's type.
         let mut other = resumed.clone();
         other.output = Some("text/plain".to_owned());
-        let other_prompt = job_prompt(&other, "https://relay.example/git/abc.git", 2_000_000_000);
+        let other_prompt = job_prompt(&other, "https://relay.example/git/abc.git", 2_000_000_000, None);
         assert!(other_prompt.contains("text/plain"), "{other_prompt}");
         assert!(!other_prompt.contains("application/json"), "{other_prompt}");
         let _ = std::fs::remove_dir_all(&root);
@@ -7935,6 +10924,7 @@ mod tests {
             store
                 .record_offer(
                     &Offer {
+                        payment_mode: crate::gateway::PaymentMode::Sat,
                         offer_id: job.clone(),
                         buyer_pubkey: buyer.clone(),
                         amount_sats: 21,
@@ -7948,9 +10938,9 @@ mod tests {
                     1,
                 )
                 .expect("record offer");
-            let draft = claim_draft(&job, &buyer, &seller, &creq, &["codex".to_owned()], &Default::default());
+            let draft = claim_draft(&job, &buyer, &seller, crate::gateway::ClaimPayment::Sat(&creq), &["codex".to_owned()], &Default::default());
             store
-                .claim_and_enqueue(&job, &job, &creq, &draft, 1, 9_999_999_999, 1)
+                .claim_and_enqueue(&job, &job, Some(&creq), &draft, 1, 9_999_999_999, 1)
                 .expect("claim");
         }
 
@@ -9873,8 +12863,8 @@ mod tests {
     /// award REQ is unscoped (#456 — both kinds ride that one REQ). No award is published at all, so
     /// both seats reach `on_accept` with `job_award_time == None`: the arm that WRITES. Binding there
     /// on claim EXISTENCE alone gives the loser a phantom `awarded` job row, which `jobs_in_flight`
-    /// counts and the heartbeat then publishes as `accepting=n` — a seat stranded out of the market
-    /// by another seat's win, holding capacity for work it never had.
+    /// counts and the heartbeat then publishes as a raised `queue_depth` (`accepting` is unmoved by
+    /// held jobs) — a seat holding capacity for work it never had, by another seat's win.
     ///
     /// The WINNER leg is the anti-vacuity control and it is load-bearing: the same ACCEPT, on the
     /// seat whose claim it names, MUST still bind. Without it a handler that refused every accept
@@ -10019,7 +13009,7 @@ mod tests {
                 assert_eq!(
                     loser.slots.available(),
                     1,
-                    "the loser's reserved slot returns, so the seat keeps advertising capacity"
+                    "the loser's reserved permit returned, so one slot is available again"
                 );
 
                 // ANTI-VACUITY: the same ACCEPT, on the seat it names, still binds.
@@ -10184,6 +13174,7 @@ mod tests {
         store
             .record_offer(
                 &crate::seller_node::store::Offer {
+                    payment_mode: crate::gateway::PaymentMode::Sat,
                     offer_id: job_id.to_owned(),
                     buyer_pubkey: buyer_hex.to_owned(),
                     amount_sats: 100,
@@ -10197,9 +13188,9 @@ mod tests {
                 now,
             )
             .expect("record offer");
-        let draft = claim_draft(job_id, buyer_hex, &"s".repeat(64), "creq", &[], &Default::default());
+        let draft = claim_draft(job_id, buyer_hex, &"s".repeat(64), crate::gateway::ClaimPayment::Sat("creq"), &[], &Default::default());
         store
-            .claim_and_enqueue(job_id, job_id, "creq", &draft, now, now + 3_600, now)
+            .claim_and_enqueue(job_id, job_id, Some("creq"), &draft, now, now + 3_600, now)
             .expect("claim");
         store
             .record_award(&"a".repeat(64), job_id, buyer_hex, now)
@@ -10523,12 +13514,13 @@ mod tests {
             "nothing delivered yet"
         );
 
-        let draft = claim_draft(&job, &buyer, &seller, &creq, &[], &Default::default());
+        let draft = claim_draft(&job, &buyer, &seller, crate::gateway::ClaimPayment::Sat(&creq), &[], &Default::default());
         let delivered_at = 6_000;
         assert!(store
             .deliver_and_enqueue(
                 &job,
                 &"c".repeat(40),
+                crate::gateway::PaymentMode::Sat,
                 &draft,
                 delivered_at,
                 delivered_at + RESULT_PUBLISH_WINDOW_SECS,
@@ -10543,7 +13535,7 @@ mod tests {
 
         // The payment lands ⇒ no longer unsettled, and the receipt time becomes the cursor.
         store
-            .collect_receipt(&"d".repeat(64), &job, 21, 10_000)
+            .collect_receipt(&"d".repeat(64), &job, 21, fees(0, 0, 0), 10_000)
             .expect("collect");
         assert_eq!(store.last_receipt_unix().expect("receipts"), Some(10_000));
         assert_eq!(
@@ -10790,11 +13782,11 @@ mod tests {
         let job = "a".repeat(64);
         let buyer = "b".repeat(64);
         let (store, root) = store_with_awarded_job(&creq, &job, &buyer, 4242);
-        let draft = claim_draft(&job, &buyer, &seller, &creq, &[], &Default::default());
+        let draft = claim_draft(&job, &buyer, &seller, crate::gateway::ClaimPayment::Sat(&creq), &[], &Default::default());
 
         // Deliver ⇒ state Delivered ⇒ NOT re-execute-eligible (the guard early-returns).
         assert!(store
-            .deliver_and_enqueue(&job, &"c".repeat(40), &draft, 5000, 5000 + RESULT_PUBLISH_WINDOW_SECS, 5000)
+            .deliver_and_enqueue(&job, &"c".repeat(40), crate::gateway::PaymentMode::Sat, &draft, 5000, 5000 + RESULT_PUBLISH_WINDOW_SECS, 5000)
             .expect("deliver"));
         assert_eq!(store.job_state(&job).expect("state"), Some(JobState::Delivered));
         assert!(
@@ -10804,7 +13796,9 @@ mod tests {
 
         // Pay ⇒ state Paid ⇒ likewise not re-execute-eligible (terminal never clobbered).
         assert_eq!(
-            store.collect_receipt(&"e".repeat(64), &job, 21, 6000).expect("collect"),
+            store
+                .collect_receipt(&"e".repeat(64), &job, 21, fees(0, 0, 0), 6000)
+                .expect("collect"),
             Collected::New
         );
         assert_eq!(store.job_state(&job).expect("state"), Some(JobState::Paid));
@@ -10841,7 +13835,7 @@ mod tests {
         let buyer = "b".repeat(64);
         // The helper journals award event A (`w`×64) — that is execution #1's award.
         let (store, root) = store_with_awarded_job(&creq, &job, &buyer, 4242);
-        let draft = claim_draft(&job, &buyer, &seller, &creq, &[], &Default::default());
+        let draft = claim_draft(&job, &buyer, &seller, crate::gateway::ClaimPayment::Sat(&creq), &[], &Default::default());
 
         // Execution #1 finished and published ⇒ Delivered.
         assert!(
@@ -10849,6 +13843,7 @@ mod tests {
                 .deliver_and_enqueue(
                     &job,
                     &"c".repeat(40),
+                    crate::gateway::PaymentMode::Sat,
                     &draft,
                     5000,
                     5000 + RESULT_PUBLISH_WINDOW_SECS,
@@ -11009,9 +14004,21 @@ mod tests {
             tag(ReasonCode::ExecutionFailed, "reason_code").as_deref(),
             Some("execution_failed")
         );
+        assert_eq!(
+            tag(ReasonCode::CapabilityMissing, "reason_code").as_deref(),
+            Some("capability_missing")
+        );
         // Coarse status is unchanged (historical `error`) for every code — the tag is the discriminator.
         assert_eq!(tag(ReasonCode::BelowRate, "status").as_deref(), Some("error"));
         assert_eq!(tag(ReasonCode::NoSentinel, "status").as_deref(), Some("error"));
+        // #821 keeps the existing convention deliberately: the §10 refusal re-class is a separate view
+        // change, so `capability_missing` rides `status=error` like every other code. This is also what
+        // discharges #821's buyer-side item without a code change — the claim-list view keys on
+        // `status`, so a code that stays `error` is already handled there.
+        assert_eq!(
+            tag(ReasonCode::CapabilityMissing, "status").as_deref(),
+            Some("error")
+        );
     }
 
     // ── Execute-body delivery contract (invariants 2 & 8), no network ────────────────────────────
@@ -11184,6 +14191,7 @@ mod tests {
         store
             .record_offer(
                 &Offer {
+                    payment_mode: crate::gateway::PaymentMode::Sat,
                     offer_id: job.to_owned(),
                     buyer_pubkey: buyer.to_owned(),
                     amount_sats: 21,
@@ -11197,9 +14205,9 @@ mod tests {
                 1,
             )
             .expect("record offer");
-        let draft = claim_draft(job, buyer, &"s".repeat(64), creq, &[], &Default::default());
+        let draft = claim_draft(job, buyer, &"s".repeat(64), crate::gateway::ClaimPayment::Sat(&creq), &[], &Default::default());
         store
-            .claim_and_enqueue(job, job, creq, &draft, 1, 9_999_999_999, 1)
+            .claim_and_enqueue(job, job, Some(creq), &draft, 1, 9_999_999_999, 1)
             .expect("claim");
         store
             .record_award(&"w".repeat(64), job, buyer, award_time)
@@ -11221,6 +14229,7 @@ mod tests {
         store
             .record_offer(
                 &Offer {
+                    payment_mode: crate::gateway::PaymentMode::Sat,
                     offer_id: job.to_owned(),
                     buyer_pubkey: buyer.to_owned(),
                     amount_sats: 21,
@@ -11234,9 +14243,9 @@ mod tests {
                 1,
             )
             .expect("record offer");
-        let draft = claim_draft(job, buyer, &"s".repeat(64), "creqL", &[], &Default::default());
+        let draft = claim_draft(job, buyer, &"s".repeat(64), crate::gateway::ClaimPayment::Sat("creqL"), &[], &Default::default());
         store
-            .claim_and_enqueue(job, job, "creqL", &draft, 1, 9_999_999_999, 1)
+            .claim_and_enqueue(job, job, Some("creqL"), &draft, 1, 9_999_999_999, 1)
             .expect("claim");
         store
             .record_award(&"w".repeat(64), job, buyer, 2)
@@ -11249,8 +14258,8 @@ mod tests {
     ///
     /// It pins the self-heal that already-stranded seats depend on: a slot-occupying `awarded` row
     /// with no delivery, no receipt, no pushed commit and a PASSED offer deadline classifies as
-    /// `SkipLapsed`, and once failed it stops counting toward `jobs_in_flight` — which is what puts
-    /// the seat back to `accepting=y`. #626 closes the source of such rows; this guards the path that
+    /// `SkipLapsed`, and once failed it stops counting toward `jobs_in_flight` — which is what drops
+    /// the published `queue_depth` back down. #626 closes the source of such rows; this guards the path that
     /// clears the ones already written, so a later change cannot delete the healing silently.
     #[test]
     fn characterization_a_lapsed_awarded_row_lapses_and_stops_counting_once_failed() {
@@ -11259,11 +14268,11 @@ mod tests {
         let now = 2_000_i64;
         let (store, root) = store_with_lapsed_awarded_job(&job, &buyer, now);
 
-        // The stranded shape, asserted rather than assumed: the seat reports itself busy.
+        // The stranded shape, asserted rather than assumed: the seat reports load it is not carrying.
         assert_eq!(
             store.jobs_in_flight().expect("in flight"),
             1,
-            "precondition: the awarded row occupies a slot, so the heartbeat publishes accepting=n"
+            "precondition: the awarded row occupies a slot, so it counts toward the published queue_depth"
         );
         let state = store.job_state(&job).expect("job_state").expect("job row present");
         assert!(!store.has_delivery(&job).expect("has_delivery"), "never delivered");
@@ -11287,7 +14296,7 @@ mod tests {
         assert_eq!(
             store.jobs_in_flight().expect("in flight"),
             0,
-            "the failed row no longer occupies a slot, so the seat advertises capacity again"
+            "the failed row no longer occupies a slot, so it no longer raises the published queue_depth"
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -11337,6 +14346,7 @@ mod tests {
                 store
                     .record_offer(
                         &Offer {
+                            payment_mode: crate::gateway::PaymentMode::Sat,
                             offer_id: job.to_owned(),
                             buyer_pubkey: buyer.clone(),
                             amount_sats: 21,
@@ -11351,9 +14361,9 @@ mod tests {
                     )
                     .expect("record offer");
                 // A per-job draft (distinct event id) — claim_and_enqueue dedups on `claim:{job}`.
-                let draft = claim_draft(job, &buyer, &seller, creq, &[], &Default::default());
+                let draft = claim_draft(job, &buyer, &seller, crate::gateway::ClaimPayment::Sat(&creq), &[], &Default::default());
                 store
-                    .claim_and_enqueue(job, job, creq, &draft, 1, 9_999_999_999, 1)
+                    .claim_and_enqueue(job, job, Some(creq), &draft, 1, 9_999_999_999, 1)
                     .expect("claim");
                 store.record_award(award, job, &buyer, 2).expect("award");
             };
@@ -11364,9 +14374,9 @@ mod tests {
             seed(&pushed_lapsed, lapsed, &format!("{}4", "w".repeat(63)));
             store.mark_pushed(&pushed_lapsed, "commitX", 3).expect("mark pushed (lapsed)");
             seed(&delivered, live, &format!("{}5", "w".repeat(63)));
-            let ddraft = claim_draft(&delivered, &buyer, &seller, creq, &[], &Default::default());
+            let ddraft = claim_draft(&delivered, &buyer, &seller, crate::gateway::ClaimPayment::Sat(&creq), &[], &Default::default());
             store
-                .deliver_and_enqueue(&delivered, &"c".repeat(40), &ddraft, 4, 4 + RESULT_PUBLISH_WINDOW_SECS, 4)
+                .deliver_and_enqueue(&delivered, &"c".repeat(40), crate::gateway::PaymentMode::Sat, &ddraft, 4, 4 + RESULT_PUBLISH_WINDOW_SECS, 4)
                 .expect("deliver");
             // #563: a live-deadline row a PRIOR resume relay-derived as settled elsewhere. The durable
             // marker must survive the restart and short-circuit the next resume to SkipTerminal WITHOUT
@@ -11466,7 +14476,7 @@ mod tests {
             &seller,
             &"c".repeat(40),
             "fork",
-            &stored,
+            creq_terms(&stored),
         );
         assert_eq!(
             preimage.creq_hash,
@@ -11544,17 +14554,17 @@ mod tests {
         )
         .expect("creq");
         let (store, root) = store_with_awarded_job(&creq, &job, &buyer, author_date);
-        let draft = claim_draft(&job, &buyer, &seller, &creq, &[], &Default::default());
+        let draft = claim_draft(&job, &buyer, &seller, crate::gateway::ClaimPayment::Sat(&creq), &[], &Default::default());
         let now = 5000;
         assert!(
             store
-                .deliver_and_enqueue(&job, &commit_first, &draft, now, now + RESULT_PUBLISH_WINDOW_SECS, now)
+                .deliver_and_enqueue(&job, &commit_first, crate::gateway::PaymentMode::Sat, &draft, now, now + RESULT_PUBLISH_WINDOW_SECS, now)
                 .expect("deliver"),
             "first delivery journals + enqueues the result"
         );
         assert!(
             !store
-                .deliver_and_enqueue(&job, &commit_resume, &draft, now, now + RESULT_PUBLISH_WINDOW_SECS, now)
+                .deliver_and_enqueue(&job, &commit_resume, crate::gateway::PaymentMode::Sat, &draft, now, now + RESULT_PUBLISH_WINDOW_SECS, now)
                 .expect("re-deliver"),
             "resume adopts the existing tip: a second delivery re-enqueues nothing"
         );
@@ -11584,22 +14594,27 @@ mod tests {
         ));
         // Already-spent + a COMPLETED receipt ⇒ idempotent no-op (legit backfill/restart re-see).
         assert!(matches!(
-            classify_redeem_outcome(Err("Token already spent".into()), || Ok(true)),
+            classify_redeem_outcome::<u64>(Err("Token already spent".into()), || Ok(true)),
             RedeemDecision::IdempotentNoOp
         ));
         // Already-spent + NO receipt (crash-between, or a replay/theft — indistinguishable) ⇒ refuse.
         assert!(matches!(
-            classify_redeem_outcome(Err("Token already spent".into()), || Ok(false)),
+            classify_redeem_outcome::<u64>(Err("Token already spent".into()), || Ok(false)),
             RedeemDecision::Refuse(_)
         ));
         // has_receipt READ ERROR ⇒ refuse, FAIL CLOSED (never read unreadable as "no receipt ⇒ safe").
         assert!(matches!(
-            classify_redeem_outcome(Err("already redeemed".into()), || Err("corrupt".into())),
+            classify_redeem_outcome::<u64>(
+                Err("already redeemed".into()),
+                || Err("corrupt".into())
+            ),
             RedeemDecision::Refuse(_)
         ));
         // A non-already-spent receive error refuses without consulting has_receipt.
         assert!(matches!(
-            classify_redeem_outcome(Err("mint offline".into()), || panic!("must not read has_receipt")),
+            classify_redeem_outcome::<u64>(Err("mint offline".into()), || panic!(
+                "must not read has_receipt"
+            )),
             RedeemDecision::Refuse(_)
         ));
     }
@@ -11739,15 +14754,418 @@ mod tests {
         let wrap_id = "e".repeat(64);
         assert!(!store.has_receipt(&job).expect("read"), "not paid before collect");
         assert_eq!(
-            store.collect_receipt(&wrap_id, &job, 21, 5000).expect("collect"),
+            store
+                .collect_receipt(&wrap_id, &job, 21, fees(0, 0, 0), 5000)
+                .expect("collect"),
             crate::seller_node::store::Collected::New
         );
         assert_eq!(
-            store.collect_receipt(&wrap_id, &job, 21, 5001).expect("replay"),
+            store
+                .collect_receipt(&wrap_id, &job, 21, fees(0, 0, 0), 5001)
+                .expect("replay"),
             crate::seller_node::store::Collected::Duplicate,
             "a replayed wrap id never credits the job twice"
         );
-        assert!(store.has_receipt(&job).expect("read"), "paid after the first collect");
+        assert!(
+            store.has_receipt(&job).expect("read"),
+            "paid after the first collect"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Platform fee (stage 1) at the collect seam. Drives the two calls `on_gift_wrap` makes once the
+    // redeem has classified `Finalize` — `platform_fee_at_collect` on the FACE (what the buyer paid),
+    // then `collect_receipt` with the result and the mint fee — against a real store, with no relay
+    // or mint.
+    //
+    // Two things are proved. (1) The seam's rate IS `PLATFORM_FEE_BPS` — asserted directly as 1000
+    // bp (10%) — and a 100-sat offer journals the 10 sats that follow, per job and in total; a seam
+    // that dropped or zeroed the rate fails here. (2) The same path through the parameterised
+    // function at a different rate (2%) journals 2 sats, so the store carries whatever rate was in
+    // force, not a baked-in number. What this does NOT drive: the wallet swap itself.
+    #[test]
+    fn a_collected_job_records_the_platform_fee_constant_and_the_sats_it_implies() {
+        use crate::platform_fee::{PLATFORM_FEE_BPS, fee_sats};
+        use crate::seller_node::store::{Collected, JobFeeAccrual};
+
+        let seller = nostr_sdk::prelude::Keys::generate().public_key().to_hex();
+        let creq = gateway::creq::build_seller_creq(
+            &"a".repeat(64),
+            100,
+            "sat",
+            &["https://testnut.cashudevkit.org".to_owned()],
+            &seller,
+        )
+        .expect("creq");
+        let job = "a".repeat(64);
+        let buyer = "b".repeat(64);
+
+        // (1) The seam reads the constant: 10% (1000 bp). A 100-sat offer (mint fee 1) is journaled
+        // with `fee_bps = 1000` and `fee_sats = 10`.
+        let (seam_bps, seam_sats) = platform_fee_at_collect(100);
+        assert_eq!(
+            seam_bps, PLATFORM_FEE_BPS,
+            "the seam's rate is the constant"
+        );
+        assert_eq!(
+            (seam_bps, seam_sats),
+            (1000, 10),
+            "stage 1 ships at 10%: a 100-sat offer owes 10 sats, recorded and not remitted"
+        );
+        assert_eq!(
+            seam_sats,
+            fee_sats(100, PLATFORM_FEE_BPS),
+            "the seam's sats follow from the constant through the parameterised function"
+        );
+        let (store, root) = store_with_awarded_job(&creq, &job, &buyer, 4242);
+        assert_eq!(
+            store
+                .collect_receipt(
+                    &"e".repeat(64),
+                    &job,
+                    100,
+                    fees(1, seam_bps, seam_sats),
+                    5000
+                )
+                .expect("collect"),
+            Collected::New
+        );
+        let accrued = store.accrued_fees().expect("read-out");
+        assert_eq!(accrued.total_fee_sats, 10, "10% of 100 sats, accrued");
+        assert_eq!(
+            accrued.by_job,
+            vec![JobFeeAccrual {
+                job_id: job.clone(),
+                amount_sats: 100,
+                mint_fee_sats: Some(1),
+                fee_bps: 1000,
+                fee_sats: 10,
+                received_at_unix: 5000,
+                remittance_id: None,
+            }]
+        );
+        assert!(
+            store.has_receipt(&job).expect("read"),
+            "the receipt still marks the job paid"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        // (2) The same fee path at a different rate: 2% (200 bp) of a 100-sat offer is 2 sats,
+        // journaled in the receipt row and read back — the store records the rate in force, whatever
+        // it is, so a later change to the constant leaves old rows telling the truth.
+        let nonzero_bps = 200;
+        let nonzero_sats = fee_sats(100, nonzero_bps);
+        assert_eq!(nonzero_sats, 2);
+        let (store, root) = store_with_awarded_job(&creq, &job, &buyer, 4242);
+        assert_eq!(
+            store
+                .collect_receipt(
+                    &"f".repeat(64),
+                    &job,
+                    100,
+                    fees(1, nonzero_bps, nonzero_sats),
+                    5000
+                )
+                .expect("collect"),
+            Collected::New
+        );
+        let accrued = store.accrued_fees().expect("read-out");
+        assert_eq!(accrued.total_fee_sats, 2, "a nonzero rate accrues");
+        assert_eq!(
+            accrued.by_job,
+            vec![JobFeeAccrual {
+                job_id: job.clone(),
+                amount_sats: 100,
+                mint_fee_sats: Some(1),
+                fee_bps: 200,
+                fee_sats: 2,
+                received_at_unix: 5000,
+                remittance_id: None,
+            }]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Face-vs-net is a test, not a comment (round 2). On the collect path the adapter hands over
+    // `(face, mint_fee)`; the platform fee is 10% of the FACE. With a nonzero mint fee, face (100)
+    // and wallet net (99) differ, so "10% of face" (10) and "10% of net" (9) are distinguishable —
+    // and the row records 10, with the mint fee beside it and `kept` = 100 − 1 − 10 = 89 derived.
+    #[test]
+    fn platform_fee_is_charged_on_the_offer_face_not_the_wallet_net() {
+        use crate::platform_fee::{PLATFORM_FEE_BPS, fee_sats, kept_sats};
+        use crate::seller_node::store::Collected;
+
+        // What the adapter returns once net credit + predicted mint fee reconcile to the face —
+        // shaped exactly as the seam destructures it after `classify_redeem_outcome`.
+        let (face, mint_fee): (u64, u64) = (100, 1);
+        let wallet_net = face - mint_fee;
+        assert_eq!(wallet_net, 99, "the two candidate bases differ");
+        match classify_redeem_outcome(Ok((face, mint_fee)), || {
+            panic!("has_receipt must not be read on success")
+        }) {
+            RedeemDecision::Finalize((amount_received, mint_fee_sats)) => {
+                assert_eq!((amount_received, mint_fee_sats), (100, 1));
+                let (fee_bps, platform_fee) = platform_fee_at_collect(amount_received);
+                assert_eq!(fee_bps, PLATFORM_FEE_BPS);
+                assert_eq!(platform_fee, 10, "10% of the 100-sat FACE");
+                assert_ne!(
+                    platform_fee,
+                    fee_sats(wallet_net, PLATFORM_FEE_BPS),
+                    "and NOT 10% of the 99-sat wallet net (which would be 9)"
+                );
+                assert_eq!(kept_sats(amount_received, mint_fee_sats, platform_fee), 89);
+
+                // The row journals all three figures; the read-out derives kept = 89.
+                let seller = nostr_sdk::prelude::Keys::generate().public_key().to_hex();
+                let creq = gateway::creq::build_seller_creq(
+                    &"a".repeat(64),
+                    100,
+                    "sat",
+                    &["https://testnut.cashudevkit.org".to_owned()],
+                    &seller,
+                )
+                .expect("creq");
+                let job = "a".repeat(64);
+                let (store, root) = store_with_awarded_job(&creq, &job, &"b".repeat(64), 4242);
+                assert_eq!(
+                    store
+                        .collect_receipt(
+                            &"e".repeat(64),
+                            &job,
+                            amount_received,
+                            fees(mint_fee_sats, fee_bps, platform_fee),
+                            5000
+                        )
+                        .expect("collect"),
+                    Collected::New
+                );
+                let accrued = store.accrued_fees().expect("read-out");
+                let row = &accrued.by_job[0];
+                assert_eq!(
+                    (
+                        row.amount_sats,
+                        row.mint_fee_sats,
+                        row.fee_bps,
+                        row.fee_sats
+                    ),
+                    (100, Some(1), 1000, 10)
+                );
+                assert_eq!(row.kept_sats(), Some(89));
+                assert_eq!(accrued.total_mint_fee_sats, 1);
+                assert_eq!(accrued.rows_without_mint_fee, 0);
+                assert_eq!(accrued.total_kept_sats(), Some(89));
+                let _ = std::fs::remove_dir_all(&root);
+            }
+            other => panic!("a successful receive must finalize, got {other:?}"),
+        }
+    }
+
+    // Stage 2a, addendum 1 rule 1: the remittance follows a receipt journaled NEW and nothing else.
+    // A replayed wrap (`Duplicate`) already paid the job once and must not pay the fee twice; a
+    // failed write journaled nothing. Checked against every outcome the collect write can produce.
+    #[test]
+    fn remittance_follows_only_a_new_receipt_never_a_duplicate_or_an_error() {
+        use crate::seller_node::store::{Collected, StoreError};
+        assert!(remit_follows_collect(&Ok(Collected::New)));
+        assert!(!remit_follows_collect(&Ok(Collected::Duplicate)));
+        assert!(!remit_follows_collect(&Err(StoreError(
+            "disk full".to_owned()
+        ))));
+    }
+
+    // Stage 2a, addendum 1 gate 2b — on the REAL collect write against an awarded job: the
+    // remittance fails (the LNURL host is unreachable, then the mint refuses the melt), and the
+    // collect still journaled the receipt, the job is still PAID, and the unremitted balance is
+    // intact — every failure journaled as an attempt, none of it propagated. This is the property
+    // that keeps a broken payout from breaking a seller's business.
+    #[test]
+    fn a_failed_remittance_leaves_the_receipt_journaled_the_job_paid_and_the_balance_intact() {
+        use crate::fee_remit::test_support::Fake;
+        use crate::fee_remit::{RemitOutcome, RemitTrigger, remit_best_effort};
+        use crate::seller_node::store::{
+            Collected, JobState, RemitAttemptOutcome, RemitAttemptTrigger, RemittanceState,
+        };
+
+        let seller = nostr_sdk::prelude::Keys::generate().public_key().to_hex();
+        let creq = gateway::creq::build_seller_creq(
+            &"a".repeat(64),
+            100,
+            "sat",
+            &["https://testnut.cashudevkit.org".to_owned()],
+            &seller,
+        )
+        .expect("creq");
+        let job = "c".repeat(64);
+        let (store, root) = store_with_awarded_job(&creq, &job, &"b".repeat(64), 4242);
+        let (fee_bps, platform_fee) = platform_fee_at_collect(100);
+        let collected = store.collect_receipt(
+            &"e".repeat(64),
+            &job,
+            100,
+            fees(1, fee_bps, platform_fee),
+            5000,
+        );
+        assert_eq!(collected, Ok(Collected::New));
+        assert!(
+            remit_follows_collect(&collected),
+            "a NEW receipt starts the attempt"
+        );
+        assert_eq!(
+            store.job_state(&job).expect("state"),
+            Some(JobState::Paid),
+            "paid BEFORE any remittance runs"
+        );
+
+        // Attempt 1: the LNURL host is down. Nothing propagates; nothing moves.
+        let mut fake = Fake::new(|_| 1);
+        fake.pay_request_error = Some("agi.cash: dns failure".to_owned());
+        let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 5001);
+        assert_eq!(report.outcome, Err("agi.cash: dns failure".to_owned()));
+        assert!(fake.melts.is_empty());
+
+        // Attempt 2: the mint refuses the melt after the plan is journaled and the fence admitted
+        // it. The row stays SPENDING (addendum 4 §1) until the mint's verdict on its quote.
+        let mut fake = Fake::new(|_| 1);
+        fake.melt_results = vec![Err("insufficient funds for melt".to_owned())];
+        let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 5002);
+        assert!(
+            matches!(report.outcome, Ok(RemitOutcome::MeltFailed { .. })),
+            "{report:?}"
+        );
+        assert_eq!(fake.melts.len(), 1);
+
+        // The collect is untouched by either failure: receipt present, job paid, fee still owed.
+        assert!(store.has_receipt(&job).expect("has_receipt"));
+        assert_eq!(store.job_state(&job).expect("state"), Some(JobState::Paid));
+        let accrued = store.accrued_fees().expect("read");
+        assert_eq!(accrued.total_fee_sats, 10);
+        assert_eq!(accrued.remitted_fee_sats, 0, "nothing was paid");
+        assert_eq!(
+            accrued.unremitted_fee_sats + accrued.in_flight_fee_sats,
+            10,
+            "the fee is still owed — pinned to the in-flight row until the next attempt reconciles it"
+        );
+        assert_eq!(
+            store
+                .in_flight_remittance()
+                .expect("query")
+                .map(|row| row.state),
+            Some(RemittanceState::Spending),
+            "the fence admitted the melt before the mint refused it: SPENDING, resolved by the mint's verdict"
+        );
+
+        // Both failures are journaled as attempts, newest first, for the operator to read.
+        let attempts = store.recent_remit_attempts(10).expect("attempts");
+        assert_eq!(attempts.len(), 2);
+        assert!(
+            attempts
+                .iter()
+                .all(|a| a.trigger == RemitAttemptTrigger::Collect)
+        );
+        assert!(
+            attempts
+                .iter()
+                .all(|a| a.outcome == RemitAttemptOutcome::Failed)
+        );
+        assert_eq!(attempts[1].detail, "agi.cash: dns failure");
+        assert!(
+            attempts[0]
+                .detail
+                .starts_with("melt failed: insufficient funds for melt")
+        );
+
+        // The next attempt (the next collect, or the operator) reconciles the SPENDING row. While
+        // the mint says only UNPAID it HOLDS (addendum 4 §1.2: the melt that errored may have
+        // reached the mint) — nothing paid, nothing released, the job untouched…
+        fake.status = Ok(Some(crate::wallet_ops::MeltQuoteStatus {
+            mint_url: "https://mint.example".to_owned(),
+            quote_id: "paid-quote-lnbc-fake-9-2".to_owned(),
+            state: crate::wallet_ops::MeltQuoteState::Unpaid,
+            amount_sats: 9,
+            fee_reserve_sats: 1,
+            expiry_unix: u64::MAX,
+        }));
+        let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 5003);
+        assert!(
+            matches!(
+                report.outcome,
+                Ok(RemitOutcome::Refused(
+                    crate::fee_remit::Refusal::SpendingHeld { .. }
+                ))
+            ),
+            "{report:?}"
+        );
+        assert_eq!(store.job_state(&job).expect("state"), Some(JobState::Paid));
+        assert_eq!(store.accrued_fees().expect("read").remitted_fee_sats, 0);
+        // …and when the mint reports the quote FAILED it STILL holds (addendum 6 §1.2): the mint
+        // pays a FAILED quote (CDK 0.17.2), so FAILED is not cancellation and releasing on it could
+        // make the same 10 sats payable twice. No melt, nothing released, the job untouched. A
+        // payment is scripted so that a release would be caught as a second debit.
+        fake.status = Ok(Some(crate::wallet_ops::MeltQuoteStatus {
+            mint_url: "https://mint.example".to_owned(),
+            quote_id: "paid-quote-lnbc-fake-9-2".to_owned(),
+            state: crate::wallet_ops::MeltQuoteState::Failed,
+            amount_sats: 9,
+            fee_reserve_sats: 1,
+            expiry_unix: u64::MAX,
+        }));
+        fake.melt_results = vec![Ok((9, 1))];
+        let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 5004);
+        assert!(
+            matches!(
+                report.outcome,
+                Ok(RemitOutcome::Refused(
+                    crate::fee_remit::Refusal::SpendingHeld { .. }
+                ))
+            ),
+            "{report:?}"
+        );
+        assert_eq!(fake.melts.len(), 1, "no second melt on FAILED");
+        assert_eq!(
+            fake.melt_results.len(),
+            1,
+            "the scripted payment was never reached"
+        );
+        assert_eq!(store.job_state(&job).expect("state"), Some(JobState::Paid));
+        let accrued = store.accrued_fees().expect("read");
+        assert_eq!(
+            (accrued.remitted_fee_sats, accrued.in_flight_fee_sats),
+            (0, 10),
+            "held: nothing paid, receipts still pinned"
+        );
+        // The one exit: the mint reports the bound quote PAID — settled by reconciliation, no melt
+        // by this run, the receipt and the job still exactly as the collect left them.
+        fake.status = Ok(Some(crate::wallet_ops::MeltQuoteStatus {
+            mint_url: "https://mint.example".to_owned(),
+            quote_id: "paid-quote-lnbc-fake-9-2".to_owned(),
+            state: crate::wallet_ops::MeltQuoteState::Paid,
+            amount_sats: 9,
+            fee_reserve_sats: 1,
+            expiry_unix: u64::MAX,
+        }));
+        let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 5005);
+        assert!(
+            matches!(
+                report.outcome,
+                Ok(RemitOutcome::Refused(
+                    crate::fee_remit::Refusal::NothingUnremitted
+                ))
+            ),
+            "settled by reconciliation, then nothing left to remit: {report:?}"
+        );
+        assert_eq!(fake.melts.len(), 1, "settled without a second melt");
+        assert_eq!(store.job_state(&job).expect("state"), Some(JobState::Paid));
+        assert!(store.has_receipt(&job).expect("has_receipt"));
+        assert_eq!(store.accrued_fees().expect("read").remitted_fee_sats, 10);
+        assert_eq!(
+            store
+                .remittances()
+                .expect("rows")
+                .into_iter()
+                .map(|row| row.state)
+                .collect::<Vec<_>>(),
+            vec![RemittanceState::Settled]
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -11798,17 +15216,17 @@ mod tests {
         );
 
         // Re-execution delivers exactly once: deliver_and_enqueue is idempotent on the job.
-        let draft = claim_draft(&job, &buyer, &seller, &creq, &[], &Default::default());
+        let draft = claim_draft(&job, &buyer, &seller, crate::gateway::ClaimPayment::Sat(&creq), &[], &Default::default());
         let now = 5000;
         assert!(
             store
-                .deliver_and_enqueue(&job, &"c".repeat(40), &draft, now, now + RESULT_PUBLISH_WINDOW_SECS, now)
+                .deliver_and_enqueue(&job, &"c".repeat(40), crate::gateway::PaymentMode::Sat, &draft, now, now + RESULT_PUBLISH_WINDOW_SECS, now)
                 .expect("deliver"),
             "first (resumed) delivery lands"
         );
         assert!(
             !store
-                .deliver_and_enqueue(&job, &"c".repeat(40), &draft, now, now + RESULT_PUBLISH_WINDOW_SECS, now)
+                .deliver_and_enqueue(&job, &"c".repeat(40), crate::gateway::PaymentMode::Sat, &draft, now, now + RESULT_PUBLISH_WINDOW_SECS, now)
                 .expect("re-deliver"),
             "a resumed re-execution delivers at most once"
         );
@@ -12251,6 +15669,516 @@ mod tests {
     /// power cut publish nothing at all, and leave the seat's last `accepting=y` standing exactly as
     /// the issue describes. Consumer-side recency filtering stays the only cover for those.
     ///
+    /// Stage 2a, addendum 2, gate 2e: **a requested shutdown ends the platform-fee retries** — after
+    /// the loop exits, no further attempt is made. This is the property that keeps the retry from
+    /// outliving the node: the retry is an arm of the loop's own `select!`, and the attempt it
+    /// starts runs on a thread the node owns through the single-flight permit and drains on exit
+    /// (addendum 3 RULING 2 — the strengthened case, a payment pending across the request, is the
+    /// next test). This one drives the real loop against an empty ledger: with the tick's bounds
+    /// shortened it watches several attempts START, asks the loop to stop, waits for it to RETURN,
+    /// then waits many more base delays and asserts the started count did not move.
+    ///
+    /// Each attempt here runs the real entry point against an empty ledger — zero balance, so it
+    /// refuses before any network (`Refusal::NothingUnremitted`, the steady state) and touches
+    /// nothing. What is under test is the clock, not the payment.
+    ///
+    /// RED ON REVERT: move the retry into a spawned task that the loop does not own and the count
+    /// keeps climbing after the join.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_requested_shutdown_ends_the_platform_fee_retries() {
+        use std::sync::atomic::Ordering;
+        use_fast_backfill_tick();
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("remit-retry-stops-with-loop");
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        home.config.relay_url = fixture.url();
+        home.config.seller = Some(seller_cfg(1, false));
+        assert!(
+            home.config.platform_fee.auto_remit,
+            "harness check: the switch is ON by default, so the tick is live"
+        );
+        let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
+        let base = Duration::from_millis(25);
+        let started = runner.remit_retry_bounds_for_test(base, Duration::from_millis(100));
+        assert_eq!(started.load(Ordering::SeqCst), 0, "nothing runs at startup");
+        let shutdown = runner.shutdown_handle();
+
+        let local = tokio::task::LocalSet::new();
+        let loop_handle = local.spawn_local(async move { runner.run().await });
+        let joined = local
+            .run_until(async {
+                // Harness check: the tick is live — several attempts start while the loop runs.
+                let deadline = tokio::time::Instant::now() + FIXTURE_WAIT;
+                while started.load(Ordering::SeqCst) < 3 {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "harness check: the retry tick never started three attempts (saw {})",
+                        started.load(Ordering::SeqCst)
+                    );
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                assert!(
+                    shutdown.request("test-requested stop"),
+                    "the loop must accept a shutdown request"
+                );
+                tokio::time::timeout(FIXTURE_WAIT, loop_handle).await
+            })
+            .await;
+        let outcome = joined
+            .expect("the run loop must RETURN on a shutdown request, not have to be killed")
+            .expect("the loop task must not panic");
+        assert!(
+            outcome.is_ok(),
+            "a requested shutdown is a clean exit: {outcome:?}"
+        );
+
+        // The loop has returned. An attempt that was already in flight when it did may still be
+        // finishing on its thread; that is not a NEW attempt. Wait far longer than any delay the
+        // shortened bounds allow, then the count must not have moved.
+        let at_exit = started.load(Ordering::SeqCst);
+        assert!(at_exit >= 3);
+        tokio::time::sleep(base * 40).await;
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            at_exit,
+            "no remittance attempt may START after the loop exited — the retry lives in the loop \
+             and ends with it"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A node whose ledger owes 10 sats, whose remittance attempts run against scripted effects
+    /// that BLOCK inside the melt until `gate` is released — a payment pending at the mint.
+    /// Returns the runner, the second connection to its ledger, the tick's started-counter, and
+    /// the gate.
+    async fn runner_with_a_pending_payment(
+        label: &str,
+        drain_bound: Option<Duration>,
+    ) -> (
+        SellerNodeRunner,
+        crate::seller_node::store::SellerStore,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<crate::fee_remit::test_support::Gate>,
+        std::path::PathBuf,
+        PGateRelay,
+    ) {
+        use crate::fee_remit::test_support::{Fake, Gate};
+        use crate::seller_node::store::{ReceiptFees, SellerStore};
+        use_fast_backfill_tick();
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root(label);
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        home.config.relay_url = fixture.url();
+        home.config.seller = Some(seller_cfg(1, false));
+        // Seed the node's OWN ledger (the file it opens at boot) through a second connection: one
+        // collected receipt owing a 10-sat platform fee.
+        let store =
+            SellerStore::open(root.join(crate::seller_node::STATE_DB_FILE)).expect("open store");
+        store
+            .collect_receipt(
+                "receipt-1",
+                "job-1",
+                100,
+                ReceiptFees {
+                    mint_fee_sats: 1,
+                    fee_bps: 1000,
+                    fee_sats: 10,
+                },
+                1,
+            )
+            .expect("collect");
+        let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
+        let started = runner
+            .remit_retry_bounds_for_test(Duration::from_millis(25), Duration::from_millis(100));
+        let gate = Gate::new();
+        let gate_for_fake = Arc::clone(&gate);
+        runner.remit_effects_for_test(
+            Arc::new(move || {
+                let mut fake = Fake::new(|_| 1);
+                fake.melt_results = vec![Ok((9, 1))];
+                fake.melt_gate = Some(Arc::clone(&gate_for_fake));
+                Box::new(fake)
+            }),
+            drain_bound,
+        );
+        (runner, store, started, gate, root, fixture)
+    }
+
+    /// Stage 2a, addendum 3 RULING 2 — gate 2e STRENGTHENED: a requested shutdown **drains** a
+    /// payment in flight; it does not race it. The retry tick starts an attempt that journals its
+    /// planned row and then blocks INSIDE the melt (proofs with the mint, no answer yet). The loop
+    /// is asked to stop while that payment is pending. It must NOT return while the melt is
+    /// pending, must start nothing new, and when the mint finally answers the attempt runs to its
+    /// end — the row is settled by the melt — and only then does `run` return.
+    ///
+    /// RED ON REVERT: drop `drain_remit_in_flight` from `run_loop` and the loop returns with the
+    /// melt still pending (first assertion); drop the `remit_closed` check and a collect-path call
+    /// could start a second attempt after serving ended.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_requested_shutdown_drains_a_pending_remittance_before_the_loop_returns() {
+        use crate::seller_node::store::{RemittanceState, SettledBy};
+        use std::sync::atomic::Ordering;
+        let base = Duration::from_millis(25);
+        let (runner, store, started, gate, root, _fixture) =
+            runner_with_a_pending_payment("remit-shutdown-drains", None).await;
+        let shutdown = runner.shutdown_handle();
+
+        let local = tokio::task::LocalSet::new();
+        let loop_handle = local.spawn_local(async move { runner.run().await });
+        let joined = local
+            .run_until(async {
+                // Harness check: an attempt reaches the melt and stops there — a pending payment.
+                let deadline = tokio::time::Instant::now() + FIXTURE_WAIT;
+                while !gate.arrived() {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "harness check: no remittance attempt reached the melt"
+                    );
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                let in_flight = started.load(Ordering::SeqCst);
+                assert!(
+                    shutdown.request("test-requested stop"),
+                    "the loop must accept a shutdown request"
+                );
+                // The payment is pending: the loop must stay, draining, well past any tick delay.
+                tokio::time::sleep(base * 12).await;
+                assert!(
+                    !loop_handle.is_finished(),
+                    "the loop returned while a melt was pending — RULING 2: shutdown DRAINS the \
+                     owned attempt, it does not abandon it"
+                );
+                assert_eq!(
+                    started.load(Ordering::SeqCst),
+                    in_flight,
+                    "nothing new may start once serving has ended"
+                );
+                assert_eq!(
+                    store
+                        .remittances()
+                        .expect("remittances")
+                        .last()
+                        .map(|row| row.state),
+                    Some(RemittanceState::Spending),
+                    "the pending payment's row is journaled SPENDING (admitted, melt in progress) while the mint has not answered"
+                );
+                // The mint answers. The attempt finishes; the drain sees the permit drop.
+                gate.release();
+                tokio::time::timeout(FIXTURE_WAIT, loop_handle).await
+            })
+            .await;
+        let outcome = joined
+            .expect("run must RETURN once the in-flight attempt finished")
+            .expect("the loop task must not panic");
+        assert!(
+            outcome.is_ok(),
+            "a drained shutdown is a clean exit: {outcome:?}"
+        );
+
+        // The payment ran to its end — not cancelled, not left Planned: settled by the melt.
+        let rows = store.remittances().expect("remittances");
+        assert_eq!(rows.len(), 1, "exactly one attempt was journaled");
+        assert_eq!(rows[0].state, RemittanceState::Settled);
+        assert_eq!(rows[0].settled_by, Some(SettledBy::Melt));
+        assert_eq!(rows[0].melt_fee_sats, Some(1));
+        let at_exit = started.load(Ordering::SeqCst);
+        tokio::time::sleep(base * 40).await;
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            at_exit,
+            "no remittance attempt may START after the loop exited"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Addendum 3 RULING 2, the other half: the drain's wait is BOUNDED. When the pending payment
+    /// does not finish inside the bound, `run` returns anyway — after the bound, not before — with
+    /// the attempt still pending (its row Spending, bound to its quote), and the attempt is
+    /// abandoned by the WAIT only:
+    /// its thread finishes on its own once the mint answers, and the row settles.
+    ///
+    /// RED ON REVERT: drop the bound from `drain_remit_in_flight` and the join times out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_shutdown_drain_gives_up_waiting_at_its_bound_but_never_cancels_the_attempt() {
+        use crate::seller_node::store::RemittanceState;
+        let bound = Duration::from_millis(300);
+        let (runner, store, _started, gate, root, _fixture) =
+            runner_with_a_pending_payment("remit-shutdown-drain-bound", Some(bound)).await;
+        let shutdown = runner.shutdown_handle();
+
+        let local = tokio::task::LocalSet::new();
+        let loop_handle = local.spawn_local(async move { runner.run().await });
+        let (joined, waited) = local
+            .run_until(async {
+                let deadline = tokio::time::Instant::now() + FIXTURE_WAIT;
+                while !gate.arrived() {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "harness check: no remittance attempt reached the melt"
+                    );
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                assert!(shutdown.request("test-requested stop"));
+                let asked = tokio::time::Instant::now();
+                let joined = tokio::time::timeout(FIXTURE_WAIT, loop_handle).await;
+                (joined, asked.elapsed())
+            })
+            .await;
+        let outcome = joined
+            .expect("run must RETURN at the drain bound even though the melt is still pending")
+            .expect("the loop task must not panic");
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert!(
+            waited >= bound,
+            "run returned after {waited:?}, before the {bound:?} drain bound elapsed"
+        );
+        // Abandoned by the wait, not cancelled: still pending, row still in flight (SPENDING: the
+        // fence admitted the melt before it blocked inside the mint call)…
+        assert!(gate.arrived(), "harness check: the melt is still blocked");
+        let rows = store.remittances().expect("remittances");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, RemittanceState::Spending);
+        // …and when the mint answers, the thread finishes its attempt on its own.
+        gate.release();
+        let deadline = std::time::Instant::now() + FIXTURE_WAIT;
+        loop {
+            let rows = store.remittances().expect("remittances");
+            if rows[0].state == RemittanceState::Settled {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the abandoned attempt never settled its row after the mint answered"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Addendum 3 §3: a SHARED outcome — the collect thread's attempt moved the backoff — re-arms
+    /// the loop's LIVE timer. The rule is `rearm_deadline`, proven here against a real `Sleep`
+    /// under Tokio's paused clock: a success pulls a 15-minute pending sleep back to the drawn
+    /// base-streak delay and the sleep fires there, not at its old deadline; a failure never
+    /// shortens a deadline — it extends a too-short one to the drawn delay and keeps a longer one.
+    #[tokio::test(start_paused = true)]
+    async fn a_shared_outcome_re_arms_the_live_retry_timer() {
+        let now = tokio::time::Instant::now();
+        // A boot floor already behind us: the re-arm rule alone is under test here.
+        let floor = now;
+        let sleep = tokio::time::sleep(Duration::from_secs(900));
+        tokio::pin!(sleep);
+        // Success (streak 0): reset to the drawn delay, however far away the old deadline was.
+        let deadline = rearm_deadline(sleep.deadline(), now, 0, Duration::from_secs(12), floor);
+        assert_eq!(deadline, now + Duration::from_secs(12));
+        sleep.as_mut().reset(deadline);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(11), sleep.as_mut())
+                .await
+                .is_err(),
+            "the re-armed timer must not fire before its new deadline"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), sleep.as_mut())
+                .await
+                .is_ok(),
+            "the re-armed timer fires at its new deadline, not the old 15-minute one"
+        );
+        // Failure (streak 2): a far deadline is kept; a too-short one is pushed out to the draw.
+        let now = tokio::time::Instant::now();
+        assert_eq!(
+            rearm_deadline(
+                now + Duration::from_secs(600),
+                now,
+                2,
+                Duration::from_secs(90),
+                floor
+            ),
+            now + Duration::from_secs(600)
+        );
+        assert_eq!(
+            rearm_deadline(
+                now + Duration::from_secs(5),
+                now,
+                2,
+                Duration::from_secs(90),
+                floor
+            ),
+            now + Duration::from_secs(90)
+        );
+    }
+
+    /// Addendum 4 §2.2 (RULING 1 under re-arm): the node boots, its first retry is armed in
+    /// [30 s, 60 s]; a collect SUCCEEDS at 5 s and the shared backoff (streak 0) draws 8 s. Without
+    /// the floor the re-arm would fire the first retry at 13 s after boot. With it, the re-armed
+    /// `Sleep` — a real one, under Tokio's paused clock — fires at 30 s after boot and not one
+    /// second sooner. A failure re-arm inside the first 30 s is floored the same way.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_retry_never_fires_before_thirty_seconds_after_boot_even_after_a_collect_success()
+     {
+        let boot = tokio::time::Instant::now();
+        let floor = boot + crate::fee_remit::RETRY_BASE;
+        assert_eq!(crate::fee_remit::RETRY_BASE, Duration::from_secs(30));
+        // Boot draw, as `run_loop` arms it: somewhere in [30 s, 60 s]; take 45 s.
+        let sleep = tokio::time::sleep(Duration::from_secs(45));
+        tokio::pin!(sleep);
+        // 5 s after boot a collect-path attempt succeeds; the shared backoff draws 8 s.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let now = tokio::time::Instant::now();
+        let deadline = rearm_deadline(sleep.deadline(), now, 0, Duration::from_secs(8), floor);
+        assert_eq!(
+            deadline, floor,
+            "8 s after a success at 5 s would be 13 s after boot: clamped to boot + 30 s"
+        );
+        sleep.as_mut().reset(deadline);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(24), sleep.as_mut())
+                .await
+                .is_err(),
+            "the first retry must not fire at 29 s after boot"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), sleep.as_mut())
+                .await
+                .is_ok(),
+            "the first retry fires at 30 s after boot"
+        );
+        // A failure re-arm inside the first 30 s is floored too: a 12 s draw at 10 s after boot,
+        // against a pending 45 s boot deadline, keeps 45 s (never shortens) — and a pending 20 s
+        // deadline would be pushed to the floor, not to 22 s.
+        let boot = tokio::time::Instant::now();
+        let floor = boot + crate::fee_remit::RETRY_BASE;
+        let at_ten = boot + Duration::from_secs(10);
+        assert_eq!(
+            rearm_deadline(
+                boot + Duration::from_secs(45),
+                at_ten,
+                1,
+                Duration::from_secs(12),
+                floor
+            ),
+            boot + Duration::from_secs(45)
+        );
+        assert_eq!(
+            rearm_deadline(
+                boot + Duration::from_secs(20),
+                at_ten,
+                1,
+                Duration::from_secs(12),
+                floor
+            ),
+            floor
+        );
+        // Past the floor the rule is exactly addendum 3's: the floor changes nothing.
+        let later = boot + Duration::from_secs(600);
+        assert_eq!(
+            rearm_deadline(
+                later + Duration::from_secs(900),
+                later,
+                0,
+                Duration::from_secs(12),
+                floor
+            ),
+            later + Duration::from_secs(12)
+        );
+    }
+
+    /// Addendum 4 §2.1: every attempt logs at most ONE line, the first failure included. A first
+    /// DNS failure (the payout host unreachable) used to log the attempt's lines and then a summary;
+    /// now the detail — destination, the balance it saw, the error — is folded into the one line.
+    /// Every other pacing outcome is one line too.
+    #[test]
+    fn a_first_failure_logs_exactly_one_line_with_its_detail_folded_in() {
+        use crate::fee_remit::test_support::Fake;
+        use crate::fee_remit::{Pacing, RemitBackoff, RemitTrigger, remit_best_effort};
+        use crate::seller_node::store::{ReceiptFees, SellerStore};
+        let root = std::env::temp_dir().join(format!(
+            "maxplayer-remit-one-line-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("mk root");
+        let store = SellerStore::open(root.join(crate::seller_node::STATE_DB_FILE)).expect("open");
+        store
+            .collect_receipt(
+                "r1",
+                "job-1",
+                100,
+                ReceiptFees {
+                    mint_fee_sats: 1,
+                    fee_bps: 1000,
+                    fee_sats: 10,
+                },
+                1,
+            )
+            .expect("collect");
+        let mut fake = Fake::new(|_| 1);
+        fake.pay_request_error = Some("agi.cash: dns failure".to_owned());
+        let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 100);
+        assert_eq!(report.outcome, Err("agi.cash: dns failure".to_owned()));
+        assert!(
+            !report.lines.is_empty(),
+            "the attempt printed its balance before the host failed: {report:?}"
+        );
+        let mut backoff = RemitBackoff::new();
+        let pacing = backoff.observe(&report, 100);
+        assert_eq!(pacing, Pacing::FirstFailure);
+        let (volume, lines) = remit_outcome_lines(
+            "remit (after job_id=job-1)",
+            &report,
+            &pacing,
+            None,
+            backoff.computed_delay(),
+        );
+        assert_eq!(volume, RemitLogVolume::Normal);
+        assert_eq!(lines.len(), 1, "one line for the first failure: {lines:#?}");
+        let line = &lines[0];
+        assert!(line.contains("agi.cash: dns failure"), "the error: {line}");
+        assert!(
+            line.contains("destination maxplayer@agi.cash"),
+            "the destination: {line}"
+        );
+        assert!(
+            line.contains("10 sats unremitted"),
+            "the balance it saw: {line}"
+        );
+        assert!(line.contains("streak 1"), "{line}");
+        assert!(
+            line.contains("next attempt on the retry tick, re-armed to within 60s"),
+            "the backoff this failure started (streak 1 ⇒ base × 2): {line}"
+        );
+        assert!(!line.contains('\n'), "one line means one line: {line:?}");
+        // Every other outcome is one line as well.
+        let second = backoff.observe(&report, 200);
+        assert!(matches!(second, Pacing::RepeatFailure { streak: 2, .. }));
+        for (pacing, expected_volume) in [
+            (second, RemitLogVolume::Normal),
+            (Pacing::Paid, RemitLogVolume::Normal),
+            (
+                Pacing::Recovered {
+                    failed_attempts: 2,
+                    owed_for_secs: 100,
+                },
+                RemitLogVolume::Normal,
+            ),
+            (Pacing::Idle, RemitLogVolume::Verbose),
+        ] {
+            let (volume, lines) = remit_outcome_lines(
+                "retry",
+                &report,
+                &pacing,
+                Some(Duration::from_secs(41)),
+                Duration::from_secs(60),
+            );
+            assert_eq!(volume, expected_volume, "{pacing:?}");
+            assert_eq!(lines.len(), 1, "{pacing:?}: {lines:#?}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// RED ON REVERT: drop the `self.publish_retraction().await` from `run_loop` (or the
     /// `shutdown::next_request` arm from the select, which strands the loop so the join times out)
     /// and this goes red.
@@ -12274,7 +16202,7 @@ mod tests {
             .run_until(async {
                 // Harness check: the seat must first be OPEN on the wire. Without this the terminal
                 // `accepting=n` would be asserted against a seat that never advertised itself as
-                // available, and the tooth would pass on a node that simply never published.
+                // serving (`accepting=y`), and the tooth would pass on a node that simply never published.
                 assert!(
                     fixture
                         .wait_until_published(FIXTURE_WAIT, |events| seat_announcements(events)
@@ -12774,6 +16702,120 @@ mod tests {
 
         assert_eq!(state.on_tick(), RearmStep::Wait, "cooling down");
         assert_eq!(state.on_tick(), RearmStep::Attempt, "then attempting again");
+    }
+
+    // ---- #773 pre-advertise probe report -------------------------------------------------------
+    //
+    // Operator lines for the prove-before-advertise probe are composed HERE, not printed, so they
+    // can be asserted on injected verdicts with no relay, no home lock, and no spawn. The call site
+    // in `boot_advertising_only_proven` emits them BEFORE the gate — including the partial-failure
+    // path that used to boot, narrow the roster, and advertise in silence.
+
+    /// Nothing proved: every failing harness is named, then `0/m`.
+    ///
+    /// RED ON REVERT: drop the FAILED-line push from `pre_advertise_probe_lines` and this set
+    /// returns only the serving count.
+    #[test]
+    fn the_pre_advertise_probe_names_every_failure_when_nothing_proved() {
+        let lines = pre_advertise_probe_lines(&[
+            HarnessProbeVerdict {
+                index: 0,
+                name: Some("claude".to_owned()),
+                result: Err(("spawn failed".to_owned(), Fault::Unproven)),
+            },
+            HarnessProbeVerdict {
+                index: 1,
+                name: Some("codex".to_owned()),
+                result: Err(("no artifact".to_owned(), Fault::Unproven)),
+            },
+        ]);
+        assert_eq!(
+            lines,
+            vec![
+                "seller node pre-advertise probe FAILED claude: spawn failed".to_owned(),
+                "seller node pre-advertise probe FAILED codex: no artifact".to_owned(),
+                "seller node pre-advertise probe: serving 0/2 configured harness(es)".to_owned(),
+            ],
+            "an all-failed probe must name every drop and report serving 0/m"
+        );
+    }
+
+    /// THE #773 CASE. At least one harness proves AND at least one fails: the seat will boot and
+    /// advertise a narrowed roster, so the log must still name every drop. The FAILED loop used to
+    /// live inside the all-failed gate, and this mixed set produced no operator line at all.
+    ///
+    /// RED ON REVERT: gate the FAILED-line push on `proven_serving_indices(verdicts).is_empty()` —
+    /// the pre-fix shape — and this mixed set returns only the serving line.
+    #[test]
+    fn the_pre_advertise_probe_names_every_failure_when_some_still_prove() {
+        let lines = pre_advertise_probe_lines(&[
+            HarnessProbeVerdict {
+                index: 0,
+                name: Some("claude".to_owned()),
+                result: Ok(None),
+            },
+            HarnessProbeVerdict {
+                index: 1,
+                name: Some("codex".to_owned()),
+                result: Err(("launcher missing".to_owned(), Fault::Unproven)),
+            },
+        ]);
+        assert_eq!(
+            lines,
+            vec![
+                "seller node pre-advertise probe FAILED codex: launcher missing".to_owned(),
+                "seller node pre-advertise probe: serving 1/2 configured harness(es)".to_owned(),
+            ],
+            "a partial failure must name the drop AND the surviving fraction"
+        );
+    }
+
+    /// Every harness proved: no FAILED line, just the serving count. Without this, a reporter that
+    /// always emitted a FAILED line (or never emitted the count) would still pass the failure tests.
+    ///
+    /// RED ON REVERT: drop the serving-count line from `pre_advertise_probe_lines` and an all-proved
+    /// set returns empty.
+    #[test]
+    fn the_pre_advertise_probe_reports_full_service_when_every_harness_proved() {
+        let lines = pre_advertise_probe_lines(&[
+            HarnessProbeVerdict {
+                index: 0,
+                name: Some("claude".to_owned()),
+                result: Ok(None),
+            },
+            HarnessProbeVerdict {
+                index: 1,
+                name: Some("codex".to_owned()),
+                result: Ok(Some("codex-current".to_owned())),
+            },
+        ]);
+        assert_eq!(
+            lines,
+            vec!["seller node pre-advertise probe: serving 2/2 configured harness(es)".to_owned()],
+            "an all-proved probe must not invent a FAILED line, and must report serving m/m"
+        );
+    }
+
+    /// A verdict whose name is `None` renders as `<unlabelled>` — the same fallback the old
+    /// in-branch print used. A named-only assertion would let that fallback rot.
+    ///
+    /// RED ON REVERT: render `None` names as empty (or skip them) instead of `<unlabelled>` and this
+    /// needle disappears.
+    #[test]
+    fn the_pre_advertise_probe_renders_a_nameless_verdict_as_unlabelled() {
+        let lines = pre_advertise_probe_lines(&[HarnessProbeVerdict {
+            index: 0,
+            name: None,
+            result: Err(("timed out".to_owned(), Fault::Unproven)),
+        }]);
+        assert_eq!(
+            lines,
+            vec![
+                "seller node pre-advertise probe FAILED <unlabelled>: timed out".to_owned(),
+                "seller node pre-advertise probe: serving 0/1 configured harness(es)".to_owned(),
+            ],
+            "a nameless failure must render as <unlabelled>, not as an empty label"
+        );
     }
 
     // ---- #357 prove-before-advertise -----------------------------------------------------------

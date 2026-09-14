@@ -272,6 +272,7 @@ mod checks {
 
     use maxplayer_core::doctor::{self, RelayProbe};
     use maxplayer_core::home::DEFAULT_MINIBITS_MINT_URL;
+    use maxplayer_core::relay_info::{self, ScopedTokenSupport};
     use maxplayer_core::home::{AgentPresetConfig, SandboxConfig, SellerConfig, TelemetryConfig};
     use maxplayer_core::seller_exec::SandboxPolicy;
 
@@ -284,10 +285,16 @@ mod checks {
 
     const RELAY_TIMEOUT: Duration = Duration::from_secs(15);
     const MINT_TIMEOUT: Duration = Duration::from_secs(10);
+    /// One small JSON document from a host the seat already talks to; a longer wait would only make
+    /// a doctor run slower on a relay that is not answering anyway.
+    const NIP11_TIMEOUT: Duration = Duration::from_secs(10);
 
     const CREDENTIAL_HELPER_CHECK: &str = "credential helper";
     const KEY_CHECK: &str = "seller key";
     const RELAY_CHECK: &str = "relay reachability";
+    /// Named apart from RELAY_CHECK: that one says the relay answers and authenticates, this one says
+    /// what the relay's NIP-11 document promises about a branch-scoped push token's lifetime.
+    const RELAY_TOKEN_POLICY_CHECK: &str = "relay token policy";
     const MINT_CHECK: &str = "mint reachability";
     const AGENT_CHECK: &str = "agent preset";
     const TELEMETRY_CHECK: &str = "telemetry";
@@ -481,6 +488,210 @@ mod checks {
                 format!("{relay_url}: {error}"),
                 "check relay_url in config.toml and network/relay availability",
             ),
+        }
+    }
+
+    /// This seat's effective delivery path, and which of the three states of `[sandbox]
+    /// container_delivery` decided it.
+    ///
+    /// Reads the CONFIG, never the resolved [`SandboxPolicy`]: the policy keeps the verdict only, and
+    /// `container_delivery = false`, an absent key under `launcher`, and a seat with no `[sandbox]`
+    /// section all resolve to the same `None`. The operator needs the reason, so the reason has to
+    /// come from the config. Mirrors the seller boot line
+    /// (`maxplayer_core::seller_node::run::delivery_path_line`).
+    fn effective_delivery_path(
+        sandbox: Option<&SandboxConfig>,
+        container_uid: u32,
+    ) -> &'static str {
+        use maxplayer_core::home::SandboxMode;
+
+        let Some(sandbox) = sandbox else {
+            return "delivery path: HOST (no [sandbox] section, so this seat has no container)";
+        };
+        let root = container_uid == 0;
+        match (sandbox.mode, sandbox.container_delivery) {
+            (SandboxMode::Docker, None) if root => {
+                "delivery path: HOST (this seat's daemon runs as root, uid 0, so its container \
+                 would run the job as root; container delivery is not the default for a root seat — \
+                 set [sandbox] container_delivery = true to opt in, or run the seller as a non-root \
+                 user)"
+            }
+            (SandboxMode::Docker, Some(true)) if root => {
+                "delivery path: CONTAINER ([sandbox] container_delivery = true; WARNING: the daemon \
+                 runs as root, uid 0, so the job is root inside the container — run the seller as a \
+                 non-root user)"
+            }
+            (SandboxMode::Docker, None) => {
+                "delivery path: CONTAINER (the default for [sandbox] mode = \"docker\"; this seat \
+                 does not set container_delivery)"
+            }
+            (SandboxMode::Docker, Some(true)) => {
+                "delivery path: CONTAINER ([sandbox] container_delivery = true)"
+            }
+            (SandboxMode::Docker, Some(false)) => {
+                "delivery path: HOST ([sandbox] container_delivery = false opts out of the docker \
+                 default)"
+            }
+            (SandboxMode::Launcher, _) => {
+                "delivery path: HOST ([sandbox] mode = \"launcher\" creates no container)"
+            }
+        }
+    }
+
+    /// What the relay says about the lifetime of a branch-scoped push token, and what that means for
+    /// the two `[sandbox] container_delivery_token` modes.
+    ///
+    /// INFORMATION under `fresh-after-agent`, a GATE under `long-lived`. The split is deliberate.
+    /// `fresh-after-agent` mints a fresh 60 s token after the agent exits and depends on no
+    /// relay feature, so its row can never block a boot. `long-lived` mints one token up front with a
+    /// NIP-40 `expiration` tag, which only works on a relay that honours that tag for a scoped token
+    /// (relay Requirement B) — and a relay that does not answers HTTP 401 on the PUSH, the last step
+    /// of a paid job. So that mode FAILs here when the relay does not advertise the field, advertises
+    /// a smaller cap than this seat is configured for, or cannot be read at all.
+    ///
+    /// This row also names the seat's EFFECTIVE delivery path, and which of the three states of
+    /// `[sandbox] container_delivery` decided it. Container delivery is the default for a docker
+    /// seat, so an upgrade moves the path with no config change; this row and the seller boot line
+    /// are the two places an operator can read the answer off.
+    ///
+    /// Costs ONE HTTP GET, and only on a seat that delivers from the container AND pushes to a
+    /// relay-git remote. A host-path seat — a launcher seat, or `container_delivery = false` — is
+    /// answered from config alone, so it gains no network read for a feature it does not use.
+    pub(super) fn check_relay_token_policy(
+        relay_url: String,
+        git_remote: Option<String>,
+        sandbox: Option<SandboxConfig>,
+    ) -> Check {
+        check_relay_token_policy_in(
+            relay_url,
+            git_remote,
+            sandbox,
+            maxplayer_core::seller_exec::job_identity().0,
+            |origin| match build_runtime() {
+                Ok(runtime) => runtime.block_on(relay_info::fetch_scoped_token_support(
+                    origin,
+                    NIP11_TIMEOUT,
+                )),
+                Err(error) => ScopedTokenSupport::Unknown(error),
+            },
+        )
+    }
+
+    /// [`check_relay_token_policy`] over an injected NIP-11 read and container uid, so every arm —
+    /// including the unreachable-relay one and the root seat — is testable with no network and as any
+    /// user. `container_uid` is the uid the seat's container runs as (`job_identity`): under root the
+    /// docker default does not apply, and both the path and the policy here say so.
+    pub(super) fn check_relay_token_policy_in(
+        relay_url: String,
+        git_remote: Option<String>,
+        sandbox: Option<SandboxConfig>,
+        container_uid: u32,
+        probe: impl Fn(&str) -> ScopedTokenSupport,
+    ) -> Check {
+        use maxplayer_core::home::ContainerDeliveryToken;
+
+        // Read from the CONFIG, not from the resolved policy, because the reason is part of the
+        // answer: `container_delivery = false` and a launcher seat both resolve to "no container
+        // delivery", and the operator has to know which one this seat is.
+        let path = effective_delivery_path(sandbox.as_ref(), container_uid);
+        let policy = match SandboxPolicy::from_config_as(sandbox.as_ref(), container_uid) {
+            Ok(policy) => policy,
+            // An unresolvable [sandbox] is already FAILed by the launcher check; do not double-report.
+            Err(_) => return Check::pass(RELAY_TOKEN_POLICY_CHECK, "no resolvable docker executor"),
+        };
+        let Some(delivery) = policy.container_delivery() else {
+            return Check::pass(
+                RELAY_TOKEN_POLICY_CHECK,
+                format!(
+                    "{path} — the host runs the git steps and no scoped push token is minted, so \
+                     the relay's token policy does not apply (not asked)"
+                ),
+            );
+        };
+        let long_lived = delivery.token == ContainerDeliveryToken::LongLived;
+        let Some(git_remote) = git_remote else {
+            return Check::pass(
+                RELAY_TOKEN_POLICY_CHECK,
+                format!(
+                    "{path} — no [seller] git_remote to push to, so there is no push token to ask \
+                     about"
+                ),
+            );
+        };
+        // A public/anonymous https remote takes no NIP-98 header at all, so no scoped token exists
+        // whose lifetime a relay could cap. Reported, never failed: nothing is wrong with the seat.
+        if !maxplayer_core::delivery_transport::is_relay_git_locator(&git_remote) {
+            return Check::pass(
+                RELAY_TOKEN_POLICY_CHECK,
+                format!(
+                    "{path} — the [seller] git remote is not relay-git, so the container pushes \
+                     with no scoped token; container_delivery_token = {:?} has no effect on this \
+                     seat",
+                    delivery.token
+                ),
+            );
+        }
+        let support = match relay_info::scoped_token_authority(&relay_url, &git_remote) {
+            Ok(origin) => probe(&origin),
+            Err(error) => ScopedTokenSupport::Unknown(error),
+        };
+        // `fresh-after-agent`: report the answer and what it would mean, and PASS whatever it is.
+        if !long_lived {
+            return Check::pass(
+                RELAY_TOKEN_POLICY_CHECK,
+                match &support {
+                    ScopedTokenSupport::Advertised(secs) => format!(
+                        "{path}; relay advertises {}={secs} s — `fresh-after-agent` (in use) works, \
+                         and `long-lived` is available up to {secs} s",
+                        relay_info::SCOPED_TOKEN_CAP_FIELD
+                    ),
+                    ScopedTokenSupport::Absent => format!(
+                        "{path}; relay advertises no {} — `fresh-after-agent` (in use) works, it \
+                         needs no relay feature; `long-lived` needs that field and would be refused \
+                         at boot",
+                        relay_info::SCOPED_TOKEN_CAP_FIELD
+                    ),
+                    ScopedTokenSupport::Unknown(reason) => format!(
+                        "{path}; relay token policy unknown ({reason}) — `fresh-after-agent` (in \
+                         use) works either way; `long-lived` needs {} and would be refused at boot",
+                        relay_info::SCOPED_TOKEN_CAP_FIELD
+                    ),
+                },
+            );
+        }
+        // `long-lived`: the same verdict the seller boot gate refuses on, one run earlier.
+        let verdict = relay_info::long_lived_verdict(&support, delivery.token_cap_secs);
+        match verdict.measured() {
+            None => Check::pass(
+                RELAY_TOKEN_POLICY_CHECK,
+                format!(
+                    "{path}; relay advertises {}={} s, at or above this seat's \
+                     container_delivery_token_cap_secs={} s — `long-lived` (in use) is usable, and \
+                     `fresh-after-agent` works too",
+                    relay_info::SCOPED_TOKEN_CAP_FIELD,
+                    support.advertised_secs().unwrap_or_default(),
+                    delivery.token_cap_secs
+                ),
+            ),
+            Some(measured) => {
+                let detail = format!(
+                    "{path}; [sandbox] container_delivery_token = \"long-lived\" is configured, \
+                     but {measured} — every job would fail on the PUSH, after the agent ran and \
+                     the buyer paid"
+                );
+                // An UNREADABLE relay is a live-dependency blip the boot gate may re-run, exactly as
+                // the relay-reachability row treats one. An ABSENT or too-small cap is the relay
+                // telling us what it does: a re-run returns the same answer, so refuse at once.
+                if matches!(verdict, relay_info::LongLivedVerdict::Unknown(_)) {
+                    Check::fail_transient(
+                        RELAY_TOKEN_POLICY_CHECK,
+                        detail,
+                        relay_info::LongLivedVerdict::FIX,
+                    )
+                } else {
+                    Check::fail(RELAY_TOKEN_POLICY_CHECK, detail, relay_info::LongLivedVerdict::FIX)
+                }
+            }
         }
     }
 
@@ -830,20 +1041,51 @@ mod checks {
             Ok(true) => {
                 // Also assert the policy is not vacuously empty. An empty plan would apply perfectly
                 // and contain nothing, which is the failure the sidecar's exit 4 exists to refuse.
+                // The resolvers are this seat's CONFIGURED ones and not an empty placeholder,
+                // because the count does depend on them — two port-53 rules per resolver — and a
+                // render with a resolver input no job will ever use would report a number for a
+                // different policy than the one launches install. Where the seat configured none,
+                // the resolvers are discovered per launch, so the number is a floor and the message
+                // says which case it is rather than certifying either silently.
+                let configured_resolvers = policy.dns_servers().to_vec();
+                let resolvers_named = configured_resolvers.len();
                 let rules = maxplayer_core::sandbox_net::NetPolicy {
-                    // A placeholder: the real address is measured per launch. Only the COUNT is read
-                    // here, and no rule's presence depends on which address this is.
+                    // A placeholder: the real address is measured per launch. No rule's presence
+                    // depends on which address this is.
                     gateway: "172.17.0.1".into(),
                     proxy_ports: policy.proxy_ports(),
                     log_connections: true,
+                    dns_resolvers: configured_resolvers,
                 }
                 .install_plan()
                 .len();
+                let (count_phrase, resolver_note) = if resolvers_named == 0 {
+                    (
+                        format!("renders AT LEAST {rules} rules"),
+                        "`[sandbox] dns_servers` names no resolver, so each job discovers this \
+                         host's own upstreams at launch and adds one udp and one tcp port-53 rule \
+                         per discovered resolver on top of that floor — this check does not run \
+                         that discovery, so how many resolvers a launch will find is UNVERIFIED \
+                         here, and a launch that finds none is refused rather than run without one"
+                            .to_owned(),
+                    )
+                } else {
+                    (
+                        format!("renders {rules} rules"),
+                        format!(
+                            "including one udp and one tcp port-53 rule for each of the \
+                             {resolvers_named} canonical resolver(s) `[sandbox] dns_servers` \
+                             resolves to — the same de-duplicated set every launch installs, not \
+                             the raw config list"
+                        ),
+                    )
+                };
                 Check::pass(
                     EGRESS_CHECK,
                     format!(
-                        "network '{network}' exists and the policy renders {rules} rules; each job \
-                         gets them installed in its own network namespace before it starts"
+                        "network '{network}' exists and the policy {count_phrase} \
+                         ({resolver_note}); each job gets them installed in its own network \
+                         namespace before it starts"
                     ),
                 )
             }
@@ -873,6 +1115,430 @@ mod checks {
                 "check the docker daemon is running and reachable: `docker network ls`",
             ),
         }
+    }
+
+    const DELIVERY_ROUTE_CHECK: &str = "sandbox delivery route";
+
+    /// The directory the route preflight runs its probe in, under the seat's real job tree — same
+    /// argument [`crate::sandbox_probe`] makes for its own paths: a launcher is configured for where
+    /// jobs run, so a probe somewhere else measures a route no job takes.
+    const ROUTE_WORKDIR_NAME: &str = ".route-preflight";
+
+    /// What exercising the real job route produced.
+    ///
+    /// Deliberately four outcomes rather than a bool: "the name never resolved", "it resolved but
+    /// TLS did not complete", and "the route could not be built at all" send an operator to three
+    /// different places, and collapsing them is how a doctor becomes something people skip.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) enum RouteProbe {
+        /// Resolved a name AND completed a certificate-VERIFIED TLS handshake, from inside the
+        /// namespace an awarded job gets.
+        Delivered { resolver: String, address: String, subject: String },
+        /// The lookup failed inside the job. The gVisor case this check was built for.
+        NoDns(String),
+        /// The name resolved, but TLS did not complete or its chain was not verified.
+        NoTls(String),
+        /// The route could not be built or the probe never reported. NOT a pass: a route that cannot
+        /// be measured has not been shown to work.
+        Unbuildable(String),
+        /// The instrument is absent — no docker on PATH — so there is nothing to measure and no
+        /// finding to report. Distinct from [`RouteProbe::Unbuildable`], which means the route WAS
+        /// asked and did not answer; the launcher check owns the missing-docker verdict and this one
+        /// must not double-report it.
+        Unmeasurable(String),
+    }
+
+    /// #? gVisor DNS delivery: does a job on THIS seat actually reach the network it is supposed to?
+    ///
+    /// Every other network check here asks the question from the HOST. That is precisely the hole:
+    /// the measured failure is a seat whose host resolves and fetches perfectly while every job it
+    /// runs dies on `EAI_AGAIN`, because docker's embedded resolver at `127.0.0.11` is unreachable
+    /// from inside a gVisor sandbox. A host-side probe reports that seat READY and it then fails
+    /// every job it wins. So this one runs the real thing: the seat's own image, in the namespace
+    /// [`maxplayer_core::sandbox_netns`] builds, under the seat's own runtime, uid, dropped
+    /// capabilities and `no-new-privileges`, with the resolver file a job is handed — and it must
+    /// both resolve a name and complete a VERIFIED TLS handshake.
+    ///
+    /// It BLOCKS. A `Fail` here keeps [`readiness_ok`] false, because advertising a seat whose jobs
+    /// cannot deliver is the exact outcome the gate exists to prevent. It is `transient`, so the
+    /// boot gate's bounded retry gives a daemon or a resolver a moment to come back before the seat
+    /// is refused — and if it is still broken after that, refused is correct.
+    ///
+    /// The advisory `check_sandbox_egress` above is untouched (petar, 2026-08-18): that one reports
+    /// whether the network EXISTS and never blocks. This one asks whether the route WORKS.
+    pub(super) fn check_sandbox_delivery_route(
+        sandbox: Option<SandboxConfig>,
+        home_root: std::path::PathBuf,
+    ) -> Check {
+        check_sandbox_delivery_route_in(sandbox, discover_resolvers, |policy, resolvers| {
+            // Ordering rule shared with check_sandbox_image and the Engine floor: ask only once
+            // docker itself resolves, or the spawn ENOENTs and a missing daemon is misreported as a
+            // broken route. A missing docker is the launcher check's verdict, not this one's. It
+            // lives in the REAL probe rather than in the injectable core so the unit tests below
+            // measure the verdicts and not the machine they run on.
+            if !argv0_resolvable("docker") {
+                return RouteProbe::Unmeasurable(
+                    "docker not resolvable; the job route was not measured (see sandbox launcher)"
+                        .to_owned(),
+                );
+            }
+            run_delivery_route(policy, resolvers, &home_root)
+        })
+    }
+
+    /// The resolvers a job would be handed, by the product's own selection order.
+    fn discover_resolvers(configured: &[String]) -> Result<Vec<String>, String> {
+        maxplayer_core::sandbox_dns::resolve(
+            configured,
+            maxplayer_core::sandbox_dns::host_resolv_conf,
+            maxplayer_core::sandbox_dns::host_resolvectl,
+        )
+        .map(|resolvers| resolvers.addresses().to_vec())
+        .map_err(|error| error.to_string())
+    }
+
+    /// [`check_sandbox_delivery_route`] over injected resolver discovery and an injected route
+    /// probe, so every verdict is testable on a host with no docker daemon at all — including the
+    /// one that matters most: host connectivity fine, job route broken, result still `Fail`.
+    pub(super) fn check_sandbox_delivery_route_in(
+        sandbox: Option<SandboxConfig>,
+        resolvers: impl Fn(&[String]) -> Result<Vec<String>, String>,
+        probe: impl Fn(&SandboxPolicy, &[String]) -> RouteProbe,
+    ) -> Check {
+        let policy = match SandboxPolicy::from_config(sandbox.as_ref()) {
+            // Already FAILed by the launcher check; do not double-report.
+            Err(_) => return Check::pass(DELIVERY_ROUTE_CHECK, "no resolvable docker executor"),
+            Ok(policy) => policy,
+        };
+        if policy.docker_image().is_none() {
+            return Check::pass(
+                DELIVERY_ROUTE_CHECK,
+                "not a docker executor; jobs use this host's own network",
+            );
+        }
+        let resolvers = match resolvers(policy.dns_servers()) {
+            Ok(resolvers) => resolvers,
+            // NOT transient: no retry discovers a resolver a misconfigured box does not have.
+            Err(error) => {
+                return Check::fail(
+                    DELIVERY_ROUTE_CHECK,
+                    format!("no resolver can be given to a job: {error}"),
+                    "set `[sandbox] dns_servers` to one or more resolver ADDRESSES the seat can \
+                     reach (for example `dns_servers = [\"1.1.1.1\"]`)",
+                )
+            }
+        };
+        match probe(&policy, &resolvers) {
+            RouteProbe::Delivered { resolver, address, subject } => Check::pass(
+                DELIVERY_ROUTE_CHECK,
+                format!(
+                    "a job resolved via {resolver} to {address} and completed a verified TLS \
+                     handshake with {subject}"
+                ),
+            ),
+            RouteProbe::NoDns(detail) => Check::fail_transient(
+                DELIVERY_ROUTE_CHECK,
+                format!("a job in the sandbox could not resolve names: {detail}"),
+                "the host resolving is not enough — the JOB must. Check `[sandbox] dns_servers` \
+                 and that port 53 to those addresses survives the job's egress policy",
+            ),
+            RouteProbe::NoTls(detail) => Check::fail_transient(
+                DELIVERY_ROUTE_CHECK,
+                format!("a job resolved, but could not complete a verified TLS handshake: {detail}"),
+                "check the job's egress policy allows 443 to the public internet and that the \
+                 sandbox image carries current CA certificates",
+            ),
+            RouteProbe::Unbuildable(detail) => Check::fail_transient(
+                DELIVERY_ROUTE_CHECK,
+                format!("the job's network route could not be measured: {detail}"),
+                "a route that cannot be measured has not been shown to work; check the docker \
+                 daemon, `[sandbox] network`, and that the sandbox image can run the probe",
+            ),
+            RouteProbe::Unmeasurable(detail) => Check::pass(DELIVERY_ROUTE_CHECK, detail),
+        }
+    }
+
+    /// The host the route probe resolves and shakes hands with: the relay, because that is where a
+    /// job's answer is delivered, so a route that cannot reach it cannot earn anything. Kept in step
+    /// with [`maxplayer_core::home::DEFAULT_RELAY_URL`] by the test below.
+    pub(super) const ROUTE_PROBE_HOST: &str = "relay.maxplayer.ai";
+
+    /// The markers the in-container payload prints. Parsed rather than trusted to an exit code,
+    /// because "the payload never ran" and "the payload ran and failed" must not be one outcome.
+    const ROUTE_DNS_OK: &str = "route-dns-ok";
+    const ROUTE_DNS_FAIL: &str = "route-dns-fail";
+    const ROUTE_TLS_OK: &str = "route-tls-ok";
+    const ROUTE_TLS_FAIL: &str = "route-tls-fail";
+
+    /// Build the real namespace, run the probe inside it, tear it down.
+    ///
+    /// Every container here comes from the PRODUCT's argv builders — `holder_argv`,
+    /// `sidecar_argv_for`, `plan_stdin`, and `SandboxPolicy::launch` — so this measures the route an
+    /// awarded job takes. A preflight that rendered its own argv would be a test of itself.
+    fn run_delivery_route(
+        policy: &SandboxPolicy,
+        resolvers: &[String],
+        home_root: &std::path::Path,
+    ) -> RouteProbe {
+        let workdir = home_root.join("seller-jobs").join(ROUTE_WORKDIR_NAME);
+        if let Err(error) = std::fs::create_dir_all(&workdir) {
+            return RouteProbe::Unbuildable(format!(
+                "cannot create the probe workdir {} ({error})",
+                workdir.display()
+            ));
+        }
+        let Some((uid, gid)) = owner_uid_gid(&workdir) else {
+            return RouteProbe::Unbuildable(
+                "cannot read the probe workdir's owner, so the probe could not run as the uid an \
+                 awarded job would get"
+                    .to_owned(),
+            );
+        };
+        let resolv_path = workdir.join("resolv.conf");
+        // Re-validated rather than trusted: these addresses came from discovery, and the file a job
+        // reads must be built by the same code that builds a job's real one.
+        let rendered = match maxplayer_core::sandbox_dns::from_config(resolvers) {
+            Ok(Some(resolvers)) => resolvers.render_resolv_conf(),
+            Ok(None) => {
+                return RouteProbe::Unbuildable(
+                    "resolver discovery returned no addresses at all".to_owned(),
+                )
+            }
+            Err(error) => return RouteProbe::Unbuildable(format!("resolvers rejected: {error}")),
+        };
+        if let Err(error) = std::fs::write(&resolv_path, rendered) {
+            return RouteProbe::Unbuildable(format!(
+                "cannot write the probe resolver file {} ({error})",
+                resolv_path.display()
+            ));
+        }
+
+        // No `[sandbox] network` ⇒ no namespace is established for a job either, so the honest route
+        // to measure is the daemon default the seat actually uses — with no resolver file, because
+        // nothing opened port 53 for one.
+        let Some(network) = policy.sandbox_network() else {
+            return job_leg(policy, &workdir, uid, gid, None, None, "the daemon's default network");
+        };
+
+        let gateway = match network_gateway(network) {
+            Ok(gateway) => gateway,
+            Err(error) => {
+                return RouteProbe::Unbuildable(format!(
+                    "cannot read the gateway of `[sandbox] network` '{network}': {error}"
+                ))
+            }
+        };
+        let image = policy.docker_image().unwrap_or_default().to_owned();
+        let holder_name = format!("maxplayer-route-preflight-{}", std::process::id());
+        // Torn down on EVERY exit below, including the early returns — a preflight that leaks a
+        // holder container leaves the seat holding a namespace nothing will ever reap.
+        let _ = docker_rm_f(&holder_name);
+        let holder = maxplayer_core::sandbox_netns::holder_argv(
+            &holder_name,
+            network,
+            &image,
+            uid,
+            gid,
+            "route-preflight",
+            "route-preflight",
+        );
+        if let Err(error) = run_docker_argv(&holder, None) {
+            let _ = docker_rm_f(&holder_name);
+            return RouteProbe::Unbuildable(format!("the namespace holder would not start: {error}"));
+        }
+
+        let net_policy = maxplayer_core::sandbox_net::NetPolicy {
+            gateway,
+            proxy_ports: None,
+            log_connections: false,
+            dns_resolvers: resolvers.to_vec(),
+        };
+        let (plan, _rules) = maxplayer_core::sandbox_netns::plan_stdin(&net_policy);
+        let sidecar = maxplayer_core::sandbox_netns::sidecar_argv_for(&holder_name, &image);
+        if let Err(error) = run_docker_argv(&sidecar, Some(plan)) {
+            let _ = docker_rm_f(&holder_name);
+            return RouteProbe::Unbuildable(format!("the egress policy would not install: {error}"));
+        }
+
+        let outcome = job_leg(
+            policy,
+            &workdir,
+            uid,
+            gid,
+            Some(holder_name.as_str()),
+            Some(resolv_path.as_path()),
+            "the job namespace",
+        );
+        let _ = docker_rm_f(&holder_name);
+        outcome
+    }
+
+    /// The job leg: the seat's own image, launched by [`SandboxPolicy::launch`] exactly as an
+    /// awarded job is, reporting the two legs that matter.
+    fn job_leg(
+        policy: &SandboxPolicy,
+        workdir: &std::path::Path,
+        uid: u32,
+        gid: u32,
+        netns: Option<&str>,
+        resolv_conf: Option<&std::path::Path>,
+        where_: &str,
+    ) -> RouteProbe {
+        let job = maxplayer_core::seller_exec::JobLaunch {
+            workdir,
+            env: &[],
+            uid,
+            gid,
+            netns,
+            resolv_conf,
+        };
+        let launch = match policy.launch(&route_payload(), &job) {
+            Ok(launch) => launch,
+            Err(error) => {
+                return RouteProbe::Unbuildable(format!("cannot build the probe launch: {error}"))
+            }
+        };
+        let mut argv = Vec::with_capacity(launch.args.len() + 1);
+        argv.push(launch.program);
+        argv.extend(launch.args);
+        let output = match run_docker_argv_capturing(&argv) {
+            Ok(output) => output,
+            Err(error) => {
+                return RouteProbe::Unbuildable(format!("the probe container did not run: {error}"))
+            }
+        };
+        read_route_markers(&output, where_)
+    }
+
+    /// Judge the payload's own words. Kept separate from the spawning so the verdicts are unit-
+    /// testable without a daemon, and so "neither marker appeared" stays a distinct outcome from
+    /// "the DNS marker said it failed".
+    pub(super) fn read_route_markers(output: &str, where_: &str) -> RouteProbe {
+        let marker = |name: &str| {
+            output.lines().find_map(|line| line.trim().strip_prefix(name).map(str::trim))
+        };
+        if let Some(detail) = marker(ROUTE_DNS_FAIL) {
+            return RouteProbe::NoDns(format!("{detail} (from inside {where_})"));
+        }
+        let Some(address) = marker(ROUTE_DNS_OK) else {
+            return RouteProbe::Unbuildable(format!(
+                "the probe in {where_} reported neither success nor failure; it likely never ran"
+            ));
+        };
+        if let Some(detail) = marker(ROUTE_TLS_FAIL) {
+            return RouteProbe::NoTls(format!("{detail} (from inside {where_})"));
+        }
+        match marker(ROUTE_TLS_OK) {
+            Some(subject) => RouteProbe::Delivered {
+                resolver: address.split_whitespace().nth(1).unwrap_or("?").to_owned(),
+                address: address.split_whitespace().next().unwrap_or("?").to_owned(),
+                subject: subject.to_owned(),
+            },
+            None => RouteProbe::NoTls(format!(
+                "the lookup succeeded in {where_} but the handshake reported nothing"
+            )),
+        }
+    }
+
+    /// The payload, in the image's own node: resolve, then complete a TLS request whose certificate
+    /// chain is VERIFIED.
+    ///
+    /// `rejectUnauthorized` is left at its default and `socket.authorized` is REPORTED, so a pass
+    /// cannot be a handshake that skipped verification — which is the failure mode a preflight for
+    /// delivery would be worst at catching.
+    fn route_payload() -> Vec<String> {
+        let script = format!(
+            "const dns=require('dns'),https=require('https');const h='{ROUTE_PROBE_HOST}';\
+             dns.lookup(h,(e,a)=>{{if(e){{console.log('{ROUTE_DNS_FAIL} '+e.code);process.exit(0);}}\
+             console.log('{ROUTE_DNS_OK} '+a);\
+             const r=https.request({{host:h,port:443,path:'/',method:'HEAD',timeout:15000}},(res)=>{{\
+             const c=res.socket.getPeerCertificate();\
+             if(res.socket.authorized){{console.log('{ROUTE_TLS_OK} '+((c&&c.subject&&c.subject.CN)||h));}}\
+             else{{console.log('{ROUTE_TLS_FAIL} certificate chain not verified');}}process.exit(0);}});\
+             r.on('timeout',()=>{{console.log('{ROUTE_TLS_FAIL} timeout');process.exit(0);}});\
+             r.on('error',(err)=>{{console.log('{ROUTE_TLS_FAIL} '+err.code);process.exit(0);}});r.end();}});"
+        );
+        vec!["node".to_owned(), "-e".to_owned(), script]
+    }
+
+    /// The uid/gid owning `path` — the uid an awarded job's container runs as, read from the
+    /// filesystem rather than through a `libc` dependency this crate does not otherwise carry.
+    fn owner_uid_gid(path: &std::path::Path) -> Option<(u32, u32)> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(path).ok().map(|m| (m.uid(), m.gid()))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            None
+        }
+    }
+
+    /// The gateway of a docker network, asked of the daemon rather than computed — the same trap
+    /// [`maxplayer_core::sandbox_netns`] documents: a computed gateway puts the pinhole on an
+    /// address nothing listens on while every rendering test stays green.
+    fn network_gateway(network: &str) -> Result<String, String> {
+        let output = std::process::Command::new("docker")
+            .args([
+                "network",
+                "inspect",
+                network,
+                "--format",
+                "{{(index .IPAM.Config 0).Gateway}}",
+            ])
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+        }
+        let gateway = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if gateway.is_empty() {
+            return Err("the daemon reported no gateway for it".to_owned());
+        }
+        Ok(gateway)
+    }
+
+    fn docker_rm_f(name: &str) -> std::io::Result<std::process::Output> {
+        std::process::Command::new("docker").args(["rm", "-f", name]).output()
+    }
+
+    /// Run a `docker ...` argv (element 0 is the program), optionally feeding it stdin.
+    fn run_docker_argv(argv: &[String], stdin: Option<String>) -> Result<String, String> {
+        let (program, args) = argv.split_first().ok_or("empty argv")?;
+        let mut command = std::process::Command::new(program);
+        command.args(args);
+        command.stdin(match stdin {
+            Some(_) => std::process::Stdio::piped(),
+            None => std::process::Stdio::null(),
+        });
+        command.stdout(std::process::Stdio::piped());
+        command.stderr(std::process::Stdio::piped());
+        let mut child = command.spawn().map_err(|error| error.to_string())?;
+        if let Some(stdin) = stdin {
+            use std::io::Write as _;
+            let mut pipe = child.stdin.take().ok_or("no stdin pipe")?;
+            pipe.write_all(stdin.as_bytes()).map_err(|error| error.to_string())?;
+        }
+        let output = child.wait_with_output().map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    /// Like [`run_docker_argv`], but the payload's OUTPUT is the evidence, so a non-zero exit still
+    /// yields what it said.
+    fn run_docker_argv_capturing(argv: &[String]) -> Result<String, String> {
+        let (program, args) = argv.split_first().ok_or("empty argv")?;
+        let output = std::process::Command::new(program)
+            .args(args)
+            .output()
+            .map_err(|error| error.to_string())?;
+        let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+        combined.push_str(&String::from_utf8_lossy(&output.stderr));
+        Ok(combined)
     }
 
     const CREDENTIAL_CONTAINMENT_CHECK: &str = "sandbox credential containment";
@@ -1181,12 +1847,14 @@ mod checks {
     /// [`DOCKER_ENGINE_FLOOR`]; below it the seat runs strangers' code with a recurring
     /// kernel-exploit surface explicitly allowed, and until this check nothing said so.
     ///
-    /// WARN for a targeted-only seat, FAIL for an open-pool one — the same exposure split
-    /// [`check_home_permissions`] and [`check_sandbox_containment`] already apply, for the same
-    /// reason: serving the open pool means executing code posted by strangers.
+    /// WARN for a seat only its named buyers can reach, FAIL for one strangers can — the same
+    /// exposure split [`check_home_permissions`] and [`check_sandbox_containment`] apply, for the
+    /// same reason: an open surface means executing code posted by someone nobody chose. ⛔The
+    /// severity turns on [`SeatExposure::serves_strangers`], NOT on open-pool claiming alone —
+    /// `accept_open_targeted` puts the same strangers' code on the same kernel.
     pub(super) fn check_sandbox_engine_floor(
         sandbox: Option<SandboxConfig>,
-        claims_open_pool: bool,
+        serves_strangers: bool,
     ) -> Check {
         let runtime = sandbox.as_ref().and_then(|sandbox| sandbox.runtime.clone());
         let policy = match SandboxPolicy::from_config(sandbox.as_ref()) {
@@ -1208,7 +1876,7 @@ mod checks {
                 "docker not resolvable; Engine version unchecked (see sandbox launcher)",
             );
         }
-        fold_sandbox_engine_floor(&probe_engine_version(), runtime.as_deref(), claims_open_pool)
+        fold_sandbox_engine_floor(&probe_engine_version(), runtime.as_deref(), serves_strangers)
     }
 
     /// Turn a probed Engine version into a Check. Pure, so every verdict — including the below-floor
@@ -1216,7 +1884,7 @@ mod checks {
     pub(super) fn fold_sandbox_engine_floor(
         probe: &EngineProbe,
         runtime: Option<&str>,
-        claims_open_pool: bool,
+        serves_strangers: bool,
     ) -> Check {
         let floor = DOCKER_ENGINE_FLOOR;
         // gVisor filters syscalls in the Sentry and does not apply the OCI seccomp profile at all
@@ -1262,7 +1930,7 @@ mod checks {
                     "upgrade the Docker Engine to {floor} or newer; on Linux, [sandbox] runtime = \
                      \"runsc\" (gVisor) also removes the exposure"
                 );
-                if claims_open_pool {
+                if serves_strangers {
                     Check::fail(SANDBOX_ENGINE_CHECK, detail, hint)
                 } else {
                     Check::warn(SANDBOX_ENGINE_CHECK, detail, hint)
@@ -1301,24 +1969,261 @@ mod checks {
         }
     }
 
-    /// Containment, for a seat that serves the OPEN POOL — which means executing code posted by
-    /// strangers. `check_sandbox_launcher` above answers "does the launcher resolve", a property
-    /// one layer out from this one: bubblewrap resolves on Ubuntu 24.04 and then fails at spawn on
-    /// the AppArmor unprivileged-userns restriction, so a resolvable launcher confined nothing on a
-    /// live seat (#451). This runs it and reads what it did.
+    /// WHICH strangers can reach this seat — the property the containment, engine-floor and
+    /// permissions checks are all actually about.
     ///
-    /// A targeted-only seat gets the same probe reported as a WARN: it runs work from
-    /// counterparties it chose, which is a different exposure from serving the open market.
+    /// ⛔ THE TWO SURFACES ARE SEPARATE AND EITHER ONE ALONE PUTS STRANGER-WRITTEN CODE ON THIS BOX.
+    /// These checks used to take a bare `claims_open_pool`, which was a sound proxy only while an
+    /// empty `accept_offers_only_from` meant accept-all: back then "targeted-only" could not be
+    /// narrowed, so the pool flag was the only axis there was. With `accept_open_targeted` the
+    /// axes come apart — a seat can now be genuinely closed (it named its buyers) or open to
+    /// strangers WITHOUT claiming the pool — and a single flag can no longer name either state.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct SeatExposure {
+        /// Claims untargeted offers from the open pool.
+        pub(super) open_pool: bool,
+        /// Accepts targeted offers from buyers the operator never named.
+        pub(super) open_targeted: bool,
+        /// How many `accept_offers_only_from` entries can actually match a buyer off the wire.
+        /// Part of the exposure rather than context carried beside it, because a populated
+        /// allowlist decides who reaches the seat just as directly as either flag does.
+        pub(super) named_buyers: usize,
+        /// Entries that can never match anything — wrong length, wrong charset, capitalised, or 64
+        /// lowercase hex characters that are not a secp256k1 x-only key.
+        ///
+        /// ⛔ THE LAST CASE IS THE ONE A SHAPE-ONLY DESCRIPTION MISSES, AND IT IS NOT AN EDGE CASE:
+        /// roughly half of all 64-hex values have no curve point, so a hand-typed key is more likely
+        /// to land here than in any of the first three. `buyer_pubkey_is_reachable` is what counts
+        /// this field, so a description that stops at shape under-describes what it counts.
+        ///
+        /// ⛔ THESE FENCE NOTHING SINCE #923, AND THAT IS WHY THEY ARE STILL COUNTED. An entry that
+        /// can never match admits nobody, and it no longer shuts anything either — so a list of
+        /// junk degrades to "no buyers named" rather than to deny-all. It is reported because the
+        /// operator believes those entries are a route in and they are not; it is NOT part of the
+        /// stranger-facing answer, which reads the open flags alone.
+        pub(super) unusable_buyers: usize,
+    }
+
+    impl SeatExposure {
+        /// A seat only its named buyers can reach.
+        pub(super) const CLOSED: Self =
+            Self { open_pool: false, open_targeted: false, named_buyers: 0, unusable_buyers: 0 };
+
+        /// Whether the operator listed ANY buyer. The fence turns on emptiness, never on validity.
+        pub(super) fn allowlist_populated(self) -> bool {
+            self.named_buyers + self.unusable_buyers > 0
+        }
+
+        /// Nobody at all can reach this seat: no entry that matches, and no open surface that the
+        /// fence has not shut. The state the whole reachability check exists to name.
+        pub(super) fn is_unreachable(self) -> bool {
+            self.named_buyers == 0 && !self.serves_strangers()
+        }
+
+        /// True when SOME counterparty the operator never chose can get code onto this box. This —
+        /// not the pool flag, and since #923 not the allowlist either — is what raises a containment
+        /// finding from advisory to BLOCKING.
+        ///
+        /// ⛔ DERIVED FROM ONE QUESTION: can a buyer the allowlist does not name be admitted? Since
+        /// #923 the three admission controls are ADDITIVE, so `accept_offers_only_from` admits the
+        /// buyers it lists and vetoes nothing beside it. `accept_open_targeted` admits an unnamed
+        /// buyer on the targeted surface, `claim_open_pool` admits one from the open pool, and each
+        /// fires on its own whatever the list holds. So EITHER open flag makes this seat
+        /// stranger-facing, and a populated allowlist cannot buy that back.
+        ///
+        /// ⛔ THE PRE-#923 FORM WAS `!allowlist_populated() && open_surface_configured()`, AND IT WAS
+        /// CORRECT THEN. The fence really did return `NotAllowlisted` ahead of both open surfaces, so
+        /// a seat that named buyers was reachable by exactly those buyers. #923 deleted that
+        /// precedence and this predicate's premise with it. Left alone it under-reported a genuinely
+        /// stranger-facing seat as advisory across engine-floor, containment and home-permission
+        /// severity — and `doctor` is also the boot readiness gate, so the seat would have booted
+        /// with no containment and no blocking finding.
+        ///
+        /// ⛔ THE ADMISSION RULE IS ENCODED TWICE — here, and in
+        /// `maxplayer_core::seller_node::run::classify_offer` — WITH NOTHING BINDING THEM. That is
+        /// the root defect this predicate keeps paying: one moved, the other did not, and no test
+        /// spanned the two. A single source of truth is NOT reachable from this crate today —
+        /// `classify_offer` is a private fn inside a `wallet`-gated module, and that feature
+        /// structure is #133's to change — so this stays a hand-kept mirror. Change one, change
+        /// the other.
+        pub(super) fn serves_strangers(self) -> bool {
+            // Coincides with `open_surface_configured()` since #923, and that is the finding, not a
+            // redundancy: the gap between "asked for" and "fires" was the allowlist's veto, and the
+            // veto is gone. Kept as its own name because the severity consumers ask THIS question.
+            self.open_surface_configured()
+        }
+
+        /// Whether an open surface is SET, regardless of whether the allowlist lets it fire. This
+        /// is the "did the operator ask for this" question, and it is deliberately NOT the same as
+        /// [`Self::serves_strangers`] — the gap between the two is exactly what makes a knob inert,
+        /// which is a finding to report rather than a state to silently normalise away.
+        pub(super) fn open_surface_configured(self) -> bool {
+            self.open_pool || self.open_targeted
+        }
+
+        /// How a stranger reaches the seat, for the operator-facing finding. The two surfaces have
+        /// different remedies, so a seat exposed only by targeted offers must not be told to turn
+        /// off open-pool claiming — a knob it never turned on.
+        /// ⛔ NO `named_buyers` SHORT-CIRCUIT. It used to return "is reachable only by the buyers it
+        /// named" whenever a buyer was listed, which was right while the allowlist fenced both
+        /// surfaces. Since #923 a listed buyer sits ALONGSIDE any open route, so that early return
+        /// would have printed "SERVING STRANGERS UNCONTAINED (this seat is reachable only by the
+        /// buyers it named)" — a sentence that contradicts itself inside one parenthesis.
+        fn stranger_surface(self) -> &'static str {
+            match (self.open_pool, self.open_targeted) {
+                (true, true) => "claims OPEN-POOL jobs and accepts targeted offers from unnamed buyers",
+                (true, false) => "claims OPEN-POOL jobs",
+                (false, true) => "accepts targeted offers from buyers it has not named",
+                (false, false) => "is reachable only by the buyers it named",
+            }
+        }
+    }
+
+    /// The one workspace-wide route list, defined in `maxplayer-core::home`.
+    ///
+    /// ⛔ NOT A LOCAL COPY, AND THE PREVIOUS LOCAL CONSTANT IS WHY. It had ALREADY drifted from the
+    /// two spellings in `seller_node::run` — while asserting, in its own doc comment, that a copy
+    /// that drifts is undetectable. It lives in `home` because the dependency runs one way
+    /// (`maxplayer` -> `maxplayer-core`), so a constant here can never be reached from `run.rs`.
+    use maxplayer_core::home::ROUTES_BACK_IN as ROUTES_IN;
+    use maxplayer_core::home::USABLE_BUYER_ENTRY;
+
+    /// Can ANY offer reach this seat, and does every knob the operator set still do something?
+    ///
+    /// ⛔ THE CASE THIS EXISTS FOR IS SILENT AND LOOKS HEALTHY. A seat that names no buyers and opens
+    /// neither surface parses, boots, connects, advertises, and passes every containment check in
+    /// this file trivially — because nothing ever arrives to be contained. It simply never claims a
+    /// job again. That is the state an already-deployed seller with no allowlist upgrades INTO, since
+    /// an empty `accept_offers_only_from` used to mean accept-all on the targeted surface.
+    ///
+    /// ⛔ THERE IS NO LONGER A SECOND, INERT-KNOB FINDING, AND ITS REMOVAL IS #923. This check used
+    /// to WARN that an open-surface flag beside a populated allowlist could not fire, because the
+    /// fence returned ahead of both surfaces. The three controls are now additive: the list admits
+    /// the buyers it names and each open flag adds its own public route, so that combination is
+    /// exactly what the operator asked for and there is no inert state left to report. Warning about
+    /// it now would tell an operator their open route is closed while strangers are being admitted
+    /// through it — the most dangerous direction this check can be wrong in.
+    ///
+    /// ⛔ ADVISORY THROUGHOUT: THIS NEVER BLOCKS BOOT. A seat with no way in sells nothing, which is
+    /// a thing to say loudly and not a reason to refuse to start — the documented first run writes
+    /// an empty allowlist with both flags false, so failing here would refuse the boot we document
+    /// and turn our own shipped `restart: unless-stopped` compose into a restart loop.
+    /// ⇒ **THE COST OF THAT DOWNGRADE IS THAT THIS TEXT IS NOW THE ONLY THING TELLING AN OPERATOR
+    /// HOW TO BECOME REACHABLE.** It names all three routes in, and an incomplete list is the whole
+    /// failure mode of the downgrade — which is why the routes live in one shared constant rather
+    /// than being spelled at each site, where one copy drifts and nothing detects it.
+    pub(super) fn check_seat_reachability(exposure: SeatExposure) -> Check {
+        const REACHABILITY_CHECK: &str = "seat reachability";
+        if exposure.is_unreachable() {
+            // Two ways to reach here and they need different remedies: an operator who named
+            // nobody has to pick a route, an operator whose entries are all malformed already
+            // picked one and needs to know it does not work.
+            if exposure.allowlist_populated() {
+                return Check::warn(
+                    REACHABILITY_CHECK,
+                    format!(
+                        "this seat can claim NOTHING: all {} entr(y/ies) in \
+                         `accept_offers_only_from` are unusable, so the list admits nobody, and \
+                         neither open route is on — so no offer can reach this seat at all",
+                        exposure.unusable_buyers
+                    ),
+                    USABLE_BUYER_ENTRY.to_owned()
+                        + ". Correct the entries, or remove them and instead "
+                        + ROUTES_IN,
+                );
+            }
+            return Check::warn(
+                REACHABILITY_CHECK,
+                "this seat can claim NOTHING: it names no buyers, does not accept targeted offers \
+                 from unnamed buyers, and does not claim the open pool"
+                    .to_owned(),
+                ROUTES_IN,
+            );
+        }
+        // #923: state the routes that are IN EFFECT, never a precedence between them. Each clause
+        // below is one admission control that can actually admit somebody, and they compose.
+        Check::pass(
+            REACHABILITY_CHECK,
+            match (exposure.named_buyers, exposure.open_surface_configured()) {
+                // No usable entry, and still reachable ⇒ an open route is carrying the seat.
+                (0, _) => format!("reachable: this seat {}", exposure.stranger_surface()),
+                (n, false) => format!("reachable: {n} named buyer(s), and no open route"),
+                // The additive case. Reported as a PASS with BOTH routes named, because the flag
+                // beside a list is no longer inert — it admits strangers, and saying so is the
+                // whole point of the check.
+                (n, true) => format!(
+                    "reachable: {n} named buyer(s), and additionally this seat {}",
+                    exposure.stranger_surface()
+                ),
+            },
+        )
+    }
+
+    /// Containment, for a seat strangers can reach — which means executing code they posted.
+    /// `check_sandbox_launcher` above answers "does the launcher resolve", a property one layer out
+    /// from this one: bubblewrap resolves on Ubuntu 24.04 and then fails at spawn on the AppArmor
+    /// unprivileged-userns restriction, so a resolvable launcher confined nothing on a live seat
+    /// (#451). This runs it and reads what it did.
+    ///
+    /// A seat reachable ONLY by buyers its operator named gets the same probe reported as a WARN: it
+    /// runs work from counterparties it chose, which is a genuinely different exposure. ⛔That
+    /// softening is earned by the ALLOWLIST, never by the absence of open-pool claiming — a seat with
+    /// `accept_open_targeted` runs stranger-written task text through the targeted surface and is
+    /// treated exactly like an open-pool seat here.
+    /// WHY this seat is not stranger-facing, and what would change that — a different sentence for
+    /// each way of being closed.
+    ///
+    /// ⛔ THE SINGLE SENTENCE THIS REPLACES WAS FALSE FOR TWO OF THE THREE STATES. It said the seat
+    /// was "reachable only by buyers it named", which is wrong for a seat that named NOBODY (nothing
+    /// reaches it at all) and for one whose every entry is unusable (it admits nobody while the
+    /// fence still shuts both surfaces). It also promised that opening either flag turns this
+    /// finding into a FAIL — untrue while a populated allowlist fences them, which is the very
+    /// state the reachability check reports as INERT two checks later.
+    /// ⇒ A LATER WARN DOES NOT MAKE AN EARLIER DIAGNOSIS TRUE. Each state gets its own remedy.
+    fn not_stranger_facing_remedy(exposure: SeatExposure) -> String {
+        // ⛔ REACHED ONLY WHEN BOTH OPEN ROUTES ARE OFF (#923). `serves_strangers()` is now exactly
+        // "either open flag is set", so an allowlist no longer softens anything by itself — what
+        // softens this finding is that NO public route is on. Every branch below must say that, and
+        // none may credit the list for it.
+        if exposure.named_buyers > 0 {
+            return "advisory because BOTH open routes are off, so every job this seat runs comes \
+                    from a buyer its operator listed in `accept_offers_only_from`. The softening is \
+                    bought by the routes being CLOSED, never by the list: since #923 the list admits \
+                    the buyers it names and vetoes nothing, so setting `claim_open_pool` or \
+                    `accept_open_targeted` makes this seat stranger-facing and turns this finding \
+                    into a FAIL - with the list still in place. Configure a working [sandbox] \
+                    launcher before you open either route"
+                .to_owned();
+        }
+        if exposure.allowlist_populated() {
+            return "advisory only because nothing can reach this seat at all: every \
+                    `accept_offers_only_from` entry is unusable, so the list admits nobody, and \
+                    neither open route is on. This is not a safe steady state - the seat sells \
+                    nothing. Correcting those entries keeps it advisory (it becomes reachable by the \
+                    buyers you named, and by nobody else while both routes stay off); turning on \
+                    either open route makes it stranger-facing and turns this finding into a FAIL, \
+                    whatever the list holds. Configure a working [sandbox] launcher first"
+                .to_owned();
+        }
+        format!(
+            "advisory only because this seat can claim NOTHING as configured - it names no buyers \
+             and neither open surface is on, so no job reaches this box and there is nothing to \
+             contain. Naming buyers keeps this advisory; opening either surface makes it \
+             stranger-facing and turns this finding into a FAIL. Configure a working [sandbox] \
+             launcher before you open one. To become reachable at all: {ROUTES_IN}"
+        )
+    }
+
     pub(super) fn check_sandbox_containment(
         sandbox: Option<SandboxConfig>,
         home_root: std::path::PathBuf,
-        claims_open_pool: bool,
+        exposure: SeatExposure,
         unsafe_override: bool,
     ) -> Check {
         check_sandbox_containment_with_model(
             sandbox,
             home_root,
-            claims_open_pool,
+            exposure,
             unsafe_override,
             ContainmentModel::assumed_for_platform(),
         )
@@ -1327,7 +2232,7 @@ mod checks {
     pub(super) fn check_sandbox_containment_with_model(
         sandbox: Option<SandboxConfig>,
         home_root: std::path::PathBuf,
-        claims_open_pool: bool,
+        exposure: SeatExposure,
         unsafe_override: bool,
         model: ContainmentModel,
     ) -> Check {
@@ -1343,7 +2248,7 @@ mod checks {
         };
         let containment = crate::sandbox_probe::probe_containment(&policy, &home_root);
 
-        if !claims_open_pool {
+        if !exposure.serves_strangers() {
             return match containment {
                 Containment::Contained => Check::pass(
                     CONTAINMENT_CHECK,
@@ -1352,10 +2257,15 @@ mod checks {
                         model.guarantee_clause()
                     ),
                 ),
+                // The DETAIL states only the property this branch actually establishes; WHY the
+                // seat is stranger-free, and what would change that, differ per state and live in
+                // the hint. The old single sentence claimed "reachable only by buyers it named",
+                // which is false for a seat that named nobody and for one whose entries match
+                // nobody — and a later WARN elsewhere does not make an earlier diagnosis true.
                 other => Check::warn(
                     CONTAINMENT_CHECK,
-                    format!("targeted-only seat, so advisory — {}", other.detail()),
-                    "advisory because this seat does not claim open-pool offers, NOT because the exposure is lower: any buyer can target this pubkey, so a targeted job runs the same stranger-written task text. Configure a working [sandbox] launcher; restrict WHICH buyers you claim from with `accept_offers_only_from`",
+                    format!("not reachable by strangers, so advisory — {}", other.detail()),
+                    not_stranger_facing_remedy(exposure),
                 ),
             };
         }
@@ -1368,7 +2278,11 @@ mod checks {
                         "--unsafe-no-sandbox passed, though the launcher does confine ({})",
                         model.guarantee_clause()
                     ),
-                    ref other => format!("--unsafe-no-sandbox passed: SERVING THE OPEN POOL UNCONTAINED — {}", other.detail()),
+                    ref other => format!(
+                        "--unsafe-no-sandbox passed: SERVING STRANGERS UNCONTAINED (this seat {}) — {}",
+                        exposure.stranger_surface(),
+                        other.detail()
+                    ),
                 },
                 "remove --unsafe-no-sandbox and configure a [sandbox] launcher that passes the probe",
             );
@@ -1384,8 +2298,11 @@ mod checks {
             ),
             Err(detail) => Check::fail(
                 CONTAINMENT_CHECK,
-                format!("this seat claims OPEN-POOL jobs — arbitrary code from strangers — and {detail}"),
-                "configure a [sandbox] launcher that passes `maxplayer sandbox-probe` — the only one of these that adds containment. `--no-claim-open-pool` silences this check without reducing exposure (a targeted job runs the same stranger-written task text); `--unsafe-no-sandbox` accepts the exposure deliberately",
+                format!(
+                    "this seat {} — arbitrary code from strangers — and {detail}",
+                    exposure.stranger_surface()
+                ),
+                "configure a [sandbox] launcher that passes `maxplayer sandbox-probe` — the only one of these that adds containment. Closing ONE open surface while the other stays open does not reduce the exposure, it only silences the surface you closed. ⛔ Since #923 listing buyers in `accept_offers_only_from` does NOT narrow who runs code here: the list admits the buyers it names and vetoes nothing, so an open route keeps admitting strangers beside it. To actually narrow who runs code, turn BOTH `accept_open_targeted` and `claim_open_pool` off and let the list carry the seat. `--unsafe-no-sandbox` accepts the exposure deliberately",
             ),
         }
     }
@@ -1398,14 +2315,14 @@ mod checks {
     /// re-bootstrapped) rather than trusting the enforcement to be the only guard.
     ///
     /// Access-exposure is orthogonal to transaction value — testnut vs real changes nothing about who
-    /// can read the key — so this never consults the mint. A too-open dir is a WARN for a targeted-only
-    /// seat (single-user boxes are common, and there the exposure is nil) and a FAIL for an open-pool
-    /// seat, whose higher exposure warrants the stricter posture. A no-op PASS where there is no POSIX
-    /// mode to read (non-unix): the `too_open` list simply stays empty.
+    /// can read the key — so this never consults the mint. A too-open dir is a WARN for a seat only its
+    /// named buyers can reach (single-user boxes are common, and there the exposure is nil) and a FAIL
+    /// for one strangers can reach, whose higher exposure warrants the stricter posture. A no-op PASS
+    /// where there is no POSIX mode to read (non-unix): the `too_open` list simply stays empty.
     pub(super) fn check_home_permissions(
         home_root: std::path::PathBuf,
         wallet_dir: std::path::PathBuf,
-        claims_open_pool: bool,
+        serves_strangers: bool,
     ) -> Check {
         let mut too_open: Vec<String> = Vec::new();
         #[cfg(unix)]
@@ -1441,7 +2358,7 @@ mod checks {
             too_open.join(", ")
         );
         let hint = "chmod 0700 the seat home and wallet/ (maxplayer re-tightens them on the next boot); on a shared host also set UMask=0077 on the service unit so harness state the binary does not own is owner-only too";
-        if claims_open_pool {
+        if serves_strangers {
             Check::fail(HOME_PERMS_CHECK, detail, hint)
         } else {
             Check::warn(HOME_PERMS_CHECK, detail, hint)
@@ -1458,7 +2375,7 @@ mod checks {
     /// narrow the sandbox, or revisit #689's conclusion that a subscription credential cannot be
     /// excluded from the cage.
     ///
-    /// Resolution is [`seller_agents::harness_credential_dir`] over the same registry boot uses.
+    /// Resolution is [`seller_agents::harness_credential_dirs`] over the same registry boot uses.
     /// An unlabelled `--agent-argv` hatch and any non-built-in label cannot be resolved: the check
     /// SAYS so and inspects nothing. Guessing a default harness's directory (or sniffing argv) would
     /// inspect the wrong path and pass — worse than no check.
@@ -1506,19 +2423,35 @@ mod checks {
         };
 
         let mut unresolvable: Vec<String> = Vec::new();
-        let mut inspect: Vec<std::path::PathBuf> = Vec::new();
+        // Grouped BY HARNESS, because that is where the bound belongs. A harness with several known
+        // locations (cursor) cannot treat an absent candidate as a finding on its own — only the
+        // operator's actual build decides which of them exists, so warning on the other would fire on
+        // every correctly configured cursor seat. But a harness with NONE of its locations present is
+        // a finding whether it has one candidate or five: that is a seat that never linked an account.
+        //
+        // ⛔ DO NOT FLATTEN THIS BACK INTO A PER-PATH "missing is fine" FLAG. Per-path, a cursor seat
+        // with no credential directory anywhere PASSES having inspected nothing — the same defect this
+        // check was widened to fix, inverted. Inspecting the wrong directory and passing is bad;
+        // inspecting nothing and passing is worse, because there is no path in the output to doubt.
+        let mut groups: Vec<(String, Vec<std::path::PathBuf>)> = Vec::new();
         for agent in resolved.registry.entries() {
-            match seller_agents::harness_credential_dir(agent, &user_home) {
-                Some(dir) => inspect.push(dir),
-                None => match &agent.name {
+            let dirs = seller_agents::harness_credential_dirs(agent, &user_home);
+            if dirs.is_empty() {
+                match &agent.name {
                     None => unresolvable
                         .push("raw --agent-argv hatch (no preset label)".to_owned()),
                     Some(name) => unresolvable
                         .push(format!("harness {name} (no known credential directory)")),
-                },
+                }
+                continue;
             }
+            let label = match &agent.name {
+                Some(name) => name.clone(),
+                None => "harness".to_owned(),
+            };
+            groups.push((label, dirs));
         }
-        if inspect.is_empty() && unresolvable.is_empty() {
+        if groups.is_empty() && unresolvable.is_empty() {
             return Check::warn(
                 HARNESS_CREDS_CHECK,
                 "no harness to inspect — cannot resolve a credential directory",
@@ -1527,6 +2460,11 @@ mod checks {
         }
 
         let mut too_open: Vec<String> = Vec::new();
+        // Harnesses with no credential directory at ANY of their known locations, and the paths that
+        // really were stat-ed. `inspected` is what the PASS line may name: naming a path that does not
+        // exist is how this check previously claimed to have looked at something it had not.
+        let mut unlinked: Vec<String> = Vec::new();
+        let mut inspected: Vec<std::path::PathBuf> = Vec::new();
         #[cfg(unix)]
         {
             use std::io::ErrorKind;
@@ -1554,29 +2492,55 @@ mod checks {
                 None
             };
 
-            for dir in &inspect {
-                if let Some(check) = consider(dir, false, &mut too_open) {
-                    return check;
-                }
+            for (label, dirs) in &groups {
+                let mut present = 0usize;
+                for dir in dirs {
+                    // Existence is read HERE rather than through `consider`, because absence is only
+                    // a finding once the WHOLE GROUP is absent — `consider` judges one path.
+                    match std::fs::metadata(dir) {
+                        Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                        Err(error) => {
+                            return Check::warn(
+                                HARNESS_CREDS_CHECK,
+                                format!("could not read {} permissions: {error}", dir.display()),
+                                "check the harness credential path exists and is readable",
+                            );
+                        }
+                        Ok(_) => present += 1,
+                    }
+                    inspected.push(dir.clone());
+                    if let Some(check) = consider(dir, false, &mut too_open) {
+                        return check;
+                    }
                 // settings.json STEERS the harness when present; absence is not a permissions
                 // problem (the file is optional) so NotFound is skipped, never a silent skip of
                 // a metadata error on a file that does exist.
-                if let Some(check) = consider(&dir.join("settings.json"), true, &mut too_open) {
-                    return check;
+                    if let Some(check) = consider(&dir.join("settings.json"), true, &mut too_open) {
+                        return check;
+                    }
+                }
+                if present == 0 {
+                    unlinked.push(format!(
+                        "{label} ({})",
+                        dirs.iter()
+                            .map(|dir| dir.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(" or ")
+                    ));
                 }
             }
         }
         #[cfg(not(unix))]
         {
-            let _ = &inspect;
+            let _ = &groups;
         }
 
-        if too_open.is_empty() && unresolvable.is_empty() {
+        if too_open.is_empty() && unresolvable.is_empty() && unlinked.is_empty() {
             return Check::pass(
                 HARNESS_CREDS_CHECK,
                 format!(
                     "not group/world-writable: {}",
-                    inspect
+                    inspected
                         .iter()
                         .map(|path| path.display().to_string())
                         .collect::<Vec<_>>()
@@ -1584,13 +2548,30 @@ mod checks {
                 ),
             );
         }
-        if too_open.is_empty() {
+        if too_open.is_empty() && unresolvable.is_empty() {
             return Check::warn(
                 HARNESS_CREDS_CHECK,
                 format!(
-                    "cannot resolve a credential directory for {} — not inspected (doctor will not guess a path)",
-                    unresolvable.join(", ")
+                    "no credential directory exists for {} — that harness is not linked to an account, so the pre-advertise probe will fail and the seat will not advertise",
+                    unlinked.join(", ")
                 ),
+                "link the account as the seller service user, then re-run doctor — see \"Link your model account\" in docs/SELLER-QUICKSTART.md",
+            );
+        }
+        if too_open.is_empty() {
+            let mut detail = format!(
+                "cannot resolve a credential directory for {} — not inspected (doctor will not guess a path)",
+                unresolvable.join(", ")
+            );
+            if !unlinked.is_empty() {
+                detail.push_str(&format!(
+                    "; also no credential directory exists for {} — that harness is not linked to an account",
+                    unlinked.join(", ")
+                ));
+            }
+            return Check::warn(
+                HARNESS_CREDS_CHECK,
+                detail,
                 "use a named preset (claude|cursor|codex) to inspect that harness's credential directory; a raw --agent-argv hatch and unknown labels have no known path",
             );
         }
@@ -1602,6 +2583,12 @@ mod checks {
             detail.push_str(&format!(
                 "; also cannot resolve a credential directory for {} — not inspected (doctor will not guess a path)",
                 unresolvable.join(", ")
+            ));
+        }
+        if !unlinked.is_empty() {
+            detail.push_str(&format!(
+                "; also no credential directory exists for {} — that harness is not linked to an account",
+                unlinked.join(", ")
             ));
         }
         Check::warn(
@@ -1639,8 +2626,22 @@ mod checks {
 fn write_usage(out: &mut dyn Write) {
     let _ = writeln!(
         out,
-        "Usage:\n  maxplayer doctor [--home <dir>]   # seller environment self-check (nix, credential helper, seller key, relay, mint, agent, sandbox, home permissions, harness credential permissions)\n\nExit codes: 0 all checks passed, 1 a blocking check FAILed"
+        "Usage:\n  maxplayer doctor [--home <dir>]   # seller environment self-check (nix, credential helper, seller key, relay, mint, agent, sandbox, home permissions, harness credential permissions)\n\nExit codes: 0 all checks passed, 1 a blocking check FAILed\n{}",
+        crate::skill::docs_pointer_line()
     );
+}
+
+/// The lines `maxplayer doctor` prints before the first check: what this is, which home it read,
+/// and where the documentation lives. Pure, so the pointer is testable without a relay, a mint or
+/// a network — the report itself needs all three. An operator reads doctor output when something
+/// is wrong, which is exactly when the route to the guides matters and, before this, was absent.
+#[cfg(feature = "wallet")]
+fn report_preamble(home_root: &std::path::Path) -> String {
+    format!(
+        "maxplayer doctor — seller environment self-check (home={})\n{}\n",
+        home_root.display(),
+        crate::skill::docs_pointer_line()
+    )
 }
 
 /// Entry from `cli::run` for `maxplayer doctor`.
@@ -1719,6 +2720,14 @@ fn build_checks(
     unsafe_no_sandbox: bool,
 ) -> Vec<Box<dyn FnOnce() -> Check>> {
     let relay_url = home.config.relay_url.clone();
+    let relay_url_for_token_policy = home.config.relay_url.clone();
+    // The delivery remote is what a scoped push token is checked against, so the token-policy row
+    // reads it rather than re-deriving one.
+    let git_remote_for_token_policy = home
+        .config
+        .seller
+        .as_ref()
+        .map(|seller| seller.git_remote.clone());
     let secret = maxplayer_core::home::read_secret_key_hex(home).ok();
     let key_present = maxplayer_core::home::key_file_present(home);
     // The key file of the RESOLVED home, so the key check names what it read (#216/#265).
@@ -1738,16 +2747,40 @@ fn build_checks(
     let sandbox_for_image = sandbox.clone();
     let sandbox_for_engine = sandbox.clone();
     let sandbox_for_egress = sandbox.clone();
+    let sandbox_for_token_policy = sandbox.clone();
+    let sandbox_for_route = sandbox.clone();
     // The probe runs in the seat's OWN home, because that is where a launcher's config points.
     let home_root = home.root.clone();
-    // Open-pool claiming is the exposure the containment gate is about: it is what makes this box
-    // run code from a counterparty nobody chose. Off by default (#357), so an unconfigured seat is
-    // targeted-only and stays advisory.
-    let claims_open_pool = home
+    let route_home_root = home.root.clone();
+    // Reaching this box with stranger-written code is what the containment gate is about, and there
+    // are TWO surfaces that do it. Both are off by default, so an unconfigured seat is reachable only
+    // by the buyers its operator named and every one of these findings stays advisory.
+    let exposure = home
         .config
         .seller
         .as_ref()
-        .is_some_and(|seller| seller.claim_open_pool);
+        .map(|seller| {
+            // Usable vs unusable is a REPORTING split and never an admission one. Since #923 no
+            // entry fences anybody; an unusable one simply admits nobody, whether or not it can
+            // ever match. Counting them apart is what stops a typo reading as a working route.
+            let named_buyers = seller
+                .accept_offers_only_from
+                .iter()
+                .filter(|entry| maxplayer_core::home::buyer_pubkey_is_reachable(entry))
+                .count();
+            checks::SeatExposure {
+                open_pool: seller.claim_open_pool,
+                open_targeted: seller.accept_open_targeted,
+                named_buyers,
+                unusable_buyers: seller.accept_offers_only_from.len() - named_buyers,
+            }
+        })
+        .unwrap_or(checks::SeatExposure::CLOSED);
+    // Asked of the type, never re-derived from the raw flags here. Since #923 the answer IS the two
+    // flags — a populated allowlist admits the buyers it names and vetoes nothing — but it stays a
+    // method call so the three severity consumers below cannot drift apart, which is the failure
+    // this line was written for and the one #923 made concrete.
+    let serves_strangers = exposure.serves_strangers();
     // Home/wallet perms are verified against the SAME resolved home the rest of the gate inspects.
     let perms_home_root = home.root.clone();
     let perms_wallet_dir = home.wallet_dir.clone();
@@ -1761,6 +2794,16 @@ fn build_checks(
     checks.push(Box::new(checks::check_credential_helper));
     checks.push(Box::new(move || checks::check_seller_key(&key_path, key_present)));
     checks.push(Box::new(move || checks::check_relay(relay_url, secret)));
+    // What the relay promises about a branch-scoped push token's lifetime. Information under the
+    // default `fresh-after-agent` token mode, a boot-blocking gate under `long-lived` — and answered
+    // from config alone (no HTTP GET) on a seat with `[sandbox] container_delivery` off.
+    checks.push(Box::new(move || {
+        checks::check_relay_token_policy(
+            relay_url_for_token_policy,
+            git_remote_for_token_policy,
+            sandbox_for_token_policy,
+        )
+    }));
     // One aggregate mint check across the accept-policy: "can I settle anywhere?".
     checks.push(Box::new(move || checks::check_mints(accepted_mints)));
     let agent_host = maxplayer_core::agent_presets::AdapterHost::for_sandbox(sandbox.as_ref());
@@ -1782,6 +2825,14 @@ fn build_checks(
     // one who can be told, so this WARNs. Advisory — never blocks boot, because turning a working
     // docker seat red on upgrade is a behaviour change, not a doctor's call.
     checks.push(Box::new(move || checks::check_sandbox_egress(sandbox_for_egress)));
+    // The route a JOB takes, measured from inside a job's own namespace. Unlike every other network
+    // check here it does not ask the host anything: a seat whose host resolves perfectly while its
+    // gVisor jobs die on EAI_AGAIN is exactly the state that produced this check, and a host-side
+    // probe calls that seat ready. BLOCKING, and transient so the boot gate's bounded retry gives a
+    // daemon a moment to come back before the seat is refused.
+    checks.push(Box::new(move || {
+        checks::check_sandbox_delivery_route(sandbox_for_route, route_home_root)
+    }));
     // #792 phase 3: under mode=docker, the image the seat runs jobs in must be present or pullable,
     // or the first awarded job stalls. On absence this prints the exact `docker pull` command. A
     // non-docker policy is a no-op Pass. Placed after the launcher (docker-resolves) check.
@@ -1790,20 +2841,24 @@ fn build_checks(
     // on a non-gVisor seat — docs/SANDBOXING.md §4 declines to hand-write one on purpose. The io_uring
     // block first ships in Engine 25.0.0, and every Engine from 2019 through 24.x explicitly ALLOWS
     // that family, so an older Engine is a materially weaker posture than the ADR assumes and nothing
-    // said so before this check. WARN for a targeted seat, FAIL for an open-pool one — the same
-    // exposure split check_home_permissions and check_sandbox_containment already use.
+    // said so before this check. WARN for a seat only its named buyers reach, FAIL for one strangers
+    // reach — the same exposure split check_home_permissions and check_sandbox_containment use.
     checks.push(Box::new(move || {
-        checks::check_sandbox_engine_floor(sandbox_for_engine, claims_open_pool)
+        checks::check_sandbox_engine_floor(sandbox_for_engine, serves_strangers)
     }));
-    // Blocking for an open-pool seat (#451). Placed after the resolve check so that a launcher which
-    // is not there reports as the missing file it is, rather than as a containment failure.
+    // Blocking for a seat strangers can reach (#451). Placed after the resolve check so that a
+    // launcher which is not there reports as the missing file it is, not as a containment failure.
     checks.push(Box::new(move || {
-        checks::check_sandbox_containment(sandbox, home_root, claims_open_pool, unsafe_no_sandbox)
+        checks::check_sandbox_containment(sandbox, home_root, exposure, unsafe_no_sandbox)
     }));
+    // Who can reach this seat at all. Reported separately from containment because the two answer
+    // opposite questions — containment asks how dangerous an incoming job is, this asks whether any
+    // can arrive — and a seat with no way in is silently healthy on every other check here.
+    checks.push(Box::new(move || checks::check_seat_reachability(exposure)));
     // Verifies the owner-only invariant `home::bootstrap` enforces at creation hasn't drifted (#473):
-    // WARN for a targeted seat, FAIL for an open-pool one.
+    // WARN for a seat only its named buyers reach, FAIL for one strangers reach.
     checks.push(Box::new(move || {
-        checks::check_home_permissions(perms_home_root, perms_wallet_dir, claims_open_pool)
+        checks::check_home_permissions(perms_home_root, perms_wallet_dir, serves_strangers)
     }));
     // #715: inspect the configured harness's credential directory. Advisory WARN; never blocks
     // boot (group-write is inert on a single-account host).
@@ -1873,7 +2928,7 @@ fn run_doctor(
         }
     };
 
-    let _ = writeln!(out, "maxplayer doctor — seller environment self-check (home={})", home.root.display());
+    let _ = write!(out, "{}", report_preamble(&home.root));
 
     // `doctor` reports; it never boots a seller, so there is nothing here for an unsafe override to
     // waive. The containment check is read at its own severity.
@@ -1960,6 +3015,41 @@ pub fn sell_readiness_gate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The docs pointer on the doctor path. Before this, `maxplayer doctor` — the command an operator
+    // runs when something is wrong — carried no route to https://www.maxplayer.ai/skill.md; only the
+    // MCP handshake did, and a seller never sees that. Asserted against the ONE shared constant, not
+    // a copied URL, and on the pure preamble rather than a full report (which needs a relay, a mint
+    // and a network), so the guard runs everywhere the unit tests do.
+    #[test]
+    fn doctor_usage_and_report_preamble_carry_the_docs_pointer() {
+        let url = crate::skill::SKILL_URL;
+
+        let mut usage = Vec::new();
+        write_usage(&mut usage);
+        let usage = String::from_utf8(usage).expect("utf8");
+        assert!(
+            usage.contains(url),
+            "`doctor --help` must point at the docs:\n{usage}"
+        );
+
+        #[cfg(feature = "wallet")]
+        {
+            let preamble = report_preamble(std::path::Path::new("/tmp/example-home"));
+            assert!(
+                preamble.contains(url),
+                "the doctor report must point at the docs:\n{preamble}"
+            );
+            assert!(
+                preamble.contains("home=/tmp/example-home"),
+                "the preamble still names the home it read:\n{preamble}"
+            );
+            assert!(
+                preamble.ends_with('\n'),
+                "each preamble line is terminated:\n{preamble:?}"
+            );
+        }
+    }
 
     #[test]
     fn registry_runs_every_check_even_after_an_early_fail() {
@@ -2104,6 +3194,389 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
+
+    // ---- Relay token policy: information under `fresh-after-agent`, a gate under `long-lived` ----
+    //
+    // The mode an operator flips is `[sandbox] container_delivery_token`, and the failure it used to
+    // buy was an HTTP 401 on the PUSH — after the agent ran and the buyer paid. These rows move that
+    // answer to a doctor run. Every case injects the NIP-11 read, so none of them touches a network.
+
+    #[cfg(feature = "wallet")]
+    const TOKEN_POLICY_RELAY: &str = "wss://relay.example";
+    /// The uid of an ordinary seller seat's container.
+    #[cfg(feature = "wallet")]
+    const NON_ROOT_UID: u32 = 1000;
+    /// A seat whose daemon — and so whose container — runs as root.
+    #[cfg(feature = "wallet")]
+    const ROOT_UID: u32 = 0;
+    #[cfg(feature = "wallet")]
+    const TOKEN_POLICY_REMOTE: &str = "https://relay.example/git/abc/m0123.git";
+    /// The shipped `container_delivery_token_cap_secs` default (6 h).
+    #[cfg(feature = "wallet")]
+    const TOKEN_POLICY_CAP: u64 = 21_600;
+
+    /// A docker seat with container delivery on, in the named token mode.
+    #[cfg(feature = "wallet")]
+    fn token_mode_sandbox(
+        token: Option<maxplayer_core::home::ContainerDeliveryToken>,
+    ) -> Option<maxplayer_core::home::SandboxConfig> {
+        use maxplayer_core::home::{SandboxConfig, SandboxMode};
+        Some(SandboxConfig {
+            mode: SandboxMode::Docker,
+            image: Some("maxplayer/sandbox:test".into()),
+            container_delivery: Some(true),
+            container_delivery_token: token,
+            ..Default::default()
+        })
+    }
+
+    /// A docker seat that names NO container-delivery switch — the commonest seat there is, and the
+    /// one the flipped default is for.
+    #[cfg(feature = "wallet")]
+    fn defaulted_docker_sandbox() -> Option<maxplayer_core::home::SandboxConfig> {
+        use maxplayer_core::home::{SandboxConfig, SandboxMode};
+        Some(SandboxConfig {
+            mode: SandboxMode::Docker,
+            image: Some("maxplayer/sandbox:test".into()),
+            ..Default::default()
+        })
+    }
+
+    /// A docker seat that has opted BACK to the host path.
+    #[cfg(feature = "wallet")]
+    fn opted_out_docker_sandbox() -> Option<maxplayer_core::home::SandboxConfig> {
+        use maxplayer_core::home::{SandboxConfig, SandboxMode};
+        Some(SandboxConfig {
+            mode: SandboxMode::Docker,
+            image: Some("maxplayer/sandbox:test".into()),
+            container_delivery: Some(false),
+            ..Default::default()
+        })
+    }
+
+    /// A seat on the HOST delivery path must be answered from config alone. The probe panics, so a
+    /// version that asked the relay anyway goes red here.
+    ///
+    /// Three seats reach the host path, and all three must ask nothing: a seat with no `[sandbox]`
+    /// section, a launcher seat, and a docker seat that opted out with `container_delivery = false`.
+    ///
+    /// RED ON REVERT: fetch before the `container_delivery` branch and this test panics.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn relay_token_policy_asks_nothing_on_the_host_delivery_path() {
+        use maxplayer_core::home::{SandboxConfig, SandboxMode};
+
+        let launcher = Some(SandboxConfig {
+            mode: SandboxMode::Launcher,
+            launcher: vec!["env".to_owned()],
+            ..Default::default()
+        });
+        for sandbox in [None, launcher, opted_out_docker_sandbox()] {
+            let check = checks::check_relay_token_policy_in(
+                TOKEN_POLICY_RELAY.into(),
+                Some(TOKEN_POLICY_REMOTE.into()),
+                sandbox,
+                NON_ROOT_UID,
+                |_| panic!("a host-path seat must not read the relay's NIP-11 document"),
+            );
+            assert_eq!(check.status, Status::Pass, "{}", check.detail);
+            assert!(
+                check.detail.contains("delivery path: HOST"),
+                "the row names the effective path: {}",
+                check.detail
+            );
+            assert!(check.detail.contains("not asked"), "{}", check.detail);
+        }
+    }
+
+    /// The row is where an operator reads the EFFECTIVE delivery path off, so it must name that path
+    /// and the config state that decided it — for every row of the switch's table.
+    ///
+    /// ⛔ WHY THIS MATTERS. Container delivery is the default for a docker seat, so an upgrade moves
+    /// the path with no config change. A row that said only "container delivery is on" would leave
+    /// the operator unable to tell a default from a choice.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn relay_token_policy_names_the_effective_delivery_path_and_the_reason() {
+        use maxplayer_core::home::{SandboxConfig, SandboxMode};
+        use maxplayer_core::relay_info::ScopedTokenSupport;
+
+        // docker + absent ⇒ CONTAINER, credited to the default.
+        let detail = checks::check_relay_token_policy_in(
+            TOKEN_POLICY_RELAY.into(),
+            Some(TOKEN_POLICY_REMOTE.into()),
+            defaulted_docker_sandbox(),
+            NON_ROOT_UID,
+            |_| ScopedTokenSupport::Advertised(TOKEN_POLICY_CAP),
+        )
+        .detail;
+        assert!(detail.contains("delivery path: CONTAINER"), "{detail}");
+        assert!(detail.contains("the default for"), "the reason is the default: {detail}");
+
+        // docker + true ⇒ CONTAINER, credited to the config.
+        let detail = checks::check_relay_token_policy_in(
+            TOKEN_POLICY_RELAY.into(),
+            Some(TOKEN_POLICY_REMOTE.into()),
+            token_mode_sandbox(None),
+            NON_ROOT_UID,
+            |_| ScopedTokenSupport::Advertised(TOKEN_POLICY_CAP),
+        )
+        .detail;
+        assert!(detail.contains("delivery path: CONTAINER"), "{detail}");
+        assert!(detail.contains("container_delivery = true"), "{detail}");
+
+        // docker + false ⇒ HOST, named as the opt-out.
+        let detail = checks::check_relay_token_policy_in(
+            TOKEN_POLICY_RELAY.into(),
+            Some(TOKEN_POLICY_REMOTE.into()),
+            opted_out_docker_sandbox(),
+            NON_ROOT_UID,
+            |_| ScopedTokenSupport::Advertised(TOKEN_POLICY_CAP),
+        )
+        .detail;
+        assert!(detail.contains("delivery path: HOST"), "{detail}");
+        assert!(detail.contains("container_delivery = false"), "{detail}");
+
+        // launcher ⇒ HOST, and the reason is the mode rather than the switch.
+        let detail = checks::check_relay_token_policy_in(
+            TOKEN_POLICY_RELAY.into(),
+            Some(TOKEN_POLICY_REMOTE.into()),
+            Some(SandboxConfig { mode: SandboxMode::Launcher, ..Default::default() }),
+            NON_ROOT_UID,
+            |_| ScopedTokenSupport::Advertised(TOKEN_POLICY_CAP),
+        )
+        .detail;
+        assert!(detail.contains("delivery path: HOST"), "{detail}");
+        assert!(detail.contains("launcher"), "the reason is the mode: {detail}");
+
+        // The path is also named when the seat has no remote to push to.
+        let detail = checks::check_relay_token_policy_in(
+            TOKEN_POLICY_RELAY.into(),
+            None,
+            defaulted_docker_sandbox(),
+            NON_ROOT_UID,
+            |_| ScopedTokenSupport::Advertised(TOKEN_POLICY_CAP),
+        )
+        .detail;
+        assert!(detail.contains("delivery path: CONTAINER"), "{detail}");
+        assert!(detail.contains("git_remote"), "{detail}");
+    }
+
+    /// The default token mode is `fresh-after-agent`, which depends on no relay feature — so a
+    /// docker seat that never named the switch can never be BLOCKED by this row, whatever the relay
+    /// answers. This is what keeps the flipped default from turning a relay hiccup into a seat that
+    /// will not boot.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn the_defaulted_docker_seat_is_never_blocked_by_the_relay_token_row() {
+        use maxplayer_core::relay_info::ScopedTokenSupport;
+
+        for support in [
+            ScopedTokenSupport::Advertised(TOKEN_POLICY_CAP),
+            ScopedTokenSupport::Advertised(1),
+            ScopedTokenSupport::Absent,
+            ScopedTokenSupport::Unknown("dns error".into()),
+        ] {
+            let check = checks::check_relay_token_policy_in(
+                TOKEN_POLICY_RELAY.into(),
+                Some(TOKEN_POLICY_REMOTE.into()),
+                defaulted_docker_sandbox(),
+                NON_ROOT_UID,
+                |_| support.clone(),
+            );
+            assert_eq!(
+                check.status,
+                Status::Pass,
+                "the new default must never block a boot: {}",
+                check.detail
+            );
+        }
+    }
+
+    /// A ROOT seat (container uid 0) that never named the key is on the HOST path, the row says root
+    /// decided it, and no relay is read. With `container_delivery = true` it is on the container
+    /// path, credited to the config, with the warning. RED ON REVERT: the row called root + absent
+    /// the docker default while the policy resolved it to the host path.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn relay_token_policy_names_the_root_posture() {
+        use maxplayer_core::relay_info::ScopedTokenSupport;
+
+        let detail = checks::check_relay_token_policy_in(
+            TOKEN_POLICY_RELAY.into(),
+            Some(TOKEN_POLICY_REMOTE.into()),
+            defaulted_docker_sandbox(),
+            ROOT_UID,
+            |_| panic!("a root seat on the host path must not read the relay's NIP-11 document"),
+        )
+        .detail;
+        assert!(detail.contains("delivery path: HOST"), "{detail}");
+        assert!(detail.contains("root"), "the reason is the uid: {detail}");
+        assert!(detail.contains("container_delivery = true"), "names the opt-in: {detail}");
+
+        let detail = checks::check_relay_token_policy_in(
+            TOKEN_POLICY_RELAY.into(),
+            Some(TOKEN_POLICY_REMOTE.into()),
+            token_mode_sandbox(None),
+            ROOT_UID,
+            |_| ScopedTokenSupport::Advertised(TOKEN_POLICY_CAP),
+        )
+        .detail;
+        assert!(detail.contains("delivery path: CONTAINER"), "{detail}");
+        assert!(detail.contains("container_delivery = true"), "{detail}");
+        assert!(detail.contains("root"), "the warning stays: {detail}");
+    }
+
+    /// `fresh-after-agent` PASSes whatever the relay says — it needs no relay feature — and the row
+    /// still reports the answer plus what it means for the other mode.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn relay_token_policy_is_information_in_fresh_after_agent_mode() {
+        use maxplayer_core::relay_info::ScopedTokenSupport;
+
+        for support in [
+            ScopedTokenSupport::Advertised(TOKEN_POLICY_CAP),
+            ScopedTokenSupport::Absent,
+            ScopedTokenSupport::Unknown("connection refused".into()),
+        ] {
+            let check = checks::check_relay_token_policy_in(
+                TOKEN_POLICY_RELAY.into(),
+                Some(TOKEN_POLICY_REMOTE.into()),
+                token_mode_sandbox(None), // None ⇒ the default, `fresh-after-agent`
+                NON_ROOT_UID,
+                |_| support.clone(),
+            );
+            assert_eq!(
+                check.status,
+                Status::Pass,
+                "fresh-after-agent must never block on the relay's answer: {}",
+                check.detail
+            );
+            assert!(
+                check.detail.contains("fresh-after-agent"),
+                "names the mode in use: {}",
+                check.detail
+            );
+            assert!(
+                check.detail.contains("long-lived"),
+                "and what the answer means for the other mode: {}",
+                check.detail
+            );
+        }
+    }
+
+    /// `long-lived` against a relay that advertises nothing is exactly the surprise this row exists
+    /// to remove: FAIL, with the working mode named in the fix.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn relay_token_policy_fails_in_long_lived_mode_when_the_field_is_missing() {
+        use maxplayer_core::home::ContainerDeliveryToken;
+        use maxplayer_core::relay_info::ScopedTokenSupport;
+
+        let check = checks::check_relay_token_policy_in(
+            TOKEN_POLICY_RELAY.into(),
+            Some(TOKEN_POLICY_REMOTE.into()),
+            token_mode_sandbox(Some(ContainerDeliveryToken::LongLived)),
+            NON_ROOT_UID,
+            |_| ScopedTokenSupport::Absent,
+        );
+        assert_eq!(check.status, Status::Fail, "{}", check.detail);
+        assert!(check.detail.contains("long-lived"), "{}", check.detail);
+        assert!(
+            check.detail.contains("scoped_token_max_lifetime_secs"),
+            "names the missing field: {}",
+            check.detail
+        );
+        let rendered = check.render();
+        assert!(
+            rendered.contains("fresh-after-agent"),
+            "the fix names the mode that works: {rendered}"
+        );
+    }
+
+    /// A relay that advertises LESS than this seat is configured for prints both numbers, so the
+    /// operator can fix either side.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn relay_token_policy_fails_when_the_advertised_cap_is_smaller_than_the_configured_one() {
+        use maxplayer_core::home::ContainerDeliveryToken;
+        use maxplayer_core::relay_info::ScopedTokenSupport;
+
+        let check = checks::check_relay_token_policy_in(
+            TOKEN_POLICY_RELAY.into(),
+            Some(TOKEN_POLICY_REMOTE.into()),
+            token_mode_sandbox(Some(ContainerDeliveryToken::LongLived)),
+            NON_ROOT_UID,
+            |_| ScopedTokenSupport::Advertised(600),
+        );
+        assert_eq!(check.status, Status::Fail, "{}", check.detail);
+        assert!(check.detail.contains("600"), "advertised: {}", check.detail);
+        assert!(
+            check.detail.contains(&TOKEN_POLICY_CAP.to_string()),
+            "configured: {}",
+            check.detail
+        );
+    }
+
+    /// An unreachable relay is UNKNOWN, and unknown FAILs in `long-lived`: nothing proves the relay
+    /// honours the expiration tag, so the row must not read silence as support.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn relay_token_policy_fails_in_long_lived_mode_when_the_relay_cannot_be_read() {
+        use maxplayer_core::home::ContainerDeliveryToken;
+        use maxplayer_core::relay_info::ScopedTokenSupport;
+
+        let check = checks::check_relay_token_policy_in(
+            TOKEN_POLICY_RELAY.into(),
+            Some(TOKEN_POLICY_REMOTE.into()),
+            token_mode_sandbox(Some(ContainerDeliveryToken::LongLived)),
+            NON_ROOT_UID,
+            |_| ScopedTokenSupport::Unknown("dns error".into()),
+        );
+        assert_eq!(check.status, Status::Fail, "{}", check.detail);
+        assert!(check.detail.contains("dns error"), "{}", check.detail);
+    }
+
+    /// The healthy `long-lived` case: a relay that advertises a cap at or above the seat's own.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn relay_token_policy_passes_in_long_lived_mode_when_the_relay_advertises_enough() {
+        use maxplayer_core::home::ContainerDeliveryToken;
+        use maxplayer_core::relay_info::ScopedTokenSupport;
+
+        let check = checks::check_relay_token_policy_in(
+            TOKEN_POLICY_RELAY.into(),
+            Some(TOKEN_POLICY_REMOTE.into()),
+            token_mode_sandbox(Some(ContainerDeliveryToken::LongLived)),
+            NON_ROOT_UID,
+            |_| ScopedTokenSupport::Advertised(TOKEN_POLICY_CAP),
+        );
+        assert_eq!(check.status, Status::Pass, "{}", check.detail);
+        assert!(
+            check.detail.contains(&TOKEN_POLICY_CAP.to_string()),
+            "{}",
+            check.detail
+        );
+    }
+
+    /// A BYO https remote takes no NIP-98 header, so no scoped token exists to cap. Reported, never
+    /// failed, and asked of no relay.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn relay_token_policy_is_inert_on_a_remote_that_takes_no_scoped_token() {
+        use maxplayer_core::home::ContainerDeliveryToken;
+
+        let check = checks::check_relay_token_policy_in(
+            TOKEN_POLICY_RELAY.into(),
+            Some("https://github.com/owner/repo.git".into()),
+            token_mode_sandbox(Some(ContainerDeliveryToken::LongLived)),
+            NON_ROOT_UID,
+            |_| panic!("a remote that takes no scoped token must not read the relay's document"),
+        );
+        assert_eq!(check.status, Status::Pass, "{}", check.detail);
+        assert!(check.detail.contains("not relay-git"), "{}", check.detail);
+    }
+
     // ---- Issue #357: the sandbox launcher must resolve before the seat advertises ----
 
     // The check is non-inert: a launcher that cannot spawn FAILs, a resolvable one PASSes, and an
@@ -2172,6 +3645,20 @@ mod tests {
         }
     }
 
+    /// The same shape as [`contained_probe_launcher`] with the canary leg inverted: the payload READ
+    /// the file it must not reach. Needed wherever a test has to tell the two severities apart — a
+    /// contained launcher passes on both branches, so it cannot discriminate.
+    fn uncontained_probe_launcher() -> maxplayer_core::home::SandboxConfig {
+        maxplayer_core::home::SandboxConfig {
+            launcher: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf 'canary_read=ok\\nworkdir_write=ok\\n'".into(),
+            ],
+            ..contained_probe_launcher()
+        }
+    }
+
     #[cfg(feature = "wallet")]
     fn containment_test_home(label: &str) -> std::path::PathBuf {
         let stamp = std::time::SystemTime::now()
@@ -2191,7 +3678,7 @@ mod tests {
         let check = checks::check_sandbox_containment(
             Some(contained_probe_launcher()),
             home.clone(),
-            false,
+            checks::SeatExposure::CLOSED,
             false,
         );
 
@@ -2238,30 +3725,43 @@ mod tests {
             let expected_pass = format!(
                 "launcher confines: a file outside the workdir was refused, the workdir was writable ({clause})"
             );
-            let targeted = checks::check_sandbox_containment_with_model(
+            let named_only = checks::check_sandbox_containment_with_model(
                 Some(contained_probe_launcher()),
                 home.clone(),
-                false,
+                checks::SeatExposure::CLOSED,
                 false,
                 model,
             );
-            assert_eq!(targeted.status, Status::Pass, "{}", targeted.render());
-            assert_eq!(targeted.detail, expected_pass);
+            assert_eq!(named_only.status, Status::Pass, "{}", named_only.render());
+            assert_eq!(named_only.detail, expected_pass);
 
             let open_pool = checks::check_sandbox_containment_with_model(
                 Some(contained_probe_launcher()),
                 home.clone(),
-                true,
+                checks::SeatExposure { open_pool: true, ..checks::SeatExposure::CLOSED },
                 false,
                 model,
             );
             assert_eq!(open_pool.status, Status::Pass, "{}", open_pool.render());
             assert_eq!(open_pool.detail, expected_pass);
 
+            // The targeted surface alone must reach the same verdict as the pool: a contained
+            // launcher passes either way, and the point of asserting it here is that the exposure
+            // type — not just the pool flag — is what the check now reads.
+            let open_targeted = checks::check_sandbox_containment_with_model(
+                Some(contained_probe_launcher()),
+                home.clone(),
+                checks::SeatExposure { open_targeted: true, ..checks::SeatExposure::CLOSED },
+                false,
+                model,
+            );
+            assert_eq!(open_targeted.status, Status::Pass, "{}", open_targeted.render());
+            assert_eq!(open_targeted.detail, expected_pass);
+
             let overridden = checks::check_sandbox_containment_with_model(
                 Some(contained_probe_launcher()),
                 home.clone(),
-                true,
+                checks::SeatExposure { open_pool: true, ..checks::SeatExposure::CLOSED },
                 true,
                 model,
             );
@@ -2275,6 +3775,503 @@ mod tests {
 
             std::fs::remove_dir_all(home).ok();
         }
+    }
+
+    // THE REASONING FIX, ASSERTED AS BEHAVIOUR. Before the three-knob split these checks keyed on
+    // `claim_open_pool` alone, which meant a seat exposed to strangers through the TARGETED surface
+    // got the soft advisory written for a seat that chose its counterparties. The severity must now
+    // turn on whether a stranger can arrive at all, by EITHER surface.
+    //
+    // The foils are what make this more than a restatement: the closed seat is checked too, so a
+    // predicate that simply always escalated would fail here rather than look correct.
+    #[test]
+    fn stranger_exposure_escalates_severity_on_either_surface() {
+        use checks::{EngineProbe, EngineVersion};
+        let below =
+            EngineProbe::Reported(EngineVersion::parse("24.0.9").expect("'24.0.9' must parse"));
+
+        assert_eq!(
+            checks::fold_sandbox_engine_floor(&below, None, false).status,
+            Status::Warn,
+            "a seat only its named buyers can reach stays advisory"
+        );
+        assert_eq!(
+            checks::fold_sandbox_engine_floor(&below, None, true).status,
+            Status::Fail,
+            "a seat strangers can reach blocks — on EITHER surface, which is what the caller now computes"
+        );
+    }
+
+    // The caller is where the two surfaces are OR-ed into the severity bool, so it is the caller that
+    // this pins. A regression that reverted the wiring to `claim_open_pool` alone would leave every
+    // check function above correct and still under-report a targeted-open seat.
+    #[test]
+    fn either_open_surface_alone_counts_as_serving_strangers() {
+        // Asserted through `serves_strangers()` rather than by re-deriving `open_pool ||
+        // open_targeted` at the call site: repeating the expression under test would restate the
+        // implementation and pass under any rewrite of it, including one that dropped a surface.
+        assert!(
+            checks::SeatExposure { open_pool: true, ..checks::SeatExposure::CLOSED }
+                .serves_strangers(),
+            "the open pool alone must count as stranger-serving"
+        );
+        assert!(
+            checks::SeatExposure { open_targeted: true, ..checks::SeatExposure::CLOSED }
+                .serves_strangers(),
+            "the targeted surface alone must count — this is the one the old claim_open_pool proxy missed"
+        );
+        assert!(
+            checks::SeatExposure {
+                open_pool: true,
+                open_targeted: true,
+                ..checks::SeatExposure::CLOSED
+            }
+            .serves_strangers(),
+            "both together, obviously"
+        );
+        assert!(
+            !checks::SeatExposure::CLOSED.serves_strangers(),
+            "and a seat only its named buyers can reach must NOT — without this the rest is vacuous"
+        );
+    }
+
+    // ⛔ THE ALLOWLIST IS NOT PART OF THIS ANSWER ANY MORE (#923), AND THIS TEST IS THE INVERSION OF
+    // THE ONE IT REPLACES. That test asserted `!fenced.serves_strangers()` — that naming a buyer made
+    // a seat stranger-free whatever its flags said — on the premise that `classify_offer` refuses an
+    // unnamed buyer ahead of both open surfaces. #923 deleted that precedence, so the premise is
+    // false and the assertion inverts: a listed buyer sits ALONGSIDE an open route, and the route
+    // still admits strangers.
+    //
+    // This is the direction that matters. The old form under-reported a genuinely stranger-facing
+    // seat as advisory across engine-floor, containment and home-permission severity, and `doctor`
+    // is also the boot readiness gate — so the seat booted uncontained with nothing blocking.
+    //
+    // RED ON REVERT: restore `!self.allowlist_populated() && self.open_surface_configured()` in
+    // `SeatExposure::serves_strangers` — every `listed` assertion below flips to false.
+    //
+    // One variable: the allowlist. Each flag combination is asserted with it empty and populated,
+    // so a predicate that ignored the flags entirely fails the foil rather than reading correct.
+    #[test]
+    fn either_open_flag_serves_strangers_even_with_a_populated_allowlist() {
+        for (open_pool, open_targeted, label) in [
+            (true, false, "the open pool"),
+            (false, true, "the targeted surface"),
+            (true, true, "both surfaces"),
+        ] {
+            let no_list =
+                checks::SeatExposure { open_pool, open_targeted, ..checks::SeatExposure::CLOSED };
+            assert!(
+                no_list.serves_strangers(),
+                "CONTROL: with no allowlist, {label} must serve strangers"
+            );
+            let listed = checks::SeatExposure { named_buyers: 1, ..no_list };
+            assert!(
+                listed.serves_strangers(),
+                "#923: naming a buyer must NOT un-open {label} — the list admits who it names and \
+                 vetoes nothing, so strangers still arrive through the open route"
+            );
+        }
+    }
+
+    // ⛔ AN ENTRY THAT MATCHES NOBODY FENCES NOBODY (#923). It admits no one, and since the list no
+    // longer vetoes the flags it also shuts nothing — so a list of junk beside an open route leaves
+    // the route wide open. The test it replaces asserted the opposite on both counts, which was the
+    // most dangerous cell in the old table: an operator with a typo'd allowlist and an open flag was
+    // reported as reachable-by-nobody while strangers were being admitted.
+    //
+    // RED ON REVERT: restore the `!self.allowlist_populated() &&` conjunct in `serves_strangers` —
+    // both assertions below flip.
+    #[test]
+    fn an_unusable_allowlist_entry_fences_nothing() {
+        let junk_and_open = checks::SeatExposure {
+            open_pool: true,
+            open_targeted: true,
+            named_buyers: 0,
+            unusable_buyers: 1,
+        };
+        assert!(
+            junk_and_open.serves_strangers(),
+            "an entry that can never match cannot close a surface — both routes are still open"
+        );
+        assert!(
+            !junk_and_open.is_unreachable(),
+            "and the seat IS reachable: the open routes carry it, whatever the junk entry does"
+        );
+        // FOIL: the same junk list with both routes OFF really does reach nobody.
+        let junk_and_closed =
+            checks::SeatExposure { named_buyers: 0, unusable_buyers: 1, ..checks::SeatExposure::CLOSED };
+        assert!(
+            !junk_and_closed.serves_strangers() && junk_and_closed.is_unreachable(),
+            "with no usable entry and no open route, nothing can arrive"
+        );
+    }
+
+    // THE SEVERITY CONSUMERS, WHICH IS WHERE THE BUG WAS ACTUALLY FELT — asserting the derivation
+    // alone would leave a caller free to re-derive the old expression and stay green.
+    // ⛔ THE SEVERITY CELL #923 FLIPS, AND THE ONE WORTH THE MOST CARE. This replaces
+    // `an_allowlist_keeps_an_open_flag_advisory_at_the_engine_floor`, which asserted `Status::Warn`
+    // for `{open_pool: true, named_buyers: 1}` — advisory — on the premise that the allowlist fenced
+    // the pool. It does not fence it any more, so that seat genuinely runs strangers' code and the
+    // floor must BLOCK. The old FOIL (same flag, no allowlist) blocked already, so post-#923 the two
+    // agree; the discriminator is now the allowlist-OFF case below, which must stay advisory.
+    //
+    // RED ON REVERT: restore the `!self.allowlist_populated() &&` conjunct in `serves_strangers` —
+    // the first assertion drops back to Warn.
+    #[test]
+    fn an_open_flag_blocks_at_the_engine_floor_even_with_an_allowlist() {
+        use checks::{EngineProbe, EngineVersion};
+        let below =
+            EngineProbe::Reported(EngineVersion::parse("24.0.9").expect("'24.0.9' must parse"));
+        let open_and_listed =
+            checks::SeatExposure { open_pool: true, named_buyers: 1, ..checks::SeatExposure::CLOSED };
+        assert_eq!(
+            checks::fold_sandbox_engine_floor(&below, None, open_and_listed.serves_strangers())
+                .status,
+            Status::Fail,
+            "#923: an open pool admits strangers whatever the list holds, so the floor must BLOCK"
+        );
+        // FOIL: a seat with a list and NO open route is genuinely stranger-free and stays advisory.
+        // Without this, the assertion above is satisfied by a predicate that simply always blocks.
+        let listed_and_closed =
+            checks::SeatExposure { named_buyers: 1, ..checks::SeatExposure::CLOSED };
+        assert_eq!(
+            checks::fold_sandbox_engine_floor(&below, None, listed_and_closed.serves_strangers())
+                .status,
+            Status::Warn,
+            "FOIL: with both routes off the list really is the only way in — advisory, not blocking"
+        );
+    }
+
+    // Containment takes the exposure TYPE rather than a precomputed bool, so it is the consumer that
+    // could most easily keep its own derivation. Needs an UNCONTAINED launcher: with a contained one
+    // both severities pass and the assertion cannot discriminate.
+    // The containment twin of the engine-floor cell above, and it takes the exposure TYPE rather
+    // than a precomputed bool — so it is the consumer that could most easily keep its own stale
+    // derivation. Needs an UNCONTAINED launcher: with a contained one both severities pass and the
+    // assertion cannot discriminate.
+    //
+    // RED ON REVERT: restore the `!self.allowlist_populated() &&` conjunct in `serves_strangers` —
+    // the open-and-listed seat drops back to Warn while running an unconfined launcher.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn an_open_flag_blocks_containment_even_with_an_allowlist() {
+        let home = containment_test_home("listed-open-flag");
+        let open_and_listed = checks::check_sandbox_containment_with_model(
+            Some(uncontained_probe_launcher()),
+            home.clone(),
+            checks::SeatExposure { open_pool: true, named_buyers: 1, ..checks::SeatExposure::CLOSED },
+            false,
+            crate::sandbox_probe::ContainmentModel::AllowList,
+        );
+        assert_eq!(
+            open_and_listed.status,
+            Status::Fail,
+            "#923: an open pool beside a list still runs strangers' code, so an unconfined launcher \
+             must BLOCK:\n{}",
+            open_and_listed.render()
+        );
+        // FOIL: identical launcher, same list, BOTH routes off — genuinely stranger-free, advisory.
+        let listed_and_closed = checks::check_sandbox_containment_with_model(
+            Some(uncontained_probe_launcher()),
+            home.clone(),
+            checks::SeatExposure { named_buyers: 1, ..checks::SeatExposure::CLOSED },
+            false,
+            crate::sandbox_probe::ContainmentModel::AllowList,
+        );
+        assert_eq!(
+            listed_and_closed.status,
+            Status::Warn,
+            "FOIL: with both routes off the seat runs only work from buyers it named:\n{}",
+            listed_and_closed.render()
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// ⛔ THE DETAIL MUST NOT CLAIM THIS SEAT NAMED ANYONE. A fresh closed seat is reachable by
+    /// NOBODY; saying it is "reachable only by buyers it named" states a config the operator does
+    /// not have, in the finding they read first. Asserted on the RENDERED output because that is
+    /// what an operator sees.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn containment_warn_on_a_closed_seat_does_not_claim_it_named_buyers() {
+        let home = containment_test_home("closed-prose");
+        let check = checks::check_sandbox_containment_with_model(
+            Some(uncontained_probe_launcher()),
+            home.clone(),
+            checks::SeatExposure::CLOSED,
+            false,
+            crate::sandbox_probe::ContainmentModel::AllowList,
+        );
+        let rendered = check.render();
+        assert_eq!(check.status, Status::Warn, "{rendered}");
+        assert!(
+            !rendered.contains("reachable only by buyers it named"),
+            "a seat that named nobody must not be described as reachable by its named buyers:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("claim NOTHING as configured"),
+            "the remedy must say the seat is reachable by nothing at all:\n{rendered}"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// ⛔ THE JUNK-ONLY STATE, AND #923 MOVES IT FROM ADVISORY TO BLOCKING. The old test asserted
+    /// `Status::Warn` here on the premise that a populated list — even a list of typos — shut both
+    /// surfaces. It shuts nothing now, so a seat whose every entry is junk and whose routes are both
+    /// open is fully stranger-facing, and an unconfined launcher on it must FAIL. This was the
+    /// worst cell in the old table: the operator's typo bought them a softened containment verdict.
+    ///
+    /// The advisory-with-junk state still exists and is covered by the FOIL: same junk list, both
+    /// routes off.
+    ///
+    /// RED ON REVERT: restore the `!self.allowlist_populated() &&` conjunct in `serves_strangers` —
+    /// the first status drops back to Warn.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn containment_blocks_on_a_junk_allowlist_with_both_routes_open() {
+        let home = containment_test_home("junk-prose");
+        let check = checks::check_sandbox_containment_with_model(
+            Some(uncontained_probe_launcher()),
+            home.clone(),
+            // Both routes ON and a list that matches nobody: nothing is fenced, everything arrives.
+            checks::SeatExposure {
+                open_pool: true,
+                open_targeted: true,
+                named_buyers: 0,
+                unusable_buyers: 2,
+            },
+            false,
+            crate::sandbox_probe::ContainmentModel::AllowList,
+        );
+        let rendered = check.render();
+        assert_eq!(
+            check.status, Status::Fail,
+            "#923: a junk list fences nothing, so both open routes make this stranger-facing:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("reachable only by buyers it named"),
+            "an all-unusable allowlist names nobody reachable:\n{rendered}"
+        );
+
+        // FOIL: identical junk list, both routes OFF — nothing arrives, so this stays advisory and
+        // must still tell the operator the entries are why.
+        let closed = checks::check_sandbox_containment_with_model(
+            Some(uncontained_probe_launcher()),
+            home.clone(),
+            checks::SeatExposure { named_buyers: 0, unusable_buyers: 2, ..checks::SeatExposure::CLOSED },
+            false,
+            crate::sandbox_probe::ContainmentModel::AllowList,
+        );
+        let closed_rendered = closed.render();
+        assert_eq!(
+            closed.status, Status::Warn,
+            "FOIL: a junk list with both routes off reaches nobody — advisory:\n{closed_rendered}"
+        );
+        assert!(
+            closed_rendered.contains("entry is unusable"),
+            "the operator must be told the entries are why nothing arrives:\n{closed_rendered}"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// The FOIL for both above, and #923 REVERSES WHAT IT CREDITS. The old test required the remedy
+    /// to say the softening was "bought by the ALLOWLIST, not by the flags being off" — true while a
+    /// populated list fenced both surfaces. It is now exactly backwards: the list admits the buyers
+    /// it names and vetoes nothing, so what makes this seat stranger-free is that BOTH routes are
+    /// off. Crediting the list would tell an operator they may open a route and stay advisory, which
+    /// is the false permission this whole widening exists to remove.
+    ///
+    /// Still a FOIL for the same reason: without it, a remedy that never mentions why the seat is
+    /// closed would satisfy the two tests above.
+    ///
+    /// RED ON REVERT: restore the `named_buyers > 0` branch of `not_stranger_facing_remedy` to
+    /// crediting the allowlist — the attribution assertion below fails.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn containment_warn_on_a_named_seat_credits_the_closed_routes_not_the_list() {
+        let home = containment_test_home("named-prose");
+        let check = checks::check_sandbox_containment_with_model(
+            Some(uncontained_probe_launcher()),
+            home.clone(),
+            checks::SeatExposure { named_buyers: 2, ..checks::SeatExposure::CLOSED },
+            false,
+            crate::sandbox_probe::ContainmentModel::AllowList,
+        );
+        let rendered = check.render();
+        assert_eq!(check.status, Status::Warn, "{rendered}");
+        assert!(
+            rendered.contains("bought by the routes being CLOSED"),
+            "the softening must be attributed to both open routes being off, never to the list:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("bought by the ALLOWLIST"),
+            "#923: crediting the allowlist tells the operator they can open a route and stay \
+             advisory, which is false:\n{rendered}"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    // A SEAT WITH NO WAY IN IS ADVISORY, NOT A REFUSAL. bob's ruling: it warns that it needs a route
+    // rather than refusing to boot — the documented first run writes exactly this config, so failing
+    // here would refuse the boot we document and restart-loop our own compose.
+    #[test]
+    fn seat_reachability_warns_a_seat_nothing_can_reach() {
+        let check = checks::check_seat_reachability(checks::SeatExposure::CLOSED);
+        assert_eq!(check.status, Status::Warn, "{}", check.render());
+    }
+
+    // ⛔ SEPARATE TEST, BECAUSE THE STATUS AND THE TEXT FAIL FOR DIFFERENT REASONS — and with the
+    // check downgraded to advisory this text is the ONLY thing telling an operator how to become
+    // reachable. bob named three routes; a list that names two is the whole failure mode of the
+    // downgrade, and it is invisible from the status alone.
+    #[test]
+    fn the_unreachable_finding_names_all_three_routes_in() {
+        // Asserted against the RENDERED finding — the string an operator actually reads — rather
+        // than a field, so a hint that stops being rendered cannot keep this test green.
+        let rendered = checks::check_seat_reachability(checks::SeatExposure::CLOSED).render();
+        for route in ["accept_offers_only_from", "accept_open_targeted", "claim_open_pool"] {
+            assert!(
+                rendered.contains(route),
+                "the finding must name `{route}` as a route back to reachable:\n{rendered}"
+            );
+        }
+    }
+
+    // Each of the three routes in must clear it — a check that warned regardless of config would
+    // satisfy the assertions above and be worthless.
+    #[test]
+    fn seat_reachability_passes_on_each_route_in() {
+        for (exposure, label) in [
+            (
+                checks::SeatExposure { named_buyers: 1, ..checks::SeatExposure::CLOSED },
+                "a named buyer",
+            ),
+            (
+                checks::SeatExposure { open_targeted: true, ..checks::SeatExposure::CLOSED },
+                "the targeted surface",
+            ),
+            (
+                checks::SeatExposure { open_pool: true, ..checks::SeatExposure::CLOSED },
+                "the open pool",
+            ),
+        ] {
+            let check = checks::check_seat_reachability(exposure);
+            assert_eq!(check.status, Status::Pass, "{label} must be a way in:\n{}", check.render());
+        }
+    }
+
+    // ⛔ THE INERT FINDING IS GONE, AND ITS ABSENCE IS THE ASSERTION (#923). This replaces
+    // `seat_reachability_warns_when_an_open_flag_cannot_fire`, which required the detail to contain
+    // "INERT" and name the flag that could not fire. Both open flags fire now, so warning that one
+    // cannot would tell an operator their public route is shut while strangers arrive through it —
+    // and this check's own text is the only thing telling them what their routes are.
+    //
+    // Asserted as a PASS that names BOTH routes, so the additive state is reported rather than
+    // normalised away. Checked for each flag separately: a rewrite that handled
+    // `accept_open_targeted` and left `claim_open_pool` on the old wording would pass a one-flag
+    // test.
+    //
+    // RED ON REVERT: reinstate the `allowlist_populated() && open_surface_configured()` INERT branch
+    // in `check_seat_reachability` — the status drops to Warn and the detail says INERT.
+    #[test]
+    fn seat_reachability_reports_a_list_and_an_open_route_as_both_in_effect() {
+        for (open_pool, open_targeted, expected_route) in [
+            (false, true, "targeted offers from buyers it has not named"),
+            (true, false, "OPEN-POOL jobs"),
+        ] {
+            let check = checks::check_seat_reachability(checks::SeatExposure {
+                open_pool,
+                open_targeted,
+                named_buyers: 2,
+                unusable_buyers: 0,
+            });
+            assert_eq!(check.status, Status::Pass, "{}", check.render());
+            assert!(
+                !check.detail.contains("INERT"),
+                "#923: an open route beside a list is not inert, and calling it inert hides live \
+                 stranger admission:\n{}",
+                check.render()
+            );
+            assert!(
+                check.detail.contains("2 named buyer(s)") && check.detail.contains(expected_route),
+                "the operator must be told BOTH routes are in effect:\n{}",
+                check.render()
+            );
+        }
+        // The foil: identical config WITHOUT an inert flag is a clean pass, so the warning is
+        // attributable to the combination rather than to having an allowlist at all.
+        assert_eq!(
+            checks::check_seat_reachability(checks::SeatExposure {
+                named_buyers: 2,
+                ..checks::SeatExposure::CLOSED
+            })
+            .status,
+            Status::Pass,
+            "an allowlist alone is a perfectly good configuration"
+        );
+    }
+
+    // ③ INVALID-ONLY. The reported hazard: an entry that can never match reads as a working route,
+    // so the seat reports `reachable: 1 named buyer` and claims nothing for the rest of its life.
+    #[test]
+    fn seat_reachability_refuses_an_allowlist_that_can_never_match() {
+        let check = checks::check_seat_reachability(checks::SeatExposure {
+            named_buyers: 0,
+            unusable_buyers: 1,
+            ..checks::SeatExposure::CLOSED
+        });
+        assert_eq!(
+            check.status,
+            Status::Warn,
+            "a list of entries that match nobody is a seat that can claim nothing:\n{}",
+            check.render()
+        );
+        // ⛔ THE DISCRIMINATOR, AND THE REASON THE OLD ASSERTION COULD NOT BE ONE. This entry
+        // satisfies every rule the previous message stated — 64 characters, lowercase, hex — and is
+        // refused anyway, so `contains("64 lowercase hex")` stayed green on a message that hands
+        // this operator a correction their own input already passes.
+        let curve_rejected = "0123456789abcdef".repeat(4);
+        assert!(
+            maxplayer_core::home::buyer_pubkey_is_wire_shaped(&curve_rejected),
+            "precondition: `{curve_rejected}` must be SHAPE-valid, or a shape-only message would be \
+             a correct explanation for it and this asserts nothing"
+        );
+        assert!(
+            !maxplayer_core::home::buyer_pubkey_is_reachable(&curve_rejected),
+            "precondition: `{curve_rejected}` must be refused for its CURVE, not its shape"
+        );
+        // Pinned twice on purpose: the first fails if this site re-inlines its own copy, the second
+        // fails if the shared constant is weakened back to shape-only. Either alone leaves one of
+        // the two ways this regressed still open.
+        assert!(
+            check.render().contains(maxplayer_core::home::USABLE_BUYER_ENTRY),
+            "the guidance must read the SHARED criterion, not a local copy:\n{}",
+            check.render()
+        );
+        assert!(
+            check.render().contains("secp256k1"),
+            "the guidance must name the criterion that actually rejects `{curve_rejected}`, not \
+             only the shape it satisfies:\n{}",
+            check.render()
+        );
+    }
+
+    // ③ MIXED, asserted independently: one usable entry among malformed ones IS a route in, so this
+    // must pass. Folded into the test above it would share an assertion path and the runner would
+    // stop before reaching whichever case ran second.
+    #[test]
+    fn seat_reachability_counts_only_the_usable_allowlist_entries() {
+        let check = checks::check_seat_reachability(checks::SeatExposure {
+            named_buyers: 1,
+            unusable_buyers: 2,
+            ..checks::SeatExposure::CLOSED
+        });
+        assert_eq!(check.status, Status::Pass, "{}", check.render());
+        assert!(
+            check.detail.contains("1 named buyer"),
+            "the count must report the entries that can actually match, not the list length:\n{}",
+            check.detail
+        );
     }
 
     #[test]
@@ -2521,6 +4518,131 @@ mod tests {
         );
     }
 
+    // RED-PROVE (verdict F2): doctor must describe the plan LAUNCHES install, not the raw config
+    // vector. A launch resolves `[sandbox] dns_servers` through `sandbox_dns::from_config`, which
+    // trims, drops blanks, canonicalises and de-duplicates; doctor reading the raw list claimed
+    // four port-53 rules for `["1.1.1.1", "1.1.1.1"]` where two are installed, and claimed a named
+    // resolver for `[" "]` where the launch performs host discovery instead.
+    //
+    // Asserted as a RELATION between doctor's number and the canonical resolver set rather than
+    // against hard-coded totals, so the test keeps meaning if the base policy gains a rule.
+    #[test]
+    fn doctor_counts_the_canonical_resolvers_a_launch_installs_not_the_raw_config_list() {
+        use maxplayer_core::home::{SandboxConfig, SandboxMode};
+
+        let seat = |resolvers: &[&str]| {
+            Some(SandboxConfig {
+                mode: SandboxMode::Docker,
+                image: Some("maxplayer-sandbox:latest".into()),
+                network: Some("sbx".into()),
+                dns_servers: resolvers.iter().map(|value| (*value).to_string()).collect(),
+                ..Default::default()
+            })
+        };
+        // The rule total out of the pass sentence, in either spelling. Panics rather than returning
+        // an option: a pass that stopped naming a number is itself the regression.
+        let rules_reported = |detail: &str| -> usize {
+            let tail = detail
+                .split_once("renders ")
+                .unwrap_or_else(|| panic!("a pass must state what the policy renders: {detail}"))
+                .1;
+            let tail = tail.strip_prefix("AT LEAST ").unwrap_or(tail);
+            tail.split_whitespace()
+                .next()
+                .and_then(|number| number.parse().ok())
+                .unwrap_or_else(|| panic!("a pass must state a rule COUNT: {detail}"))
+        };
+        let reported = |resolvers: &[&str]| -> usize {
+            let check = checks::check_sandbox_egress_in(seat(resolvers), |_| Ok(true));
+            assert_eq!(check.status, Status::Pass, "{}", check.render());
+            rules_reported(&check.detail)
+        };
+
+        // The floor: no resolver named at all. Every case below is measured against this, and one
+        // resolver is worth exactly one udp plus one tcp rule.
+        let floor = reported(&[]);
+        let one = reported(&["1.1.1.1"]);
+        assert_eq!(
+            one,
+            floor + 2,
+            "one resolver is one udp and one tcp port-53 rule",
+        );
+
+        // F2's first counterexample. The raw list has two entries; the launch installs one
+        // resolver's rules, so doctor must say so too.
+        assert_eq!(
+            reported(&["1.1.1.1", "1.1.1.1"]),
+            one,
+            "a repeated resolver is ONE resolver at launch — de-duplicated by \
+             `sandbox_dns::from_config` — so doctor must not double its rules",
+        );
+        assert_eq!(
+            reported(&["", "1.1.1.1", "   "]),
+            one,
+            "blank entries are not resolvers; a launch drops them before rendering any rule",
+        );
+        assert_eq!(
+            reported(&["2001:db8::1", "2001:0db8:0000:0000:0000:0000:0000:0001"]),
+            one,
+            "two spellings of one IPv6 address canonicalise to one resolver at launch",
+        );
+        assert_eq!(
+            reported(&["1.1.1.1", "2001:db8::1"]),
+            floor + 4,
+            "two distinct resolvers, one per family, are two pairs of rules",
+        );
+
+        // F2's second counterexample: whitespace-only is NOT a named resolver. The launch discovers
+        // the host's upstreams, so the number doctor prints is a floor and must say so — including
+        // that this check did not run that discovery.
+        let whitespace = checks::check_sandbox_egress_in(seat(&[" "]), |_| Ok(true));
+        assert_eq!(whitespace.status, Status::Pass, "{}", whitespace.render());
+        assert_eq!(
+            rules_reported(&whitespace.detail),
+            floor,
+            "a whitespace-only entry names no resolver, so the count is the discovery floor",
+        );
+        assert!(
+            whitespace.detail.contains("AT LEAST")
+                && whitespace.detail.contains("UNVERIFIED")
+                && whitespace.detail.contains("discovers"),
+            "the unconfigured case must read as an UNVERIFIED floor with discovery at launch, not \
+             as a certified plan: {}",
+            whitespace.detail
+        );
+        let unconfigured = checks::check_sandbox_egress_in(seat(&[]), |_| Ok(true));
+        assert!(
+            unconfigured.detail.contains("AT LEAST") && unconfigured.detail.contains("UNVERIFIED"),
+            "same wording for an empty list as for a blank one — they are the same state: {}",
+            unconfigured.detail
+        );
+        assert!(
+            !unconfigured.detail.contains("resolver(s) `[sandbox] dns_servers` resolves to"),
+            "an unconfigured seat must not claim a named resolver count: {}",
+            unconfigured.detail
+        );
+        // And the configured case must NOT read as a floor: it is the exact set launches install.
+        let configured = checks::check_sandbox_egress_in(seat(&["1.1.1.1"]), |_| Ok(true));
+        assert!(
+            !configured.detail.contains("AT LEAST") && configured.detail.contains("canonical"),
+            "a configured seat's count is exact and is the canonical set, not a floor: {}",
+            configured.detail
+        );
+
+        // Unusable resolvers never reach a count at all: config resolution refuses them, and the
+        // launcher check is the row that reports it. Doctor must not invent a plan for a config no
+        // job can run — nor claim DNS readiness from any of this.
+        for refused in ["127.0.0.53", "169.254.169.254", "dns.example.com"] {
+            let check = checks::check_sandbox_egress_in(seat(&[refused]), |_| Ok(true));
+            assert_eq!(
+                check.detail, "no resolvable docker executor",
+                "`{refused}` must not resolve to a policy, so this row defers to the launcher \
+                 check: {}",
+                check.render()
+            );
+        }
+    }
+
     // RED-PROVE (#792 phase 3): an absent docker sandbox image is flagged with the ACTIONABLE
     // `docker pull <ref>` command, not a raw failure — the operator can act without reading source.
     // A present image passes; a pullable one warns and still prints the pre-pull command.
@@ -2645,14 +4767,15 @@ mod tests {
         let below =
             EngineProbe::Reported(EngineVersion::parse("24.0.9").expect("'24.0.9' must parse"));
 
-        // An open-pool seat executes code posted by strangers, so the finding blocks boot — the same
-        // exposure split check_home_permissions and check_sandbox_containment already apply.
-        let open_pool = checks::fold_sandbox_engine_floor(&below, None, true);
-        let rendered = open_pool.render();
+        // A seat strangers can reach executes code they posted, so the finding blocks boot — the same
+        // exposure split check_home_permissions and check_sandbox_containment apply. The bool is
+        // `serves_strangers`: EITHER open surface sets it, not open-pool claiming alone.
+        let serves_strangers = checks::fold_sandbox_engine_floor(&below, None, true);
+        let rendered = serves_strangers.render();
         assert_eq!(
-            open_pool.status,
+            serves_strangers.status,
             Status::Fail,
-            "an open-pool seat below the floor must FAIL: {rendered}"
+            "a seat strangers can reach, below the floor, must FAIL: {rendered}"
         );
         for needle in ["24.0.9", "25.0.0", "io_uring_setup", "BELOW"] {
             assert!(rendered.contains(needle), "below-floor text must name '{needle}': {rendered}");
@@ -2662,13 +4785,15 @@ mod tests {
             "below-floor text must carry the actionable fix, not just the finding: {rendered}"
         );
 
-        // A targeted-only seat chose its counterparties, so the same finding is advisory there.
-        let targeted = checks::fold_sandbox_engine_floor(&below, None, false);
+        // A seat reachable only by the buyers its operator NAMED chose its counterparties, so the same
+        // finding is advisory there. ⛔Not "targeted-only": a seat with `accept_open_targeted` takes
+        // targeted offers from buyers it never named and is escalated with the open-pool case.
+        let named_buyers_only = checks::fold_sandbox_engine_floor(&below, None, false);
         assert_eq!(
-            targeted.status,
+            named_buyers_only.status,
             Status::Warn,
-            "a targeted seat below the floor WARNs: {}",
-            targeted.render()
+            "a seat only its named buyers can reach, below the floor, WARNs: {}",
+            named_buyers_only.render()
         );
     }
 
@@ -2695,7 +4820,7 @@ mod tests {
         assert_eq!(
             checks::fold_sandbox_engine_floor(&just_below, None, true).status,
             Status::Fail,
-            "24.9.9 is below 25.0.0 and must still FAIL an open-pool seat"
+            "24.9.9 is below 25.0.0 and must still FAIL a seat strangers can reach"
         );
     }
 
@@ -2735,7 +4860,7 @@ mod tests {
         assert_eq!(
             checks::fold_sandbox_engine_floor(&below, None, true).status,
             Status::Fail,
-            "control: the same Engine FAILs an open-pool seat under the default runtime"
+            "control: the same Engine FAILs a seat strangers can reach under the default runtime"
         );
 
         let under_gvisor = checks::fold_sandbox_engine_floor(&below, Some("runsc"), true);
@@ -2804,6 +4929,9 @@ mod tests {
             // sandbox field breaks this test and makes someone decide what it should be here.
             network: None,
             proxy_port_range: None,
+            // No resolver named: this check reads the engine floor, and the resolver a job gets is
+            // decided per launch.
+            dns_servers: Vec::new(),
             // Decision for this test, per the note above: none. It asserts the engine-version floor,
             // and a file-sourced credential is a containment concern that would only add a second
             // reason for the check to move.
@@ -2811,6 +4939,13 @@ mod tests {
             // Same decision and the same reason: a host ChatGPT session is a containment concern,
             // and reading one here would give the check a second reason to move.
             codex_chatgpt: None,
+            // ABSENT, with its two companion keys unset: where the delivery's git runs is a
+            // delivery concern, and this check asserts the engine-version floor. Absent is what a
+            // real docker seat has, so the check measures the seat as shipped — which since the
+            // default moved means the container delivery path.
+            container_delivery: None,
+            container_delivery_token: None,
+            container_delivery_token_cap_secs: None,
         });
         home.config.relay_url = "not-a-relay-url".into();
         home.config.accepted_mints = Vec::new();
@@ -2820,6 +4955,47 @@ mod tests {
             results.iter().any(|check| check.name == "sandbox engine floor"),
             "build_checks must run the sandbox engine floor check; got: {:?}",
             results.iter().map(Check::render).collect::<Vec<_>>()
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+
+    // RED-PROVE (wiring): the relay token-policy row must sit in the ONE registry that both
+    // `maxplayer doctor` and the seller boot gate run — drop the `check_relay_token_policy` push
+    // from `build_checks` and this goes red. The seat has NO `[sandbox]` section, so it is on the
+    // host delivery path: the row is answered from config alone and this test reads no network.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn relay_token_policy_check_is_wired_into_the_boot_gate() {
+        let tmp = std::env::temp_dir().join(format!(
+            "maxplayer-doctor-token-policy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut home = resolve_doctor_home(Some(tmp.clone())).expect("bootstrap the home");
+        home.config.sandbox = None;
+        home.config.relay_url = "not-a-relay-url".into();
+        home.config.accepted_mints = Vec::new();
+
+        let results = run_checks(build_checks(&home, false));
+        let row = results
+            .iter()
+            .find(|check| check.name == "relay token policy")
+            .unwrap_or_else(|| {
+                panic!(
+                    "build_checks must run the relay token policy check; got: {:?}",
+                    results.iter().map(Check::render).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(
+            row.status,
+            Status::Pass,
+            "a seat with container delivery off must never fail this row: {}",
+            row.detail
         );
 
         std::fs::remove_dir_all(&tmp).ok();
@@ -2956,10 +5132,12 @@ mod tests {
         let seller = SellerConfig {
             agent_command: vec![existing.to_string_lossy().into_owned()],
             rate_sats: 5,
+            takes_no_payment: false,
             git_remote: "https://example.invalid/repo".into(),
             job_timeout_secs: None,
             agents: Vec::new(), // empty ⇒ boot uses fallback_registry (agent_command VERBATIM)
             claim_open_pool: false,
+            accept_open_targeted: false,
             accept_offers_only_from: Vec::new(),
             offer_backfill_secs: 0,
             contribution_enabled: true,
@@ -3002,10 +5180,12 @@ mod tests {
         let seller = SellerConfig {
             agent_command: vec![existing.to_string_lossy().into_owned()],
             rate_sats: 5,
+            takes_no_payment: false,
             git_remote: "https://example.invalid/repo".into(),
             job_timeout_secs: None,
             agents: Vec::new(),
             claim_open_pool: false,
+            accept_open_targeted: false,
             accept_offers_only_from: Vec::new(),
             offer_backfill_secs: 0,
             contribution_enabled: true,
@@ -3053,10 +5233,12 @@ mod tests {
         let seller = SellerConfig {
             agent_command: vec!["ignored-when-agents-listed".to_owned()],
             rate_sats: 5,
+            takes_no_payment: false,
             git_remote: "https://example.invalid/repo".into(),
             job_timeout_secs: None,
             agents: vec!["ghostxyz-not-a-preset".to_owned()],
             claim_open_pool: false,
+            accept_open_targeted: false,
             accept_offers_only_from: Vec::new(),
             offer_backfill_secs: 0,
             contribution_enabled: true,
@@ -3129,7 +5311,8 @@ mod tests {
     }
 
     // #473: the perms leg VERIFIES the owner-only invariant bootstrap enforces — PASS when owner-only,
-    // WARN for a targeted seat that drifted open, FAIL for an open-pool one. Pure over two real dirs,
+    // WARN for a seat only its named buyers can reach, FAIL for one strangers can reach by EITHER open
+    // surface (the bool is `serves_strangers`, not `claim_open_pool`). Pure over two real dirs,
     // so no agent or network. Access-exposure is orthogonal to the mint (testnut vs real is irrelevant).
     #[cfg(all(unix, feature = "wallet"))]
     #[test]
@@ -3154,12 +5337,12 @@ mod tests {
         assert_eq!(
             checks::check_home_permissions(home.clone(), wallet.clone(), false).status,
             Status::Warn,
-            "a group/world-accessible home is a WARN for a targeted seat"
+            "a group/world-accessible home is a WARN for a seat only its named buyers can reach"
         );
         assert_eq!(
             checks::check_home_permissions(home.clone(), wallet.clone(), true).status,
             Status::Fail,
-            "…and a FAIL for an open-pool seat"
+            "…and a FAIL for a seat strangers can reach — by EITHER open surface, not open-pool alone"
         );
 
         let _ = std::fs::remove_dir_all(&base);
@@ -3172,10 +5355,12 @@ mod tests {
         maxplayer_core::home::SellerConfig {
             agent_command,
             rate_sats: 5,
+            takes_no_payment: false,
             git_remote: "https://example.invalid/repo".into(),
             job_timeout_secs: None,
             agents,
             claim_open_pool: false,
+            accept_open_targeted: false,
             accept_offers_only_from: Vec::new(),
             offer_backfill_secs: 0,
             contribution_enabled: true,
@@ -3198,6 +5383,119 @@ mod tests {
             },
         );
         presets
+    }
+
+    /// RED-PROVE: a harness whose credential directory is missing EVERYWHERE must still be a
+    /// finding. Cursor is the harness with more than one known location, and a missing candidate
+    /// there cannot be a finding on its own — only the operator's actual build decides which of the
+    /// two exists, so warning on the absent one would fire on every correct cursor seat.
+    ///
+    /// The bound belongs to the HARNESS, not to each candidate. Make "missing is fine" a property of
+    /// the individual path and a cursor seat with NO credential directory at all passes silently,
+    /// which is the exact defect this check was widened to fix, inverted: before, it inspected the
+    /// wrong directory and passed; after, it would inspect nothing and pass. A check that passes
+    /// having looked at nothing is the worse of the two.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn a_cursor_seat_with_no_credential_directory_anywhere_is_a_finding() {
+        // A home that is deliberately never created, so BOTH cursor candidates are absent. Built from
+        // the pid rather than a fixed name: a fixed path under the shared temp directory is another
+        // user's to create, and this test's whole meaning is that the path does not exist.
+        let home = std::env::temp_dir()
+            .join(format!("maxplayer-doctor-unlinked-cursor-{}", std::process::id()));
+        assert!(!home.exists(), "the fixture home must not exist: {}", home.display());
+        let existing = std::env::current_exe()
+            .expect("current exe")
+            .to_string_lossy()
+            .into_owned();
+        let mut presets = std::collections::BTreeMap::new();
+        presets.insert(
+            "cursor".to_owned(),
+            maxplayer_core::home::AgentPresetConfig {
+                argv: vec![existing],
+            },
+        );
+        let seller = seller_for_agents(vec!["cursor".into()], vec!["ignored".into()]);
+        let check = checks::check_harness_credential_permissions(
+            Some(seller),
+            presets,
+            Some(home),
+        );
+        assert_ne!(
+            check.status,
+            Status::Pass,
+            "a cursor seat with no credential directory anywhere must not pass silently: {}",
+            check.render()
+        );
+        let rendered = check.render();
+        assert!(
+            rendered.contains("cursor"),
+            "the finding must name the harness it could not find a directory for: {rendered}"
+        );
+    }
+
+    /// RED-PROVE on the PR base: the direction this change was MADE for. `<home>/.config/cursor`
+    /// exists and `<home>/.cursor` does not — a seat whose Cursor build wrote the measured location.
+    ///
+    /// On the base this check resolved ONE cursor directory (`<home>/.cursor`) and stat-ed it with
+    /// absence treated as an error, so this seat took a WARN naming a path it had correctly never
+    /// created. The sibling test above only covers both-absent, which WARNS on the base and on this
+    /// head alike — it would pass without the grouping. This one is the case the grouping exists for:
+    /// the check must Pass and must name the directory it really inspected.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn a_cursor_seat_that_linked_at_the_measured_location_passes_and_names_it() {
+        // Built from the pid, not a fixed name: a fixed path under the shared temp directory is
+        // another user's to create, and this test writes into it.
+        let home = std::env::temp_dir()
+            .join(format!("maxplayer-doctor-configcursor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let measured = home.join(".config").join("cursor");
+        std::fs::create_dir_all(&measured).expect("create the measured cursor credential directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&measured, std::fs::Permissions::from_mode(0o700))
+                .expect("tighten the fixture directory");
+        }
+        let documented = home.join(".cursor");
+        assert!(
+            !documented.exists(),
+            "the documented location must stay absent: {}",
+            documented.display()
+        );
+        let existing = std::env::current_exe()
+            .expect("current exe")
+            .to_string_lossy()
+            .into_owned();
+        let mut presets = std::collections::BTreeMap::new();
+        presets.insert(
+            "cursor".to_owned(),
+            maxplayer_core::home::AgentPresetConfig {
+                argv: vec![existing],
+            },
+        );
+        let seller = seller_for_agents(vec!["cursor".into()], vec!["ignored".into()]);
+        let check = checks::check_harness_credential_permissions(
+            Some(seller),
+            presets,
+            Some(home.clone()),
+        );
+        let rendered = check.render();
+        let _ = std::fs::remove_dir_all(&home);
+        assert_eq!(
+            check.status,
+            Status::Pass,
+            "a cursor seat linked at the measured location must pass: {rendered}"
+        );
+        assert!(
+            rendered.contains(&measured.display().to_string()),
+            "the pass line must name the directory it actually inspected: {rendered}"
+        );
+        assert!(
+            !rendered.contains("not linked to an account"),
+            "a linked seat must not be reported as unlinked: {rendered}"
+        );
     }
 
     /// RED-PROVE: a raw `--agent-argv` hatch must SAY it cannot resolve, and must not name a
@@ -3405,11 +5703,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// A metadata read error is a WARN, never a silent skip — same tooth as the home-perms check.
-    /// RED-PROVE: `continue` on a missing dir and a 0755-passing mask would Pass this.
+    /// A credential directory that is not there is a WARN, never a silent skip — same tooth as the
+    /// home-perms check. RED-PROVE: `continue` on a missing dir and a 0755-passing mask would Pass this.
+    ///
+    /// ⚠ NAMED FOR WHAT IT EXERCISES: ABSENCE. It was called `..._metadata_error_...` and never drove a
+    /// metadata error — it creates a home with no `.claude` in it, which is `NotFound`. The other arm of
+    /// that match, a stat that fails for a reason other than absence (a parent that denies it), has NO
+    /// test. Left uncovered and named here rather than papered over with one that would have to fake a
+    /// stat failure to run.
+    ///
+    /// The FINDING here is now "this harness is not linked to an account" rather than "could not read
+    /// the path". Absence stopped being a stat failure when a harness gained more than one candidate
+    /// directory: for cursor, one of the two is expected to be missing on any given build, so absence
+    /// is judged per HARNESS and only reported when every candidate is gone. A genuine metadata error
+    /// (a parent that denies the stat, say) is still reported as `could not read`, which is the other
+    /// arm of the same match. The tooth this test guards is unchanged: missing must never Pass.
     #[cfg(all(unix, feature = "wallet"))]
     #[test]
-    fn harness_credential_check_metadata_error_is_warn_not_silent_skip() {
+    fn harness_credential_check_absent_directory_is_warn_not_silent_skip() {
         let base = std::env::temp_dir().join(format!(
             "mp-harness-creds-missing-{}-{}",
             std::process::id(),
@@ -3433,8 +5744,8 @@ mod tests {
             check.render()
         );
         assert!(
-            check.detail.contains("could not read") && check.detail.contains(".claude"),
-            "must name the path it failed to stat: {}",
+            check.detail.contains("not linked to an account") && check.detail.contains(".claude"),
+            "must name the harness and the path it looked for: {}",
             check.render()
         );
         let _ = std::fs::remove_dir_all(&base);
@@ -3821,4 +6132,156 @@ mod tests {
             run.err
         );
     }
+    /// RED-PROVE for the gVisor delivery failure: a seat whose HOST resolves and fetches perfectly
+    /// while its jobs cannot must be refused, and refused with words that send the operator to the
+    /// job's route rather than to their own network.
+    ///
+    /// This is the whole point of the check. Every other network row here is answered by the host,
+    /// and the measured failure — docker's embedded resolver at `127.0.0.11` being unreachable from
+    /// inside a gVisor sandbox — is invisible from there: the seat looks healthy, advertises, wins a
+    /// job, and fails it. So the probe result is INJECTED here and the host's own connectivity is
+    /// never consulted: these assertions hold on a laptop with perfect internet.
+    #[test]
+    fn doctor_delivery_route_fails_when_the_job_route_is_broken_however_healthy_the_host_is() {
+        use checks::RouteProbe;
+        use maxplayer_core::home::{SandboxConfig, SandboxMode};
+        let docker = || {
+            Some(SandboxConfig {
+                mode: SandboxMode::Docker,
+                image: Some("maxplayer-sandbox:latest".into()),
+                network: Some("sbx".into()),
+                ..Default::default()
+            })
+        };
+        let resolvers_ok = |_: &[String]| Ok(vec!["1.1.1.1".to_owned()]);
+
+        // The gVisor case itself: resolvers were found, the namespace was built, and the JOB still
+        // could not resolve. Blocking, and retryable.
+        let no_dns = checks::check_sandbox_delivery_route_in(docker(), resolvers_ok, |_, _| {
+            RouteProbe::NoDns("EAI_AGAIN (from inside the job namespace)".to_owned())
+        });
+        assert_eq!(no_dns.status, Status::Fail, "{}", no_dns.render());
+        assert!(no_dns.transient, "a resolver blip deserves the bounded retry: {}", no_dns.render());
+        assert!(
+            !readiness_ok(&[no_dns.clone()]),
+            "a seat whose jobs cannot resolve must not be advertised as ready: {}",
+            no_dns.render()
+        );
+        assert!(
+            no_dns.render().contains("JOB") && no_dns.render().contains("dns_servers"),
+            "the remedy must point at the job's route and the key that fixes it, not at the host: \
+             {}",
+            no_dns.render()
+        );
+
+        // Resolved, but the handshake never completed or its chain was not verified. Also blocking:
+        // a job that cannot complete verified TLS cannot deliver an answer.
+        let no_tls = checks::check_sandbox_delivery_route_in(docker(), resolvers_ok, |_, _| {
+            RouteProbe::NoTls("certificate chain not verified".to_owned())
+        });
+        assert_eq!(no_tls.status, Status::Fail, "{}", no_tls.render());
+        assert!(!readiness_ok(&[no_tls.clone()]), "{}", no_tls.render());
+
+        // Could not be measured at all. NOT a pass — "I could not ask" is not "it works", and this
+        // is the arm a future edit is most likely to soften into a Warn.
+        let unbuildable = checks::check_sandbox_delivery_route_in(docker(), resolvers_ok, |_, _| {
+            RouteProbe::Unbuildable("the namespace holder would not start".to_owned())
+        });
+        assert_eq!(unbuildable.status, Status::Fail, "{}", unbuildable.render());
+        assert!(!readiness_ok(&[unbuildable]));
+
+        // No resolver can be given to a job at all. Blocking and NOT transient: no retry discovers
+        // a resolver the box does not have, so burning the backoff budget only delays the same
+        // refusal.
+        let no_resolver = checks::check_sandbox_delivery_route_in(
+            docker(),
+            |_| Err("the host names only the systemd stub and resolvectl reported none".to_owned()),
+            |_, _| panic!("the probe must not run when no resolver can be handed to a job"),
+        );
+        assert_eq!(no_resolver.status, Status::Fail, "{}", no_resolver.render());
+        assert!(
+            !no_resolver.transient,
+            "retrying cannot conjure a resolver; refuse immediately: {}",
+            no_resolver.render()
+        );
+
+        // The healthy route passes, and says what it actually proved — a resolver, an address, and
+        // a VERIFIED peer — so a green row cannot be read as "docker looked fine".
+        let ok = checks::check_sandbox_delivery_route_in(docker(), resolvers_ok, |_, _| {
+            RouteProbe::Delivered {
+                resolver: "1.1.1.1".to_owned(),
+                address: "34.225.223.145".to_owned(),
+                subject: "relay.maxplayer.ai".to_owned(),
+            }
+        });
+        assert_eq!(ok.status, Status::Pass, "{}", ok.render());
+        assert!(
+            ok.detail.contains("verified") && ok.detail.contains("1.1.1.1"),
+            "a pass must name the resolver it used and that the handshake was verified: {}",
+            ok.detail
+        );
+        assert!(readiness_ok(&[ok]));
+
+        // A host executor has no container route to measure ⇒ never a spurious failure.
+        assert_eq!(
+            checks::check_sandbox_delivery_route_in(None, resolvers_ok, |_, _| panic!(
+                "a host executor has no job container to probe"
+            ))
+            .status,
+            Status::Pass,
+        );
+
+        // No docker on PATH is the launcher check's verdict, not this one's: reporting it here too
+        // would refuse a box twice for one fault and bury the row that names the real fix.
+        let unmeasurable =
+            checks::check_sandbox_delivery_route_in(docker(), resolvers_ok, |_, _| {
+                RouteProbe::Unmeasurable("docker not resolvable".to_owned())
+            });
+        assert_eq!(unmeasurable.status, Status::Pass, "{}", unmeasurable.render());
+    }
+
+    /// The payload's own words are judged, and silence is not consent: a container that printed
+    /// nothing (no node in the image, an entrypoint that swallowed the payload) must never read as a
+    /// working route.
+    #[test]
+    fn a_silent_route_probe_is_not_a_passing_route() {
+        use checks::RouteProbe;
+        assert!(matches!(
+            checks::read_route_markers("", "the job namespace"),
+            RouteProbe::Unbuildable(_)
+        ));
+        assert!(matches!(
+            checks::read_route_markers("sh: node: not found", "the job namespace"),
+            RouteProbe::Unbuildable(_)
+        ));
+        // Resolved, then nothing about the handshake: not a pass either.
+        assert!(matches!(
+            checks::read_route_markers("route-dns-ok 34.225.223.145", "the job namespace"),
+            RouteProbe::NoTls(_)
+        ));
+        assert!(matches!(
+            checks::read_route_markers("route-dns-fail EAI_AGAIN", "the job namespace"),
+            RouteProbe::NoDns(_)
+        ));
+        assert!(matches!(
+            checks::read_route_markers(
+                "route-dns-ok 34.225.223.145\nroute-tls-ok relay.maxplayer.ai",
+                "the job namespace"
+            ),
+            RouteProbe::Delivered { .. }
+        ));
+    }
+
+    /// The host the probe shakes hands with is the relay the seat actually delivers to. Pinned so a
+    /// relay move cannot leave the preflight proving reachability to an address nothing uses.
+    #[test]
+    fn the_route_probe_targets_the_configured_relay_host() {
+        assert!(
+            maxplayer_core::home::DEFAULT_RELAY_URL.contains(checks::ROUTE_PROBE_HOST),
+            "probe host {} is not the relay in DEFAULT_RELAY_URL {}",
+            checks::ROUTE_PROBE_HOST,
+            maxplayer_core::home::DEFAULT_RELAY_URL
+        );
+    }
+
 }

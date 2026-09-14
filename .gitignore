@@ -27,3 +27,6 @@
 # Editor / OS
 .DS_Store
 *.swp
+
+.claude
+.idea

@@ -25,8 +25,10 @@ where
 {
     let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
     match args.get(1).map(String::as_str) {
+        // #818: both arms print the SAME line, built by one function, so the build stamp cannot be
+        // present on the form a release verifier probes and absent on the one a stranger types.
         Some("version" | "--version") if args.len() == 2 => {
-            let _ = writeln!(out, "maxplayer {}", maxplayer_core::version());
+            let _ = writeln!(out, "{}", crate::build_stamp::version_line());
             SUCCESS
         }
         Some("--help") if args.len() == 2 => {
@@ -50,14 +52,25 @@ where
         Some("accept") => crate::accept_cli::run(&args[2..], out, err),
         Some("collect") => crate::collect_cli::run(&args[2..], out, err),
         Some("doctor") => crate::doctor::run(&args[2..], out, err),
+        // INTERNAL (Track B): container-side delivery orchestrator. Not advertised in usage.
+        Some("__deliver") => crate::deliver_cli::run(&args[2..], out, err),
         // Run BY the boot gate, inside the configured launcher, to report what the launcher let it
         // do. Reachable by hand too: an operator debugging a sandbox wants to run exactly what the
         // gate runs rather than a description of it.
         #[cfg(feature = "wallet")]
         Some("sandbox-probe") => crate::sandbox_probe::run(&args[2..], out, err),
+        // Operator-only, and deliberately NOT on the boot path: it reaps the holders of a seat the
+        // OPERATOR names as retired. The host cannot make that call — a retired seat and a slow-
+        // starting one leave identical evidence — so the seat id arrives from a human or not at all
+        // (#905). `--all` is refused inside, by name, rather than being merely unrecognised here.
+        #[cfg(feature = "acp")]
+        Some("sandbox-reap") => crate::sandbox_reap::run(&args[2..], out, err),
         Some("wallet") => crate::wallet_cli::run(&args[2..], out, err),
         Some("profile") => crate::profile_cli::run(&args[2..], out, err),
         Some("whoami") => crate::whoami::run(&args[2..], out, err),
+        // Where the agent documentation lives. Pure print — no home, key, wallet or network — so
+        // it works on a box that has installed nothing but the binary.
+        Some("skill") => crate::skill::run(&args[2..], out, err),
         #[cfg(feature = "stub-pay")]
         Some("stub-pay") => crate::stub_pay_cli::run(&args[2..], out, err),
         Some("log") => run_log(&args[2..], out, err),
@@ -314,7 +327,7 @@ fn usage(err: &mut dyn Write) -> i32 {
 fn write_usage(out: &mut dyn Write) {
     let _ = write!(
         out,
-        "Usage:\n  maxplayer [--help | --version]\n  maxplayer version\n  maxplayer mcp\n  maxplayer buyer     # persistent per-home daemon (exclusive lock, unix-socket RPC); `maxplayer buyer status` = thin client\n  maxplayer doctor   # seller environment self-check (git, credential helper, relay, mint, agent)\n  maxplayer wallet <setup|balance|mint|mint-complete|send|receive|melt|invoice|mints|reconcile> ...\n  maxplayer profile set [--name <name>] [--about <about>]   # publish kind-0 identity\n  maxplayer whoami [--home <dir>]   # print this seat's public identity (hex pubkey, npub, resolved home)\n"
+        "Usage:\n  maxplayer [--help | --version]\n  maxplayer version\n  maxplayer skill    # print where the agent documentation lives (orientation URL + skill index); no wallet, key or network\n  maxplayer mcp\n  maxplayer buyer     # persistent per-home daemon (exclusive lock, unix-socket RPC); `maxplayer buyer status` = thin client\n  maxplayer doctor   # seller environment self-check (git, credential helper, relay, mint, agent)\n  maxplayer wallet <setup|balance|mint|mint-complete|send|receive|melt|invoice|mints|reconcile> ...\n  maxplayer profile set [--name <name>] [--about <about>]   # publish kind-0 identity\n  maxplayer whoami [--home <dir>]   # print this seat's public identity (hex pubkey, npub, resolved home)\n"
     );
     #[cfg(feature = "stub-pay")]
     let _ = write!(
@@ -327,11 +340,12 @@ fn write_usage(out: &mut dyn Write) {
     #[cfg(feature = "acp")]
     let _ = write!(
         out,
-        "  maxplayer seller --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool]\n  maxplayer seller   # zero-prompt relaunch from config.toml\n"
+        "  maxplayer seller --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--accept-open-targeted]\n  maxplayer seller   # zero-prompt relaunch from config.toml\n  maxplayer sandbox-reap --seat <64-hex> [--dry-run]   # remove a RETIRED seat's leftover containment holders\n"
     );
     let _ = writeln!(
         out,
-        "  maxplayer accept <job_id> <claim_id> [--result-id <id>]   # buyer: bind a delivered result (collect folds this in)\n  maxplayer collect <job_id> [--out <folder>]   # buyer: accept-if-needed + verify + pay + materialize\n  maxplayer log replay <path>\n  maxplayer mock run --script <path> --log <path> [--job-id <id>] [--permission-policy allow|deny]\n  maxplayer run --agent-command <cmd> --task <text> --log <path> [--cwd <dir>] [--job-id <id>] [--permission-policy allow|allow-always|deny] [--idle-timeout <secs>]\n\nExit codes: 0 success, 1 usage error, 2 runtime error"
+        "  maxplayer accept <job_id> <claim_id> [--result-id <id>]   # buyer: bind a delivered result (collect folds this in)\n  maxplayer collect <job_id> [--out <folder>]   # buyer: accept-if-needed + verify + pay + materialize\n  maxplayer log replay <path>\n  maxplayer mock run --script <path> --log <path> [--job-id <id>] [--permission-policy allow|deny]\n  maxplayer run --agent-command <cmd> --task <text> --log <path> [--cwd <dir>] [--job-id <id>] [--permission-policy allow|allow-always|deny] [--idle-timeout <secs>]\n\nExit codes: 0 success, 1 usage error, 2 runtime error\n{}",
+        crate::skill::docs_pointer_line()
     );
 }
 
@@ -537,7 +551,14 @@ mod tests {
 
         let (code, out, err) = run_captured(["maxplayer", "version"]);
         assert_eq!(code, 0);
-        assert_eq!(out, format!("maxplayer {}\n", maxplayer_core::version()));
+        assert_eq!(
+            out,
+            format!(
+                "maxplayer {} ({})\n",
+                maxplayer_core::version(),
+                crate::build_stamp::build_commit()
+            )
+        );
         assert!(err.is_empty());
     }
 
@@ -550,7 +571,14 @@ mod tests {
 
         let (code, out, err) = run_captured(["maxplayer", "--version"]);
         assert_eq!(code, 0);
-        assert_eq!(out, format!("maxplayer {}\n", maxplayer_core::version()));
+        assert_eq!(
+            out,
+            format!(
+                "maxplayer {} ({})\n",
+                maxplayer_core::version(),
+                crate::build_stamp::build_commit()
+            )
+        );
         assert!(err.is_empty());
 
         // Trailing arguments are still a usage error, so `--help` cannot swallow a mistyped command.
@@ -558,6 +586,54 @@ mod tests {
         assert_eq!(code, 1);
         assert!(out.is_empty());
         assert!(err.contains("Usage:"));
+    }
+
+    /// #818: the shape of the stamp, read off what the command PRINTS rather than off the accessor
+    /// it prints from — a test that asks `build_commit()` about `build_commit()` would pass on a
+    /// binary whose version arm never reached it.
+    ///
+    /// Two properties, and only the two the issue's acceptance can be held to at build time. The
+    /// stamp is 40 lowercase hex or the literal `unknown`: nothing else, so the class of value #818
+    /// measured (a 40-hex string that resolves to no commit, or the `0000111122223333…` noise beside
+    /// it) cannot be produced by a padded, zeroed or truncated value. And both dispatch arms print
+    /// the SAME line — the arm a release verifier probes and the arm a stranger types are separate
+    /// code, so agreement is a claim that has to be measured, not assumed.
+    ///
+    /// Whether the sha RESOLVES to a commit is not assertable here (a test binary knows nothing
+    /// about the repo it was built from); that half of the acceptance is
+    /// `scripts/verify-release-version.sh`, which holds a release artifact to `git cat-file -t`.
+    #[test]
+    fn version_carries_a_build_stamp_in_both_forms() {
+        let (code, subcommand, _) = run_captured(["maxplayer", "version"]);
+        assert_eq!(code, 0);
+        let (code, flag, _) = run_captured(["maxplayer", "--version"]);
+        assert_eq!(code, 0);
+        assert_eq!(
+            subcommand, flag,
+            "`version` and `--version` printed different lines"
+        );
+
+        let line = subcommand.trim_end_matches('\n');
+        let stamp = line
+            .strip_prefix(&format!("maxplayer {} (", maxplayer_core::version()))
+            .and_then(|rest| rest.strip_suffix(')'))
+            .unwrap_or_else(|| {
+                panic!("`{line}` is not `maxplayer <version> (<stamp>)`");
+            });
+
+        if stamp != "unknown" {
+            assert_eq!(
+                stamp.len(),
+                40,
+                "stamp `{stamp}` is neither `unknown` nor a 40-character sha"
+            );
+            assert!(
+                stamp
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+                "stamp `{stamp}` is not lowercase hex"
+            );
+        }
     }
 
     // ---- #570: `--help` on every subcommand exits 0 with usage on stdout and no side effects ----
@@ -594,6 +670,53 @@ mod tests {
         assert!(!is_help_request(&s(&["status"])));
     }
 
+    // The docs pointer on the paths that had none. Measured on the base commit: the whole binary
+    // carried exactly one route to https://www.maxplayer.ai/skill.md, the MCP handshake text — so
+    // a seller-only operator, or an agent driving the CLI directly, was never told where the
+    // guides are. Every assertion is against the ONE shared constant, never a hand-copied URL: a
+    // copy in the test would let the constant change while the test keeps passing against the old
+    // text. `maxplayer skill` is the route with no prerequisites (no home, no key, no network), and
+    // the top-level help is where an agent looks first.
+    #[test]
+    fn help_and_skill_carry_the_docs_pointer() {
+        let url = crate::skill::SKILL_URL;
+
+        let (code, out, _) = run_captured(["maxplayer", "--help"]);
+        assert_eq!(code, 0);
+        assert!(
+            out.contains(url),
+            "`maxplayer --help` must point at the docs:\n{out}"
+        );
+        assert!(
+            out.contains("maxplayer skill"),
+            "`maxplayer --help` must list the skill subcommand:\n{out}"
+        );
+
+        // A wrong invocation prints the same usage to stderr — a stranger who typed the wrong thing
+        // is exactly the reader who needs the pointer.
+        let (code, _, err) = run_captured(["maxplayer", "unknown"]);
+        assert_eq!(code, 1);
+        assert!(
+            err.contains(url),
+            "usage on stderr must carry the pointer too:\n{err}"
+        );
+
+        let (code, out, err) = run_captured(["maxplayer", "skill"]);
+        assert_eq!(code, 0, "stderr={err}");
+        assert!(
+            out.contains(url),
+            "`maxplayer skill` must print the orientation URL:\n{out}"
+        );
+        assert!(
+            out.contains(crate::skill::SKILL_INDEX_URL),
+            "`maxplayer skill` must print the skill index URL:\n{out}"
+        );
+        assert!(
+            err.is_empty(),
+            "`maxplayer skill` needs nothing and touches nothing:\n{err}"
+        );
+    }
+
     // The shape #570 is about: a sole `--help` on ANY registered subcommand — at every nesting depth
     // (`buyer status`, `wallet mints add`) — prints that command's usage to STDOUT and exits 0 with
     // nothing on stderr (no parse, no home bootstrap, no daemon socket). #549 fixed only `seller`;
@@ -626,6 +749,7 @@ mod tests {
             ("profile --help", "maxplayer profile"),
             ("profile set --help", "maxplayer profile"),
             ("whoami --help", "maxplayer whoami"),
+            ("skill --help", "maxplayer skill"),
             ("accept --help", "maxplayer accept"),
             ("collect --help", "maxplayer collect"),
             ("mcp --help", "maxplayer mcp"),
@@ -639,6 +763,8 @@ mod tests {
         // dispatch arms in `run`), so this tracks the surface a given build actually ships.
         #[cfg(feature = "acp")]
         cases.push(("seller --help", "maxplayer seller"));
+        #[cfg(feature = "acp")]
+        cases.push(("sandbox-reap --help", "maxplayer sandbox-reap"));
         #[cfg(feature = "wallet")]
         cases.push(("sandbox-probe --help", "maxplayer sandbox-probe"));
         #[cfg(feature = "stub-pay")]
@@ -661,6 +787,29 @@ mod tests {
                 "`maxplayer {line}` must have no side-effect output on stderr:\nstderr={err}"
             );
         }
+    }
+
+    // #905: `sandbox-reap --all` must be REFUSED, not merely unrecognised. The seat id is the
+    // operator's EVIDENCE that a seat is retired, not a parameter to be defaulted or widened.
+    // Nobody is in a position to know "every seat but mine is retired" — that claim is false the
+    // instant a co-tenant is booting, and the host cannot check it. So the flag gets a deliberate
+    // refusal arm that names itself: a maintainer who wants host-wide selection has to DELETE a
+    // refusal rather than fill a gap, and the operator is taught at the moment of the mistake.
+    // Falling through to the generic usage would exit 1 too, which is why this asserts on the TEXT.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn sandbox_reap_refuses_all_seats_rather_than_leaving_the_flag_unrecognised() {
+        let (code, out, err) = run_captured(["maxplayer", "sandbox-reap", "--all"]);
+        assert_eq!(code, 1, "`--all` must be a usage error:\nstdout={out}\nstderr={err}");
+        assert!(out.is_empty(), "a refusal prints nothing to stdout:\nstdout={out}");
+        assert!(
+            err.contains("--all"),
+            "the refusal must NAME the flag it refuses, not print generic usage:\nstderr={err}"
+        );
+        assert!(
+            err.contains("retired"),
+            "the refusal must say why: only an operator can name a RETIRED seat:\nstderr={err}"
+        );
     }
 
     // #570, the worst instance: `buyer status --help` must answer from usage WITHOUT opening the

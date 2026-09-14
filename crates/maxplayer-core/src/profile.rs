@@ -774,12 +774,14 @@ mod tests {
 
     fn wiring_seller(rate_sats: u64) -> home::SellerConfig {
         home::SellerConfig {
+            takes_no_payment: false,
             agent_command: vec!["claude".into()],
             rate_sats,
             git_remote: "https://example.invalid/repo.git".into(),
             job_timeout_secs: None,
             agents: vec!["claude".into()],
             claim_open_pool: false,
+            accept_open_targeted: false,
             accept_offers_only_from: Vec::new(),
             offer_backfill_secs: home::default_offer_backfill_secs(),
             contribution_enabled: true,

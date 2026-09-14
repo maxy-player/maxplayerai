@@ -451,6 +451,48 @@ struct PostJobParams {
     /// award filter on BOTH award paths. Omitted or empty ⇒ no requirement.
     #[serde(default)]
     capabilities: Option<Vec<String>>,
+    /// How this job settles (§1.1): `"sat"` (priced, the default) or `"none"` (free).
+    ///
+    /// ABSENT ⇒ `sat`, so every request written before this parameter existed produces the exact
+    /// bytes it produced before — the offer carries no `["param","payment",…]` tag at all, since
+    /// `Sat` is stated by absence on the wire.
+    ///
+    /// An UNRECOGNIZED value is REFUSED here rather than defaulted. The wire readers fail closed to
+    /// `sat` because they must cope with events from strangers, but an RPC caller that typed
+    /// `payment: "free"` asked for something specific; silently posting a priced job for real money
+    /// instead is the one outcome nobody wants.
+    #[serde(default)]
+    payment: Option<String>,
+}
+
+/// Resolve the offer's payment mode from the RPC `payment` parameter (§1.1).
+///
+/// Absent ⇒ [`PaymentMode::Sat`] (byte-identical to every pre-existing caller). `"none"` requires
+/// `amount_sats == 0`, mirroring the library's own post gate
+/// ([`job_lifecycle::post_job_async`]) — refused here too so the caller gets the reason at its own
+/// surface rather than as an internal error from one layer down. Anything unrecognized is refused.
+fn post_job_payment_mode(
+    payment: Option<&str>,
+    amount_sats: u64,
+) -> Result<crate::gateway::PaymentMode, String> {
+    let mode = match payment.map(str::trim) {
+        None => crate::gateway::PaymentMode::Sat,
+        Some("sat") => crate::gateway::PaymentMode::Sat,
+        Some("none") => crate::gateway::PaymentMode::None,
+        Some(other) => {
+            return Err(format!(
+                "post_job payment must be \"sat\" or \"none\" (got {other:?}); omit it for a \
+                 priced job"
+            ))
+        }
+    };
+    if mode.is_free() && amount_sats != 0 {
+        return Err(format!(
+            "post_job payment=none requires amount_sats = 0 (got {amount_sats}): a free job \
+             priced above zero is a contradiction — refused"
+        ));
+    }
+    Ok(mode)
 }
 
 /// Resolve the offer kind from the contribution pins: all four present ⇒ contribution; none ⇒
@@ -493,6 +535,10 @@ async fn post_job(context: &Arc<BuyerContext>, id: Value, params: Value) -> Resp
         Ok(job) => job,
         Err(message) => return Response::err(id, CODE_METHOD_NOT_FOUND, message),
     };
+    let payment_mode = match post_job_payment_mode(params.payment.as_deref(), params.amount_sats) {
+        Ok(mode) => mode,
+        Err(message) => return Response::err(id, CODE_METHOD_NOT_FOUND, message),
+    };
     let max_sats = params.max_sats.unwrap_or(params.amount_sats);
     let harness = params.harness.clone();
     let model = params.model.clone();
@@ -513,6 +559,14 @@ async fn post_job(context: &Arc<BuyerContext>, id: Value, params: Value) -> Resp
         // offer says, and the award filter reads only the offer.
         requested_model: model.clone(),
         required_capabilities: params.capabilities.unwrap_or_default(),
+        // §1.1 — from the `payment` parameter, absent ⇒ `Sat`. This is the surface that makes the
+        // free lane reachable by a user at all: the MCP `post_job` tool routes here, and until this
+        // read the daemon hardcoded `Sat` and no shipped surface could post a free job.
+        //
+        // ⛔ It is committed TOGETHER with `collect`'s mode branch (Bob, 2026-09-04). Shipping this
+        // read alone would make free jobs postable and — because `authorize_pay_async` refuses a
+        // free bind — uncollectable.
+        payment_mode,
     };
     match job_lifecycle::post_job_async(&context.home, request).await {
         Ok(outcome) => {
@@ -1038,7 +1092,8 @@ impl std::fmt::Display for SettleJobError {
     }
 }
 
-/// The daemon's ONE path to the spend gate: money lock → budget gate → pay-then-flip.
+/// The daemon's ONE path to the spend gate: money lock → resolve the bind → budget gate (PAID ARM
+/// ONLY) → pay-then-flip.
 ///
 /// Both the `collect` RPC and the delivery watcher call this and nothing else. That is deliberate:
 /// it makes "can the watcher reach around a money gate?" answerable by construction instead of by
@@ -1057,8 +1112,37 @@ async fn settle_job(
     // Serialize with award + other collects: at most one wallet-melting op in flight daemon-wide.
     let _guard = context.money_lock.lock().await;
 
-    let mut gate =
-        BudgetGate::from_home(&context.home).map_err(|error| SettleJobError::Gate(error.to_string()))?;
+    // #967 ground B — LEARN THE MODE BEFORE OPENING THE MONEY SUBSYSTEM. `BudgetGate::from_home`
+    // is a genuine durable read (it folds `spent.jsonl` and the legacy total), so constructing it
+    // unconditionally put the spend ledger on the critical path of a FREE collect: a buyer holding
+    // no bitcoin — the exact buyer the free lane exists to serve — had its free collect aborted by
+    // the money subsystem whenever that ledger was unreadable or malformed.
+    //
+    // The mode is `bind.payment_mode`, the sealed agreement of the signed offer and the signed
+    // claim. Resolving the bind HERE — load, and when none exists run the SAME
+    // `accept_for_collect_async` that `collect_async` would have run — is what lets the ledger stay
+    // shut on the free arm. It is one accept, not two: `collect_async` re-loads this now-persisted
+    // bind and never re-accepts. And it moves no ordering `settle_after_pay` guarantees, because
+    // that function runs nothing before its pay closure. Errors are mapped to the same variant the
+    // in-closure accept produced, so the wire code and operator line are unchanged.
+    let bind = match job_lifecycle::load_accepted_bind(&context.home, job_id) {
+        Ok(Some(bind)) => bind,
+        Ok(None) => job_lifecycle::accept_for_collect_async(&context.home, job_id)
+            .await
+            .map_err(|error| SettleJobError::Pay(collect::CollectError::Lifecycle(error)))?,
+        Err(error) => return Err(SettleJobError::Pay(collect::CollectError::Lifecycle(error))),
+    };
+
+    // The free arm opens NO gate — not a swallowed one, not an in-memory stand-in: none. The paid
+    // arm still fails loudly on an unreadable ledger, which is the behaviour a spend requires.
+    let mut gate = if bind.payment_mode.is_free() {
+        None
+    } else {
+        Some(
+            BudgetGate::from_home(&context.home)
+                .map_err(|error| SettleJobError::Gate(error.to_string()))?,
+        )
+    };
     let request = CollectRequest {
         job_id: job_id.to_owned(),
         out,
@@ -1069,8 +1153,10 @@ async fn settle_job(
         &context.store,
         job_id,
         now_unix(),
-        || collect::collect_async(&context.home, &mut gate, request),
-        |outcome| outcome.pay.amount_sats,
+        || collect::collect_async(&context.home, gate.as_mut(), request),
+        // A free collect settles `0`, which flips a zero reservation and moves no ledger total —
+        // the same arithmetic the award already reserved for a zero-amount offer.
+        |outcome| outcome.pay.amount_sats(),
     )
     .await
     .map(|(outcome, _converted)| outcome)
@@ -1143,6 +1229,49 @@ fn could_not_settle_line(job_id: &str, error: &impl std::fmt::Display) -> String
     format!("buyer: could not settle {job_id}: {error}")
 }
 
+/// How a settled collect describes what it settled, for the operator log. Split out (not inlined)
+/// so the wording is assertable without capturing stderr, per #183's rule.
+fn settled_payment_line(pay: &collect::CollectPayment) -> String {
+    match pay {
+        collect::CollectPayment::Sat(outcome) => format!("paid {} sat", outcome.amount_sats),
+        collect::CollectPayment::Free => "settled FREE (payment=none, nothing paid)".to_owned(),
+    }
+}
+
+/// The `pay` object of the `collect` response.
+///
+/// A paid collect's response bytes are exactly what they were before the free lane existed — the
+/// same four keys, read off the pay outcome. A free collect says what it is in the values it cannot
+/// fake: `state = "none"` and a null `attempt_id`, because no payment state machine ran and no
+/// attempt id was ever derived.
+///
+/// **`spent_total_sats` is ABSENT on a free collect (#967 ground B).** It used to be a fresh
+/// `BudgetGate::from_home` — a durable read of the spend ledger on the free path, publishing the
+/// buyer's lifetime spend total on a response for a trade that moved no money. The green e2e that
+/// read `spent_total_sats: 0` was success-shaped: zero only because that run's ledger happened to be
+/// zero. Emitting a constant instead would be worse than absence — `0` on a buyer with prior spend
+/// is a false statement about their money — so the key is omitted, and its absence is the honest
+/// report that no spend total was read. `undefined`/`None` is what a consumer sees; see the
+/// `a_free_collect_response_carries_no_spend_total` test for the asserted shape.
+///
+/// The function takes no [`BuyerContext`] on purpose: with no home in hand it CANNOT reopen the
+/// ledger, so the property is structural rather than a rule someone has to remember.
+fn collect_pay_response(pay: &collect::CollectPayment) -> Value {
+    match pay {
+        collect::CollectPayment::Sat(outcome) => json!({
+            "state": format!("{:?}", outcome.state),
+            "attempt_id": outcome.attempt_id,
+            "amount_sats": outcome.amount_sats,
+            "spent_total_sats": outcome.spent_total_sats,
+        }),
+        collect::CollectPayment::Free => json!({
+            "state": crate::gateway::PaymentMode::None.as_wire(),
+            "attempt_id": Value::Null,
+            "amount_sats": 0,
+        }),
+    }
+}
+
 async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
     let params: CollectParams = match serde_json::from_value(params) {
         Ok(params) => params,
@@ -1153,12 +1282,7 @@ async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
         Ok(outcome) => Response::ok(
             id,
             json!({
-                "pay": {
-                    "state": format!("{:?}", outcome.pay.state),
-                    "attempt_id": outcome.pay.attempt_id,
-                    "amount_sats": outcome.pay.amount_sats,
-                    "spent_total_sats": outcome.pay.spent_total_sats,
-                },
+                "pay": collect_pay_response(&outcome.pay),
                 "commit_oid": outcome.commit_oid,
                 "path": outcome.path,
                 "files": outcome.files,
@@ -2366,9 +2490,12 @@ async fn settle_awarded(context: &Arc<BuyerContext>, wake: Option<&nostr_sdk::Ev
             // "unreported" is honest absence, never a guess at what was requested. Rendered
             // through `log_safe_agent`: this is the one place seller-authored free text reaches
             // the operator's terminal, so control bytes must not survive into the log line.
+            // A free settle says FREE, not "paid 0 sat": an operator reading the log must be able
+            // to tell a zero-payment trade from a payment of zero, which the money path refuses to
+            // make at all (§11.6).
             Ok(outcome) => crate::opline!(
-                "buyer: delivery watcher settled {job_id} — paid {} sat for commit {} ({} file(s); agent={})",
-                outcome.pay.amount_sats,
+                "buyer: delivery watcher settled {job_id} — {} for commit {} ({} file(s); agent={})",
+                settled_payment_line(&outcome.pay),
                 outcome.commit_oid,
                 outcome.files.len(),
                 log_safe_agent(outcome.agent_used.as_deref())
@@ -2426,17 +2553,32 @@ async fn release_on_failure_feedback(context: &BuyerContext, event: &nostr_sdk::
 /// emitting site pairs them ([`crate::gateway::error_draft`]) — requiring both keeps a malformed
 /// event inert.
 ///
-/// The releasable set is exactly the three POST-AWARD failure codes — `delivery_failed`,
-/// `execution_failed`, and `no_sentinel` ([`crate::gateway::ReasonCode`]): each means the awarded
+/// The releasable set is the POST-AWARD failure codes — `delivery_failed`, `execution_failed`,
+/// `no_sentinel` and `capability_missing` ([`crate::gateway::ReasonCode`]): each means the awarded
 /// seller will not deliver a payable result, so the buyer's held reservation should be freed (#562
-/// shipped `delivery_failed`; #574 widened to its two siblings). The siblings ride the byte-identical
-/// wire — same kind, same tags, `status=error` — so this broadens ONLY the discriminator; the author
-/// gate + idempotency + money lock downstream are reason-code-agnostic and inherited unchanged. The
-/// remaining codes (`below_rate`, `unsupported_version`, `mint_incompatible`, `at_capacity`) are
-/// PRE-award offer declines: no award — hence no reservation — exists when they are emitted, so they
-/// are deliberately NOT releasable. A future POST-AWARD failure code must be added here explicitly;
-/// an unrecognised code is inert (funds stay held until the deadline reconcile — the conservative
-/// default).
+/// shipped `delivery_failed`; #574 widened to two siblings; #821 added `capability_missing`). The
+/// siblings ride the byte-identical wire — same kind, same tags, `status=error` — so this broadens
+/// ONLY the discriminator; the author gate + idempotency + money lock downstream are
+/// reason-code-agnostic and inherited unchanged. The remaining codes (`below_rate`,
+/// `unsupported_version`, `mint_incompatible`, `at_capacity`) are PRE-award offer declines: no award
+/// — hence no reservation — exists when they are emitted, so they are deliberately NOT releasable. A
+/// future POST-AWARD failure code must be added here explicitly; an unrecognised code is inert (funds
+/// stay held until the deadline reconcile — the conservative default).
+///
+/// ⚠ **`capability_missing` is the first code emitted from BOTH positions, so the pre/post-award
+/// partition above no longer classifies the vocabulary cleanly.** The seat emits it post-award when
+/// dispatch finds no serving harness (`seller_node::run`, the arm below `job_award_time`), and the
+/// claim gate can also refuse on capability PRE-award. Membership here is therefore no longer
+/// derivable from the code alone.
+///
+/// **That is safe, and NOT because of this discriminator.** A pre-award emit frees nothing by two
+/// independent downstream mechanisms: a job that was never awarded is not in
+/// `awarded_unsettled_job_ids()` at all, and a job awarded to a DIFFERENT seat fails the author gate
+/// in [`release_reservation_on_failure_feedback`] (`author != award.seller_pubkey` ⇒ strict
+/// no-op). This predicate only decides whether a feedback is worth taking the money lock for; the
+/// authorization is reason-code-agnostic and downstream. ⛔ Both of those are now load-bearing for
+/// this member rather than incidental, so they are pinned by test — do not refactor either into a
+/// property that "the reason code already guarantees", because for this code it does not.
 fn is_releasable_failure_feedback(event: &nostr_sdk::Event) -> bool {
     let tag_value = |name: &str| {
         event.tags.iter().find_map(|tag| {
@@ -2453,6 +2595,7 @@ fn is_releasable_failure_feedback(event: &nostr_sdk::Event) -> bool {
     code == Some(crate::gateway::ReasonCode::DeliveryFailed.as_str())
         || code == Some(crate::gateway::ReasonCode::ExecutionFailed.as_str())
         || code == Some(crate::gateway::ReasonCode::NoSentinel.as_str())
+        || code == Some(crate::gateway::ReasonCode::CapabilityMissing.as_str())
 }
 
 /// The authorized core of the post-award failure release, split out so its authorization +
@@ -4055,6 +4198,111 @@ mod tests {
         assert_settled_sibling_is_no_op("no_sentinel");
     }
 
+    #[test]
+    fn a_capability_missing_from_the_awarded_seller_releases_the_reservation() {
+        assert_awarded_failure_releases("capability_missing");
+    }
+    #[test]
+    fn a_capability_missing_from_a_non_awarded_pubkey_does_not_release() {
+        assert_non_awarded_sibling_does_not_release("capability_missing");
+    }
+    #[test]
+    fn a_capability_missing_for_an_already_settled_job_is_a_no_op() {
+        assert_settled_sibling_is_no_op("capability_missing");
+    }
+
+    // ⭐ #821 CROSS-MODULE INVARIANT — the coupling whose ABSENCE made the regression invisible.
+    //
+    // The seller's dispatch-refusal arm is POST-AWARD, so whatever reason code it emits must be
+    // releasable here, or a buyer whose awarded job died at dispatch waits for the deadline reconcile
+    // instead of being freed on the feedback. Before #821 nothing tied the two together: the
+    // `#574 SIBLING WIDENING` block parametrises its codes so THEY cannot diverge, but it asserts on
+    // codes and never on an emit site — so the emitter could move to a non-releasable code with every
+    // test in this file still green. That is exactly what a `capability_missing` relabel would have
+    // done.
+    //
+    // Asserts on the EMITTER'S OWN CONST, not on a literal spelling of it, so the two cannot drift:
+    // repoint `UNDISPATCHABLE_REASON_CODE` at any code outside the releasable set and this goes red at
+    // the assertion below. A literal `"capability_missing"` here would keep passing and prove nothing
+    // about what the seller actually sends.
+    #[test]
+    fn the_undispatchable_arms_reason_code_is_releasable() {
+        let code = crate::seller_node::run::UNDISPATCHABLE_REASON_CODE;
+        let event = failure_feedback(&"a".repeat(64), &nostr_sdk::Keys::generate(), code.as_str());
+
+        assert!(
+            is_releasable_failure_feedback(&event),
+            "the post-award dispatch-refusal arm emits {:?} ({}), which is NOT in the releasable set — \
+             a buyer's awarded job would die at dispatch with its reservation held until the deadline \
+             reconcile",
+            code,
+            code.as_str()
+        );
+    }
+
+    // ⭐ #821 — THE ASSERTION ONLY THIS CODE NEEDS, because only this code breaks the set's organising
+    // principle. Its three siblings are releasable AND post-award-only, so for them "is it in the set"
+    // and "can it arrive pre-award" are the same question. `capability_missing` is emitted post-award
+    // when dispatch finds no serving harness AND pre-award when the claim gate refuses on capability,
+    // so membership here is no longer derivable from the code itself.
+    //
+    // What keeps that safe is a mechanism this predicate does not own: a job with no award record is
+    // not in `awarded_unsettled_job_ids()`, so the release never runs. That was incidental for the
+    // other three and is LOAD-BEARING for this one, which is why it is pinned rather than left as a
+    // property a refactor could fold into "the reason code already guarantees it".
+    //
+    // Shape: a RESERVATION but NO AWARD — the exact pre-award state — so the awarded-set join is the
+    // only thing that can refuse. The second half is the POSITIVE CONTROL: recording the award and
+    // re-running the SAME event on the SAME store releases. Without it, `None` would also be the
+    // answer for a malformed event or a job id that never matched, and the test would pass while
+    // proving nothing. Red-on-revert: scope the release to every reserved job instead of the
+    // awarded-unsettled JOIN → the first assertion releases and fails.
+    #[test]
+    fn a_pre_award_capability_missing_for_a_job_we_never_awarded_does_not_release() {
+        let root = temp_home("cap-preaward");
+        let seller = nostr_sdk::Keys::generate();
+        let job = "a".repeat(64);
+        std::fs::create_dir_all(&root).expect("temp dir");
+        let store = store::BuyerStore::open(root.join("buyer.sqlite")).expect("open store");
+        store.reserve(&job, 100, 10_000, now_unix()).expect("reserve");
+
+        let event = failure_feedback(&job, &seller, "capability_missing");
+        let outcome =
+            release_reservation_on_failure_feedback(&store, &event, now_unix()).expect("no store error");
+
+        assert_eq!(
+            outcome, None,
+            "a capability_missing for a job we never awarded must free nothing — no award, no reservation to release"
+        );
+        assert_eq!(
+            store.reservation(&job).expect("read").map(|(state, _)| state),
+            Some(reservations::ReservationState::Reserved),
+            "the reservation must stay held: nothing has been awarded, so nothing has failed"
+        );
+
+        // POSITIVE CONTROL — the same event and store, now WITH an award. If this did not release, the
+        // no-op above would be evidence of a broken fixture rather than of the awarded-set join.
+        store
+            .record_award(
+                &job,
+                &"c".repeat(64),
+                &"e".repeat(64),
+                &seller.public_key().to_hex(),
+                100,
+                now_unix(),
+            )
+            .expect("record award");
+        let after_award =
+            release_reservation_on_failure_feedback(&store, &event, now_unix()).expect("no store error");
+        assert_eq!(
+            after_award,
+            Some((job.clone(), 100)),
+            "positive control: the identical event DOES release once the award exists — so the refusal above was the missing award, not a dead fixture"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // BOUNDARY — the widening must NOT over-broaden to "any status=error feedback". The PRE-award
     // decline codes (below_rate / unsupported_version / mint_incompatible / at_capacity) name an offer
     // decline for which no award — hence no reservation — exists, and an unrecognised code is
@@ -4989,6 +5237,7 @@ mod tests {
 
         fn claim_with(status: &str, seller_pubkey: String) -> job_lifecycle::ClaimView {
             job_lifecycle::ClaimView {
+                payment_mode: crate::gateway::PaymentMode::Sat,
                 // The UNSTATED capability — a seat advertising nothing. Set explicitly because `ClaimView`
                 // has no `Default` derive and must not gain one: a default `SandboxConfig` is a meaningful
                 // object, but a default `ClaimView` is a claim that never existed.
@@ -5045,6 +5294,7 @@ mod tests {
                 results: vec![result(Some("d".repeat(40)))],
                 live_claim_id: None,
                 accepted: Some(job_lifecycle::AcceptedBind {
+                    payment_mode: crate::gateway::PaymentMode::Sat,
                     job_id: "a".repeat(64),
                     claim_id: "c".repeat(64),
                     result_id: "r".repeat(64),
@@ -5083,6 +5333,7 @@ mod tests {
                 results: vec![result(Some("d".repeat(40)))],
                 live_claim_id: None,
                 accepted: Some(job_lifecycle::AcceptedBind {
+                    payment_mode: crate::gateway::PaymentMode::Sat,
                     job_id: "a".repeat(64),
                     claim_id: "b".repeat(64),
                     result_id: "q".repeat(64),
@@ -5664,7 +5915,7 @@ mod tests {
             &seller_hex,
         )
         .expect("creq");
-        let claim_draft = crate::gateway::claim_draft(&job_id, &buyer_hex, &seller_hex, &creq, &[], &crate::heartbeat::SeatCapability::default());
+        let claim_draft = crate::gateway::claim_draft(&job_id, &buyer_hex, &seller_hex, crate::gateway::ClaimPayment::Sat(&creq), &[], &crate::heartbeat::SeatCapability::default());
         let claim_id = publish(&seller, &claim_draft).await.to_hex();
 
         // The buyer AWARDED this claim on the relay (kind-3405) — collect resolves the delivery
@@ -6065,5 +6316,191 @@ mod tests {
         assert_eq!(merge_progress(Some(PaymentProgress::Closed), PaymentProgress::None), PaymentProgress::Closed);
         assert_eq!(merge_progress(Some(PaymentProgress::Uncertain), PaymentProgress::None), PaymentProgress::Uncertain);
         assert_eq!(merge_progress(None, PaymentProgress::Uncertain), PaymentProgress::Uncertain);
+    }
+
+    // ————————————————————————————————————————————————————————————————————————————————————————
+    // FREE JOB LANE — the `post_job` RPC's `payment` parameter (§1.1). This is the surface that
+    // makes the lane reachable by a user; until it existed the daemon hardcoded `Sat`.
+    // ————————————————————————————————————————————————————————————————————————————————————————
+
+    /// The mode a `post_job` request body resolves to, going through the REAL deserializer — so a
+    /// `#[serde(default)]` that stopped defaulting, or a field renamed on one side only, is caught
+    /// here rather than by inspection.
+    fn mode_for_body(body: Value) -> Result<crate::gateway::PaymentMode, String> {
+        let params: PostJobParams = serde_json::from_value(body).expect("post_job params");
+        post_job_payment_mode(params.payment.as_deref(), params.amount_sats)
+    }
+
+    /// TEST 3 — ABSENT `payment` ⇒ `Sat`, ON THE WIRE.
+    ///
+    /// Both halves, because either alone is passable by a broken implementation: the mode must
+    /// resolve to `Sat`, AND the offer that mode builds must carry NO `["param","payment",…]` tag
+    /// — `Sat` is stated by ABSENCE on the wire, which is the whole reason no `PROTOCOL_VERSION`
+    /// bump is needed. A body that omits `payment` must produce the exact bytes it produced before
+    /// the parameter existed.
+    #[test]
+    fn post_job_without_a_payment_parameter_posts_sat_and_emits_no_payment_tag() {
+        let body = json!({ "task": "t", "output": "text/plain", "amount_sats": 7 });
+        assert_eq!(
+            mode_for_body(body).expect("an absent payment parameter is always valid"),
+            crate::gateway::PaymentMode::Sat,
+            "omitting `payment` must mean a PRICED job — every caller written before this \
+             parameter existed omits it"
+        );
+
+        // The wire half: the draft this mode builds must be silent about payment.
+        let draft = crate::gateway::OfferDraft::new("t", "text/plain", 7, 2_000_000_000, &"s".repeat(64))
+            .with_payment_mode(crate::gateway::PaymentMode::Sat)
+            .to_event_draft();
+        assert!(
+            !draft
+                .tags
+                .iter()
+                .any(|tag| tag.first() == Some("param")
+                    && tag.0.get(1).map(String::as_str) == Some("payment")),
+            "a priced offer must emit NO payment tag: {:?}",
+            draft.tags
+        );
+
+        // An EXPLICIT "sat" is the same job as an omitted one — no third behaviour.
+        let explicit = json!({ "task": "t", "output": "text/plain", "amount_sats": 7, "payment": "sat" });
+        assert_eq!(
+            mode_for_body(explicit).expect("explicit sat is valid"),
+            crate::gateway::PaymentMode::Sat
+        );
+    }
+
+    /// TEST 2 (the refusal half) — `payment=none` REQUIRES `amount_sats = 0`.
+    ///
+    /// Mirrors the library's own post gate rather than trusting it: the RPC caller gets the reason
+    /// at the surface it called. A free job priced above zero is a contradiction, and the offer must
+    /// never reach the relay.
+    #[test]
+    fn post_job_payment_none_requires_a_zero_amount_and_is_refused_otherwise() {
+        assert_eq!(
+            mode_for_body(json!({ "task": "t", "output": "text/plain", "amount_sats": 0, "payment": "none" }))
+                .expect("free at zero is the whole point of the lane"),
+            crate::gateway::PaymentMode::None
+        );
+
+        for amount in [1u64, 7, 21_000] {
+            let refusal = mode_for_body(
+                json!({ "task": "t", "output": "text/plain", "amount_sats": amount, "payment": "none" }),
+            )
+            .expect_err("payment=none above zero must be refused, never silently repriced");
+            assert!(
+                refusal.contains("requires amount_sats = 0"),
+                "the refusal must name the rule it enforced, got: {refusal}"
+            );
+        }
+    }
+
+    /// An UNRECOGNIZED `payment` value is REFUSED, never quietly treated as `sat`.
+    ///
+    /// The wire readers fail closed to `sat` because they parse events from strangers. An RPC caller
+    /// is not a stranger: it asked for something specific, and posting a PRICED job for real money
+    /// because it typed `"free"` is the one outcome nobody wants. This is the asymmetry.
+    #[test]
+    fn post_job_refuses_an_unrecognized_payment_value_rather_than_defaulting_to_sat() {
+        for value in ["free", "none ", "NONE", "sats", "0", ""] {
+            // "none " (trailing space) is TRIMMED and accepted; the rest must refuse. Kept in one
+            // list so the trim is stated rather than assumed.
+            let result = mode_for_body(
+                json!({ "task": "t", "output": "text/plain", "amount_sats": 0, "payment": value }),
+            );
+            if value.trim() == "none" {
+                assert_eq!(
+                    result.expect("a trimmed \"none\" is free"),
+                    crate::gateway::PaymentMode::None
+                );
+                continue;
+            }
+            let refusal = result.expect_err(&format!("payment={value:?} must refuse"));
+            assert!(
+                refusal.contains("must be \"sat\" or \"none\""),
+                "the refusal must name the accepted values, got: {refusal}"
+            );
+        }
+    }
+
+    /// The operator log must distinguish a FREE settle from a payment of zero — a distinction the
+    /// money path refuses to make at all (§11.6 has no zero payment), so a log line reading
+    /// "paid 0 sat" would describe something that cannot happen.
+    #[test]
+    fn a_free_settle_logs_free_and_a_paid_settle_logs_the_amount() {
+        assert_eq!(
+            settled_payment_line(&collect::CollectPayment::Free),
+            "settled FREE (payment=none, nothing paid)"
+        );
+        // `AttemptId` has no public constructor (it is only ever derived from a payment key), so the
+        // paid control is built through the durable serde form the journal itself uses.
+        let state: crate::payment::PaymentState =
+            serde_json::from_value(json!({ "state": "intent", "attempt_id": "attempt" }))
+                .expect("payment state");
+        let paid = collect::CollectPayment::Sat(crate::authorize_pay::AuthorizePayOutcome {
+            state,
+            attempt_id: "attempt".to_owned(),
+            amount_sats: 21,
+            charged_sats: 21,
+            spent_total_sats: 21,
+        });
+        assert_eq!(settled_payment_line(&paid), "paid 21 sat");
+        assert_eq!(paid.amount_sats(), 21);
+        assert_eq!(collect::CollectPayment::Free.amount_sats(), 0);
+        assert!(collect::CollectPayment::Free.paid().is_none());
+    }
+
+    /// #967 ground B, site 2 — RED-PROVE of the wire shape. The free arm of the collect response
+    /// must carry NO `spent_total_sats`. It used to carry a fresh `BudgetGate::from_home` read:
+    /// a durable read of the spend ledger on a path that moved no money, publishing the buyer's
+    /// lifetime spend total on a FREE collect's response. The old e2e read `0` there and looked
+    /// green only because that run's ledger was empty; a buyer with prior spend got a real total.
+    ///
+    /// Emitting a constant `0` instead would be a WORSE failure than absence — a false statement
+    /// about someone's money rather than a missing one — so the key is absent, and the absence is
+    /// the honest report that nothing was read. The paid arm is unchanged and still carries all
+    /// four keys, off the pay outcome, never off a fresh ledger read.
+    ///
+    /// The structural half of the guard is the signature: `collect_pay_response` takes no
+    /// `BuyerContext`, so it has no home to open a ledger from. If someone re-adds the key here
+    /// they must first re-add the parameter, which this test cannot stop but the reviewer will see.
+    #[test]
+    fn a_free_collect_response_carries_no_spend_total() {
+        let free = collect_pay_response(&collect::CollectPayment::Free);
+        let free = free.as_object().expect("the pay response is an object");
+
+        assert!(
+            !free.contains_key("spent_total_sats"),
+            "a FREE collect must publish no spend total — the key is absent, not zero: {free:?}"
+        );
+        // `serde_json::Map` is a `BTreeMap` here, so `keys()` comes out sorted — the assertion is
+        // on the SET of keys, which is what "no fourth key" means.
+        assert_eq!(
+            free.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["amount_sats", "attempt_id", "state"],
+            "the free shape is exactly these three keys — no fourth"
+        );
+        assert_eq!(free["state"], "none");
+        assert_eq!(free["attempt_id"], Value::Null);
+        assert_eq!(free["amount_sats"], 0);
+
+        // The PAID control: same builder, all four keys, and the total comes off the pay outcome.
+        let state: crate::payment::PaymentState =
+            serde_json::from_value(json!({ "state": "intent", "attempt_id": "attempt" }))
+                .expect("payment state");
+        let paid = collect_pay_response(&collect::CollectPayment::Sat(
+            crate::authorize_pay::AuthorizePayOutcome {
+                state,
+                attempt_id: "attempt".to_owned(),
+                amount_sats: 21,
+                charged_sats: 21,
+                spent_total_sats: 9_999,
+            },
+        ));
+        assert_eq!(
+            paid["spent_total_sats"], 9_999,
+            "a PAID collect still reports the total, and reports the one the pay path returned"
+        );
+        assert_eq!(paid["amount_sats"], 21);
     }
 }

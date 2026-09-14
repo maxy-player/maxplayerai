@@ -1,7 +1,12 @@
 mod accept_cli;
+// #818: the build-time commit stamp `--version` prints. Compiled on every build — provenance is not
+// a feature, and a deployed binary that cannot say what it was built from is the state #818 measured.
+mod build_stamp;
 mod buyer;
 mod cli;
 mod collect_cli;
+// Container-side delivery orchestrator entrypoint (`maxplayer __deliver …`, Track B). INTERNAL.
+mod deliver_cli;
 #[cfg(feature = "wallet")]
 mod daemon;
 mod doctor;
@@ -15,10 +20,22 @@ mod profile_cli;
 // at award (#360). Gate the whole surface on `acp` so a buyer-only build cannot advertise at all.
 #[cfg(feature = "acp")]
 mod sell;
+// `maxplayer seller fees` — the seller-facing read-out of the platform fee journal. Same gate as
+// `sell`: it is reached only through the `seller` arm and reads the seller node's store.
+#[cfg(feature = "acp")]
+mod seller_fees;
 // The containment probe is compiled on every build, not only the seller one: the payload half runs
 // INSIDE the launcher, and a seat may reasonably run the probe from a binary it already trusts.
 #[cfg(feature = "wallet")]
 mod sandbox_probe;
+// The retired-seat holder reaper (#905). `acp`, not `wallet`: it calls `sandbox_netns::reap_orphans`,
+// which needs the docker runner behind that feature â the same gate the boot reaper carries.
+#[cfg(feature = "acp")]
+mod sandbox_reap;
+// `maxplayer skill` and the ONE docs-pointer constant `--help`, `doctor`, seller first-run and the
+// MCP handshake all print from. Every build: a box with nothing but the binary must be able to
+// find the documentation.
+mod skill;
 #[cfg(feature = "stub-pay")]
 mod stub_pay_cli;
 mod wallet_cli;

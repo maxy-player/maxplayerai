@@ -42,6 +42,7 @@
 //! | `telemetry.mirror_file` | `MAXPLAYER_TELEMETRY__MIRROR_FILE` |
 //! | `seller_heartbeat.interval_secs` | `MAXPLAYER_SELLER_HEARTBEAT__INTERVAL_SECS` |
 //! | `seller_preflight.boot_push_preflight` | `MAXPLAYER_SELLER_PREFLIGHT__BOOT_PUSH_PREFLIGHT` |
+//! | `platform_fee.auto_remit` | `MAXPLAYER_PLATFORM_FEE__AUTO_REMIT` |
 //! | `buyer.hop_fee_buffer_multiplier` | `MAXPLAYER_BUYER__HOP_FEE_BUFFER_MULTIPLIER` |
 //! | `contribution.allowed_paths` (list) | `MAXPLAYER_CONTRIBUTION__ALLOWED_PATHS=…` |
 //!
@@ -193,6 +194,22 @@ pub struct SellerConfig {
     #[serde(deserialize_with = "deserialize_agent_command_argv")]
     pub agent_command: Vec<String>,
     pub rate_sats: u64,
+    /// This seat TAKES NO PAYMENT (§2.1, §4.1). Default **false**. Opting in does two things and
+    /// only these two: it lets the seat admit a `payment=none` offer, and it puts
+    /// `["takes_payment","none"]` on the seat's kind-30340 beat so a buyer holding zero bitcoin can
+    /// find it.
+    ///
+    /// ⛔ ONLY VALID WITH `rate_sats = 0` — [`crate::seller::require_seller_config`] refuses the
+    /// other pair. `rate_sats = 0` alone does NOT mean this: it means "any amount ≥ 0", which is not
+    /// the same statement as "I take nothing", and a buyer with no sats cannot act on the first.
+    ///
+    /// ⚠ ADMISSION BECOMES THE ONLY CONTROL LEFT. The price floor is the market's one natural
+    /// throttle and this sets it aside, so with `claim_open_pool = true` the seat will claim every
+    /// well-formed free offer in the pool until its slots fill. `accept_offers_only_from`,
+    /// `accept_open_targeted` and `claim_open_pool` are what scope who may reach it; `slots` bounds
+    /// concurrency, not volume. There are deliberately no caps, rate limits or quotas (§6).
+    #[serde(default)]
+    pub takes_no_payment: bool,
     pub git_remote: String,
     /// Job deadline override (seconds). Default: offer `deadline_unix`, else ~600s.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -209,7 +226,9 @@ pub struct SellerConfig {
     /// plain list of harness names, and the top-level `slots` is the only concurrency knob.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agents: Vec<String>,
-    /// Opt-in to claim untargeted/open offers. Default **false** (targeted-only).
+    /// Opt-in to claim untargeted/open offers. Default **false**. ⛔ That default is NOT
+    /// "targeted-only": the targeted surface is its own opt-in ([`SellerConfig::accept_open_targeted`]),
+    /// so a seat with both flags false and no allowlist claims NOTHING.
     ///
     /// This flag decides whether the seat can LOSE a race, and that is what makes it more than a
     /// throughput knob. A targeted offer has exactly one eligible claimant — `rate_gate_allows`
@@ -223,12 +242,58 @@ pub struct SellerConfig {
     /// (#626). Any handler added to that subscription inherits the same obligation.
     #[serde(default)]
     pub claim_open_pool: bool,
-    /// Allowlist of buyer pubkeys (64-hex) whose offers this seller will claim. **Empty/absent =
-    /// accept-all** — every buyer is eligible, subject to the usual targeting/rate/harness gates
-    /// (the pre-#482 behavior; existing sellers are unaffected). **Populated = a hard fence**: an
-    /// offer whose author (the buyer) is not on the list is skipped with a named `NotAllowlisted`
-    /// skip reason and NO buyer feedback — a private seller does not advertise why it declined a
-    /// stranger. Consulted right after the lapsed-offer refusal, before the rate/harness gates.
+    /// Opt-in to let a buyer this seat has NOT named target it directly. Default **false**.
+    ///
+    /// This is the TARGETED half of the seat's exposure, and it is a separate surface from
+    /// [`SellerConfig::claim_open_pool`]: that flag governs UNTARGETED (open-pool) offers, this one
+    /// governs offers whose `p` tag is this seat. A seat can be reachable on either, both, or
+    /// neither, so the two are independent knobs rather than one "openness" setting.
+    ///
+    /// The three buyer-facing knobs are deliberately independent and NOTHING is inferred from a
+    /// field being empty:
+    /// - [`SellerConfig::accept_offers_only_from`] — the buyers this operator named.
+    /// - `accept_open_targeted` — may a buyer it did NOT name target this seat.
+    /// - [`SellerConfig::claim_open_pool`] — may it claim untargeted pool offers.
+    ///
+    /// A default seat therefore claims only from the buyers its operator listed, and a seat with no
+    /// list claims nothing until the operator opts in to one of the open surfaces.
+    ///
+    /// **ADDITIVE — NO PRECEDENCE (#923).** This flag and [`SellerConfig::accept_offers_only_from`]
+    /// are independent grants on the targeted surface, and admission is the UNION of the two: a
+    /// listed buyer gets in because it is listed, and this flag ADDITIONALLY admits a buyer the
+    /// operator never named. A populated list does not cancel it.
+    ///
+    /// ⛔ IT DID UNTIL #923, AND THAT WAS THE DEFECT. The list was a hard fence ahead of both
+    /// surfaces, so this flag read `true` in `config.toml` and did nothing whenever a list existed —
+    /// the config and the seat disagreed with no error to say so, and an operator could not open a
+    /// public route temporarily without deleting the buyers it wanted to keep. Setting this flag
+    /// beside a list is now exactly what it looks like: a public route, open, alongside the private
+    /// one. `doctor` reports both routes as in effect and no longer calls either inert.
+    ///
+    /// ⛔ SO THIS FLAG IS A STRANGER-FACING SWITCH ON ITS OWN. Turning it on admits arbitrary
+    /// buyers' task text for execution on this box whatever the allowlist holds, which is why
+    /// `doctor`'s containment findings go from advisory to BLOCKING on it alone.
+    #[serde(default)]
+    pub accept_open_targeted: bool,
+    /// Allowlist of buyer pubkeys (64-hex) whose offers this seller will claim on the TARGETED
+    /// surface. **Populated = an always-admits set, NOT a veto (#923).** A listed buyer's targeted
+    /// offer is claimed; an unlisted buyer's is skipped with a named `NotAllowlisted` skip reason and
+    /// NO buyer feedback — unless [`SellerConfig::accept_open_targeted`] admits it, which this field
+    /// cannot override. Consulted right after the lapsed-offer refusal, before the rate/harness
+    /// gates.
+    ///
+    /// ⛔ THIS LIST DOES NOT FENCE THE OPEN POOL, AND NEVER FENCES THE FLAGS. Until #923 a populated
+    /// list refused an unlisted buyer on BOTH surfaces and made both open flags inert; it now governs
+    /// only who is admitted for TARGETED work, and untargeted claiming is decided by
+    /// [`SellerConfig::claim_open_pool`] alone. An entry that cannot match a wire pubkey therefore
+    /// admits nobody and fences nobody — a list of typos degrades to "no buyers named", not to
+    /// deny-all.
+    ///
+    /// **Empty/absent means the operator named no buyers — it does NOT mean accept-all.** Which
+    /// strangers may reach a seat with no list is decided by the two surface flags above, never
+    /// inferred from this field's emptiness. Before the three-knob change an empty list DID mean
+    /// accept-all on the targeted surface; see [`SellerConfig::accept_open_targeted`] for the
+    /// migration a seat with no list now needs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accept_offers_only_from: Vec<String>,
     /// Backfill window (seconds) for the seller's UNTARGETED (open-pool) offer-kind offer
@@ -266,6 +331,205 @@ pub struct SellerConfig {
     /// default (see `DEFAULT_CLAIM_AWARD_TIMEOUT_SECS`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_award_timeout_secs: Option<u64>,
+}
+
+/// Every route back to reachable, named once for the whole workspace.
+///
+/// ⛔ THIS LIVES HERE FOR A STRUCTURAL REASON, NOT A TIDINESS ONE. The dependency runs ONE WAY —
+/// `maxplayer` depends on `maxplayer-core` and never the reverse — so a constant in the CLI crate
+/// is unreachable from `seller_node::run`, which is why that file ended up with its own copies.
+/// `home` is also UNGATED, where `seller_node` is `#[cfg(feature = "wallet")]`: putting the
+/// operator's remedy text there would gate it behind `wallet` for no reason.
+///
+/// ⛔ AND THE DRIFT WAS NOT HYPOTHETICAL — IT HAD ALREADY HAPPENED. Three spellings existed: the two
+/// in `run.rs` were byte-identical to each other, and both differed from the doctor's. **The two
+/// agreeing is exactly why it looked consolidated** — within one file the duplication is visible,
+/// and the divergence lived across the crate boundary where nobody greps.
+///
+/// The doctor's wording won on merit rather than seniority: backticked and spaced, it reads as the
+/// TOML an operator must actually type. Callers add their own framing and terminal punctuation.
+pub const ROUTES_BACK_IN: &str = "list the buyers you work with in `[seller] \
+     accept_offers_only_from`, or set `accept_open_targeted = true` to accept targeted offers from \
+     buyers you have not named, or set `claim_open_pool = true` to claim untargeted jobs from the \
+     open pool";
+
+/// What makes an `accept_offers_only_from` entry a route in, stated to the operator.
+///
+/// ⛔ SHAPE IS NOT THE RULE, AND A MESSAGE THAT SAYS IT IS HANDS THE OPERATOR A CORRECTION THEIR
+/// INPUT ALREADY PASSES. `buyer_pubkey_is_reachable` parses the x-only key as well as the shape, so
+/// `"0123456789abcdef".repeat(4)` — 64 lowercase hex characters, no curve point — satisfies every
+/// syllable of a shape-only explanation and is still refused.
+///
+/// ⛔ A RIGHT DIAGNOSIS WITH A WRONG CORRECTION IS WORSE THAN A VAGUE ONE. The operator is told every
+/// entry is unusable, handed a rule their entries demonstrably pass, and left with no way to see the
+/// difference — this text is their ONLY interface to the predicate, because they cannot read
+/// `home.rs`. The classifier learning curve validity while its explanations kept the old rule is the
+/// same failure as the remedy text above: the fix reached the site under the cursor and stopped.
+///
+/// ⛔ REPORTING ONLY. The admission gate stays an exact byte compare — this explains a refusal and
+/// never widens one. Callers add their own framing and terminal punctuation.
+/// ⛔ AND THE CLAUSE THIS SENTENCE MUST NOT MAKE, BECAUSE THIS FILE REFUTES IT ON LINE 2065: THE
+/// PREDICATE HAS NO PROVENANCE SIGNAL. It cannot know whether bytes were copied or typed, and
+/// `GENERATOR_X` — hand-entered hex in this very file — is asserted REACHABLE. Grouping hand entry
+/// with the forms that match NOBODY was false by this tree's own positive control, and it is the
+/// exact defect this constant exists to fix: an operator-facing rule the code does not hold.
+/// ⇒ the honest claim is narrower — typed hex may be curve-invalid, or valid and name someone else,
+/// so it is no EVIDENCE the intended buyer was listed. Copying is what carries that evidence.
+pub const USABLE_BUYER_ENTRY: &str = "Copy the canonical public key the buyer gives you: 64 \
+     lowercase hex characters that are ALSO a valid secp256k1 x-only key (the hex pubkey a Nostr \
+     client shows). An `npub1…`, a shortened id or a capitalised key is compared literally and \
+     matches nobody. Hex you typed rather than copied is not refused for being typed — but it may \
+     be curve-invalid, or valid and name a different buyer, so it is no evidence you listed the \
+     one you meant";
+
+/// Can this `accept_offers_only_from` entry ever match a real buyer?
+///
+/// ⛔ THE FENCE IS AN EXACT STRING COMPARE, SO AN ENTRY IN ANY OTHER FORM IS NOT A NARROW ROUTE —
+/// IT IS NO ROUTE. A buyer pubkey arrives off the wire as 64 lowercase hex characters, and the
+/// allowlist is matched against that byte-for-byte. An `npub1…`, a truncated id, a capitalised
+/// hex string or a typo therefore fences out *everyone* while reading, to an operator and to
+/// `doctor` alike, as a seat that named a buyer.
+///
+/// **This deliberately reports rather than repairs.** Trimming and lower-casing the entry here
+/// would make some of these match — which means admitting a counterparty the seat is currently
+/// refusing. Widening who can reach a seat is the opposite of what the opt-in surfaces are for,
+/// so an unusable entry stays unusable and the operator is told. Matching semantics are unchanged.
+pub fn buyer_pubkey_is_wire_shaped(entry: &str) -> bool {
+    entry.len() == 64 && entry.chars().all(|ch| ch.is_ascii_digit() || ('a'..='f').contains(&ch))
+}
+
+/// Can this entry match a buyer that can actually EXIST? Shape, plus a real x-only public key.
+///
+/// ⛔ SHAPE IS NECESSARY AND NOT SUFFICIENT, AND THE GAP IS HALF OF ALL TYPOS. A buyer pubkey is a
+/// secp256k1 x-coordinate, and roughly half of all 64-hex values have no curve point at all — so a
+/// mistyped key is far more likely to be *unusable* than merely *wrong*. Counting a shape-valid
+/// entry as a route in is what produced `PASS reachable: 1 named buyer` for a seat no offer can
+/// ever reach.
+///
+/// ⛔ `PublicKey::from_hex` IS NOT THE VALIDATOR, THOUGH IT LOOKS LIKE ONE. Read in the pinned
+/// nostr 0.44.4: `PublicKey` is `{ buf: [u8; 32] }` and `from_hex` is `hex::decode_to_slice` with
+/// no secp256k1 call, while `hex` accepts `A-F` as well as `a-f`. A `from_hex` -> `to_hex`
+/// round-trip therefore proves exactly *64 hex characters, lowercase* — verbatim the contract
+/// [`buyer_pubkey_is_wire_shaped`] already has, so it would change nothing. **`.xonly()` is the
+/// call that parses**: it reaches `XOnlyPublicKey::from_slice`, which rejects an x with no point.
+///
+/// ⚠ `gateway` is the MINIMAL feature supplying nostr-sdk; `wallet` composes it, and every
+/// production caller of this is already `wallet`-gated. This deliberately does NOT change the
+/// admission gate, which stays an exact string compare — see [`buyer_pubkey_is_wire_shaped`].
+#[cfg(feature = "gateway")]
+pub fn buyer_pubkey_is_reachable(entry: &str) -> bool {
+    use nostr_sdk::prelude::PublicKey;
+    buyer_pubkey_is_wire_shaped(entry)
+        && PublicKey::from_hex(entry).is_ok_and(|key| key.xonly().is_ok())
+}
+
+/// The §4.2 admission vocabulary — ONE spelling shared by both admission tags.
+///
+/// `admits_pool` carries [`ADMISSION_OPEN`] or [`ADMISSION_CLOSED`]; `admits_targeted` carries
+/// those two plus [`ADMISSION_NAMED`]. The tags describe different-sized state spaces — only the
+/// targeted surface has three states — but they must not describe them in different WORDS. These
+/// constants are what makes that structural instead of remembered: a second spelling cannot be
+/// introduced by editing one emitter, because there is only one place the words live.
+pub const ADMISSION_OPEN: &str = "open";
+/// Only buyers this seat named. Targeted surface only — the pool has no such state.
+pub const ADMISSION_NAMED: &str = "named";
+/// Admits nobody on this surface.
+pub const ADMISSION_CLOSED: &str = "closed";
+
+/// How this seat admits TARGETED offers — those whose `p` tag names this seat.
+///
+/// Three states, because the targeted surface has three and a boolean has two. Admission is the
+/// UNION `buyer_is_named || accept_open_targeted` (`seller_node::run::classify_offer`), so
+/// `accept_open_targeted = false` does NOT mean closed: with buyers named it means closed to
+/// STRANGERS. Collapsing [`Self::Named`] and [`Self::Closed`] onto one `no` is what would tell a
+/// buyer the operator deliberately listed to give up on a seat that would have served it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum TargetedAdmission {
+    /// Any buyer may target this seat: `accept_open_targeted = true`.
+    Open,
+    /// Only buyers this seat named. Never says WHO — the allowlist itself stays off the wire.
+    Named,
+    /// The targeted surface admits nobody.
+    Closed,
+}
+
+impl TargetedAdmission {
+    /// The §4.2 wire value. One spelling, used by the emitter and the reader alike.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => ADMISSION_OPEN,
+            Self::Named => ADMISSION_NAMED,
+            Self::Closed => ADMISSION_CLOSED,
+        }
+    }
+
+    /// Read a §4.2 wire value. Unknown text ⇒ `None` — a reader must not guess a policy.
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            ADMISSION_OPEN => Some(Self::Open),
+            ADMISSION_NAMED => Some(Self::Named),
+            ADMISSION_CLOSED => Some(Self::Closed),
+            _ => None,
+        }
+    }
+}
+
+/// What a seat advertises about WHO it admits, on each of its two surfaces (§4.2).
+///
+/// ⛔ **DERIVED, NEVER CONFIGURED.** There is deliberately no way for an operator to set this: it is
+/// computed from the live [`SellerConfig`] at announce time by [`Self::from_seller_config`]. A
+/// separate field an operator typed would drift from the code that enforces it, and an
+/// advertisement that can disagree with the admission gate is worse than no advertisement — it is a
+/// new lie in the exact place this tag exists to remove one.
+///
+/// ⚠ **IDENTITY ONLY.** This answers *whose* offers are admitted and nothing else. A seat that
+/// admits a buyer still refuses it below `rate`, and still declines when it cannot run the
+/// requested harness. Like `accepting`, it is a statement of intent and not a guarantee — the
+/// authoritative signal that a seat will take a job remains that the seat claims one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct AdmissionPolicy {
+    /// Whether this seat claims UNTARGETED (open-pool) offers: `claim_open_pool`.
+    ///
+    /// A `bool` because the pool surface genuinely has two states — it is spelled
+    /// [`ADMISSION_OPEN`] / [`ADMISSION_CLOSED`] on the wire so both admission tags read in one
+    /// vocabulary, not because it has a third.
+    pub pool: bool,
+    /// Who this seat admits on the targeted surface.
+    pub targeted: TargetedAdmission,
+}
+
+#[cfg(feature = "gateway")]
+impl AdmissionPolicy {
+    /// Derive the advertisement from the config the admission gate itself reads.
+    ///
+    /// ⛔ **`is_empty()` IS NOT THE PREDICATE, AND USING IT WOULD REBUILD THIS BUG INSIDE ITS OWN
+    /// FIX.** `buyer_is_named` is an exact byte compare against a 64-hex wire pubkey, so an entry
+    /// that [`buyer_pubkey_is_reachable`] refuses can never match anybody. A populated list of
+    /// unusable entries therefore admits NOBODY — it degrades to "no buyers named", not to
+    /// deny-all — and an emptiness test would advertise [`TargetedAdmission::Named`] for a seat no
+    /// targeted offer can reach. The same predicate `doctor` counts `named_buyers` with is the one
+    /// used here, so a typo cannot read as a working route in either place.
+    ///
+    /// `accept_open_targeted` is checked FIRST because it is a union arm, not a fallback: when it is
+    /// set, a stranger is admitted whatever the list holds, so the answer is
+    /// [`TargetedAdmission::Open`] and the existence of an allowlist is not disclosed at all.
+    pub fn from_seller_config(seller: &SellerConfig) -> Self {
+        let targeted = if seller.accept_open_targeted {
+            TargetedAdmission::Open
+        } else if seller
+            .accept_offers_only_from
+            .iter()
+            .any(|entry| buyer_pubkey_is_reachable(entry))
+        {
+            TargetedAdmission::Named
+        } else {
+            TargetedAdmission::Closed
+        };
+        Self {
+            pool: seller.claim_open_pool,
+            targeted,
+        }
+    }
 }
 
 /// Executor sandbox config (`[sandbox]` section): which executor the awarded agent command runs
@@ -320,6 +584,20 @@ pub struct SandboxConfig {
     /// not name, or to carry a gateway base-URL. Unused under `launcher` mode.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forward_env: Vec<String>,
+    /// `docker` mode: the DNS resolver ADDRESSES a contained job's `/etc/resolv.conf` names.
+    /// Omitted ⇒ the host's own upstream resolvers are discovered and used; a host that names none
+    /// refuses to run jobs rather than picking a public resolver nobody chose.
+    ///
+    /// This exists because docker's embedded resolver at `127.0.0.11` is unreachable from a gVisor
+    /// sandbox — measured, with a runc control that succeeds on the identical image and network —
+    /// and because `docker run --dns` does not change what the daemon writes into a container on a
+    /// user-defined network. Addresses only, never hostnames: resolving the resolver is the problem
+    /// being fixed. A loopback address is refused for the same reason `127.0.0.11` fails.
+    ///
+    /// Each address named here is opened by the job's egress policy on port 53 and nothing else,
+    /// as a single host (`/32`, or `/128` for v6) — never a subnet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns_servers: Vec<String>,
     /// `docker` mode: the container runtime to run the job under (`docker run --runtime <name>`).
     /// Omitted ⇒ the daemon's default runtime (`runc`). The v1 sandbox posture sets this to `runsc`
     /// on Linux, where the default container shares the host kernel and gVisor is the primary
@@ -329,24 +607,28 @@ pub struct SandboxConfig {
     /// Unused under `launcher` mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<String>,
-    /// `docker` mode: the dedicated docker network a job's container joins (`docker run --network`).
-    /// Omitted ⇒ the daemon default (the shared `bridge` network).
+    /// `docker` mode: the **name prefix** for the docker network each job gets to itself.
+    /// Omitted ⇒ no containment, and the daemon default bridge.
     ///
     /// **Setting this is what turns #797 egress containment on for this seat.** A job launched under
     /// it runs in a network namespace whose rules were installed before the job process existed, and
     /// a job whose containment cannot be established FAILS rather than running exposed. There is no
     /// second step: no root command, and nothing to reinstall after a reboot.
     ///
-    /// Two reasons a *named* network rather than the default bridge:
+    /// **It names, it does not share.** This value is not one bridge every job sits on: each job gets
+    /// `<this>-job-<job_id>`, created before its holder and removed after it. The name still does the
+    /// job it always did — telling this seat's networks from a co-tenant daemon's — and no longer
+    /// puts two jobs on one wire. That changed because of a measurement: with jobs sharing a bridge,
+    /// a gVisor job REACHED a live listener inside another job's namespace and no host rule stopped
+    /// it, two containers on one bridge being switched rather than routed, and switched frames
+    /// entering no iptables chain at all on a host without `br_netfilter`. A network per job leaves
+    /// the job no on-link peer but its own gateway, which is also what makes every other destination
+    /// routed, and therefore visible to the host-side policy that binds a gVisor job at all.
     ///
-    /// * **The seller's own services are not on it.** The rules deny by destination, and the seat's
-    ///   LAN and host addresses fall inside those denies. A dedicated network keeps a job's traffic
-    ///   off the bridge every other container on the box shares.
-    /// * **DNS keeps working.** On a user-defined network a container resolves through docker's
-    ///   embedded resolver at `127.0.0.11` inside its own netns, so no packet crosses to a host or LAN
-    ///   resolver. On the shared default bridge docker copies the host's `resolv.conf` instead, and if
-    ///   that names a LAN or host resolver then denying the LAN also denies DNS — which presents as
-    ///   "the internet is broken" rather than as a firewall rule.
+    /// A *named* network rather than the default bridge, for a reason that predates all of that:
+    /// **the seller's own services are not on it.** The rules deny by destination, and the seat's LAN
+    /// and host addresses fall inside those denies, so a job must not share the bridge every other
+    /// container on the box uses.
     ///
     /// See [`crate::sandbox_net`] for what the rules are and [`crate::sandbox_netns`] for how they are
     /// put in force.
@@ -385,6 +667,97 @@ pub struct SandboxConfig {
     /// remains unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_chatgpt: Option<CodexChatgptConfig>,
+    /// `docker` mode: run the job's git delivery INSIDE the sandbox container (Track B).
+    ///
+    /// **The DEFAULT for a docker seat, since the container path was proven live.** Container
+    /// delivery moves the clone, the completion gate, the commit and the push into ONE container, so
+    /// the host never opens a git repository the job agent could write. The host then reads back only
+    /// the commit oid and publishes it.
+    ///
+    /// Three states, and the absent one is what makes the default a default:
+    ///
+    /// * Absent under `docker` ⇒ **container delivery is ON** for a seat whose container runs as a
+    ///   non-root uid. A docker seat that never named the key adopts the container path on upgrade.
+    ///   A ROOT seat (daemon uid 0) resolves the absent key to the HOST path instead; see
+    ///   [`Self::container_delivery_enabled`]. The seller boot line says which.
+    /// * `Some(true)` under `docker` ⇒ ON, said out loud.
+    /// * `Some(false)` under `docker` ⇒ the HOST path: the host clones the base, the container runs
+    ///   the agent, and the host commits and pushes. This is the explicit opt-out, and it keeps
+    ///   working.
+    ///
+    /// Under `launcher` mode there is no container to move the git steps into, so:
+    ///
+    /// * Absent ⇒ the host path, and no refusal. This is every launcher seat, and the flip of the
+    ///   docker default must not make one of them refuse to boot.
+    /// * `Some(true)` ⇒ REFUSED. The config says two different things about where git runs.
+    /// * `Some(false)` ⇒ the host path, and no refusal: it names the path launcher mode already
+    ///   takes, so it contradicts nothing.
+    ///
+    /// `Option<bool>` rather than `bool` for exactly one reason: `bool` cannot tell "the operator
+    /// asked for the host path" apart from "the operator never wrote the key". The default may only
+    /// move where a container exists, and that needs the difference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_delivery: Option<bool>,
+    /// `docker` mode, with container delivery on: how the container obtains the branch-scoped
+    /// push token. Omitted ⇒ [`ContainerDeliveryToken::FreshAfterAgent`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_delivery_token: Option<ContainerDeliveryToken>,
+    /// `docker` mode, with `container_delivery_token = "long-lived"`: the relay's cap on a scoped
+    /// token's lifetime, in seconds. The host REFUSES to mint a token whose `deadline + push margin`
+    /// exceeds this cap, so a job that the relay would refuse at push time fails at launch instead.
+    /// Omitted ⇒ [`crate::seller_exec::DEFAULT_CONTAINER_DELIVERY_TOKEN_CAP_SECS`] (6 hours, the
+    /// relay brief's default). Must be greater than zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_delivery_token_cap_secs: Option<u64>,
+}
+
+impl SandboxConfig {
+    /// Whether this seat runs the job's git delivery inside the sandbox container.
+    ///
+    /// ONE place answers the question, because two places answered it differently and disagreed the
+    /// moment the default moved. Reading `container_delivery` raw now gives the wrong answer for the
+    /// commonest seat there is: a docker seat that never wrote the key.
+    ///
+    /// The mode is part of the answer, not a separate check. Launcher mode creates no container, so
+    /// it is always the host path here; a `Some(true)` under launcher is refused by
+    /// [`crate::seller_exec::SandboxPolicy::from_config`], which is where a config contradiction
+    /// belongs.
+    ///
+    /// `container_uid` is the uid the container will run as — the daemon's own, what `docker run
+    /// --user` gets. Under uid 0 the job is ROOT inside the container: it can unlink any file the
+    /// delivery orchestrator shares with it, and the same-uid boundary between the two is at its
+    /// weakest. Such a seat does not get the container path by default: the absent key resolves to
+    /// the HOST path there, and only an explicit `container_delivery = true` selects the container
+    /// (the operator chose it; the seller boot line still warns). A non-root uid keeps the docker
+    /// default. Injected rather than read here so the resolution is testable for a root seat.
+    pub fn container_delivery_enabled(&self, container_uid: u32) -> bool {
+        matches!(self.mode, SandboxMode::Docker)
+            && match self.container_delivery {
+                Some(explicit) => explicit,
+                None => container_uid != 0,
+            }
+    }
+}
+
+/// How a container-side delivery obtains its branch-scoped push token (`[sandbox]
+/// container_delivery_token`).
+///
+/// The token is a NIP-98 `Authorization` header the host signs. It is scoped to the ONE delivery
+/// ref, so a leaked token can push nothing but the seller's own delivery branch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ContainerDeliveryToken {
+    /// The host mints a FRESH 60-second token only after the container reports that the agent has
+    /// exited and the delivery commit is gated. The container waits for the token file, reads it, and
+    /// pushes. Works with a relay that enforces the standard ±60 s token age. The default.
+    #[default]
+    FreshAfterAgent,
+    /// The host mints ONE token before the container starts, with a NIP-40 `expiration` of
+    /// `deadline + push margin`. The container deletes the inputs file before the agent runs and
+    /// pushes from memory at the end. Requires a relay that honours `expiration` for scoped tokens
+    /// (relay Requirement B); refused at mint when the lifetime exceeds
+    /// `container_delivery_token_cap_secs`.
+    LongLived,
 }
 
 /// Host ChatGPT session source for a contained Docker Codex run.
@@ -444,16 +817,55 @@ pub struct FileCredential {
     /// resolution (`getaddrinfo EAI_AGAIN`) without ever reaching authentication. Every job fails while
     /// the proxy log looks healthy, because nothing about that leg was ever addressed to the proxy.
     ///
-    /// Naming both flags is necessary and, for Cursor today, not sufficient: the redirected agent leg
-    /// reaches the proxy and speaks h2c, and [`crate::credential_proxy`] buffers a request body that
-    /// this client does not close, so the request is never forwarded. Measured on a live contained
-    /// seat. A second flag here fixes the addressing, not that.
+    /// RETRACTED 2026-08-26 — the tree moved under this comment. It was written at `61ee4bc`
+    /// (2026-08-24) and said naming both flags was "not sufficient", because the redirected agent leg
+    /// reached the proxy and spoke h2c while [`crate::credential_proxy`] BUFFERED a request body this
+    /// client never closes, so the request was never forwarded. `0769580` removed that buffering: the
+    /// forward path now streams (`reqwest::Body::wrap_stream(size_bounded(idle_bounded(..)))`), and
+    /// `58008b7` releases the response scrub per chunk rather than per idle. Both are ancestors here.
+    ///
+    /// So naming both flags IS the addressing fix, and a contained cursor seat is no longer blocked on
+    /// this. `a086998` corrected the matching "unsupported" claims in the seller docs.
+    ///
+    /// ⚠ THE SIZE CAP DID NOT GO AWAY WITH THE BUFFER — it changed shape, and reading only the
+    /// removal half of that diff says the opposite. `MAX_REQUEST_BODY_BYTES` is alive and still 32 MiB:
+    /// a declared `content-length` over it is refused 413 BEFORE any forward, and the streamed body is
+    /// bounded by `size_bounded` at the same constant. Two enforcement points, one number.
     ///
     /// Accepts a bare string (one flag) or a list. A bare string is taken **verbatim as a single
     /// flag** and is never split: an element containing whitespace is refused rather than shell-parsed,
     /// for the same reason [`deserialize_agent_command_argv`] refuses a shell string outright.
     #[serde(alias = "endpoint_arg", deserialize_with = "deserialize_endpoint_args")]
     pub endpoint_args: Vec<String>,
+    /// Additional (flags, upstream) legs, for a client whose separate connections go to separate
+    /// hosts. Measured on cursor-agent: `--endpoint` moves the control plane and `--agent-endpoint`
+    /// moves the agent/inference leg, and the two legs' true destinations differ — one `upstream`
+    /// cannot name both. Each leg gets its own proxy listener bound for that leg's authority, and
+    /// the leg's flags are emitted pointing at that listener, so which base URL the client dials is
+    /// what routes each leg to its true host — the client still cannot reach anything this list
+    /// does not name.
+    ///
+    /// Optional and empty by default, so every existing config parses unchanged. NOTE FOR
+    /// DOWNGRADES: a config that has adopted `legs` is refused by any binary predating this field
+    /// (`deny_unknown_fields`), so rolling a seat back means restoring the pre-adoption config
+    /// snapshot alongside the older binary — the binary alone is not a rollback.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub legs: Vec<CredentialLeg>,
+}
+
+/// One additional leg of a [`FileCredential`]: the client flag(s) that redirect this leg to the
+/// proxy, and the true upstream this leg's traffic belongs to. Field semantics match the parent
+/// credential's `endpoint_args`/`upstream` pair exactly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialLeg {
+    /// The client's argument(s) for pointing THIS leg at the proxy (e.g. `--agent-endpoint`). Same
+    /// shape and refusals as [`FileCredential::endpoint_args`].
+    #[serde(alias = "endpoint_arg", deserialize_with = "deserialize_endpoint_args")]
+    pub endpoint_args: Vec<String>,
+    /// The upstream base URL this leg's traffic is actually for (e.g.
+    /// `https://agentn.global.api5.cursor.sh`).
+    pub upstream: String,
 }
 
 /// Which executor the `[sandbox]` section selects.
@@ -789,6 +1201,65 @@ pub fn default_boot_push_preflight() -> bool {
     true
 }
 
+/// `[platform_fee]` — the ONE operational switch on the seller node's automatic platform fee
+/// remittance (seller fee stage 2a, addendum 1). Top-level rather than inside `[seller]` for the
+/// same structural reason as [`SellerPreflightConfig`]: a serde default on a nested table reaches
+/// every existing `config.toml` without a rewrite.
+///
+/// ## What this is
+///
+/// An **operational safety valve**. Money leaves the seller's wallet with no human in the loop once
+/// a payment is collected (see `seller_node::run` and `fee_remit`), so an operator needs a way to
+/// stop those outbound payments without patching a binary — a mint that is misbehaving, a payout
+/// host that is down, an incident. `auto_remit = false` (or `MAXPLAYER_PLATFORM_FEE__AUTO_REMIT=false`)
+/// does exactly one thing: the node stops ATTEMPTING a remittance — on BOTH of its paths, the
+/// collect path's attempt and the run loop's retry tick (stage 2a, addendum 2). One flag, both paths.
+///
+/// ## What this is NOT
+///
+/// - **Not an authorization boundary.** The fee is owed whether or not this is on; the switch does not
+///   forgive it. Accrual is untouched: every collected payment still journals its platform fee, the
+///   unremitted balance keeps growing and stays visible in `maxplayer seller fees`, and the next
+///   remittance — automatic once the switch is back on, or `maxplayer seller fees remit --confirm`
+///   run by hand — pays the whole accumulated balance.
+/// - **Not a way to change where or how much.** It cannot touch the destination
+///   ([`crate::platform_fee::PLATFORM_FEE_ADDRESS`]) or the rate
+///   ([`crate::platform_fee::PLATFORM_FEE_BPS`]); both are compiled in, and this table
+///   (`deny_unknown_fields`) has no key for either.
+/// - **Not a gate on the manual command.** `maxplayer seller fees remit --confirm` is the operator's
+///   recovery path and pays regardless of this switch; the switch governs the automatic attempt only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlatformFeeConfig {
+    /// Attempt to remit the accrued platform fee automatically — after each collected payment, and
+    /// on the node's retry tick while a remittance is failing. Default **true**. Set false (or the
+    /// env override `MAXPLAYER_PLATFORM_FEE__AUTO_REMIT=false`) to stop both automatic attempts; the
+    /// fee keeps accruing and the balance stays owed and visible.
+    #[serde(default = "default_auto_remit")]
+    pub auto_remit: bool,
+}
+
+impl Default for PlatformFeeConfig {
+    fn default() -> Self {
+        Self {
+            auto_remit: default_auto_remit(),
+        }
+    }
+}
+
+impl PlatformFeeConfig {
+    /// True when every field is at its shipped default (so config.toml stays clean — the section is
+    /// only serialized once an operator sets a non-default knob).
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// serde default for [`PlatformFeeConfig::auto_remit`] — automatic remittance ON.
+pub fn default_auto_remit() -> bool {
+    true
+}
+
 impl SellerMemoryConfig {
     /// True when every field is at its shipped default (so config.toml stays clean — the section
     /// is only serialized once an operator sets a non-default knob).
@@ -1077,6 +1548,10 @@ pub struct MaxplayerConfig {
     /// `[seller_preflight]` boot push-probe config. Defaults (probe ON) when absent.
     #[serde(default, skip_serializing_if = "SellerPreflightConfig::is_default")]
     pub seller_preflight: SellerPreflightConfig,
+    /// `[platform_fee]` — the off switch on the seller node's automatic platform fee remittance.
+    /// Defaults (automatic remittance ON) when absent. See [`PlatformFeeConfig`] for what it is not.
+    #[serde(default, skip_serializing_if = "PlatformFeeConfig::is_default")]
+    pub platform_fee: PlatformFeeConfig,
     /// `[buyer_reservation_floor]` local-clock release of an unattempted reservation.
     /// Defaults (feature OFF) when absent.
     #[serde(default, skip_serializing_if = "BuyerReservationFloorConfig::is_default")]
@@ -1229,6 +1704,7 @@ impl Default for MaxplayerConfig {
             telemetry: TelemetryConfig::default(),
             seller_heartbeat: SellerHeartbeatConfig::default(),
             seller_preflight: SellerPreflightConfig::default(),
+            platform_fee: PlatformFeeConfig::default(),
             buyer_reservation_floor: BuyerReservationFloorConfig::default(),
             buyer: BuyerConfig::default(),
             contribution: None,
@@ -1490,6 +1966,7 @@ pub(crate) fn parse_config_toml(raw: &str) -> Result<MaxplayerConfig, HomeError>
 /// `MAXPLAYER_*` spelling, so excluding them costs no config coverage.
 const RESERVED_ENV_VARS: &[&str] = &[
     "MAXPLAYER_HOME",
+    "MAXPLAYER_VERBOSE",
     "MAXPLAYER_HEARTBEAT_INTERVAL_SECS",
     "MAXPLAYER_HEARTBEAT_ENABLED",
     "MAXPLAYER_HEARTBEAT_STALL_MISSED_INTERVALS",
@@ -1659,6 +2136,15 @@ fn documented_config_toml(config: &MaxplayerConfig) -> Result<String, HomeError>
                 "Set false to force testnut/dev-only (any real mint is then refused fail-closed).",
             ],
         ),
+        (
+            "auto_remit",
+            &[
+                "Seller platform fee auto-remittance: after each collected payment the node pays the",
+                "accrued platform fee to the platform's fixed Lightning address. Set false to STOP the",
+                "automatic attempt — an operational valve, not a waiver: the fee keeps accruing and stays",
+                "owed (`maxplayer seller fees remit --confirm` pays it by hand). Cannot change rate/address.",
+            ],
+        ),
     ];
 
     let body =
@@ -1689,8 +2175,10 @@ fn documented_config_toml(config: &MaxplayerConfig) -> Result<String, HomeError>
     out.push_str(
         r#"# --- [sandbox]: how an awarded job runs. Uncomment ONE option below. ---
 # With no [sandbox] section (the default here) the agent runs PASS-THROUGH:
-# directly as this daemon, with no isolation. A seat that claims open-pool
-# work is refused at the boot gate until a real sandbox is configured.
+# directly as this daemon, with no isolation. A seat that strangers can reach
+# — one that claims open-pool work OR accepts targeted offers from buyers it
+# has not named — is refused at the boot gate until a real sandbox is
+# configured.
 #
 # USE DOCKER. It is the only mode with a kernel boundary and egress
 # containment, and the only one that exists on macOS.
@@ -1720,11 +2208,19 @@ fn documented_config_toml(config: &MaxplayerConfig) -> Result<String, HomeError>
 #   proxy_port_range = "9100-9199"
 #   # (no runtime line on macOS; image defaulted by the binary as in Option A)
 #
+# LINK THE MODEL ACCOUNT FIRST. Maxplayer does not authenticate cursor, claude
+# or codex - the adapter starts the vendor CLI and that CLI must already be
+# logged in, as the seller service user. Full walkthrough, per provider:
+# docs/SELLER-QUICKSTART.md "3a. Link your model account".
+#
 # THE CREDENTIAL DOES NOT CROSS INTO THE CONTAINER. A container inherits no
 # home directory and no macOS Keychain, so a `claude /login` credential is
-# unreachable and every job fails on auth while `doctor` and the pre-advertise
-# probe (which run on the HOST) both pass. Put a token in the DAEMON's own
-# environment - for claude, CLAUDE_CODE_OAUTH_TOKEN from `claude setup-token`.
+# unreachable inside the container. `doctor` still passes - it runs no agent
+# turn - but the pre-advertise probe runs INSIDE the container and FAILS, so the
+# seat never advertises rather than advertising and failing every job. A seat
+# that will not advertise under docker is usually THIS. Put a token in the
+# DAEMON's own environment - for claude, CLAUDE_CODE_OAUTH_TOKEN from
+# `claude setup-token`.
 #
 # Option C - launcher, ONLY for a Linux box that cannot run docker. Weaker: no
 # kernel boundary, no egress containment. Full bwrap example: docs/DOCKER.md
@@ -1923,6 +2419,111 @@ mod tests {
     #[test]
     fn default_rate_sats_is_the_market_floor() {
         assert_eq!(DEFAULT_RATE_SATS, 100);
+    }
+
+    /// The positive control. Without it every rejection below would be satisfied by a predicate
+    /// that simply answered `false`.
+    /// The positive control for the SHAPE predicate. Without it every rejection below would be
+    /// satisfied by a predicate that simply answered `false`.
+    ///
+    /// ⚠ `0123456789abcdef…` is asserted here DELIBERATELY and it is correct: it IS wire-shaped.
+    /// It is also unreachable, because it has no curve point — and that gap is the whole reason
+    /// [`buyer_pubkey_is_reachable`] exists. Asserting it here is not a bug being pinned; the bug
+    /// was the CALLERS binding a reachability question to this shape-only answer.
+    #[test]
+    fn a_wire_form_buyer_pubkey_is_wire_shaped() {
+        assert!(buyer_pubkey_is_wire_shaped(&"a1".repeat(32)));
+        assert!(buyer_pubkey_is_wire_shaped(&"0123456789abcdef".repeat(4)));
+    }
+
+    /// x-coordinate of the secp256k1 generator: a key that provably exists, used as the positive
+    /// control so a strict predicate that always answered `false` cannot pass the rejections below.
+    #[cfg(feature = "gateway")]
+    const GENERATOR_X: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+
+    #[cfg(feature = "gateway")]
+    #[test]
+    fn a_real_curve_point_is_reachable() {
+        assert!(
+            buyer_pubkey_is_reachable(GENERATOR_X),
+            "the generator's x-coordinate is a valid x-only key and must count as a route in"
+        );
+    }
+
+    /// ⛔ THE OPERATOR-FACING RULE MUST NOT CLAIM SOMETHING THIS FILE REFUTES. The predicate has no
+    /// provenance signal — it cannot tell copied bytes from typed ones — and `GENERATOR_X` is
+    /// hand-entered right here and reachable. So any wording that groups hand entry with the forms
+    /// that match NOBODY is false, and false in the direction that matters: it hands an operator a
+    /// correction that does not explain their refusal.
+    ///
+    /// ⛔ ASSERTED ON THE NEVER-MATCH CLAUSE ALONE, NOT THE WHOLE STRING. The sentence is ALLOWED to
+    /// discuss typed hex — it must simply not do so inside the claim about what matches nobody, so
+    /// splitting on the marker is what gives this test access to the claim it is actually making.
+    #[cfg(feature = "gateway")]
+    #[test]
+    fn the_criterion_never_groups_typed_hex_with_the_forms_that_match_nobody() {
+        assert!(
+            buyer_pubkey_is_reachable(GENERATOR_X),
+            "precondition: a HAND-ENTERED VALID key must be reachable, or the wording under test \
+             would be true and this test asserts nothing"
+        );
+        let never_match_claim = USABLE_BUYER_ENTRY
+            .split_once("matches nobody")
+            .expect("the criterion must keep a never-match clause for this to assert against")
+            .0;
+        for token in ["hand", "typed", "invented"] {
+            assert!(
+                !never_match_claim.contains(token),
+                "`{token}` appears inside the never-match claim, but `{GENERATOR_X}` is entered by \
+                 hand in this file and IS reachable:\n{USABLE_BUYER_ENTRY}"
+            );
+        }
+    }
+
+    /// ⛔ SHAPE IS NOT SUFFICIENT, AND THESE FIXTURES ARE COMPUTED RATHER THAN EYEBALLED. Roughly
+    /// half of all 64-hex values have no curve point, so "looks like a key" is a coin flip.
+    /// ⚠ TWO OBVIOUS-LOOKING NEGATIVE CONTROLS ARE ACTUALLY VALID KEYS and must NOT be used here:
+    /// x = 1, and `cafe01` zero-padded to 64 — both land ON the curve. A negative control chosen by
+    /// eye is how a strict predicate gets a test that cannot fail.
+    #[cfg(feature = "gateway")]
+    #[test]
+    fn a_wire_shaped_entry_with_no_curve_point_is_not_reachable() {
+        for (entry, why) in [
+            ("0123456789abcdef".repeat(4), "x is a quadratic non-residue: no y exists"),
+            ("ff".repeat(32), "x is above the field modulus: not a field element at all"),
+        ] {
+            assert!(
+                buyer_pubkey_is_wire_shaped(&entry),
+                "precondition: `{entry}` must be SHAPE-valid, or this proves nothing about the \
+                 curve check ({why})"
+            );
+            assert!(
+                !buyer_pubkey_is_reachable(&entry),
+                "{why}: `{entry}` can never be a buyer, so it is not a route in"
+            );
+        }
+    }
+
+    /// ⛔ EACH OF THESE FENCES EVERYONE AND MATCHES NOBODY. The allowlist is compared byte-for-byte
+    /// against a pubkey that arrives as 64 lowercase hex characters, so an entry in any other form
+    /// is not a narrow route in — it is no route at all, while reading to an operator like a seat
+    /// that named a buyer. The capitalised case is the dangerous one: it is the right key.
+    #[test]
+    fn an_entry_that_can_never_match_a_wire_pubkey_is_not_wire_shaped() {
+        for (entry, why) in [
+            ("A1".repeat(32), "capitalised hex — the right key, and it still matches nobody"),
+            ("a1".repeat(31), "too short"),
+            ("a1".repeat(33), "too long"),
+            (String::new(), "empty"),
+            (format!("npub1{}", "q".repeat(58)), "bech32 npub rather than hex"),
+            (format!(" {}", "a1".repeat(32)), "leading space, not trimmed at the match site"),
+            ("g".repeat(64), "right length, not hex"),
+        ] {
+            assert!(
+                !buyer_pubkey_is_wire_shaped(&entry),
+                "{why}: `{entry}` cannot match a wire pubkey and must not be counted as a route in"
+            );
+        }
     }
 
     #[test]
@@ -2175,6 +2776,117 @@ mod tests {
     }
 
     #[test]
+    fn the_onboarding_template_does_not_claim_the_probe_runs_on_the_host() {
+        // The template told a docker operator that `doctor` and the pre-advertise probe "run on the
+        // HOST" and therefore both pass while every job fails on auth. The probe half is FALSE:
+        // `capability::probe_capabilities` renders every probe through
+        // `seller_exec::probe_launch_argv`, so under a docker policy the probe launches INSIDE the
+        // container and a missing contained credential FAILS it — the seat never advertises. A
+        // render failure is fatal there rather than a bare-argv fallback, precisely so a capability
+        // is never proven in the wrong environment
+        // (`capability.rs`, and `a_docker_policy_probes_inside_the_container_and_never_bare_on_the_host`).
+        //
+        // `doctor` is the half that really does stay green: it runs no agent turn. Keeping the two
+        // in one sentence taught operators to expect a seat that advertises and then fails every
+        // job, which is the opposite of what a contained seat does.
+        let rendered = documented_config_toml(&MaxplayerConfig::default()).expect("render documented");
+        assert!(
+            !rendered.contains("which run on the HOST"),
+            "the template must not tell a docker operator the pre-advertise probe runs on the host"
+        );
+        assert!(
+            rendered.contains("doctor"),
+            "the template must still name the check that DOES stay green"
+        );
+    }
+
+    /// The template is where a first-run operator meets `[sandbox]`, and a contained seat with an
+    /// unlinked harness fails the pre-advertise probe and never advertises. Naming the step here is
+    /// the difference between that and a silent non-advertising seat.
+    #[test]
+    fn the_onboarding_template_points_at_the_account_linking_step() {
+        let rendered = documented_config_toml(&MaxplayerConfig::default()).expect("render documented");
+        assert!(
+            rendered.contains("3a. Link your model account"),
+            "the template must name the account-linking section by its heading"
+        );
+        assert!(
+            rendered.contains("docs/SELLER-QUICKSTART.md"),
+            "the template must name the file that section lives in"
+        );
+    }
+
+    // Seller fee stage 2a, addendum 1 §4: the automatic remittance's off switch. ON by default and
+    // absent from a clean config; `false` in the file or via env turns the automatic attempt off; the
+    // table has no key for the destination or the rate, so neither can be moved through it.
+    #[test]
+    fn platform_fee_auto_remit_defaults_on_and_the_switch_cannot_touch_rate_or_address() {
+        assert!(default_auto_remit());
+        let defaults = MaxplayerConfig::default();
+        assert!(
+            defaults.platform_fee.auto_remit,
+            "automatic remittance is ON by default"
+        );
+        assert!(
+            !toml::to_string_pretty(&defaults)
+                .expect("ser")
+                .contains("[platform_fee]"),
+            "a default config carries no [platform_fee] section"
+        );
+
+        let absent = parse_config_toml("relay_url = 'r'\nper_job_budget_sats = 1\n")
+            .expect("absent [platform_fee] parses");
+        assert!(
+            absent.platform_fee.auto_remit,
+            "absent ⇒ ON: existing homes keep remitting"
+        );
+
+        let off = parse_config_toml(
+            "relay_url = 'r'\nper_job_budget_sats = 1\n[platform_fee]\nauto_remit = false\n",
+        )
+        .expect("explicit off parses");
+        assert!(!off.platform_fee.auto_remit);
+        assert!(
+            toml::to_string_pretty(&off)
+                .expect("ser")
+                .contains("[platform_fee]\nauto_remit = false"),
+            "a non-default switch is serialized so it survives a rewrite"
+        );
+
+        let via_env = apply_env_layer(
+            &MaxplayerConfig::default(),
+            env(&[("MAXPLAYER_PLATFORM_FEE__AUTO_REMIT", "false")]),
+        )
+        .expect("env override parses");
+        assert!(
+            !via_env.platform_fee.auto_remit,
+            "the env override turns it off"
+        );
+        let back_on = apply_env_layer(&off, env(&[("MAXPLAYER_PLATFORM_FEE__AUTO_REMIT", "true")]))
+            .expect("env override parses");
+        assert!(
+            back_on.platform_fee.auto_remit,
+            "and back on over a file that says off"
+        );
+
+        // No key for the destination or the rate: the switch cannot be turned into a redirect.
+        for key in ["address", "destination", "fee_bps", "rate"] {
+            let refused = parse_config_toml(&format!(
+                "relay_url = 'r'\nper_job_budget_sats = 1\n[platform_fee]\n{key} = 1\n"
+            ));
+            assert!(
+                refused.is_err(),
+                "[platform_fee] {key} must be refused (deny_unknown_fields)"
+            );
+        }
+        let malformed = apply_env_layer(
+            &MaxplayerConfig::default(),
+            env(&[("MAXPLAYER_PLATFORM_FEE__AUTO_REMIT", "sometimes")]),
+        );
+        assert!(malformed.is_err(), "a non-boolean refuses, never defaults");
+    }
+
+    #[test]
     fn shipped_defaults_are_real_money_and_the_fence_admits_them() {
         // #378 flipped fresh nodes real-money-capable. The whole default posture in one place; the
         // load-bearing part is that mint_allowed ADMITS the shipped default mint (it would REFUSE it
@@ -2262,6 +2974,96 @@ mod tests {
         assert_eq!(buzz.name, "legacy-buzz");
         assert_eq!(buzz.heartbeat_secs, 30);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// ⛔ AN ABSENT `container_delivery` MUST SURVIVE A REAL SAVE. Container delivery is the default
+    /// for a docker seat, and the default is reachable only while the key stays out of the file. A
+    /// `save_config` that wrote `container_delivery = false` for an unset switch would pin every
+    /// docker seat to the host path on its next save, and the new default would reach nobody.
+    ///
+    /// Goes through `save_config` and `write_config` — `toml::to_string_pretty`, not the
+    /// `toml::to_string` the `seller_exec` unit test uses — and then re-reads the file, so the
+    /// guarantee is measured on the writer an operator's seat actually runs.
+    ///
+    /// RED ON REVERT: drop `skip_serializing_if = "Option::is_none"` from the field and this fails.
+    #[test]
+    fn an_unset_container_delivery_switch_is_never_written_back() {
+        let root = temp_home("container-delivery-writeback");
+        let _ = fs::remove_dir_all(&root);
+        let mut home = bootstrap(&root).expect("bootstrap");
+
+        // A docker seat that names the mode and nothing about delivery.
+        save_config(&mut home, |config| {
+            config.sandbox = Some(SandboxConfig {
+                mode: SandboxMode::Docker,
+                image: Some("maxplayer-sandbox:test".into()),
+                ..Default::default()
+            });
+        })
+        .expect("save");
+
+        let raw = fs::read_to_string(home.root.join(CONFIG_FILE)).expect("read config.toml");
+        assert!(
+            raw.contains("mode = \"docker\""),
+            "the fixture must really have written a docker seat: {raw}"
+        );
+        assert!(
+            !raw.contains("container_delivery"),
+            "an unset switch must leave no trace in config.toml: {raw}"
+        );
+        let on_disk = load_config(&home.root.join(CONFIG_FILE)).expect("reload file");
+        let sandbox = on_disk.sandbox.expect("the [sandbox] section survived");
+        assert_eq!(sandbox.container_delivery, None);
+        assert!(
+            sandbox.container_delivery_enabled(1000),
+            "and the re-read config still resolves to the container path"
+        );
+
+        // The explicit opt-out, by contrast, is written and re-read.
+        save_config(&mut home, |config| {
+            if let Some(sandbox) = config.sandbox.as_mut() {
+                sandbox.container_delivery = Some(false);
+            }
+        })
+        .expect("save the opt-out");
+        let raw = fs::read_to_string(home.root.join(CONFIG_FILE)).expect("read config.toml");
+        assert!(raw.contains("container_delivery = false"), "{raw}");
+        let on_disk = load_config(&home.root.join(CONFIG_FILE)).expect("reload file");
+        let sandbox = on_disk.sandbox.expect("the [sandbox] section survived");
+        assert_eq!(sandbox.container_delivery, Some(false));
+        assert!(!sandbox.container_delivery_enabled(1000));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The root posture of the container-delivery default: an absent key is ON for a non-root
+    /// container uid and OFF for uid 0; an explicit value wins under either uid; launcher mode is
+    /// always off. RED ON REVERT: `unwrap_or(true)` made root + absent resolve to the container.
+    #[test]
+    fn container_delivery_default_depends_on_the_container_uid() {
+        let absent = SandboxConfig { mode: SandboxMode::Docker, ..Default::default() };
+        assert!(absent.container_delivery_enabled(1000));
+        assert!(!absent.container_delivery_enabled(0), "root + absent ⇒ the host path");
+        let on = SandboxConfig {
+            mode: SandboxMode::Docker,
+            container_delivery: Some(true),
+            ..Default::default()
+        };
+        assert!(on.container_delivery_enabled(0), "root + true ⇒ the operator chose the container");
+        assert!(on.container_delivery_enabled(1000));
+        let off = SandboxConfig {
+            mode: SandboxMode::Docker,
+            container_delivery: Some(false),
+            ..Default::default()
+        };
+        assert!(!off.container_delivery_enabled(0));
+        assert!(!off.container_delivery_enabled(1000));
+        let launcher = SandboxConfig {
+            mode: SandboxMode::Launcher,
+            container_delivery: Some(true),
+            ..Default::default()
+        };
+        assert!(!launcher.container_delivery_enabled(1000));
     }
 
     #[test]
@@ -2533,6 +3335,7 @@ mod tests {
         // resolution from refusing when they are set. The filtered map must drop them.
         let raw = env(&[
             ("MAXPLAYER_HOME", "/tmp/x"),
+            ("MAXPLAYER_VERBOSE", "1"),
             ("MAXPLAYER_HEARTBEAT_INTERVAL_SECS", "9"),
             ("MAXPLAYER_RELAY_URL", "wss://kept"),
         ]);
@@ -2712,6 +3515,43 @@ mod tests {
         "#;
         let cred: super::FileCredential = toml::from_str(old).expect("the old spelling must parse");
         assert_eq!(cred.endpoint_args, vec!["--endpoint".to_owned()]);
+    }
+
+    // BACK-COMPAT FOR PERSISTED CONFIG: a credential block written before `legs` existed parses
+    // unchanged — the field is optional and defaults empty, and no existing field changed shape.
+    // This is the config half of "the length-1 case behaves exactly as before".
+    #[test]
+    fn a_file_credential_without_legs_parses_unchanged() {
+        let old = r#"
+            path = "/home/seller/.config/cursor/auth.json"
+            field = "accessToken"
+            env = "CURSOR_AUTH_TOKEN"
+            upstream = "https://api2.cursor.sh"
+            endpoint_args = ["--endpoint"]
+        "#;
+        let cred: super::FileCredential =
+            toml::from_str(old).expect("a pre-legs credential block must parse unchanged");
+        assert!(cred.legs.is_empty(), "absent legs must default to empty, never error");
+    }
+
+    #[test]
+    fn a_credential_leg_parses_with_its_own_flags_and_upstream() {
+        let with_leg = r#"
+            path = "/home/seller/.config/cursor/auth.json"
+            field = "accessToken"
+            env = "CURSOR_AUTH_TOKEN"
+            upstream = "https://api2.cursor.sh"
+            endpoint_args = ["--endpoint"]
+
+            [[legs]]
+            endpoint_args = ["--agent-endpoint"]
+            upstream = "https://agentn.global.api5.cursor.sh"
+        "#;
+        let cred: super::FileCredential =
+            toml::from_str(with_leg).expect("a credential with one leg must parse");
+        assert_eq!(cred.legs.len(), 1);
+        assert_eq!(cred.legs[0].endpoint_args, vec!["--agent-endpoint".to_owned()]);
+        assert_eq!(cred.legs[0].upstream, "https://agentn.global.api5.cursor.sh");
     }
 
     #[test]

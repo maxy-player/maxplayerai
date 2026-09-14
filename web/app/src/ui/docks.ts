@@ -173,7 +173,7 @@ const statBlock = (pairs: [string, string, string?][]): string =>
 
 const fieldLabel = (name: string): string => ({
   d: "Seat", t: "Namespace", v: "Protocol version", rate: "Rate (sats)",
-  accepting: "Accepting work", queue_depth: "Queue depth",
+  accepting: "Serving", queue_depth: "Jobs in flight",
   accepted_mints: "Accepted mints", agents: "Agents",
   model: "Model", models: "Models", hardware: "Hardware",
 } as Record<string, string>)[name] || String(name).replaceAll("_", " ").replace(/\b\w/g, (c) => c.toUpperCase());
@@ -259,61 +259,35 @@ const OPERATOR_DECLARED = {
 };
 
 /**
- * The one capability field backed by a mechanism, and the only one current as
- * of the beat that carries it (protocol v1 §4.5.3, §4.5.4).
- */
-const ENFORCED_AT_DISPATCH = {
-  mark: "enforced at dispatch",
-  markClass: "provenance",
-  title: "Read from the live roster each time a beat is drafted, so it is current as of this beat. Dispatch binds to the named family exactly or not at all — the only one of the three filterable fields backed by a mechanism.",
-};
-
-/**
- * Last-observed, and never a promise about the next job.
- *
- * The wording here is constrained on purpose. This field carries what a harness
- * reported when it was last asked; nothing in the stack pins a model or reads
- * back what executed. Any stronger verb — ran, runs, will run, is serving,
- * guarantees — states a fact no code supports, and the tense is not what makes
- * it wrong. See `HARNESS_MODEL_TAG` beside the emitter.
- */
-const LAST_OBSERVED = {
-  mark: "last observed",
-  markClass: "provenance",
-  title: "What this harness said about itself when it was last asked, republished on every beat since. Not a promise about the next job. A result echoes a model id, so a divergence is visible in a buyer's own records — an inconsistency signal, never proof of what ran.",
-};
-
-/**
- * The stalest of the three, and the one a buyer commits sats on. Bounded by the
- * seat's UPTIME rather than by the beat cadence, and it drifts in both
- * directions — only one of which is safe (protocol v1 §4.5.4).
- */
-const AS_OF_SEAT_START = {
-  mark: "as of seat start",
-  markClass: "provenance",
-  title: "Probed once when the seat started and republished on every beat since, so a recent beat is NOT evidence of a recent measurement. A token means its probe command resolved in the job execution environment then: necessary for the work, not sufficient. A toolchain removed since start is still advertised, so this row can over-claim, and nothing on the filter path catches it.",
-};
-
-/**
  * What the runner says it can run, from the newest heartbeat.
  *
- * THE ROWS ARE NOT EQUAL, and the difference is provenance, not confidence.
- * Protocol v1 §4.5.3 is explicit that a reader MUST NOT read the three
- * filterable fields as three grades of proof: `harness_family` is an
- * ENFORCEMENT, `harness_model` is an ECHO a buyer can notice a divergence
- * against, and `capabilities` is a SILENCE — no event carries a capability back
- * at all. §4.5.4 then gives the three different freshness guarantees, and only
- * `harness_family` is current as of the beat carrying it.
+ * ⚠ WHAT THIS FUNCTION NO LONGER TELLS A BUYER. Until 2026-08-27 the three
+ * machine-sourced rows each carried a provenance mark and a hover title, and
+ * the comment here argued at length that they MUST: protocol v1 §4.5.3 says a
+ * reader must not read `harness_family`, `harness_model` and `capabilities` as
+ * three grades of one proof, and §4.5.4 gives them three different freshness
+ * guarantees. The owner removed the marks and the titles as unwanted warnings
+ * (bob, 01:41:30Z and 01:48:06Z). That is a product decision about the sheet
+ * and it stands — but it does not make the protocol distinction untrue, so the
+ * argument is restated here as a limitation rather than deleted.
  *
- * So every row wears its own mark and the marks differ where the proof differs.
- * Flush and unmarked, the weakest row reads as solidly as the enforced one, and
- * a buyer commits sats on the weakest of the three. The last two rows are free
- * text an operator typed; they stay marked apart from all three, because
- * nothing pays out on them.
+ * The three rows now render flush and identical. On this sheet a buyer cannot
+ * see that `harness_family` is current as of the beat carrying it, that
+ * `harness_model` is only what the harness last said about itself, or that
+ * `capabilities` was probed once at seat start and is bounded by the seat's
+ * UPTIME — which is the stalest of the three and the one a buyer commits sats
+ * on. Nothing here is enforcement either way: nothing at the seat reads the
+ * family, and no event carries a capability back at all.
  *
- * Every row is an ANNOUNCEMENT either way. This reader sees the claim, never
- * the probe. A mark says what a claim is worth, not that anything verified it
- * here.
+ * So the capability row can over-claim — a toolchain removed since seat start
+ * is still advertised — and nothing on the filter path and nothing on this
+ * sheet now catches it. If that gap is to be closed it must be closed
+ * somewhere other than these rows.
+ *
+ * The last two rows are free text an operator typed. They keep their
+ * `operator-declared` mark: it was not in scope, and nothing pays out on them.
+ *
+ * Every row is an ANNOUNCEMENT. This reader sees the claim, never the probe.
  *
  * An unstated field yields no row. A seat may state nothing — the stock Docker
  * runtime image proves no tokens at all — and an empty row would read as a
@@ -322,10 +296,10 @@ const AS_OF_SEAT_START = {
 export function capabilityRows(s: { harnessFamilies?: string[]; harnessModels?: HarnessModel[]; capabilities?: string[]; harnessVariant?: string | null; hardware?: string | null } | null): ProfileRow[] {
   if (!s) return [];
   return [
-    ["Harness family", s.harnessFamilies?.length ? s.harnessFamilies.join(" · ") : null, ENFORCED_AT_DISPATCH],
+    ["Harness family", s.harnessFamilies?.length ? s.harnessFamilies.join(" · ") : null],
     ["Harness model", s.harnessModels?.length
-      ? s.harnessModels.map((m) => `${m.family} ${m.model}`).join(" · ") : null, LAST_OBSERVED],
-    ["Capabilities", s.capabilities?.length ? s.capabilities.join(" · ") : null, AS_OF_SEAT_START],
+      ? s.harnessModels.map((m) => `${m.family} ${m.model}`).join(" · ") : null],
+    ["Capabilities", s.capabilities?.length ? s.capabilities.join(" · ") : null],
     ["Harness variant", s.harnessVariant || null, OPERATOR_DECLARED],
     ["Hardware", s.hardware || null, OPERATOR_DECLARED],
   ];
@@ -361,24 +335,37 @@ function participantSheet(view: MarketView, role: "buyer" | "seller", pubkey: st
   }
   const parts = [`<h3>${dot}<span>${isSeller ? "Runner" : "Racer"} ${title}</span></h3>`];
 
-  /* Profile: identity plus what the participant advertises. "Accepting work:
-     No" is a published value and stays; an absent advertisement does not. */
+  /* Profile: identity plus what the participant advertises. "Status: Not
+     serving" is a published value and stays; an absent advertisement does not. */
   const kind0 = view.profiles.get(pubkey);
   const about = kind0?.about ?? s?.about ?? b?.about;
   const accepting = s?.accepting;
   // The wire value is "y"/"n" (measured on the live relay 8/13 — 20 of 21
   // heartbeats say "y"). Accept the long forms too; an unknown value shows
   // raw rather than being silently misread as a refusal.
-  const acceptingText = accepting == null ? null
-    : ["y", "yes", "true", "1"].includes(String(accepting).toLowerCase()) ? "Yes"
-    : ["n", "no", "false", "0"].includes(String(accepting).toLowerCase()) ? "No"
+  const acceptingFlag = accepting == null ? null
+    : ["y", "yes", "true", "1"].includes(String(accepting).toLowerCase()) ? true
+    : ["n", "no", "false", "0"].includes(String(accepting).toLowerCase()) ? false
+    : null;
+  // `accepting=y` means the seat is alive and serving, NOT that it has a free
+  // slot (protocol-v1 §4.2): a seat holding one job of three still says "y".
+  // So the row is not "Accepting work: Yes/No" — that read as "has room". It
+  // renders `accepting` and `queue_depth` together: serving plus the load it
+  // is carrying. A seat that is actually full shows it by not claiming. Depth
+  // 0 is NOT rendered as "idle": claim-time slot reservations are excluded
+  // from `queue_depth`, so 0 can be a seat with every slot spoken for.
+  const depth = s?.queueDepth;
+  const loadText = depth == null ? null
+    : `${nf.format(depth)} job${depth === 1 ? "" : "s"} in flight`;
+  const statusText = accepting == null ? null
+    : acceptingFlag === true ? (loadText ? `Serving · ${loadText}` : "Serving")
+    : acceptingFlag === false ? (depth ? `Not serving · ${loadText}` : "Not serving")
     : String(accepting);
   const profileRowsHtml = ([
     ["About", about ? String(about) : null],
     ["Min rate", s?.askSats == null ? null : `${usd(s.askSats)} · ${nf.format(s.askSats)} sat`],
-    ["Accepting work", acceptingText],
+    ["Status", statusText],
     ["Accepted mints", s?.acceptedMints?.length ? s.acceptedMints.join(" · ") : null],
-    ["Agents", s?.advertisedAgents?.length ? s.advertisedAgents.join(" · ") : null],
     ...capabilityRows(s),
   ] as ProfileRow[])
     .filter(([, v]) => v != null && v !== "")
@@ -484,7 +471,9 @@ function eventSheet(view: MarketView, id: string, jobExpanded = false): string {
   rows.push(["Published", esc(stamp(raw.created_at))]);
   rows.push(["Event id", copyId(raw.id)]);
   if (e?.offerId) rows.push(["Job", copyId(e.offerId)]);
-  if (e?.amount != null) rows.push(["Amount", esc(`${usd(e.amount)} · ${nf.format(e.amount)} sat`)]);
+  // A free offer is named, not priced at zero: "$0.00" reads as a price.
+  if (e?.free) rows.push(["Amount", "free · no payment"]);
+  else if (e?.amount != null) rows.push(["Amount", esc(`${usd(e.amount)} · ${nf.format(e.amount)} sat`)]);
   if (e?.outputType) rows.push(["Deliverable", copyTrunc(e.outputType)]);
   if (e?.deadline) rows.push(["Deadline", esc(stamp(e.deadline))]);
   if (e?.harness) rows.push(["Harness", esc(e.harness)]);
@@ -512,6 +501,7 @@ function eventSheet(view: MarketView, id: string, jobExpanded = false): string {
   const workingDot = workingJob ? statusDot(true, [workingJob]) : "";
   return `<h3>${workingDot}<span>${esc(KIND_LABELS[raw.kind] || "Event")}</span></h3>
     ${e?.selfTrade ? '<p class="selfnote"><b>Self-commissioned.</b> The racer operates the runner being paid. Real work, but not market demand.</p>' : ""}
+    ${e?.free || trade?.free ? '<p class="selfnote"><b>Free job.</b> It settles with no payment: the accept is the last event, and no receipt is owed or expected.</p>' : ""}
     <h4>Event details</h4>${detailsKv}
     ${e?.description ? `<h4>The job</h4><div class="job-wrap"><p class="job ${jobExpanded ? "" : "clamp"}">${esc(e.description)}</p><div class="chips">${e.description.length > 160 ? `<button type="button" class="chip show-chip" data-job-toggle>${jobExpanded ? "hide" : "show"}</button>` : ""}<button type="button" class="chip copy-chip" data-copy-text="${esc(e.description)}">copy</button></div></div>` : ""}
     ${eventAdvert}

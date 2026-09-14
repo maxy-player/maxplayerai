@@ -27,6 +27,8 @@ pub mod delivery_git;
 #[cfg(feature = "git-delivery")]
 pub mod git_transport;
 #[cfg(feature = "git-delivery")]
+pub mod delivery_orchestrator;
+#[cfg(feature = "git-delivery")]
 mod store_maint;
 #[cfg(feature = "wallet")]
 pub mod doctor;
@@ -37,11 +39,21 @@ pub mod engine;
 pub mod env_provision;
 pub mod episode;
 pub mod event;
+/// Paying the accrued platform fee: the ONE remit path in the product, behind an effects trait so
+/// the decision logic is tested without a network or a mint. Three callers — the seller node's
+/// collect path (automatic, best-effort), the seller node's retry tick (automatic, backed off), and
+/// `maxplayer seller fees remit` (inspection and recovery).
+#[cfg(feature = "wallet")]
+pub mod fee_remit;
 pub mod format;
 pub mod gateway;
 pub mod heartbeat;
 pub mod home;
 pub mod kinds;
+/// LNURL-pay (LUD-06/LUD-16) resolution of a Lightning address to a bolt11 invoice, fail-closed.
+/// Used by [`fee_remit`] only; `wallet`-gated because it rides the `reqwest` client.
+#[cfg(feature = "wallet")]
+pub mod lnurl_pay;
 pub mod log;
 // Ungated on purpose: the CLI's MCP tool table reads the long-poll cap from here on a build with
 // no `wallet` feature, where `job_lifecycle` is compiled out.
@@ -62,12 +74,38 @@ pub mod payment;
 pub mod payment_send;
 #[cfg(feature = "wallet")]
 pub mod payment_wallet;
+/// Seller-side platform fee: the product-set rate in basis points, the fee arithmetic, and the
+/// product-set payout address. Ungated so the arithmetic builds and tests everywhere; accrued and
+/// journaled at collect, remitted by [`fee_remit`] — automatically after each collect, or by
+/// `maxplayer seller fees remit --confirm`.
+pub mod platform_fee;
 pub mod receipt;
 /// Shared NIP-42 relay-auth handshake, neutral to any single consumer (seller receive + buyer
 /// receipt-publish both use it).
 #[cfg(feature = "gateway")]
 pub mod relay_auth;
+/// The relay's advertised scoped-token policy (NIP-11), and the boot verdict for `[sandbox]
+/// container_delivery_token = "long-lived"`.
+///
+/// UNGATED on purpose, like [`sandbox_net`] below: the decision "may this seat mint a long-lived
+/// push token" is a safety verdict, so it is compiled and tested on every feature set. Only the one
+/// HTTP GET inside it needs `git-delivery`, which is the feature that carries `reqwest`.
+pub mod relay_info;
 pub mod runtime_guard;
+/// The resolver a contained job can actually reach, and the `/etc/resolv.conf` that names it.
+/// Ungated for the same reason as [`sandbox_net`] below: under gVisor a job that cannot resolve
+/// cannot deliver, so where its lookups go is policy, and it is compiled and tested on every build.
+pub mod sandbox_dns;
+/// The live DNS runtime gate: `#[ignore]`d tests that ask a real kernel whether a contained job can
+/// resolve through the file its launch wrote. HARNESS ONLY — no product behaviour lives here, and it
+/// compiles only under `cfg(test)` with the feature combination `prepare_launch` needs.
+#[cfg(all(test, feature = "acp", feature = "wallet"))]
+mod sandbox_dns_live;
+/// The live egress ATTRIBUTION gate: `#[ignore]`d numeric-IP probes that ask whether a contained
+/// gVisor payload reaches denied destinations, so the same file can be run against the DNS patch and
+/// against its base to tell a regression from a preexisting condition. HARNESS ONLY.
+#[cfg(all(test, feature = "acp", feature = "wallet"))]
+mod sandbox_egress_live;
 /// Host-side network containment for a docker job (#797): which destinations a job may reach, and
 /// the `iptables` rules that enforce it on the two chains container traffic actually splits across.
 ///

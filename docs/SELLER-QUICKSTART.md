@@ -125,7 +125,8 @@ All four are overridable in `config.toml`.
 creation — on a shared host, seller state (key, mint proofs, config, job workdirs) IS the wallet, so a
 group/world-readable home lets any local user read money-bearing material (#473). This is a property of
 the binary, not of your `umask`, and `maxplayer doctor` has a **home permissions** leg that flags a home
-that has since drifted open (WARN for a targeted seat, FAIL for an open-pool one). The one thing the
+that has since drifted open (WARN for a seat only its named buyers can reach, FAIL for one strangers
+can reach by either open surface — see §6). The one thing the
 binary cannot own is state a **harness** writes outside the seat home (e.g. a Cursor config under `~`):
 run the daemon under a service unit with **`UMask=0077`** so that residue is owner-only too.
 
@@ -159,7 +160,7 @@ Notes:
   - no --key (packaged key file only)
   - startup runs the doctor readiness gate and REFUSES to boot on a blocking failure (no working nix, agent unresolvable, no mint reachable, seller key missing, relay unreachable), each with a fix hint
   - --skip-doctor: bypass the startup readiness checks (default: checks-on; not recommended). The nix check still runs — it is an environment requirement (#745) with no bypass
-  - --unsafe-no-sandbox: serve the OPEN POOL with no working sandbox — this box then runs code written by strangers with no containment (waives only that one check)
+  - --unsafe-no-sandbox: serve a STRANGER-FACING surface with no working sandbox (either open surface) — this box then runs code written by strangers with no containment (waives only that one check)
   - open-pool claiming is OFF by default; pass --claim-open-pool to opt in
   - --offer-backfill-secs <n>: see OPEN-POOL offers posted up to n seconds before startup (default 1200; 0 = live-only; targeted offers always backfill)
 ```
@@ -170,12 +171,13 @@ Notes:
 | `--agent-argv <part>` | yes* (repeatable) | Build `agent_command` as an **argv array** (first entry = program). Shell strings refused. Pass either `--agent` **or** `--agent-argv`, not both. |
 | `--rate-sats <n>` | yes (first run) | Claim floor in sats + your net-positive floor. The setup default is `100` (see [§7](#7-fees--rate--set---rate-sats-to-net-positive)). |
 | `--git-remote <url>` | no | Public https delivery remote (BYO). Omit → the hosted relay-git default. |
-| `--claim-open-pool` | no | Opt in to also claim untargeted/open offers (default **off** = targeted-only). `--no-claim-open-pool` forces off. |
+| `--claim-open-pool` | no | Opt in to claim untargeted/open-pool offers (default **off**). `--no-claim-open-pool` forces off. |
+| `--accept-open-targeted` | no | Opt in to accept targeted offers from buyers you have NOT named (default **off**). `--no-accept-open-targeted` forces off. See §6 — with neither this nor an allowlist, the seat claims nothing. |
 | `--name <display>` | no | Optional kind-0 display name published for discoverability. |
 | `--job-timeout-secs <n>` | no | Per-job timeout (seconds). |
 | `--offer-backfill-secs <n>` | no | See OPEN-POOL offers posted up to `n` seconds before startup (default `1200`; `0` = live-only; targeted offers always backfill). |
 | `--skip-doctor` | no | Bypass the startup readiness checks (checks-on by default; not recommended). Does **not** bypass the nix check — that is an environment requirement (#745: "can this box EVER do the work"), so it survives every flag. |
-| `--unsafe-no-sandbox` | no | Serve the open pool with no working sandbox — this box then runs strangers' code uncontained. Waives that one check only. |
+| `--unsafe-no-sandbox` | no | Serve a stranger-facing surface (either open surface) with no working sandbox — this box then runs strangers' code uncontained. Waives that one check only. |
 | `--home <dir>` | no | Home root (else `MAXPLAYER_HOME` / `~/.maxplayer`). |
 
 \* Exactly one of `--agent` / `--agent-argv` is required on the **first** run. After that they are
@@ -233,6 +235,207 @@ text in that workdir, and on completion pushes the tree and publishes kind-3403 
 > fallback commits.
 
 ---
+
+## 3a. Link your model account
+
+Maxplayer does not authenticate Cursor, Claude, or Codex. The ACP adapter starts the vendor CLI, and
+that CLI must **already be linked to an account**. A seat with a correct `config.toml` and an
+unauthenticated CLI is a seat that cannot earn.
+
+### Rules that apply to every provider
+
+- **Link as the seller service user, with its real `HOME` and `PATH`.** A login performed as `root` is
+  invisible to a daemon running as `seller`. An `export` in an interactive shell is invisible to an
+  already-running systemd service — the credential takes effect on the **restart**, not before it.
+- **Keep each runner's login fresh and separate.** Do not copy another runner's credential or reuse its
+  home. Credential directories should be mode `0700`; credential files and service environment files
+  should be mode `0600`.
+- **Subscription login and API-key login are different things.** They use different billing,
+  different entitlements, and sometimes different available models. Choose deliberately.
+- **`maxplayer doctor` cannot tell you the CLI is linked.** It checks configuration, binaries, images,
+  and containment, and it runs **no agent turn**. The seller's pre-advertise probe does run one,
+  through the same sandbox path a paid job uses, so an auth failure there keeps the seat off the board.
+  A green `doctor` beside a seat that never advertises is the normal shape of an unlinked harness.
+- **Never print, commit, paste into chat, or place a durable credential in `config.toml`.** On a
+  headless server, share only the one-time browser URL or code through a private channel, and keep the
+  login process running until approval completes.
+
+### Cursor
+
+For a host or `launcher` seat:
+
+```bash
+# Run as the seller service user, with its real HOME and PATH.
+NO_OPEN_BROWSER=1 cursor-agent login
+cursor-agent status
+```
+
+`NO_OPEN_BROWSER=1` makes a headless runner print the browser URL instead of trying to open a local
+browser. Keep the command running, open the URL on a signed-in computer, approve it, and wait for the
+terminal to report success.
+
+> **Vendor behaviour we do not control.** The `login`, `status` and `logout` commands and the
+> `NO_OPEN_BROWSER=1` environment variable are documented by Cursor at
+> <https://cursor.com/docs/cli/reference/authentication> (read 2026-08-27). Maxplayer neither sets nor
+> validates them, and Cursor may change them in any release.
+>
+> ⚠ **`AGENT_CLI_CREDENTIAL_STORE` is NOT on that page, and neither is any session-file path.** Read
+> 2026-08-27, that article (`<title>Authentication | Cursor Docs</title>`) names exactly two environment
+> variables — `NO_OPEN_BROWSER` and `CURSOR_API_KEY` — and contains **zero** occurrences of
+> `AGENT_CLI_CREDENTIAL_STORE`, `auth.json` or `/.cursor`. So the variable in the command below, and
+> the file location after it, rest on **one operator run — 2026-08-26, Cursor Agent
+> `2026.08.25-3e8eec8` on Linux — not on vendor documentation, and not reproduced by this project.**
+> Treat both as unverified and confirm them on your own machine before you rely on them.
+>
+> The URL earlier editions of this page cited, `docs.cursor.com/en/cli/reference/authentication`, is
+> dead. Every path on that host answers `HTTP 308` to the same `cursor.com/docs` landing page —
+> including a path we invented that cannot exist (measured 2026-08-27). A link that accepts a nonsense
+> path is not a citation, so it was replaced rather than followed.
+
+For a Docker seat, use the **browser session file**, not `CURSOR_API_KEY`. Force file storage during
+login if the platform would otherwise use a Keychain:
+
+```bash
+AGENT_CLI_CREDENTIAL_STORE=file NO_OPEN_BROWSER=1 cursor-agent login
+```
+
+⚠ **Find the session file; do not assume its path.** Cursor Agent `2026.08.25-3e8eec8` on Linux wrote
+`$HOME/.config/cursor/auth.json` even with `AGENT_CLI_CREDENTIAL_STORE=file` (operator-measured,
+2026-08-26), while older Cursor documentation names `$HOME/.cursor/auth.json`. Both locations are real
+for some build. Locate the one **your** build wrote, then lock it down:
+
+```bash
+ls -l "$HOME/.config/cursor/auth.json" "$HOME/.cursor/auth.json" 2>/dev/null
+chmod 600 <the file that exists>
+cursor-agent status
+```
+
+⛔ **Do not read `doctor`'s credential-directory check as proof of this file.** It inspects the
+directories Maxplayer knows for a harness; it does not open your session file, and it cannot tell you
+which location your Cursor build actually uses. `stat` the configured file yourself and confirm the
+owner, the mode, and that the service user can read it — without printing its contents.
+
+Point the contained seat at the file by **absolute path**. Cursor needs **two legs**: its control plane
+and its agent/inference leg go to different hosts, and one `upstream` cannot name both.
+
+```toml
+[[sandbox.file_credentials]]
+path = "/absolute/path/to/.config/cursor/auth.json"   # the path YOU verified above
+field = "accessToken"
+env = "CURSOR_AUTH_TOKEN"
+upstream = "https://api2.cursor.sh"
+endpoint_args = ["--endpoint"]
+
+[[sandbox.file_credentials.legs]]
+endpoint_args = ["--agent-endpoint"]
+upstream = "https://agentn.global.api5.cursor.sh"
+```
+
+If you select a **named agent pool**, pin the model on the named preset, not only on the legacy
+fallback command. `agents = ["cursor"]` alone resolves the built-in preset and drops extra model
+arguments:
+
+```toml
+[seller]
+agents = ["cursor"]
+
+[agents.cursor]
+argv = ["cursor-agent", "--model", "cursor-grok-4.6-high", "acp"]
+```
+
+⛔ **`forward_env = ["CURSOR_API_KEY"]` is unsafe for untrusted Docker jobs.** It puts a real, reusable
+key inside the job container, where a stranger's job reads it. `doctor` WARNs rather than refusing, so
+the seat runs and leaks. Use the session file above instead: the per-job proxy keeps the real value on
+the host and hands the container a placeholder.
+
+The endpoint flags, the upstream hosts, and the session-file location are all **version-measured Cursor
+behaviour**. Revalidate them whenever you move the pinned Cursor build.
+
+### Claude
+
+For a host or `launcher` seat, run `claude`, choose the Claude.ai or Console account in the browser, and
+use `/login` to relink an existing install. Over SSH or in a container, copy the displayed URL into a
+browser and paste the returned code back into the terminal.
+
+```bash
+claude auth status
+```
+
+> **Vendor behaviour we do not control.** Anthropic documents the current flow and its storage locations
+> at <https://code.claude.com/docs/en/authentication> (read 2026-08-26).
+
+`/login` writes a user credential under `~/.claude` on Linux and Windows, and to the **macOS Keychain**.
+That is enough for a host or `launcher` seat. It is **not visible inside Docker**: a container inherits
+no home directory and no Keychain.
+
+For an unattended Docker seller on a Claude subscription, generate the long-lived, model-only token:
+
+```bash
+claude setup-token
+```
+
+Store the result as `CLAUDE_CODE_OAUTH_TOKEN` in a root-owned or seller-owned mode-`0600` systemd
+environment file. Never echo it into docs, logs, shell history, `config.toml`, or chat. Maxplayer's
+contained Claude path takes it from the daemon environment, keeps the real value on the host, and gives
+the job a per-job placeholder.
+
+`ANTHROPIC_API_KEY` is the **usage-billed Console path**, not a subscription login. It also needs a
+one-time interactive approval that a daemon has nobody to give, which is why the OAuth token is the
+right choice for an unattended seat.
+
+### Codex
+
+Use a **dedicated Codex home** for the seller, so its login and refresh state cannot disturb another
+Codex process. Configure file storage before you log in:
+
+```toml
+# $CODEX_HOME/config.toml
+cli_auth_credentials_store = "file"
+```
+
+```bash
+export CODEX_HOME="/absolute/path/to/.codex-maxplayer-seller"
+install -d -m 700 "$CODEX_HOME"
+codex login                 # on a browser-capable host
+codex login --device-auth   # on a headless host
+codex login status
+test -f "$CODEX_HOME/auth.json"
+chmod 600 "$CODEX_HOME/auth.json"
+```
+
+> **Vendor behaviour we do not control.** OpenAI's current auth guide is
+> <https://developers.openai.com/codex/auth/> (read 2026-08-26). `cli_auth_credentials_store` is Codex's
+> own setting. Device-code login may need to be enabled in the user's ChatGPT security settings or by a
+> workspace admin.
+
+For Docker, **do not mount or copy `auth.json` into the job container.** Point Maxplayer at the absolute
+host path:
+
+```toml
+[sandbox.codex_chatgpt]
+auth_file = "/absolute/path/to/.codex-maxplayer-seller/auth.json"
+```
+
+Maxplayer reads the needed ChatGPT fields **on the host, once per job**, and sends only placeholders into
+Docker. The path must be absolute; a relative one is refused at config load. If the stored access token
+is close to expiry, relink or refresh it on the host — **no seller restart is needed** for the next job
+to reread the file.
+
+For usage-billed API access, use the stdin form:
+
+```bash
+printenv OPENAI_API_KEY | codex login --with-api-key
+```
+
+(The removed `--api-key` flag no longer exists; `--with-api-key` and `--device-auth` do.)
+
+### The verification gate — run this for every provider
+
+1. Run the vendor's status command **as the exact seller service user**.
+2. Check only file **existence, owner, mode, and expected JSON field shape** — never print the credential.
+3. Start the seller and require the **real pre-advertise probe** to pass.
+4. Confirm the signed heartbeat advertises the intended harness and model.
+5. Run one small targeted canary job before opening any stranger-facing route.
 
 ## 3b. Setup gotchas — two environment prerequisites that silently break `execute`
 
@@ -406,9 +609,11 @@ setup-token`) — an environment API key needs a one-time interactive approval a
 Docker Codex has a separate ChatGPT session route. `[sandbox.codex_chatgpt]` reads the host Codex auth
 file for each job and keeps the real session outside Docker. See the controlled setup below.
 
-The pre-advertise probe does not catch this: it runs the CLI **on the host**, where `~/.claude` is
-readable, so the seat advertises normally and then fails every job on auth. Set the variable where the
-daemon **actually starts** — a systemd `Environment=`, a launchd plist, or the launcher script that
+Whether the pre-advertise probe catches this depends on your sandbox mode, because the probe runs
+wherever jobs run. Under `launcher` or no sandbox it runs the CLI **on the host**, where `~/.claude` is
+readable — so it passes on a credential the daemon environment is missing, and you find out at the first
+job. Under `mode = "docker"` it runs **inside the container**, so it fails and the seat **never
+advertises**. Set the variable where the daemon **actually starts** — a systemd `Environment=`, a launchd plist, or the launcher script that
 `exec`s it. Not your login shell, and note an `export` in an interactive shell cannot reach an
 already-running daemon: the credential change takes effect on the **restart**, not before it.
 
@@ -417,15 +622,18 @@ reusable key; the list above is claude and codex only, and the per-job proxy can
 **`forward_env = ["CURSOR_API_KEY"]` sends your real key into the container for a stranger's job to
 read** — caught by a `doctor` WARN, not a refusal, so the seat runs and leaks. Never do that.
 
-The browser-login **session** does have a contained path. `[[sandbox.file_credentials]]` reads one
-named field out of the session file on the host, once per job, and gives the container a placeholder
-plus a redirect flag; the real value never crosses. That path is verified against the real vendor on
-the host leg. **From inside a running container it has now been exercised, and it does not complete —
-Docker-contained cursor is unsupported.** The redirected h2c agent leg reaches the proxy and stalls in
-the proxy's pre-forward body collection, so every job fails; a seat configured that way fails its
-pre-advertise probe and refuses to advertise rather than taking awards it cannot serve. Run cursor
-under `launcher` mode, or use a claude/codex harness under docker. The fields, the expiry behaviour,
-and the per-client measurement caveat are in [DOCKER.md](DOCKER.md).
+Use the browser-login **session** instead. `[[sandbox.file_credentials]]` reads one named field out of
+the session file on the host, once per job, and gives the container a placeholder plus a redirect flag;
+the real value never crosses. **This path is reported working by the maintainer, measured 2026-08-26 on
+Cursor Agent `2026.08.25-3e8eec8` (Linux), and not reproduced by us.** Nobody on this project has run
+`cursor-agent`; it is not installed on our build hosts. Treat it as a maintainer measurement rather than
+a supported configuration, and **prove it on your own seat before you take paid work on it.** It needs a
+two-leg config, because cursor's agent traffic goes to a second host (`agentn.global.api5.cursor.sh`) —
+name it as a `[[sandbox.file_credentials.legs]]` entry. On macOS the session lives in the login Keychain,
+which the daemon cannot read, so create the file first with `AGENT_CLI_CREDENTIAL_STORE=file cursor-agent
+login`, then locate the file it wrote: that path is build-dependent, so use **[Cursor](#cursor)** above
+rather than typing `~/.cursor/auth.json` from this line. The fields, the `legs` entry, the expiry
+behaviour, and the per-client caveat are in [DOCKER.md](DOCKER.md).
 
 #### Controlled Docker Codex seller with ChatGPT auth
 
@@ -441,11 +649,12 @@ CODEX_HOME="$MAXPLAYER_CODEX_AUTH" codex login
 chmod 600 "$MAXPLAYER_CODEX_AUTH/auth.json"
 ```
 
-Next, build the source-test sandbox image and create its network. A released binary can omit `image`
-and use its versioned image instead.
+Next, build the source-test sandbox image and create its network. Run the build from the repository
+root. The build compiles the `maxplayer` binary into the image, so it takes several minutes. A released
+binary can omit `image` and use its versioned image instead.
 
 ```bash
-docker build -t maxplayer-sandbox:codex-test docker/maxplayer-sandbox
+docker build -f docker/maxplayer-sandbox/Dockerfile -t maxplayer-sandbox:codex-test .
 docker network create maxplayer-codex-test
 ```
 
@@ -514,10 +723,136 @@ hardening flags every docker job gets and `SANDBOXING.md` for the architecture.
 An existing seat on `launcher` is never moved by an upgrade — see *Moving an existing seat from
 `launcher` to `docker`* at the end of this section.
 
+#### Container-side delivery (the default under `mode = "docker"`)
+
+**A docker seat delivers from inside its container.** ONE sandbox container runs the agent and every
+git step: clone, completion gate, commit, and push. The host runs no git for the job. It writes the
+job inputs into a per-job directory, starts the container, hands over a push token, and reads back the
+commit id. Then it publishes the result as before. The host never opens a git repository the job agent
+can write.
+
+This is the default. A seat with `mode = "docker"` that does not name `container_delivery` gets it.
+
+```toml
+[sandbox]
+mode = "docker"
+# container_delivery = false                       # opt back into the host delivery path
+# container_delivery_token = "fresh-after-agent"   # default; the other value is "long-lived"
+# container_delivery_token_cap_secs = 21600        # "long-lived" only; the relay's cap, 6 h
+```
+
+`container_delivery = false` is the opt-out, and it keeps working. On that path the host clones the
+base, the container runs the agent, and the host commits and pushes.
+
+**Root posture.** A seat whose daemon runs as root (uid 0) runs the job as root inside the
+container, where the boundary between the job and the delivery orchestrator is weakest. Such a seat
+does not get container delivery by default. It must set `container_delivery = true` to opt in, and
+the boot line warns when it does. Run the seller as a non-root user.
+
+**A `launcher` seat is not affected, and cannot use this mode.** Launcher mode creates no container to
+move the git steps into, so such a seat always delivers from the host. Adding
+`container_delivery = false` to a launcher seat changes nothing and is accepted;
+`container_delivery = true` under `launcher` is REFUSED at boot, and so is either token key. An
+upgrade never moves a launcher seat.
+
+The seller prints the effective path at boot, on one line, so you can read it off a boot scroll:
+
+```text
+seller node delivery path: CONTAINER — one container runs the agent and every git step. This is the default for [sandbox] mode = "docker", and this seat does not set container_delivery. Set container_delivery = false for the host path.
+```
+
+The line names the path in capitals (`CONTAINER` or `HOST`) and the reason: the docker default, an
+explicit `container_delivery` value, or `mode = "launcher"`. The `relay token policy` row of
+`maxplayer doctor` reports the same answer.
+
+Requirements:
+
+- `mode = "docker"`. The seller refuses `container_delivery = true` and both token keys under
+  `launcher` mode.
+- A non-root seller uid, or an explicit `container_delivery = true`. A root daemon (uid 0) runs the
+  job as root inside the container, so the default does not apply to it.
+- A sandbox image that contains the `maxplayer` binary at `/usr/local/bin/maxplayer`. The shipped
+  image has it. A custom image must add it, or set `container_delivery = false`.
+- A relay that enforces the branch scope on push tokens (PR #929).
+
+The token mode selects when the host mints the branch-scoped push token:
+
+- `fresh-after-agent` (the default). The container reports that the agent has exited and the delivery
+  commit is gated. The host then mints a 60-second token and writes it into the per-job directory. The
+  container reads the token and pushes. This mode works with the relay as deployed today.
+- `long-lived`. The host mints one token before the container starts. The token expires at the job
+  deadline plus 5 minutes. The relay must accept the token's `expiration` tag for scoped tokens
+  (relay Requirement B). The host refuses to start the job when the token lifetime exceeds
+  `container_delivery_token_cap_secs`.
+
+##### `long-lived` needs a relay that advertises support
+
+**As of 2026-09-03 the deployed relay does NOT honor the `expiration` tag.** The relay refuses a
+scoped token older than 60 seconds with HTTP 401, even when the token carries a future `expiration`.
+Use `fresh-after-agent` on that relay.
+
+A relay that does honor the tag advertises the cap it applies in its NIP-11 `limitation` object, as
+`scoped_token_max_lifetime_secs`. The seat reads that field before it advertises:
+
+- The seat REFUSES to boot in `long-lived` mode when the field is absent, when its value is smaller
+  than `container_delivery_token_cap_secs`, or when the relay cannot be read at all. The refusal names
+  the mode and tells you to use `fresh-after-agent`.
+- `fresh-after-agent` reads nothing over the network. It depends on no relay feature, so no relay
+  answer can block a boot in that mode.
+
+The refusal happens at boot, and never in the middle of a paid job. Before this gate, a config flip
+to `long-lived` caused an HTTP 401 on the push. The push is the last step of a job, and it runs after
+the agent ran and after the buyer paid.
+
+The `relay token policy` row of `maxplayer doctor` reports the same answer. The row is information
+under `fresh-after-agent`, and it FAILs under `long-lived`. A docker seat reaches the row by default.
+A seat on the host delivery path — a `launcher` seat, or `container_delivery = false` — reads the
+config only and asks no relay.
+
+To measure a relay yourself, run the canary test. It pushes with the production push path and prints
+what the relay did with a scoped token that carries an `expiration` tag:
+
+```bash
+MAXPLAYER_CANARY_KEY_FILE=/path/to/key \
+MAXPLAYER_CANARY_REMOTE=https://<relay>/git/<owner>/<repo> \
+  cargo test -p maxplayer-core --features git-delivery --test relay_canary -- --ignored --nocapture
+```
+
+The last line reads `CANARY VERDICT A=<...> B=<...>`. `B=deployed` means the relay honors the
+`expiration` tag; `B=not-deployed` means `long-lived` cannot work there.
+
+Watch these lines in the seller log for one job:
+
+```text
+seller node execute job_id=… : container delivery started container=maxplayer-job-… token=FreshAfterAgent
+seller node execute job_id=… : agent done in container, gated commit=<oid>
+seller node execute job_id=… : fresh push token handed to the container
+seller node execute job_id=… : container outcome status=Delivered exit=exit status: 0 detail=
+seller node delivered job_id=… commit=<oid> agent=… result enqueued
+```
+
+The per-job directory is `$MAXPLAYER_HOME/seller-delivery/<job_id>`. The host creates it with mode
+`0700`, writes the inputs file and the token file with mode `0600`, and removes the directory when the
+job ends. The container's diagnostics land in `seller-diagnostics/<job_id>` as for every docker job.
+
+Known limits of this mode:
+
+- Every process inside the container runs as one uid. A process the agent leaves behind can read every
+  file the orchestrator can read. The orchestrator therefore deletes the inputs file before it starts
+  the agent, kills every other process before it requests the token, and reads the token only after
+  that. The token can push only the seller's own delivery branch, so a leaked token cannot reach any
+  other ref.
+- The container clones a contribution base without a credential. A base repository that requires an
+  authenticated fetch is not supported in this mode.
+- The `checks.toml` environment provisioning step of a contribution base does not run in this mode.
+- The usage and model metadata on the result come from the container's report. Metering at the
+  credential proxy is a follow-up.
+
 ### `launcher` mode — only if this box cannot run docker
 
 The launcher below is `bwrap` (bubblewrap), and it is not present on a stock box. Install it before
-you configure the section, or the boot gate refuses to start an open-pool seat:
+you configure the section, or the boot gate refuses to start a seat strangers can reach — one that
+claims the open pool OR accepts targeted offers from buyers it has not named:
 
 ```bash
 command -v bwrap            # prints a path once installed
@@ -570,10 +905,13 @@ and aborts the boot probe without them (read-only is enough — it never writes 
   and the job workdir must be writable. Fail either leg and the seat refuses to start (#451).
   `launcher = ["env"]` resolves perfectly and confines nothing — it is refused on the second leg,
   not the first.
-- **Targeted-only seats stay advisory.** Without `claim_open_pool`, the same probe reports as a WARN:
-  you run work from counterparties you accepted, rather than whatever the market posts.
+- **Seats only their named buyers can reach stay advisory.** With BOTH open surfaces off
+  (`claim_open_pool` and `accept_open_targeted`), the same probe reports as a WARN: every job comes
+  from a buyer you listed, rather than from whoever the market sends. That softening is bought by the
+  allowlist — opening **either** surface makes this a blocking FAIL, because a targeted job from an
+  unnamed buyer is the same stranger-written task text an open-pool job is.
 - **The escape hatch is one flag, and it is narrow on purpose.** `maxplayer seller --unsafe-no-sandbox`
-  serves the open pool uncontained. It waives THIS check only — the relay, mint, key and agent gates
+  serves strangers uncontained. It waives THIS check only — the relay, mint, key and agent gates
   stay blocking, so accepting the code-execution exposure never means switching the rest off.
 
 ### Verify before going live
@@ -629,8 +967,10 @@ maxplayer doctor
 ```
 
 **Check your credential before restarting.** A seat that has run on `launcher` may be authenticated only
-through `~/.claude`, which a container cannot read. That is the usual cause of a switched seat that
-claims jobs and then fails them all on auth — see the two blockers above.
+through `~/.claude`, which a container cannot read. That is the usual cause of a switched seat that comes
+back up and **never advertises**: the pre-advertise probe now runs inside the container, finds no
+credential, and holds the seat off the board. `doctor` stays green throughout — it runs no agent turn —
+so read the probe, not `doctor`. See the two blockers above, and link the account first: [§3a](#3a-link-your-model-account).
 
 Then restart the daemon. Two more things to expect on a seat that is already earning: the first job pulls
 the sandbox image unless it is already local (`doctor` warns and hands you the `docker pull` so you can do
@@ -674,7 +1014,7 @@ On start (after `[seller]` is written) the daemon publishes:
   `maxplayer-seller-<short>` name is filled if you did not pass `--name`), and
 - once the node is live, a **seat heartbeat** (**kind 30340**, `d=maxplayer-seller`) republished every
   ~5 min, carrying the tags `d` / `t` / `v` / `rate` / `accepting` / `queue_depth` / `accepted_mints`,
-  plus `agents` when your seat states a harness roster. Each beat is best-effort: a failed publish is
+  plus `agents` when your seat states a harness roster and `takes_payment` when it works for free. Each beat is best-effort: a failed publish is
   logged and the next beat retries.
 
 So buyers discover the seller **by capability**, not by hand-swapping a pubkey. The heartbeat is
@@ -693,6 +1033,64 @@ tuning a live seat:
   change its toolchain**, or the advertisement and the machine disagree.
 
 `docs/protocol-v1.md` §4.5.4 is normative for both.
+
+### Working for free — `takes_no_payment`
+
+A seat can advertise that it takes **no payment at all**, so a buyer holding zero bitcoin can hire
+it. It is off by default and it is a config edit, not a flag:
+
+```toml
+[seller]
+rate_sats = 0            # required: the pairing below is refused otherwise
+takes_no_payment = true
+```
+
+Two things change, and only these two. The seat admits offers that carry
+`["param","payment","none"]`, and its beat gains `["takes_payment","none"]` so free buyers can find
+it. Everything else — delivery, verification, the result event — is identical to a paid job.
+
+**`rate_sats = 0` alone does NOT do this.** `rate` is a floor, so `0` means "I accept any amount,
+including nothing" — which is not the same statement as "I take nothing", and a buyer with no sats
+cannot act on the first. A seat at `rate_sats = 0` that never set `takes_no_payment` refuses every
+free offer, and the skip line tells you which knob to set. `takes_no_payment = true` alongside a
+non-zero `rate_sats` is refused at startup: that pair describes a seat no buyer can satisfy in
+either mode.
+
+⚠ **Admission becomes your only control.** The price floor is the market's one natural throttle and
+this sets it aside. There are deliberately no caps, no rate limits and no quotas. With
+`claim_open_pool = true` a free seat claims every well-formed free offer in the pool until its slots
+fill, and `slots` bounds how many run at once, not how many arrive. What scopes who can reach you is
+admission — `accept_offers_only_from`, `accept_open_targeted`, `claim_open_pool` ([§6](#6-open-pool--claiming-untargeted-offers)).
+The cost of a free job is entirely yours: compute, egress, and whatever your harness provider bills.
+
+The brake is not claiming: a seat whose slots are full simply does not claim, and its beat still says
+`accepting=y` because `accepting` means the seat is serving, not that it has room. Only a seat with
+nothing serving publishes `accepting=n`, and even that is not instant: the beat is addressable and
+buyers weigh it by age, so there is a cadence-sized window where a stale `accepting=y` still attracts
+offers.
+
+**You still need a mint — on the beat, and on the way up.** `accepted_mints` stays required on the
+beat: a seat that publishes none does not parse for ANY buyer, free or paid, so a free seat still
+names a mint it will never be paid at. *That* part is cosmetic, and relaxing it would make a
+genuinely unpayable priced seat parseable. The boot requirement behind it is not cosmetic, and
+`takes_no_payment = true` does not waive it.
+
+**The mint must be `https://` and it must be reachable.** A non-`https://` URL is refused whatever
+`allow_real_mints` is set to. Reachability is then a startup check in its own right: the doctor gate
+probes every accepted mint and asks "can this seat settle anywhere at all" — all reachable is a
+`Pass`, some reachable is a `Warn`, and none configured or none reachable is a `Fail`
+(`no accepted mint reachable — cannot settle anywhere`). A `Fail` refuses boot
+([§2](#2-maxplayer-seller-flags)), so a free seat with a dead mint dies at startup and never
+advertises at all — the same gate, on the same terms, as a paid seat.
+
+**So name the mint you would actually want to be paid at.** A placeholder that happens to answer
+today buys you nothing: the mint you configure is the wallet this seat opens, and it is where you
+top up with bitcoin later. Working for free now is not a decision to stay unpaid, so pick the mint
+you would keep if you turned `takes_no_payment` back off.
+
+**Free jobs sit at `delivered` forever.** A free job never advances to `paid` and publishes no
+receipt, so it leaves your public settlement history unchanged. Local tooling that reads
+"delivered but not paid" as money owed must read the delivery row's `payment` column first.
 
 ### Getting your first jobs — be introduced, don't wait
 
@@ -719,42 +1117,66 @@ working sandbox before a seat claims there. Get targeted work first.
 
 ---
 
-## 6. Open-pool — claiming untargeted offers
+## 6. Who can reach you — three independent knobs
 
-By default the daemon is **targeted-only**: it auto-claims **only** offers whose `#p` equals this
-seller's pubkey (untargeted/open offers are soft-skipped; wrong `#p` refused; then `amount ≥ rate_sats`).
-
-Opt in to also claim untargeted/open offers that still clear your rate:
-
-```bash
-"$MAXPLAYER_BIN" seller --agent claude --rate-sats 100 --claim-open-pool
-```
-
-`--claim-open-pool` (or `claim_open_pool = true` in `config.toml`) widens claiming to the open pool;
-`--no-claim-open-pool` forces it off. **Targeted-only stays the default** — open-pool is your explicit choice.
-
-**Targeted-only is not a security boundary.** `#p` names *you*; it does not name *who may post*. Any
-buyer can target this pubkey, so a targeted job runs the same stranger-written task text an open-pool
-job does, through the same agent, with the same filesystem and credentials. The seller-side control
-over *who* reaches you is a separate setting:
+**A fresh seat claims nothing until you say who may reach it.** Both ways a stranger can hand this
+box work are opt-in, and neither is inferred from the other or from a field being empty:
 
 ```toml
-accept_offers_only_from = ["<buyer-pubkey-64-hex>"]   # empty/absent = claim from any buyer
+[seller]
+accept_offers_only_from = []       # the buyers you name. Default: none named.
+accept_open_targeted    = false    # may a buyer you did NOT name target you directly?
+claim_open_pool         = false    # may you claim untargeted offers from the open pool?
 ```
 
-Populated, it is a hard fence checked before the rate and harness gates: an offer whose author is not
-on the list is skipped (`NotAllowlisted`), silently — a private seller does not tell a stranger why it
-declined. Containment ([SANDBOXING.md](SANDBOXING.md)) is the other control, and it is worth having on
-any seat that runs jobs at all. `doctor` only *requires* it for open-pool claiming; that threshold is
-about which check is blocking, not about where the exposure is.
+| You want | Set |
+| --- | --- |
+| Work only with buyers you know | `accept_offers_only_from = ["<buyer-hex>", …]` |
+| Take targeted offers from anyone | `accept_open_targeted = true` |
+| Compete for untargeted pool offers | `claim_open_pool = true` |
+
+The CLI flags mirror the defaults — both are opt-INs, so the safe posture needs no flag at all:
+
+```bash
+"$MAXPLAYER_BIN" seller --agent claude --rate-sats 100 --accept-open-targeted   # accept strangers
+"$MAXPLAYER_BIN" seller --agent claude --rate-sats 100 --claim-open-pool        # claim the pool
+```
+
+**The three knobs are additive — each admits on its own, and none cancels another** (#923). The
+allowlist admits the buyers you name. `accept_open_targeted` **additionally** admits targeted offers
+from buyers you did *not* name, whether or not the list has entries. `claim_open_pool` independently
+permits open-pool claims. Admission is checked before the rate and harness gates: an offer that no
+knob admits is skipped (`NotAllowlisted`), silently — a private seller does not tell a stranger why
+it declined. Because a list and an open flag are now both in effect at once, there is no inert
+combination left for `doctor` to report; its **seat reachability** line names the routes that are
+open.
+
+⚠ **So naming buyers does not fence the other surfaces.** With `accept_offers_only_from` populated
+*and* `accept_open_targeted = true`, a buyer you never named can still reach this box and run code
+on it. If you want only the buyers you named, leave both flags `false`.
+
+> ⚠ **Upgrading an existing seat? Read this.** An empty `accept_offers_only_from` used to mean
+> *accept from any buyer* on the targeted surface. It no longer does — it means *no buyer named*. A
+> seat with no allowlist and neither flag set will **stop claiming targeted work after the upgrade**:
+> it still boots, connects and advertises, it just never claims. There is no config error, because the
+> config is valid. The daemon says so loudly at boot and `maxplayer doctor` fails the **seat
+> reachability** check. To restore the old behaviour, either list your buyers or set
+> `accept_open_targeted = true`.
+
+**Neither flag is a security boundary, and `#p` never was one.** `#p` names *you*; it does not name
+*who may post*. A targeted job from an unnamed buyer runs the same stranger-written task text an
+open-pool job does, through the same agent, with the same filesystem and credentials — which is why
+opening *either* surface makes containment ([SANDBOXING.md](SANDBOXING.md)) a blocking `doctor` check
+rather than an advisory one. The allowlist is the control over *who* reaches you; containment is the
+control over what they can do once they have.
 
 **What changes when you opt in:** your seat can now *lose*. A targeted offer names you and nobody
 else, so a claim you park is a claim you win. An open-pool offer is claimed by several seats and the
 buyer picks one, so your seat also sees the buyer's AWARD and ACCEPT for offers **another seat won** —
 by design, since that is how a losing seat learns to free its execution slot. The daemon binds a job
 only when the award or accept names **your** published claim; a foreign one releases your claim
-instead. If it ever bound one of those, the seat would report itself busy (`accepting=n`) while
-running nothing, so a seat that shows queued work with no agent process is worth reporting.
+instead. If it ever bound one of those, the seat would publish a `queue_depth` that never drops
+while no agent process runs, so a seat that shows queued work with no agent process is worth reporting.
 
 ---
 
@@ -778,6 +1200,174 @@ On a typical keyset the fee is **1 sat** for small amounts:
 - **The setup default is `100`, and that is the number to start from.** Clearing the fee is not the same as being paid what the work is worth: buyers post at 100 sats, so a rate of `2` nets you a sat while advertising your work at 2% of the going rate. Set it lower than 100 only if you deliberately want to undercut the market.
 - The **receipt / journal records the FACE (offer) amount**, not your wallet net. The face is the accounting figure; the **sats you receive are `face − fee`**. Do not read the receipt's face number as "sats pocketed."
 
+### Platform fee (recorded at collect; paid automatically by your node)
+
+The product charges a platform fee on each payment you collect. **The rate is set by the product,
+in the binary, and you cannot change it** — there is no config key, no environment variable and no
+flag for it. **The rate is 10%.** Collection records what that comes to, and **your node then pays it
+automatically**: once a payment has landed and its receipt is journaled, the node makes a best-effort
+attempt to remit the whole unremitted balance to the platform's Lightning address. You do not have to
+remember to pay; there is nothing to run.
+
+**The fee is 10% of the offer amount — the price the buyer paid — not of what lands in your
+wallet.** The mint's own input fee (described above) is a separate deduction and does not shrink the
+base: on a 100-sat offer the platform fee is 10 sats whether the mint kept 0 or 1 of those 100. The
+daemon rounds the fee **down** to whole sats — a payment too small to owe a whole sat owes `0` — and
+records it beside the receipt in `seller.sqlite` (`receipts.fee_bps` is the rate in force, in basis
+points; `receipts.fee_sats` is what it came to; `receipts.mint_fee_sats` is the mint's fee).
+
+**Every number is shown, so you never have to do the arithmetic.** Run
+
+```
+maxplayer seller fees [--home <dir>]
+```
+
+and each collected job prints four figures with plain labels: **what the buyer paid** (the offer
+amount), **mint fee**, **platform fee (10%)** with whether it is unremitted or which remittance paid
+it, and **you keep** (`paid − mint fee − platform fee`), plus the totals — the platform fee split
+into remitted and unremitted — and every remittance so far. The `seller node collect ok` log line
+carries the same figures (`amount_received=` is what the buyer paid, then `mint_fee=`, `fee_sats=`,
+`fee_bps=`, `kept=`). Jobs collected before the mint fee was recorded print `mint fee: not recorded`
+and no "you keep" figure, rather than a made-up zero.
+
+**How the automatic remittance behaves.** A 100-sat offer with a 1-sat mint fee, for example, records
+`amount_sats = 100, mint_fee_sats = 1, fee_bps = 1000, fee_sats = 10`, prints `you keep: 89 sats`, and
+the 10 sats are now **unremitted** platform fee. Right after that receipt is written — and only after
+a *new* receipt, never on a replayed payment — the node starts one remittance attempt on a thread of
+its own:
+
+- It resolves the platform's Lightning address over LNURL-pay (the address is fixed in the binary,
+  not configurable — a seller-editable address would let a seller pay the fee to itself), reads the
+  destination's minimum, and **if the unremitted balance is below that minimum it does nothing**: a
+  10% fee on payments under 10 sats owes under 1 sat, and small balances simply accumulate until they
+  clear the minimum. That is the expected steady state for small jobs, not an error.
+- Otherwise it takes a melt quote from your default mint and invoices **the largest amount the
+  wallet can actually pay for at most the accrued fee**: the mint's melt fee reserve and the proof
+  fees come out of it (a mint that charges per input proof, or one whose proofs do not fit the
+  amount and need a swap first). The wallet SDK (CDK) *estimates* the proof fee before paying and
+  *recomputes* it on the proofs its swap hands back, refusing after the swap if they fall short — so
+  the planner runs that recomputation itself and picks an amount that survives it (the plan prints
+  both figures: `expected proof fees (SDK estimate, bounded exactly at payment): N sats; actual
+  proof input fee the SDK recomputes on the swapped proofs: M sats ⇒ worst case W sats leaves the
+  wallet (≤ G)`). **You never pay more than the fee you accrued; every fee comes out of that amount,
+  not on top of it.** It then journals
+  the attempt in `seller.sqlite` (`fee_remittances`: gross, melt fee, net, the address literal,
+  melt quote id, payment hash, state, which process owns the attempt, and when it was admitted to
+  spend), pays the invoice from your ecash through the wallet's gated melt (the same
+  `allow_real_mints` gate `maxplayer wallet melt` honours), and marks the receipts it covered as
+  discharged. **The accrued fee is a hard ceiling on everything that leaves the wallet, enforced
+  before any ecash is spent**, in one sequence: first the payment quote's **invoice plus the mint's
+  fee reserve alone** is checked against the gross (a reserve that grew past it is refused here); if
+  the live reserve differs from the estimate and the planned amount would no longer confirm, the
+  attempt re-plans once onto a new invoice; then the wallet prepares the payment locally — reserving
+  proofs; it may fetch the mint's fee table, but sends no proofs and pays no fee yet — and the node
+  re-runs the SDK's post-swap arithmetic on the prepared figures: the bound is the **actual** proof
+  input fee the SDK recomputes on the proofs its swap hands back, so **the invoice plus the reserve
+  plus that actual input fee plus any pre-melt swap fee** must fit the gross, and the payment is
+  refused if the SDK would fail after its swap. The SDK's *prepared* fee display is not the bound: a
+  prepared total over the gross whose actual debit fits is paid. On any of these refusals the
+  prepared payment (if any) is cancelled — the proofs go back to unspent — before any ecash is
+  consumed; the journaled row is left as it was, still planned with its receipts pinned, the refusal
+  is journaled, and the next attempt's reconciliation releases that row (it was this process's own
+  earlier attempt) and re-quotes. After a payment the report counts the SDK's fee once — `melt fee taken by
+  the mint` already includes the actual proof input fee — and prints `actual debit: D sats = net +
+  melt fee + swap fee`; if the wallet cannot read its balance afterwards it prints `wallet balance
+  now: unknown (…)` rather than a guessed number. **Known bound:** the mint can change its fee
+  table between the preparation and the payment and the SDK accepts no caller maximum; if that
+  happens the payment can fail after its swap (the swap fee is lost and the row stays held until
+  the mint says PAID or an operator decides) or cost more than predicted (a `WARNING` line). Not
+  observed on any mint; disclosed, not solved. Also owed: if cancelling a prepared payment itself
+  fails, a local proof reservation can remain — reopening the wallet does not clear it — until a
+  supported recovery path exists. (The operator's plain `maxplayer wallet melt` keeps its older
+  check — invoice plus reserve only — and is not changed by this.)
+- **It cannot affect the payment it followed.** Your receipt is written and the job is marked paid
+  before the attempt starts. If the attempt fails — the mint is down, the payout host is unreachable,
+  the wallet is short, no route — the failure is written to the node log and journaled
+  (`fee_remit_attempts`), and the balance stays unremitted. **The node then retries on its own clock,
+  for as long as it runs**: after a failure the next attempt comes within a minute, and the ceiling
+  on the wait then doubles — 2, 4, 8, 16 minutes — up to once every 30 minutes, each delay
+  randomised between zero and that ceiling so a fleet of sellers does not hit a recovering host in
+  the same second. A success resets the clock to its 30-second base; a balance under the
+  destination's minimum is not a failure and does not lengthen it. Nothing runs at startup: the
+  first check comes between 30 and 60 seconds after boot, and a payment collected in those first
+  seconds cannot pull it earlier — the 30-second floor holds. The retries live inside the node's
+  main loop, so stopping the node stops them from being scheduled — and a payment already in flight
+  when you stop the node is **drained, not cut off**: once serving has ended the node waits up to 60
+  seconds for the attempt to finish (ecash that may already be with the mint is never abandoned
+  mid-payment), and if that wait runs out it logs one incident line and exits while the attempt
+  finishes on its own. The next collected payment also tries again with the whole accumulated
+  balance. An attempt interrupted mid-payment is reconciled with the mint on the next attempt:
+  settled if the mint reports the payment landed. An attempt that never reached the point of
+  spending is released if its quote failed or expired, or if the process that owned it is provably
+  gone. An attempt that DID reach the point of spending — the store admitted it and bound the one
+  mint quote it may pay — is **held**, however long, on anything but the mint saying PAID: not
+  released on "expired", not on "failed", not on any clock. We do not infer that a payment is dead
+  from a clock, because the mint pays a quote it calls unpaid or failed regardless of its expiry,
+  and a payment prepared before the expiry can land after it; releasing on either would let the
+  same balance be paid twice. Two processes sharing one store — the node and a hand-run
+  `maxplayer seller fees remit --confirm`, say — pay an accrued balance once, not twice: at most one
+  remittance can be in flight (a second cannot even be planned while one exists), the receipts it
+  covers are pinned to it, only the process that planned it may pay it, it passes a single
+  compare-and-set in the store immediately before spending which also fixes the one mint quote it
+  may pay, and it never pays under any other quote; a second process asks the mint about that exact
+  quote and holds off unless it is PAID, and every release is written as a condition on the row, so
+  a release decided on a stale reading changes nothing. A held attempt is visible, not silent:
+  `maxplayer seller fees remit` prints one `HELD:` line naming the row, the quote, what the mint said
+  (unpaid, failed, pending, unknown, or a quote the wallet does not know — the same one line for each)
+  and how many sats are pinned, and exits 3 — on the dry run too. Clearing it is an operator's
+  decision, and there is no command for it yet; until then the node's later attempts are refused and
+  the balance accumulates unremitted behind the held row. This is what the module's two-process tests
+  prove, and its bound: two processes, each on its own connection to one store, against one fake mint
+  that accepts unpaid or failed quotes regardless of expiry as the inspected CDK 0.17.2 mint
+  implementation does (pauses after the plan, after the quote, after the gate, inside the payment
+  after the wallet's last local check, and between a release decision and its write; the lease and
+  the quote expiring while paused; distinct invoices; funds for a second payment present; actual
+  melts counted). What the two processes share is stated per test in the module's documentation,
+  not assumed: all of them share the one store; the fake mint's quote registry is shared in seven
+  (the live-owner, expired-estimate, expired-quote-held, paused-owner, stale-snapshot, full-path and
+  delayed-payment cases); one clock is handed from the first process to the second in four of those
+  (expired-quote-held, paused-owner, stale-snapshot, delayed-payment) while the other three leave
+  each process its own clock; and only the delayed-payment case also shares one wallet's proofs
+  between the two. They do not run a real mint or a real wallet, and no deployed mint's behaviour
+  was measured — the mint behaviour they model is read from the pinned CDK 0.17.2 source.
+- **The log stays readable while it retries.** Every attempt gets at most one line. The first
+  failure's line carries its detail — the destination, the balance it saw, the error — and the
+  backoff it starts; later attempts in the same streak get one line each (how many have failed,
+  when the next is; the moment the delay reaches its 30-minute cap is said on that same line); and
+  the success that ends a streak says how many attempts failed and for how long the fee sat owed —
+  the line to look for when you ask "did it ever go out?".
+
+**The off switch.** If you need to stop the automatic payout — a misbehaving mint, an incident — set
+
+```toml
+[platform_fee]
+auto_remit = false      # or MAXPLAYER_PLATFORM_FEE__AUTO_REMIT=false
+```
+
+and restart the node. One flag covers both automatic paths — the attempt after each payment and the
+retry clock. This is an **operational valve, not a waiver**: the fee keeps accruing on every payment,
+stays owed, and stays visible in `maxplayer seller fees`; when you turn the switch back on the next
+attempt (a collect, or the retry clock's first check) remits the whole accumulated balance. The switch
+cannot change the rate or the address — the `[platform_fee]` table has no key for either.
+`maxplayer seller fees remit --confirm` still pays by hand while it is off.
+
+**Inspecting and forcing a remittance by hand.** `maxplayer seller fees remit` is the operator's
+window onto the automatic path, and its recovery lever:
+
+```
+maxplayer seller fees remit [--home <dir>]              # dry run: recent attempts, resolve, quote, print the plan, move nothing
+maxplayer seller fees remit --confirm [--home <dir>]    # pay the unremitted balance NOW (also with auto_remit = false)
+```
+
+The dry run prints whether the automatic remittance is on, the recent attempts with their outcomes
+(paid / refused / failed and why), any attempt still in flight, the gross unremitted fee, the mint's
+melt fee reserve, the invoice amount the platform receives, and the most that can leave your wallet —
+and moves nothing. `--confirm` forces one attempt now, under exactly the same rules as the automatic
+path. It refuses, moving nothing (exit 3), when nothing is unremitted; when the balance is below the
+destination's minimum (the command prints how far short you are); when an earlier attempt is still
+settling at the mint; or when an admitted attempt is held on its bound quote (the `HELD:` line above).
+**Running it again after a payment pays nothing** — the receipts it discharged are recorded.
+
 ---
 
 ## 8. Lifecycle (seller side)
@@ -790,7 +1380,7 @@ offer (3401)  →  claim (3402 status=processing)
 ```
 
 1. **Offer** — buyer posts kind-3401. Offers may be targeted (`#p=<seller>`) or untargeted (open).
-2. **Claim (targeted-only by default)** — the daemon auto-claims only offers `#p`-tagged to this seller and `amount ≥ rate_sats`; untargeted offers are soft-skipped unless `--claim-open-pool`. (Unattended claim-to-collect over a live offer used a harness in testing — see the autonomy caveat above.)
+2. **Claim (nothing, until you say who may reach you)** — the daemon auto-claims an offer only if its author is a buyer you named, or the offer is `#p`-tagged to you and `accept_open_targeted = true`, or it is untargeted and `claim_open_pool = true`; then `amount ≥ rate_sats`. See §6. (Unattended claim-to-collect over a live offer used a harness in testing — see the autonomy caveat above.)
 3. **Execute** — the ACP agent runs the task in the job workdir (real files / commit).
 4. **Deliver** — push to the delivery remote (relay-git default or BYO); publish kind-3403 with the commit OID.
 5. **Collect (working, fee-aware)** — when the buyer pays, a NIP-17 gift-wrapped cashu token (kind-1059) arrives for the seller pubkey. The daemon AUTH-then-reads `#p=seller` on the relay (p-gated), unwraps, predicts the mint fee, refuses dust up front, and redeems against your configured mint. Your wallet nets `face − fee`.
@@ -824,7 +1414,7 @@ wrote [seller] to …/config.toml
 relay-git NIP-34 announce ok id=… remote=…
 relay-git seed probe ok (info/refs reachable)
 discoverable kind0=… name=… pubkey=…
-seller node starting pubkey=… agent=claude rate_sats=100 claim_open_pool=false git_remote=… (never-echo: key omitted)
+seller node starting pubkey=… agent=claude rate_sats=100 claim_open_pool=false accept_open_targeted=false accept_offers_only_from=0 git_remote=… (never-echo: key omitted)
 ```
 
 It must **not** print the secret key. Leave it running: on a matching offer the daemon claims,
@@ -999,6 +1589,6 @@ signed in for you is not signed in for the service unless its config lives under
 → gotcha 2 (NixOS): CLAUDE_CODE_EXECUTABLE points at a NixOS-runnable claude; a PATH shim alone leaves the ACP/agent path dead (§3b)
 → delivery defaults to relay-git (NIP-34 announce → in-process NIP-98 push, no external git/helper); --git-remote for BYO https
 → discoverability: kind-0 profile on start; capability on the kind-30340 seat heartbeat, republished every ~5 min
-→ targeted-only by default; --claim-open-pool to opt into the open pool
+→ both open surfaces off by default; --accept-open-targeted for targeted offers from unnamed buyers, --claim-open-pool for the open pool
 → --rate-sats defaults to 100, the rate buyers post at: wallet nets face − fee; receipt records FACE, not net; dust refused up front
 ```

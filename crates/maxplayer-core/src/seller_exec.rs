@@ -200,8 +200,9 @@ impl AgentRunTimeout {
 /// The in-container mount point for the per-job workdir under `docker` mode. The agent works here
 /// (its ACP session cwd), the host workdir is bind-mounted here read-write, and NOTHING ELSE of the
 /// host is mounted — so `$MAXPLAYER_HOME` (wallet/keys/journal) is absent from the container by
-/// construction.
-const CONTAINER_WORKDIR: &str = "/work";
+/// construction. Public because the container-side delivery orchestrator names the same path in the
+/// inputs it hands the container (`delivery_orchestrator`), and one definition keeps the two equal.
+pub const CONTAINER_WORKDIR: &str = "/work";
 
 /// How the awarded agent command is launched. Pass-through and launcher runs stay on the host; a
 /// docker run puts the command inside a container that mounts only the per-job workdir. The launch
@@ -261,6 +262,37 @@ pub struct DockerPolicy {
     /// same reason as `proxy_ports`: the containment path that reads them is the one that builds the
     /// launch, so both come from one config value rather than being written down twice.
     file_credentials: Vec<crate::home::FileCredential>,
+    /// Operator-named resolver addresses for contained jobs, from
+    /// [`crate::home::SandboxConfig::dns_servers`], **canonicalised and de-duplicated** by
+    /// [`crate::sandbox_dns::from_config`] — the same function every launch resolves through. Empty
+    /// ⇒ nothing usable was configured, so each launch discovers the host's own upstreams.
+    ///
+    /// Canonical rather than raw so that anything reading the policy describes the plan launches
+    /// actually install: two spellings of one address are one resolver and one pair of rules, and a
+    /// blank entry is not a resolver at all. Carried on the policy for the same reason as
+    /// `proxy_ports`: the argv that mounts the job's `resolv.conf` and the policy that opens port 53
+    /// to those addresses must name the same resolvers, or the job is handed a resolver its own
+    /// firewall drops.
+    dns_servers: Vec<String>,
+    /// Container-side delivery (Track B), `None` ⇒ the host delivery path. Resolved from
+    /// [`crate::home::SandboxConfig::container_delivery`] and its two companion keys. Carried on the
+    /// policy so the one `[sandbox]` parse decides both the executor and where git runs.
+    container_delivery: Option<ContainerDeliveryPolicy>,
+}
+
+/// The default `[sandbox] container_delivery_token_cap_secs`: 6 hours, the relay brief's default
+/// `SCOPED_TOKEN_MAX_LIFETIME` (`docs/superpowers/briefs/2026-08-31-relay-scoped-token-lifetime.md`).
+pub const DEFAULT_CONTAINER_DELIVERY_TOKEN_CAP_SECS: u64 = 21_600;
+
+/// The resolved container-side delivery settings of a docker seat that delivers from inside the
+/// container — the default for `mode = "docker"`. Absent from a seat on the host delivery path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContainerDeliveryPolicy {
+    /// How the container obtains its branch-scoped push token.
+    pub token: crate::home::ContainerDeliveryToken,
+    /// The relay's cap on a long-lived scoped token's lifetime, in seconds. The host refuses to mint a
+    /// long-lived token that would outlive it.
+    pub token_cap_secs: u64,
 }
 
 /// The agent-auth environment carried from the daemon into the container.
@@ -307,6 +339,13 @@ pub struct JobLaunch<'a> {
     /// rules live in the namespace this names, and they were installed before this job's process
     /// existed. A `Some` here is therefore a containment claim, not a networking preference.
     pub netns: Option<&'a str>,
+    /// A host file to bind-mount read-only at `/etc/resolv.conf`, when this job needs a resolver
+    /// docker will not give it. `None` ⇒ the container keeps whatever the daemon wrote.
+    ///
+    /// Present for gVisor jobs and measured, not assumed: docker's embedded resolver at
+    /// `127.0.0.11` never answers inside a runsc sandbox, and `--dns` does not change what the
+    /// daemon writes on a user-defined network, so the file is the only lever that reaches the job.
+    pub resolv_conf: Option<&'a Path>,
 }
 
 /// What the ACP driver spawns: the process `program` + `args`, and the `cwd` the ACP session runs
@@ -354,13 +393,57 @@ impl SandboxPolicy {
     /// mode a missing (or blank) `image` DEFAULTS to [`DEFAULT_SANDBOX_IMAGE`] — the binary supplies
     /// the version-pinned GHCR ref — so a fresh seller who sets only `mode = "docker"` gets a working
     /// container without naming an image.
+    ///
+    /// The container-delivery default depends on the uid the container will run as
+    /// ([`job_identity`]): see [`Self::from_config_as`].
     pub fn from_config(config: Option<&crate::home::SandboxConfig>) -> Result<Self, ExecError> {
+        Self::from_config_as(config, job_identity().0)
+    }
+
+    /// [`Self::from_config`] for a container that will run as `container_uid` — the uid `docker run
+    /// --user` gets, which is this daemon's own ([`job_identity`]). Injected so the resolution is
+    /// testable for a root seat without being one.
+    ///
+    /// Under uid 0 the job is root INSIDE the container, and the same-uid boundary between the job
+    /// and the delivery orchestrator is at its weakest, so container delivery is NOT the default for
+    /// such a seat: an absent `container_delivery` resolves to the host path there, and only an
+    /// explicit `container_delivery = true` selects the container
+    /// ([`crate::home::SandboxConfig::container_delivery_enabled`]).
+    pub fn from_config_as(
+        config: Option<&crate::home::SandboxConfig>,
+        container_uid: u32,
+    ) -> Result<Self, ExecError> {
         use crate::home::SandboxMode;
         let Some(config) = config else {
             return Ok(Self::passthrough());
         };
         match config.mode {
-            SandboxMode::Launcher => Ok(Self::wrapped(config.launcher.clone())),
+            SandboxMode::Launcher => {
+                // The container-delivery keys name a container that launcher mode never creates. A
+                // seat that sets them under `launcher` has a config that says two different things
+                // about where git runs, so it is refused here rather than read as "host path".
+                //
+                // `container_delivery = false` is the ONE exception, and it is not a courtesy: since
+                // the docker default moved to the container path, that value is how an operator
+                // writes down "the host path". Under launcher mode it names the path the mode already
+                // takes, so it contradicts nothing and refusing it would refuse a true statement.
+                // The ABSENT key is the same case, and it is every launcher seat: the flipped default
+                // must never make one of them refuse to boot.
+                if config.container_delivery == Some(true)
+                    || config.container_delivery_token.is_some()
+                    || config.container_delivery_token_cap_secs.is_some()
+                {
+                    return Err(ExecError::Config(
+                        "[sandbox] container_delivery = true, container_delivery_token and \
+                         container_delivery_token_cap_secs require mode = \"docker\", because \
+                         launcher mode creates no container to run the git steps in \
+                         (container_delivery = false is accepted: it names the path launcher mode \
+                         already takes)"
+                            .into(),
+                    ));
+                }
+                Ok(Self::wrapped(config.launcher.clone()))
+            }
             SandboxMode::Docker => {
                 let image = config
                     .image
@@ -389,6 +472,22 @@ impl SandboxPolicy {
                     .map_err(|error| {
                         ExecError::Config(format!("[sandbox] proxy_port_range: {error}"))
                     })?;
+                // Validated HERE, at config resolution, for the same reason as the port range: a
+                // resolver that is a hostname or a loopback stub cannot serve a sandboxed job, and
+                // discovering that at job time would fail every job with an error that names the
+                // symptom rather than the config key.
+                //
+                // The CANONICAL addresses are what the policy carries, not the raw config vector.
+                // `sandbox_dns::from_config` trims, drops blanks, canonicalises each address and
+                // de-duplicates, and every launch resolves through it — so a policy holding the raw
+                // list would describe a different plan from the one launches install: `["1.1.1.1",
+                // "1.1.1.1"]` claims four port-53 rules where two are rendered, and `[" "]` claims a
+                // named resolver where a launch performs host discovery. Anything reading the policy
+                // (`doctor` above all) then reports numbers no job will ever have.
+                let configured_resolvers = crate::sandbox_dns::from_config(&config.dns_servers)
+                    .map_err(|error| ExecError::Config(error.to_string()))?
+                    .map(|resolvers| resolvers.addresses().to_vec())
+                    .unwrap_or_default();
                 if let Some(codex) = &config.codex_chatgpt {
                     if !codex.auth_file.is_absolute() {
                         return Err(ExecError::Config(format!(
@@ -490,6 +589,25 @@ impl SandboxPolicy {
                         )));
                     }
                 }
+                // A zero cap would refuse every long-lived mint; it is a typo, not a policy, and is
+                // refused at config resolution so the seat does not fail its first job instead.
+                if config.container_delivery_token_cap_secs == Some(0) {
+                    return Err(ExecError::Config(
+                        "[sandbox] container_delivery_token_cap_secs must be greater than zero".into(),
+                    ));
+                }
+                // ON unless the operator wrote `container_delivery = false` — or the container
+                // would run as root, where the absent key resolves to the host path instead.
+                // `container_delivery_enabled` is the one place that reads the default, and the
+                // seller boot line reports what it decided.
+                let container_delivery = config.container_delivery_enabled(container_uid).then(|| {
+                    ContainerDeliveryPolicy {
+                        token: config.container_delivery_token.unwrap_or_default(),
+                        token_cap_secs: config
+                            .container_delivery_token_cap_secs
+                            .unwrap_or(DEFAULT_CONTAINER_DELIVERY_TOKEN_CAP_SECS),
+                    }
+                });
                 let mut policy = Self::docker(DockerPolicy {
                     image,
                     forward_env: config.forward_env.clone(),
@@ -497,6 +615,8 @@ impl SandboxPolicy {
                     network,
                     proxy_ports,
                     file_credentials: config.file_credentials.clone(),
+                    dns_servers: configured_resolvers,
+                    container_delivery,
                 });
                 policy.codex_chatgpt = config.codex_chatgpt.clone();
                 Ok(policy)
@@ -562,6 +682,18 @@ impl SandboxPolicy {
         }
     }
 
+    /// The operator-named resolver addresses, empty when none were configured — which means
+    /// "discover the host's own at launch", not "no resolver".
+    ///
+    /// Read by the containment path so the file a job is handed and the port-53 exceptions its
+    /// policy opens come from one config value rather than being decided twice.
+    pub fn dns_servers(&self) -> &[String] {
+        match &self.kind {
+            PolicyKind::Docker(policy) => &policy.dns_servers,
+            PolicyKind::Passthrough | PolicyKind::Launcher(_) => &[],
+        }
+    }
+
     /// The file-sourced credentials this policy contains (#852), empty under a host policy — which
     /// needs no containment at all, having inherited the daemon's environment and filesystem.
     pub fn file_credentials(&self) -> &[crate::home::FileCredential] {
@@ -575,6 +707,17 @@ impl SandboxPolicy {
     pub fn codex_chatgpt(&self) -> Option<&crate::home::CodexChatgptConfig> {
         match &self.kind {
             PolicyKind::Docker(_) => self.codex_chatgpt.as_ref(),
+            PolicyKind::Passthrough | PolicyKind::Launcher(_) => None,
+        }
+    }
+
+    /// The container-side delivery settings, `Some` for a docker policy that delivers from inside
+    /// the container — which is the DEFAULT for `mode = "docker"`. `None` ⇒ the host delivery path:
+    /// a launcher or pass-through policy, or a docker seat with `[sandbox] container_delivery =
+    /// false`.
+    pub fn container_delivery(&self) -> Option<ContainerDeliveryPolicy> {
+        match &self.kind {
+            PolicyKind::Docker(policy) => policy.container_delivery,
             PolicyKind::Passthrough | PolicyKind::Launcher(_) => None,
         }
     }
@@ -604,6 +747,20 @@ impl SandboxPolicy {
         &self,
         agent_command: &[String],
         job: &JobLaunch<'_>,
+    ) -> Result<AgentLaunch, ExecError> {
+        self.launch_with_mounts(agent_command, job, &[])
+    }
+
+    /// [`Self::launch`] with extra read-write bind mounts for a docker launch: `(host_dir,
+    /// container_path)` pairs added after the workdir mount. A host executor has no mount namespace
+    /// to add to and ignores them. The container-delivery launch mounts its per-job exchange
+    /// directory this way; the agent launch adds nothing — so ONE argv builder still serves both, and
+    /// the only difference between the two launches is the command and this list.
+    pub fn launch_with_mounts(
+        &self,
+        agent_command: &[String],
+        job: &JobLaunch<'_>,
+        extra_mounts: &[(PathBuf, String)],
     ) -> Result<AgentLaunch, ExecError> {
         if agent_command.is_empty() {
             return Err(ExecError::Config("agent_command empty".into()));
@@ -637,7 +794,7 @@ impl SandboxPolicy {
                         )));
                     }
                 }
-                let argv = policy.run_argv(agent_command, job);
+                let argv = policy.run_argv(agent_command, job, extra_mounts);
                 // The ACP session runs at the in-container mount point, not the host path.
                 return Ok(split_argv(argv, PathBuf::from(CONTAINER_WORKDIR)));
             }
@@ -678,7 +835,16 @@ impl DockerPolicy {
     /// runs against a userspace kernel, not the host one; a Mac seat leaves it unset (the platform VM
     /// is the boundary there). The named runtime must be registered with the daemon, or the run fails
     /// at spawn — a fail-closed the seller boot doctor is meant to catch first.
-    fn run_argv(&self, agent_command: &[String], job: &JobLaunch<'_>) -> Vec<String> {
+    ///
+    /// `extra_mounts` — further read-write bind mounts, `(host_dir, container_path)`, after the
+    /// workdir. Empty for the agent launch. The container-delivery launch passes its exchange
+    /// directory, which lives OUTSIDE the workdir so the deliverable never contains it.
+    fn run_argv(
+        &self,
+        agent_command: &[String],
+        job: &JobLaunch<'_>,
+        extra_mounts: &[(PathBuf, String)],
+    ) -> Vec<String> {
         let mut argv: Vec<String> = vec!["docker".into(), "run".into(), "-i".into()];
         // Runtime first, so it is unambiguously a `docker run` flag and not read as the image.
         if let Some(runtime) = &self.runtime {
@@ -730,15 +896,35 @@ impl DockerPolicy {
             "-w".into(),
             CONTAINER_WORKDIR.into(),
         ]);
+        for (host_dir, container_path) in extra_mounts {
+            argv.push("-v".into());
+            argv.push(format!("{}:{container_path}", host_dir.display()));
+        }
+        // The job's resolver, read-only, when containment wrote one.
+        //
+        // ⛔ Not a preference and not a convenience: under gVisor docker's embedded resolver at
+        // `127.0.0.11` never answers, so without this file every lookup inside the job fails
+        // `EAI_AGAIN` while the identical container under runc resolves fine (measured, with the raw
+        // UDP datagram to `127.0.0.11:53` timing out). `--dns` cannot substitute — on a user-defined
+        // network the daemon writes `nameserver 127.0.0.11` whatever it is told — so the file is the
+        // lever, and `:ro` keeps a stranger's job from rewriting where its own lookups go.
+        if let Some(resolv_conf) = job.resolv_conf {
+            argv.push("-v".into());
+            argv.push(format!("{}:/etc/resolv.conf:ro", resolv_conf.display()));
+        }
         // Egress containment (#797): join the namespace a holder container already owns, where the
         // rendered policy is in force BEFORE this process exists — the rules are not applied to the
         // job, the job is started into them. `crate::sandbox_netns` establishes that; `None` here
         // means it was not established, and the job falls back to the configured network (or, unset,
         // to the daemon default — exactly the behaviour before any of this existed).
         //
-        // Name resolution survives the swap: a container joining a namespace still gets its own
-        // /etc/resolv.conf pointing at docker's embedded resolver on 127.0.0.11 (measured), which is
-        // why `sandbox_net` must never deny loopback.
+        // Name resolution does NOT survive the swap on its own. A container joining a namespace gets
+        // its own /etc/resolv.conf pointing at docker's embedded resolver on 127.0.0.11, and under
+        // gVisor that resolver is unreachable: the sandbox terminates loopback in its own network
+        // stack, so the packet never reaches the NAT rules or the daemon socket behind them
+        // (measured — runsc EAI_AGAIN, runc OK, identical image and network). That is what the
+        // `resolv_conf` mount above exists to fix, and `sandbox_net` still never denies loopback
+        // because a runc seat continues to rely on exactly that resolver.
         match job.netns {
             Some(holder) => {
                 argv.push("--network".into());
@@ -901,6 +1087,7 @@ pub fn probe_launch_argv(
         uid,
         gid,
         netns: None,
+        resolv_conf: None,
     };
     let launch = policy.launch(probe_command, &job)?;
     let mut argv = Vec::with_capacity(launch.args.len() + 1);
@@ -1287,7 +1474,7 @@ impl Drop for ProbeWorkdir {
 /// attributed instead of merely noticed. Sanitised to what docker accepts in a container name
 /// (`[a-zA-Z0-9][a-zA-Z0-9_.-]*`), and never empty: a workdir with no usable final component would
 /// otherwise produce a name docker rejects at the moment containment is being established.
-fn job_id_of(workdir: &Path) -> String {
+pub(crate) fn job_id_of(workdir: &Path) -> String {
     let raw = workdir.file_name().and_then(|name| name.to_str()).unwrap_or_default();
     let cleaned: String = raw
         .chars()
@@ -1511,25 +1698,83 @@ impl DockerCli for RealDockerCli {
     }
 }
 
+/// What became of a container's evidence.
+///
+/// ⚠ **Three states rather than two, because "this job has no diagnostics" is two different facts.**
+/// A capture that FAILED means evidence existed and was lost — an alarm worth waking someone for. A
+/// capture deliberately not attempted is a policy decision with nothing wrong in it. Collapsing the
+/// two makes [`CleanupReport::evidence_lost`] fire on every self-probe, and an alarm that fires on
+/// the common case is one nobody still reads by the time it means something.
+#[derive(Debug)]
+pub enum CaptureOutcome {
+    /// Diagnostics were written into this directory.
+    Written(PathBuf),
+    /// Capture was not attempted, by policy. Carries a FIXED marker ([`CAPTURE_SKIPPED_PROBE`])
+    /// rather than prose, because it is what an operator greps for when a run has no diagnostics.
+    SkippedByPolicy(&'static str),
+    /// Capture was attempted and failed, with the reason.
+    Failed(String),
+}
+
 /// What cleanup did, with capture and removal reported **independently**.
 ///
-/// ⚠ Two `Result`s and not one, deliberately. A single status collapses "evidence saved but the
+/// ⚠ Two fields and not one, deliberately. A single status collapses "evidence saved but the
 /// container is still there" and "container gone, evidence lost" into one word — and those want
 /// opposite responses. A caller that only ever reads a combined verdict cannot tell an orphan from a
 /// blind spot.
 #[derive(Debug)]
 pub struct CleanupReport {
     /// Where the diagnostics were written, or why they were not.
-    pub capture: Result<PathBuf, String>,
+    pub capture: CaptureOutcome,
     /// Whether the exact job container is gone, or why it is not.
     pub removal: Result<(), String>,
 }
 
 impl CleanupReport {
-    /// The one state nothing else can recover from: the container is gone AND its evidence was not
-    /// saved. Named so a caller can act on it rather than re-deriving it from two fields.
+    /// The one state nothing else can recover from: the container is gone AND evidence that was
+    /// meant to exist was not saved. Named so a caller can act on it rather than re-deriving it from
+    /// two fields.
+    ///
+    /// A [`CaptureOutcome::SkippedByPolicy`] is deliberately NOT this. Nothing was lost where
+    /// nothing was going to be captured, and counting it here would bury the one real signal under
+    /// the most frequent event on the node.
     pub fn evidence_lost(&self) -> bool {
-        self.capture.is_err() && self.removal.is_ok()
+        matches!(self.capture, CaptureOutcome::Failed(_)) && self.removal.is_ok()
+    }
+}
+
+/// Which cleanup a run's container gets.
+///
+/// The discriminator is [`AgentRunTimeout`], which the caller already has to pass — a run that
+/// carries a job deadline is an awarded job, and one that carries a probe limit is the node probing
+/// itself. No new parameter, and no way for a caller to hold the two apart incorrectly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CleanupPolicy {
+    /// Capture the diagnostics, then remove: an awarded job, whose failure someone must be able to
+    /// explain after the fact.
+    CaptureThenRemove,
+    /// Remove without capturing: a self-probe.
+    RemoveOnly,
+}
+
+/// The cleanup a run under `timeout` gets.
+///
+/// **Awarded jobs capture; self-probes do not, and the asymmetry is the point.** A probe runs on
+/// every harness at boot and again on every re-probe, minting a FRESH job id each time
+/// (`seller_node::run::mint_probe_identity` stamps the clock into its `dir_label`). Capturing each
+/// one writes a new directory under `seller-diagnostics/` that nothing ever prunes — the probe's own
+/// cleanup removes its WORKDIR, and diagnostics are a deliberate sibling of that, out of the
+/// container's reach ([`job_diagnostics_dir`]). Unbounded growth on the seller's own disk, in
+/// exchange for the diagnostics of a run whose verdict is already reported in full through
+/// `ProbeAttempt`.
+///
+/// What a probe keeps is REMOVAL. The leak this whole path exists to close — a driver shutdown kills
+/// the `docker run` client while the container keeps running — is not specific to awarded jobs, and
+/// an abandoned probe container leaks exactly the same way.
+pub fn cleanup_policy(timeout: AgentRunTimeout) -> CleanupPolicy {
+    match timeout {
+        AgentRunTimeout::JobDeadline(_) => CleanupPolicy::CaptureThenRemove,
+        AgentRunTimeout::HarnessProbe(_) => CleanupPolicy::RemoveOnly,
     }
 }
 
@@ -1560,7 +1805,10 @@ pub fn capture_then_remove<D: DockerCli>(
     event_log: Option<&Path>,
     secrets: &[String],
 ) -> CleanupReport {
-    let capture = capture_into(cli, name, dir, event_log, secrets);
+    let capture = match capture_into(cli, name, dir, event_log, secrets) {
+        Ok(at) => CaptureOutcome::Written(at),
+        Err(error) => CaptureOutcome::Failed(error),
+    };
     // Attempted on BOTH branches. See the doc comment: not removing would leave a running container
     // AND a name collision for the next attempt.
     let removal = cli.run(&force_remove_argv(name)).map(|_| ());
@@ -1600,6 +1848,22 @@ fn capture_into<D: DockerCli>(
     Ok(dir.to_path_buf())
 }
 
+/// Remove the container, capturing nothing, and say in the report that this was a CHOICE.
+///
+/// The counterpart to [`capture_then_remove`] under [`CleanupPolicy::RemoveOnly`]. It touches the
+/// filesystem not at all — no directory is created, which is the whole property: a path that creates
+/// an empty directory per run is the unbounded growth this policy exists to prevent, and
+/// [`capture_into`] creates its directory before it knows whether anything can be captured into it.
+///
+/// `reason` is recorded rather than dropped so that "this run has no diagnostics" stays
+/// distinguishable from "this run's diagnostics were lost" downstream, where only the report survives.
+pub fn remove_only<D: DockerCli>(cli: &mut D, name: &str, reason: &'static str) -> CleanupReport {
+    CleanupReport {
+        capture: CaptureOutcome::SkippedByPolicy(reason),
+        removal: cli.run(&force_remove_argv(name)).map(|_| ()),
+    }
+}
+
 /// Write `body` to `path` with mode `0600`, creating it.
 ///
 /// Owner-only because the file holds a stranger's job output on a host that may run more than one
@@ -1627,6 +1891,15 @@ fn restrict_to_owner(path: &Path, mode: u32) -> Result<(), String> {
 /// The structured marker the `Drop` fallback emits. A FIXED string, because it is what an operator
 /// greps for when a job has no diagnostics — a reworded marker is an unfindable record.
 pub const CAPTURE_SKIPPED_MARKER: &str = "capture_skipped=drop_fallback";
+
+/// The structured marker for a capture skipped under [`CleanupPolicy::RemoveOnly`].
+///
+/// ⚠ **A DIFFERENT string from [`CAPTURE_SKIPPED_MARKER`], and the two must never be merged.** They
+/// record opposite things. This one says a healthy path decided there was nothing worth keeping;
+/// that one says a guard fired because no explicit cleanup ever ran, which is a near-miss on the bug
+/// this module exists to fix. One marker for both would make the near-miss unfindable in exactly the
+/// logs where it matters, buried under one line per probe per boot.
+pub const CAPTURE_SKIPPED_PROBE: &str = "capture_skipped=probe";
 
 /// What [`JobContainer`]'s `Drop` must do, as a VALUE.
 ///
@@ -2140,7 +2413,7 @@ fn codex_chatgpt_session_for_command(
 /// Run the awarded agent under the ACP driver: one session in `workdir`, seeded with `prompt`, with
 /// the delivery `identity`'s git env, bounded by `timeout` (the unified job timeout). The agent
 /// command is launched through `policy` — directly under a pass-through policy, or inside the
-/// policy's launcher.
+/// policy's launcher. The agent child inherits this process's environment (the host behaviour).
 #[cfg(feature = "acp")]
 pub async fn run_agent_job(
     agent_command: &[String],
@@ -2150,143 +2423,52 @@ pub async fn run_agent_job(
     identity: &DeliveryAgentIdentity,
     timeout: AgentRunTimeout,
 ) -> Result<AgentRunReport, ExecError> {
+    run_agent_job_with_env(agent_command, policy, prompt, workdir, identity, timeout, None).await
+}
+
+/// [`run_agent_job`] with an explicit agent environment. `agent_env = Some(pairs)` spawns the agent
+/// child with EXACTLY `pairs` as its environment (nothing inherited); `None` inherits, as
+/// [`run_agent_job`] does. The container-side delivery orchestrator passes the allowlist it computed
+/// (`delivery_orchestrator::agent_env_allowlist`), so the agent never sees the push token, the
+/// `job_hash`, or the inputs path — C4 of the container-delivery review. Under a docker policy the
+/// container's own `-e` pairs are what the agent sees, so callers pass `None` there.
+#[cfg(feature = "acp")]
+#[allow(clippy::too_many_arguments)]
+pub async fn run_agent_job_with_env(
+    agent_command: &[String],
+    policy: &SandboxPolicy,
+    prompt: &str,
+    workdir: &Path,
+    identity: &DeliveryAgentIdentity,
+    timeout: AgentRunTimeout,
+    agent_env: Option<Vec<(String, String)>>,
+) -> Result<AgentRunReport, ExecError> {
     use crate::driver::{AcpDriver, AgentCommand, ContentBlock, PromptTurn, SessionConfig};
     use crate::engine::{run_job, RunParams};
     use crate::event::JobId;
     use crate::log::EventLog;
 
-    // Run the container/process as the seller's own uid/gid so a docker bind-mount's output is owned
-    // by the seller and the delivery snapshot can read it. Ignored by the host executors.
-    //
-    // The delivery identity, plus the agent-auth allowlist a container needs because it inherits
-    // nothing from the daemon. Empty under a host executor, which already inherits it all.
-    let mut env = identity.git_env();
-    // Read and validate the host session before any docker holder or job container starts. The
-    // session reader binds no refresh token and requires the token to outlive this job.
-    let codex_chatgpt_session =
-        codex_chatgpt_session_for_command(policy, agent_command, timeout.duration())?;
-    // The argv actually spawned. Identical to `agent_command` unless containment adds a redirect flag
-    // for a file-sourced credential, whose proxy URL is not known until the proxy is bound.
-    let mut effective_command = agent_command.to_vec();
-    let forwarded = forwarded_agent_env(policy);
-    // The credential VALUES this run forwards, held for the capture redactor's exact-value pass.
-    // Taken here because `forwarded` is consumed into `env` further down, and taken as values rather
-    // than trusting patterns because a pattern-only redactor reports "no credential found" identically
-    // for text that is clean and text whose token shape it does not recognise.
-    //
-    // ⛔ These are never printed, formatted into an error, or written anywhere but through
-    // [`redact`], which replaces them. A capture path is exactly where a secret must not leak.
-    let forwarded_secrets: Vec<String> = forwarded.iter().map(|(_, value)| value.clone()).collect();
-    // Credential containment (#647). Under docker the real model credential must NOT enter the
-    // container: a stranger's job can read `-e ANTHROPIC_API_KEY` and exfiltrate a reusable secret.
-    // Start a per-job host proxy that holds the real credential, forward a format-plausible
-    // placeholder + a base-URL override pointing at the proxy in its place, and keep the proxy alive
-    // for the run (dropping `_proxy` at fn end revokes the placeholder). If containment is required
-    // but cannot be established, the job FAILS — there is no fallback to putting the real credential
-    // in the container.
-    let (uid, gid) = job_identity();
-    // Egress containment (#797), FIRST, because two things downstream depend on what it measures: the
-    // job's `--network` names the holder it creates, and the credential proxy's base URL must carry the
-    // address it resolved. Declared before `_proxy` so it is dropped LAST — the namespace has to
-    // outlive the job that runs in it.
-    //
-    // Established only for a docker policy with a configured network. No network ⇒ no containment,
-    // which is the behaviour a seat had before any of this existed; it is not silently claimed.
-    let _containment;
-    let holder = match (policy.docker_image(), policy.sandbox_network()) {
-        (Some(image), Some(network)) => {
-            let established = crate::sandbox_netns::establish(
-                network,
-                image,
-                crate::sandbox_netns::DEFAULT_NETFILTER_IMAGE,
-                crate::credential_proxy::PROXY_HOST_ALIAS,
-                &job_id_of(workdir),
-                // The holder is stamped with this seat's own key, so the boot reaper of a co-tenant
-                // daemon can tell it is not theirs to remove.
-                identity.seller_pubkey_hex(),
-                uid,
-                gid,
-                policy.proxy_ports(),
-                true,
-            )
-            .await
-            // Fail the job rather than run it uncontained. The whole point of moving containment into
-            // the namespace is that "configured but not enforced" stops being representable, and a
-            // fallback here would put it straight back.
-            .map_err(|error| {
-                ExecError::Policy(format!("[sandbox] egress containment not established: {error}"))
-            })?;
-            let name = established.holder.name().to_owned();
-            let host = established.proxy_host.clone();
-            _containment = Some(established);
-            Some((name, host))
-        }
-        _ => {
-            _containment = None;
-            None
-        }
-    };
-    // Credential containment (#647). Under docker the real model credential must NOT enter the
-    // container: a stranger's job can read `-e ANTHROPIC_API_KEY` and exfiltrate a reusable secret.
-    // Start a per-job host proxy that holds the real credential, forward a format-plausible
-    // placeholder + a base-URL override pointing at the proxy in its place, and keep the proxy alive
-    // for the run (dropping `_proxy` at fn end revokes the placeholder). If containment is required
-    // but cannot be established, the job FAILS — there is no fallback to putting the real credential
-    // in the container.
-    let _proxy;
-    if policy.docker_image().is_some() {
-        // A namespace-contained job reaches the proxy at the measured address, not at the docker
-        // alias: `--add-host` and `--network=container:…` are mutually exclusive, so the alias would
-        // never resolve inside it. The same string is what the firewall pinhole names.
-        let proxy_host = holder
-            .as_ref()
-            .map(|(_, host)| host.as_str())
-            .unwrap_or(crate::credential_proxy::PROXY_HOST_ALIAS);
-        match start_credential_containment(
-            &forwarded,
-            policy.file_credentials(),
-            codex_chatgpt_session,
-            timeout.duration(),
-            policy.proxy_ports(),
-            proxy_host,
-        )
-        .await?
-        {
-            Some(containment) => {
-                // A contained credential the job cannot reach is worse than a loud failure: the run
-                // would burn its whole timeout on auth errors. The pinhole comes from `proxy_ports`,
-                // so without a range there is no hole for the proxy to be reached through.
-                if holder.is_some() && policy.proxy_ports().is_none() {
-                    return Err(ExecError::Config(
-                        "[sandbox] docker: a contained credential needs [sandbox] proxy_port_range \
-                         when egress containment is active — without it the firewall opens no pinhole \
-                         and the job cannot reach its model"
-                            .into(),
-                    ));
-                }
-                env.extend(containment.env);
-                // A file-sourced credential is reached through the client's own flag, not a base-URL
-                // variable, so the redirect has to land in the argv the driver spawns.
-                effective_command.extend(containment.argv_extra);
-                _proxy = Some(containment.proxy);
-            }
-            None => env.extend(forwarded),
-        }
-    } else {
-        env.extend(forwarded);
-    }
+    let prepared = prepare_launch(agent_command, policy, workdir, identity, timeout.duration()).await?;
     let job = JobLaunch {
         workdir,
-        env: &env,
-        uid,
-        gid,
-        netns: holder.as_ref().map(|(name, _)| name.as_str()),
+        env: &prepared.env,
+        uid: prepared.uid,
+        gid: prepared.gid,
+        netns: prepared.holder_name.as_deref(),
+        // Present exactly when containment was established, because that is the only path that
+        // wrote a resolver file and opened port 53 to the addresses in it. Handing a job this file
+        // without those pinholes would point it at a resolver its own firewall drops.
+        resolv_conf: prepared.resolv_conf.as_deref(),
     };
-    let launch = policy.launch(&effective_command, &job)?;
+    let launch = policy.launch(&prepared.effective_command, &job)?;
     // The ACP idle/response timeout IS the unified job timeout — never a hardcoded 300s that could
     // override or conflict with `--job-timeout-secs`.
+    let mut agent = AgentCommand::new(launch.program, launch.args);
+    if let Some(env) = agent_env {
+        agent = agent.with_env(env);
+    }
     let mut driver = AcpDriver::new(
-        AgentCommand::new(launch.program, launch.args),
+        agent,
         crate::driver::PermissionOutcome::Allow,
         timeout.duration(),
     );
@@ -2327,75 +2509,18 @@ pub async fn run_agent_job(
     // an agent failure returns `Err`, and the error exit is precisely the one that leaves a container
     // running — `AcpDriver::shutdown` kills the `docker run` CLIENT, so `--rm` never fires. A cleanup
     // placed after `map_err(…)?` would therefore run on every exit EXCEPT the ones that need it.
-    if let Some(mut container) = container.take() {
-        let name = container.name().to_owned();
-        let destination = job_diagnostics_dir(workdir);
-        let event_log = log_path.clone();
-        let secrets = forwarded_secrets;
-        // Owned: `spawn_blocking` needs `'static`, and this is only ever used in a message.
-        let workdir_shown = workdir.display().to_string();
-        // Off the runtime, for the reason `AcpDriver::shutdown` gives for its own blocking work: the
-        // seller node runs every awarded job as a `spawn_local` task on ONE LocalSet thread, so
-        // blocking docker calls here would stall every sibling job for the duration.
-        let reported = tokio::task::spawn_blocking(move || match destination {
-            Some(dir) => {
-                capture_then_remove(&mut RealDockerCli, &name, &dir, Some(&event_log), &secrets)
-            }
-            // The workdir is not one `job_workdir` built, so there is nowhere derivable to put the
-            // evidence. Still remove the container — a leak would also block the next attempt on this
-            // job id — but say plainly that nothing was captured rather than reporting a clean exit.
-            None => CleanupReport {
-                capture: Err(format!(
-                    "no diagnostics directory derivable from the workdir {workdir_shown}"
-                )),
-                removal: RealDockerCli.run(&force_remove_argv(&name)).map(|_| ()),
-            },
-        })
+    if let Some(container) = container.take() {
+        // An awarded job's diagnostics are worth keeping; a self-probe's are not worth a directory
+        // per run in a tree nothing prunes. `cleanup_policy` carries the full reasoning, and the
+        // removal — the leak this path exists to close — happens either way.
+        cleanup_job_container(
+            container,
+            workdir,
+            log_path.clone(),
+            prepared.forwarded_secrets.clone(),
+            cleanup_policy(timeout),
+        )
         .await;
-        // The explicit path ran, so `Drop` must not also fire its fallback and report a
-        // `capture_skipped` that did not happen. `settle` records that it RAN, not that it SUCCEEDED —
-        // the two legs below carry the outcome.
-        container.settle();
-        match reported {
-            // Reported as two independent facts. A single verdict would collapse "evidence saved, the
-            // container is still there" and "container gone, evidence lost" — opposite problems.
-            Ok(report) => {
-                match &report.capture {
-                    Ok(dir) => eprintln!(
-                        "sandbox: job_capture=ok container={} dir={}",
-                        container.name(),
-                        dir.display()
-                    ),
-                    Err(error) => eprintln!(
-                        "sandbox: job_capture=failed container={} error={error}",
-                        container.name()
-                    ),
-                }
-                match &report.removal {
-                    Ok(()) => {
-                        eprintln!("sandbox: job_cleanup=ok container={}", container.name())
-                    }
-                    Err(error) => eprintln!(
-                        "sandbox: job_cleanup=failed container={} error={error}",
-                        container.name()
-                    ),
-                }
-                if report.evidence_lost() {
-                    eprintln!(
-                        "sandbox: job_capture=evidence_lost container={} — the container was removed \
-                         and its diagnostics were not saved",
-                        container.name()
-                    );
-                }
-            }
-            // The blocking task itself died, so neither leg has an answer and the container's state is
-            // unknown. Saying so is the point: an unreported orphan is the failure mode this work
-            // exists to remove.
-            Err(error) => eprintln!(
-                "sandbox: job_cleanup=unknown container={} error=cleanup task panicked: {error}",
-                container.name()
-            ),
-        }
     }
     let outcome = outcome.map_err(|error| classify_run_error(error, timeout))?;
     match outcome.terminal {
@@ -2404,6 +2529,316 @@ pub async fn run_agent_job(
             last_agent_message: capture.into_last_message(),
         }),
         other => Err(ExecError::Agent(format!("agent terminal {other:?}"))),
+    }
+}
+
+/// The host-side preparation of one job launch under `policy`: the delivery-identity env, the
+/// forwarded agent-auth allowlist, egress containment (#797) and credential containment (#647) when
+/// the policy is docker — everything [`run_agent_job`] did before it built the argv, as ONE value
+/// whose guards live for the run. Both the agent launch ([`run_agent_job_with_env`]) and the
+/// container-delivery launch (`seller_node::run`) call this, so a docker seat's containment is
+/// decided in one place whichever command runs inside the container.
+///
+/// Field order is drop order: the proxy goes first, then the namespace — the namespace has to
+/// outlive the job that ran in it.
+#[cfg_attr(not(feature = "acp"), allow(dead_code))]
+pub(crate) struct PreparedLaunch {
+    /// The container environment (`-e` pairs under docker): the delivery identity plus the contained
+    /// or forwarded agent auth. Placeholders and base URLs, never a real contained credential.
+    pub env: Vec<(String, String)>,
+    /// The argv actually spawned: `agent_command` plus any containment redirect flags.
+    pub effective_command: Vec<String>,
+    /// The real credential values this run forwards, for the capture redactor's exact-value pass.
+    /// ⛔ Never printed, formatted into an error, or written anywhere but through [`redact`].
+    pub forwarded_secrets: Vec<String>,
+    pub uid: u32,
+    pub gid: u32,
+    /// The netns holder's container name when egress containment is in force.
+    pub holder_name: Option<String>,
+    /// The resolver file written for this job, bind-mounted read-only at `/etc/resolv.conf`.
+    ///
+    /// `Some` exactly when containment is in force, because that is the only path that wrote the
+    /// file AND opened port 53 to the addresses inside it. Carried on the prepared launch rather
+    /// than re-derived per call site so the agent launch and the container-delivery launch hand the
+    /// job the same resolvers its own firewall was told about.
+    pub resolv_conf: Option<std::path::PathBuf>,
+    _proxy: Option<crate::credential_proxy::RunningProxy>,
+    _containment: Option<crate::sandbox_netns::Containment>,
+}
+
+/// Prepare a launch (see [`PreparedLaunch`]). `job_lifetime` bounds the contained credentials'
+/// placeholders and the host ChatGPT session read; the agent launch passes its unified job timeout,
+/// the container-delivery launch adds its push margin.
+#[cfg(feature = "acp")]
+pub(crate) async fn prepare_launch(
+    agent_command: &[String],
+    policy: &SandboxPolicy,
+    workdir: &Path,
+    identity: &DeliveryAgentIdentity,
+    job_lifetime: Duration,
+) -> Result<PreparedLaunch, ExecError> {
+    // Run the container/process as the seller's own uid/gid so a docker bind-mount's output is owned
+    // by the seller and the delivery snapshot can read it. Ignored by the host executors.
+    //
+    // The delivery identity, plus the agent-auth allowlist a container needs because it inherits
+    // nothing from the daemon. Empty under a host executor, which already inherits it all.
+    let mut env = identity.git_env();
+    // Read and validate the host session before any docker holder or job container starts. The
+    // session reader binds no refresh token and requires the token to outlive this job.
+    let codex_chatgpt_session =
+        codex_chatgpt_session_for_command(policy, agent_command, job_lifetime)?;
+    // The argv actually spawned. Identical to `agent_command` unless containment adds a redirect flag
+    // for a file-sourced credential, whose proxy URL is not known until the proxy is bound.
+    let mut effective_command = agent_command.to_vec();
+    let forwarded = forwarded_agent_env(policy);
+    // The credential VALUES this run forwards, held for the capture redactor's exact-value pass.
+    // Taken here because `forwarded` is consumed into `env` further down, and taken as values rather
+    // than trusting patterns because a pattern-only redactor reports "no credential found" identically
+    // for text that is clean and text whose token shape it does not recognise.
+    //
+    // ⛔ These are never printed, formatted into an error, or written anywhere but through
+    // [`redact`], which replaces them. A capture path is exactly where a secret must not leak.
+    let forwarded_secrets: Vec<String> = forwarded.iter().map(|(_, value)| value.clone()).collect();
+    // Credential containment (#647). Under docker the real model credential must NOT enter the
+    // container: a stranger's job can read `-e ANTHROPIC_API_KEY` and exfiltrate a reusable secret.
+    // Start a per-job host proxy that holds the real credential, forward a format-plausible
+    // placeholder + a base-URL override pointing at the proxy in its place, and keep the proxy alive
+    // for the run (dropping `_proxy` at fn end revokes the placeholder). If containment is required
+    // but cannot be established, the job FAILS — there is no fallback to putting the real credential
+    // in the container.
+    let (uid, gid) = job_identity();
+    // Egress containment (#797), FIRST, because two things downstream depend on what it measures: the
+    // job's `--network` names the holder it creates, and the credential proxy's base URL must carry the
+    // address it resolved. Declared before `_proxy` so it is dropped LAST — the namespace has to
+    // outlive the job that runs in it.
+    //
+    // Established only for a docker policy with a configured network. No network ⇒ no containment,
+    // which is the behaviour a seat had before any of this existed; it is not silently claimed.
+    let _containment;
+    // The resolver file this job is handed, when it gets one. Declared out here so the argv built
+    // further down can name it: the file is written by the containment path, and only that path
+    // opens port 53 to the addresses inside it.
+    let mut job_resolv_conf: Option<std::path::PathBuf> = None;
+    let holder = match (policy.docker_image(), policy.sandbox_network()) {
+        (Some(image), Some(network)) => {
+            // Resolvers FIRST, before the namespace exists, so a seat with no usable resolver fails
+            // with that reason and leaves nothing to tear down. Docker's embedded resolver is not an
+            // option here — under gVisor it never answers — so a job that cannot be given a real
+            // resolver is refused rather than launched to fail EAI_AGAIN with no explanation.
+            //
+            // Resolved ONCE. The same `Resolvers` value renders the file below and is handed to
+            // `establish` for the port-53 exceptions, because a second discovery could disagree with
+            // the first and the job would be pointed at a resolver its own firewall drops.
+            let resolvers = crate::sandbox_dns::resolve(
+                policy.dns_servers(),
+                crate::sandbox_dns::host_resolv_conf,
+                crate::sandbox_dns::host_resolvectl,
+            )
+            .map_err(|error| ExecError::Policy(format!("[sandbox] {error}")))?;
+            let resolv_path = workdir
+                .parent()
+                .unwrap_or(workdir)
+                .join(format!("resolv-{}.conf", job_id_of(workdir)));
+            std::fs::write(&resolv_path, resolvers.render_resolv_conf()).map_err(|error| {
+                ExecError::Policy(format!(
+                    "[sandbox] could not write the job's resolver file {}: {error}",
+                    resolv_path.display()
+                ))
+            })?;
+            job_resolv_conf = Some(resolv_path);
+            let established = crate::sandbox_netns::establish(
+                network,
+                image,
+                crate::sandbox_netns::DEFAULT_NETFILTER_IMAGE,
+                crate::credential_proxy::PROXY_HOST_ALIAS,
+                &job_id_of(workdir),
+                // The holder is stamped with this seat's own key, so the boot reaper of a co-tenant
+                // daemon can tell it is not theirs to remove.
+                identity.seller_pubkey_hex(),
+                uid,
+                gid,
+                policy.proxy_ports(),
+                true,
+                resolvers.addresses().to_vec(),
+            )
+            .await
+            // Fail the job rather than run it uncontained. The whole point of moving containment into
+            // the namespace is that "configured but not enforced" stops being representable, and a
+            // fallback here would put it straight back.
+            .map_err(|error| {
+                ExecError::Policy(format!("[sandbox] egress containment not established: {error}"))
+            })?;
+            let name = established.holder.name().to_owned();
+            let host = established.proxy_host.clone();
+            _containment = Some(established);
+            Some((name, host))
+        }
+        _ => {
+            _containment = None;
+            None
+        }
+    };
+    // Credential containment (#647). Under docker the real model credential must NOT enter the
+    // container: a stranger's job can read `-e ANTHROPIC_API_KEY` and exfiltrate a reusable secret.
+    // Start a per-job host proxy that holds the real credential, forward a format-plausible
+    // placeholder + a base-URL override pointing at the proxy in its place, and keep the proxy alive
+    // for the run (dropping `_proxy` at fn end revokes the placeholder). If containment is required
+    // but cannot be established, the job FAILS — there is no fallback to putting the real credential
+    // in the container.
+    let mut _proxy: Option<crate::credential_proxy::RunningProxy> = None;
+    if policy.docker_image().is_some() {
+        // A namespace-contained job reaches the proxy at the measured address, not at the docker
+        // alias: `--add-host` and `--network=container:…` are mutually exclusive, so the alias would
+        // never resolve inside it. The same string is what the firewall pinhole names.
+        let proxy_host = holder
+            .as_ref()
+            .map(|(_, host)| host.as_str())
+            .unwrap_or(crate::credential_proxy::PROXY_HOST_ALIAS);
+        match start_credential_containment(
+            &forwarded,
+            policy.file_credentials(),
+            codex_chatgpt_session,
+            job_lifetime,
+            policy.proxy_ports(),
+            proxy_host,
+        )
+        .await?
+        {
+            Some(containment) => {
+                // A contained credential the job cannot reach is worse than a loud failure: the run
+                // would burn its whole timeout on auth errors. The pinhole comes from `proxy_ports`,
+                // so without a range there is no hole for the proxy to be reached through.
+                if holder.is_some() && policy.proxy_ports().is_none() {
+                    return Err(ExecError::Config(
+                        "[sandbox] docker: a contained credential needs [sandbox] proxy_port_range \
+                         when egress containment is active — without it the firewall opens no pinhole \
+                         and the job cannot reach its model"
+                            .into(),
+                    ));
+                }
+                env.extend(containment.env);
+                // A file-sourced credential is reached through the client's own flag, not a base-URL
+                // variable, so the redirect has to land in the argv the driver spawns.
+                effective_command.extend(containment.argv_extra);
+                _proxy = Some(containment.proxy);
+            }
+            None => env.extend(forwarded),
+        }
+    } else {
+        env.extend(forwarded);
+    }
+    Ok(PreparedLaunch {
+        env,
+        effective_command,
+        forwarded_secrets,
+        uid,
+        gid,
+        holder_name: holder.map(|(name, _)| name),
+        resolv_conf: job_resolv_conf,
+        _proxy,
+        _containment,
+    })
+}
+
+/// Without the `acp` feature there is no containment path to prepare — fail closed.
+#[cfg(not(feature = "acp"))]
+pub(crate) async fn prepare_launch(
+    _agent_command: &[String],
+    _policy: &SandboxPolicy,
+    _workdir: &Path,
+    _identity: &DeliveryAgentIdentity,
+    _job_lifetime: Duration,
+) -> Result<PreparedLaunch, ExecError> {
+    Err(ExecError::AcpRequired)
+}
+
+/// Capture the job container's diagnostics, then remove it, and report both — the tail every docker
+/// launch shares ([`run_agent_job_with_env`] and the container-delivery launch in
+/// `seller_node::run`). `container` is settled here, so its `Drop` fallback stays quiet. `event_log`
+/// is the run's maxplayer event log to copy into the bundle; `secrets` feeds the redactor.
+pub(crate) async fn cleanup_job_container(
+    mut container: JobContainer,
+    workdir: &Path,
+    event_log: PathBuf,
+    secrets: Vec<String>,
+    cleanup: CleanupPolicy,
+) {
+    let name = container.name().to_owned();
+    let destination = job_diagnostics_dir(workdir);
+    // Owned: `spawn_blocking` needs `'static`, and this is only ever used in a message.
+    let workdir_shown = workdir.display().to_string();
+    // Off the runtime, for the reason `AcpDriver::shutdown` gives for its own blocking work: the
+    // seller node runs every awarded job as a `spawn_local` task on ONE LocalSet thread, so
+    // blocking docker calls here would stall every sibling job for the duration.
+    let reported = tokio::task::spawn_blocking(move || match (cleanup, destination) {
+        (CleanupPolicy::RemoveOnly, _) => {
+            remove_only(&mut RealDockerCli, &name, CAPTURE_SKIPPED_PROBE)
+        }
+        (CleanupPolicy::CaptureThenRemove, Some(dir)) => {
+            capture_then_remove(&mut RealDockerCli, &name, &dir, Some(&event_log), &secrets)
+        }
+        // The workdir is not one `job_workdir` built, so there is nowhere derivable to put the
+        // evidence. Still remove the container — a leak would also block the next attempt on this
+        // job id — but say plainly that nothing was captured rather than reporting a clean exit.
+        // A FAILURE and not a policy skip: this job was owed diagnostics and did not get them.
+        (CleanupPolicy::CaptureThenRemove, None) => CleanupReport {
+            capture: CaptureOutcome::Failed(format!(
+                "no diagnostics directory derivable from the workdir {workdir_shown}"
+            )),
+            removal: RealDockerCli.run(&force_remove_argv(&name)).map(|_| ()),
+        },
+    })
+    .await;
+    // The explicit path ran, so `Drop` must not also fire its fallback and report a
+    // `capture_skipped` that did not happen. `settle` records that it RAN, not that it SUCCEEDED —
+    // the two legs below carry the outcome.
+    container.settle();
+    match reported {
+        // Reported as two independent facts. A single verdict would collapse "evidence saved, the
+        // container is still there" and "container gone, evidence lost" — opposite problems.
+        Ok(report) => {
+            match &report.capture {
+                CaptureOutcome::Written(dir) => eprintln!(
+                    "sandbox: job_capture=ok container={} dir={}",
+                    container.name(),
+                    dir.display()
+                ),
+                // Emitted rather than stayed silent about: a run with no diagnostics and no line
+                // explaining why is the ambiguity `CAPTURE_SKIPPED_MARKER` exists to remove, and
+                // a deliberate skip needs the same treatment as a fallback's.
+                CaptureOutcome::SkippedByPolicy(reason) => eprintln!(
+                    "sandbox: {reason} container={}",
+                    container.name()
+                ),
+                CaptureOutcome::Failed(error) => eprintln!(
+                    "sandbox: job_capture=failed container={} error={error}",
+                    container.name()
+                ),
+            }
+            match &report.removal {
+                Ok(()) => {
+                    eprintln!("sandbox: job_cleanup=ok container={}", container.name())
+                }
+                Err(error) => eprintln!(
+                    "sandbox: job_cleanup=failed container={} error={error}",
+                    container.name()
+                ),
+            }
+            if report.evidence_lost() {
+                eprintln!(
+                    "sandbox: job_capture=evidence_lost container={} — the container was removed \
+                     and its diagnostics were not saved",
+                    container.name()
+                );
+            }
+        }
+        // The blocking task itself died, so neither leg has an answer and the container's state is
+        // unknown. Saying so is the point: an unreported orphan is the failure mode this work
+        // exists to remove.
+        Err(error) => eprintln!(
+            "sandbox: job_cleanup=unknown container={} error=cleanup task panicked: {error}",
+            container.name()
+        ),
     }
 }
 
@@ -2517,7 +2952,9 @@ pub fn uncontained_forwarded_credentials(
 struct MintedCredential {
     real: String,
     placeholder: String,
-    upstream: String,
+    /// Approved upstream base URLs, primary first — the shape
+    /// [`crate::credential_proxy::JobCredential::upstreams`] takes.
+    upstreams: Vec<String>,
 }
 
 /// One host ChatGPT session and its two container-facing placeholders.
@@ -2669,7 +3106,7 @@ async fn start_credential_containment(
             MintedCredential {
                 real,
                 placeholder: proxy::mint_placeholder(cred.placeholder_prefix, cred.placeholder_random_len),
-                upstream,
+                upstreams: vec![upstream],
             },
         ));
     }
@@ -2682,16 +3119,37 @@ async fn start_credential_containment(
     // rather than as a bad placeholder). `exp` is per-job and rolling for the same reason a fixed one
     // would be wrong — it would start being refused at a date nothing in the config explains.
     let mut minted_files: Vec<(&crate::home::FileCredential, MintedCredential)> = Vec::new();
+    // Every leg authority across every file credential, deduped — each becomes one extra proxy
+    // listener, and which listener a request arrives on is what routes it (see
+    // [`proxy::start_with_legs`]).
+    let mut leg_authorities: Vec<String> = Vec::new();
     for cred in file_creds {
         let real = read_file_credential(cred)?;
-        let upstream = cred.upstream.trim().to_owned();
-        let host = proxy::authority_of(&upstream).ok_or_else(|| {
+        let mut upstreams = Vec::with_capacity(1 + cred.legs.len());
+        let primary = cred.upstream.trim().to_owned();
+        let host = proxy::authority_of(&primary).ok_or_else(|| {
             ExecError::Config(format!(
-                "[sandbox] file_credentials: upstream {upstream} is not a valid URL"
+                "[sandbox] file_credentials: upstream {primary} is not a valid URL"
             ))
         })?;
         if !upstream_hosts.contains(&host) {
             upstream_hosts.push(host);
+        }
+        upstreams.push(primary);
+        for leg in &cred.legs {
+            let upstream = leg.upstream.trim().to_owned();
+            let host = proxy::authority_of(&upstream).ok_or_else(|| {
+                ExecError::Config(format!(
+                    "[sandbox] file_credentials: legs upstream {upstream} is not a valid URL"
+                ))
+            })?;
+            if !upstream_hosts.contains(&host) {
+                upstream_hosts.push(host.clone());
+            }
+            if !leg_authorities.contains(&host) {
+                leg_authorities.push(host);
+            }
+            upstreams.push(upstream);
         }
         minted_files.push((
             cred,
@@ -2701,7 +3159,7 @@ async fn start_credential_containment(
                     FILE_CREDENTIAL_CLAIM_TYPE,
                     FILE_CREDENTIAL_PLACEHOLDER_LIFETIME,
                 ),
-                upstream,
+                upstreams,
             },
         ));
     }
@@ -2730,42 +3188,7 @@ async fn start_credential_containment(
     }
 
     let engine = Arc::new(proxy::ProxyEngine::new(upstream_hosts));
-    // The proxy is header-agnostic by design: it forwards whatever the container sent, and the
-    // forwarded agent credential rides `x-api-key`. reqwest's default redirect policy is
-    // `Policy::limited(10)`, and its cross-host scrub covers only AUTHORIZATION, COOKIE, cookie2,
-    // PROXY_AUTHORIZATION and WWW_AUTHENTICATE — `x-api-key` is in none of them. So a 3xx from an
-    // allowlisted host would carry the credential onward to a host the allowlist never approved:
-    // the destination is decided BEFORE the redirect moves it.
-    //
-    // So a redirect is followed only while it stays on the upstream the credential in flight was
-    // registered for. That upstream is not the allowlist: `authorize` picks the destination from the
-    // credential itself, and the allowlist is the UNION of every present credential's upstream. A
-    // union check would approve a 3xx from one registered vendor to ANOTHER — handing an Anthropic key
-    // to OpenAI's host — because both are on it. A refused attempt is `stop()`, which returns the 3xx
-    // for the proxy to relay to the container unchanged.
-    //
-    // The pairing is available without per-request state, so the generic client can use one shared
-    // policy. `Policy::custom` never receives a credential. The typed Codex route selects a second,
-    // no-redirect client inside the proxy because its credential is valid for fixed paths only.
-    //
-    // EVERY HOP, not just the first, and each judged against the ORIGINAL rather than its predecessor:
-    // judging hop-against-predecessor would let a chain walk one authority at a time to anywhere.
-    // Verified in reqwest 0.12.28 rather than assumed — `TowerRedirectPolicy::redirect`
-    // (`src/redirect.rs:306`) pushes the previous URL onto an accumulating chain (`:315`) and then
-    // calls this policy with THAT hop's target (`:317`), so `previous()[0]` is the original request URL
-    // on every hop. An empty chain yields no original and is refused rather than followed.
-    let forwarding_client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-            let original = attempt.previous().first().map(|url| url.as_str()).unwrap_or("");
-            if proxy::allows_paired_redirect(original, attempt.url().as_str()) {
-                attempt.follow()
-            } else {
-                attempt.stop()
-            }
-        }))
-        .build()
-        .map_err(|error| ExecError::Agent(format!("credential proxy client: {error}")))?;
-    let running = proxy::start(Arc::clone(&engine), forwarding_client, proxy_ports)
+    let running = proxy::start_with_legs(Arc::clone(&engine), proxy_ports, &leg_authorities)
         .await
         .map_err(|error| ExecError::Agent(format!("credential proxy failed to start: {error}")))?;
 
@@ -2781,7 +3204,7 @@ async fn start_credential_containment(
             .register(proxy::JobCredential {
                 placeholder: m.placeholder.clone(),
                 real: m.real.clone(),
-                upstream: m.upstream.clone(),
+                upstreams: m.upstreams.clone(),
             })
             .map_err(|refusal| {
                 ExecError::Agent(format!("credential proxy registration refused: {refusal}"))
@@ -2804,7 +3227,7 @@ async fn start_credential_containment(
             .register(proxy::JobCredential {
                 placeholder: m.placeholder.clone(),
                 real: m.real.clone(),
-                upstream: m.upstream.clone(),
+                upstreams: m.upstreams.clone(),
             })
             .map_err(|refusal| {
                 ExecError::Agent(format!("credential proxy registration refused: {refusal}"))
@@ -2812,7 +3235,10 @@ async fn start_credential_containment(
         substitutions.push((m.real.clone(), m.placeholder.clone()));
         placed.push((cred, m.placeholder.clone()));
     }
-    let (file_env, argv_extra) = file_credential_launch_additions(&placed, &base_url);
+    let (file_env, argv_extra) = file_credential_launch_additions(&placed, &base_url, |upstream| {
+        proxy::authority_of(upstream)
+            .and_then(|authority| running.leg_base_url_via(proxy_host, &authority))
+    })?;
 
     let mut codex_env = Vec::new();
     if let Some(m) = minted_codex {
@@ -2904,7 +3330,8 @@ pub fn contain_env_values(
 fn file_credential_launch_additions(
     placed: &[(&crate::home::FileCredential, String)],
     base_url: &str,
-) -> (Vec<(String, String)>, Vec<String>) {
+    leg_base_url: impl Fn(&str) -> Option<String>,
+) -> Result<(Vec<(String, String)>, Vec<String>), ExecError> {
     let mut env = Vec::with_capacity(placed.len());
     let mut argv = Vec::new();
     for (cred, placeholder) in placed {
@@ -2913,8 +3340,23 @@ fn file_credential_launch_additions(
             argv.push(flag.clone());
             argv.push(base_url.to_owned());
         }
+        for leg in &cred.legs {
+            // The leg listeners were started from this same config, so a missing URL here is a
+            // programmer error — refused rather than silently pointing the leg at the primary,
+            // which would recreate the exact wrong-host failure legs exist to fix.
+            let url = leg_base_url(&leg.upstream).ok_or_else(|| {
+                ExecError::Agent(format!(
+                    "no leg listener for {} — the proxy was started without it",
+                    leg.upstream
+                ))
+            })?;
+            for flag in &leg.endpoint_args {
+                argv.push(flag.clone());
+                argv.push(url.clone());
+            }
+        }
     }
-    (env, argv)
+    Ok((env, argv))
 }
 
 #[cfg(feature = "acp")]
@@ -2941,6 +3383,21 @@ pub async fn run_agent_job(
     Err(ExecError::AcpRequired)
 }
 
+/// Without the `acp` feature there is no agent runtime — fail closed with the rebuild hint.
+#[cfg(not(feature = "acp"))]
+#[allow(clippy::too_many_arguments)]
+pub async fn run_agent_job_with_env(
+    _agent_command: &[String],
+    _policy: &SandboxPolicy,
+    _prompt: &str,
+    _workdir: &Path,
+    _identity: &DeliveryAgentIdentity,
+    _timeout: AgentRunTimeout,
+    _agent_env: Option<Vec<(String, String)>>,
+) -> Result<AgentRunReport, ExecError> {
+    Err(ExecError::AcpRequired)
+}
+
 #[cfg(feature = "acp")]
 fn short_hash(input: &str) -> String {
     let digest = Sha256::digest(input.as_bytes());
@@ -2950,6 +3407,11 @@ fn short_hash(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The uid of an ordinary seller seat's container: the default rows resolve under it.
+    const NON_ROOT_UID: u32 = 1000;
+    /// A seat whose daemon — and so whose container — runs as root.
+    const ROOT_UID: u32 = 0;
 
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
@@ -2962,6 +3424,7 @@ mod tests {
             uid: 1000,
             gid: 1000,
             netns: None,
+            resolv_conf: None,
         }
     }
 
@@ -3071,6 +3534,8 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            dns_servers: Vec::new(),
+            container_delivery: None,
         });
         let env = vec![("GIT_AUTHOR_NAME".to_string(), "maxplayer-seller-abcd".to_string())];
         let workdir = Path::new("/home/seller/.maxplayer/seller-jobs/job1");
@@ -3136,7 +3601,57 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            dns_servers: Vec::new(),
+            container_delivery: None,
         })
+    }
+
+    /// The resolver file reaches the job as a read-only bind mount at `/etc/resolv.conf`, and only
+    /// when containment wrote one.
+    ///
+    /// Both halves matter. Without the mount the job keeps docker's `127.0.0.11`, which under gVisor
+    /// never answers; without `:ro` a stranger's job can rewrite the file and point its own lookups
+    /// wherever it likes, inside a namespace whose port 53 is open to the addresses we chose.
+    #[test]
+    fn the_resolver_file_is_mounted_read_only_at_etc_resolv_conf_and_only_when_one_was_written() {
+        let policy = docker_policy_for_probe();
+        let dir = ProbeDir::new("resolv");
+        let workdir = dir.path();
+        let (uid, gid) = job_identity();
+        let command = argv(&["claude-agent-acp"]);
+        let render = |resolv_conf: Option<&Path>| -> Vec<String> {
+            let launch = policy
+                .launch(
+                    &command,
+                    &JobLaunch { workdir, env: &[], uid, gid, netns: None, resolv_conf },
+                )
+                .expect("a job renders");
+            std::iter::once(launch.program).chain(launch.args).collect()
+        };
+
+        let path = PathBuf::from("/var/tmp/resolv-job-7.conf");
+        let with = render(Some(path.as_path()));
+        let mount = with
+            .windows(2)
+            .find(|pair| pair[0] == "-v" && pair[1].contains("/etc/resolv.conf"))
+            .expect("the resolver mount is rendered");
+        assert_eq!(
+            mount[1], "/var/tmp/resolv-job-7.conf:/etc/resolv.conf:ro",
+            "the exact source path, the exact container path, and read-only"
+        );
+
+        // Without a written file the flag is absent entirely: a seat that never established
+        // containment is left exactly as it was, not handed an empty or missing mount source.
+        let without = render(None);
+        assert!(
+            !without.iter().any(|arg| arg.contains("/etc/resolv.conf")),
+            "an uncontained job must not gain a resolver mount: {without:?}"
+        );
+        assert_eq!(
+            with.len(),
+            without.len() + 2,
+            "the mount is the only difference between the two argvs"
+        );
     }
 
     /// A REAL throwaway directory, because `probe_launch_argv` refuses one that does not exist — and
@@ -3288,7 +3803,7 @@ mod tests {
         let job_launch = policy
             .launch(
                 &job_command,
-                &JobLaunch { workdir, env: &[], uid, gid, netns: None },
+                &JobLaunch { workdir, env: &[], uid, gid, netns: None, resolv_conf: None },
             )
             .expect("a job renders");
         let job_argv: Vec<String> =
@@ -3337,6 +3852,8 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            dns_servers: Vec::new(),
+            container_delivery: None,
         });
 
         // A REAL directory, for the reason `probe_launch_argv` refuses a missing one.
@@ -4025,6 +4542,8 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            dns_servers: Vec::new(),
+            container_delivery: None,
         });
         let launch = policy
             .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
@@ -4065,6 +4584,8 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            dns_servers: Vec::new(),
+            container_delivery: None,
         });
         let launch = policy
             .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
@@ -4120,6 +4641,8 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            dns_servers: Vec::new(),
+            container_delivery: None,
         });
         let launch = policy
             .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
@@ -4182,6 +4705,24 @@ mod tests {
         fail_on: Option<&'static str>,
         /// Output handed back for `logs`, so a test can plant a credential in it.
         logs_output: String,
+        /// The state `inspect` reports, so a run that SUCCEEDED can be modelled and not just one
+        /// that was killed. A capture path that is only ever exercised on failures is a capture path
+        /// whose happy case nobody has looked at.
+        inspect_output: String,
+        /// Whether the container is already GONE: docker resolves the name to nothing, and every
+        /// command that addresses it fails the way docker fails for a name it cannot find.
+        ///
+        /// ⚠ **This is the state a fake must be able to reach, and the reason is a defect that
+        /// survived nine red-proven assertions.** Red-proving shows that an ASSERTION can fail. It
+        /// says nothing about whether the FAKE is faithful — and a fake whose `inspect` always
+        /// succeeds cannot fail any test about what happens when there is nothing left to inspect.
+        /// `--rm` on the job container was exactly that shape: it deleted every SUCCESSFUL job's
+        /// container before capture could read it, and no assertion here could express the state, so
+        /// they all passed. The flag is forbidden now
+        /// (`docker_policy_keeps_the_container_alive_for_its_own_diagnostics`), but a container can
+        /// still be gone for reasons this module does not control — an operator removed it, the
+        /// daemon restarted, `docker run` failed after the guard adopted the name.
+        container_absent: bool,
     }
 
     impl RecordingDocker {
@@ -4192,6 +4733,8 @@ mod tests {
                 dir: dir.to_path_buf(),
                 fail_on: None,
                 logs_output: "job line one\njob line two".into(),
+                inspect_output: "status=exited exit_code=137 oom_killed=false".into(),
+                container_absent: false,
             }
         }
     }
@@ -4207,9 +4750,24 @@ mod tests {
             if self.fail_on == Some(verb.as_str()) {
                 return Err(format!("{verb} refused"));
             }
+            if self.container_absent {
+                let target = argv.last().cloned().unwrap_or_default();
+                return match verb.as_str() {
+                    // `rm --force` against a name that resolves to nothing is modelled as SUCCESS,
+                    // and that is the PESSIMISTIC choice deliberately: a succeeding removal paired
+                    // with a failed capture is the definition of `evidence_lost`, so this fake
+                    // produces the alarm rather than swallowing it. ⚠ Not measured against a live
+                    // daemon — pinning docker's real exit code would mean running a destructive verb
+                    // for a claim nothing below rests on, so the tests assert their own precondition
+                    // (`removal.is_ok()`) instead of assuming this.
+                    "rm" => Ok(String::new()),
+                    _ => Err(format!("Error response from daemon: No such container: {target}")),
+                };
+            }
             match verb.as_str() {
                 "logs" => Ok(self.logs_output.clone()),
-                _ => Ok("status=exited exit_code=137 oom_killed=false".into()),
+                "inspect" => Ok(self.inspect_output.clone()),
+                _ => Ok(String::new()),
             }
         }
     }
@@ -4228,7 +4786,11 @@ mod tests {
         let mut cli = RecordingDocker::new(&dir);
         let report = capture_then_remove(&mut cli, "maxplayer-job-j1", &dir, None, &[]);
 
-        assert!(report.capture.is_ok(), "capture: {:?}", report.capture);
+        assert!(
+            matches!(report.capture, CaptureOutcome::Written(_)),
+            "capture: {:?}",
+            report.capture
+        );
         assert!(report.removal.is_ok(), "removal: {:?}", report.removal);
         let rm_at = cli.verbs.iter().position(|v| v == "rm").expect("rm was issued");
         let inspect_at = cli.verbs.iter().position(|v| v == "inspect").expect("inspect was issued");
@@ -4260,8 +4822,9 @@ mod tests {
         let report = capture_then_remove(&mut cli, "maxplayer-job-j2", &dir, None, &[]);
 
         assert!(
-            report.capture.is_err(),
-            "a failed inspect must be reported as a capture failure, not swallowed: {:?}",
+            matches!(report.capture, CaptureOutcome::Failed(_)),
+            "a failed inspect must be reported as a capture FAILURE — not swallowed, and not as the \
+             policy skip that means nothing was ever going to be captured: {:?}",
             report.capture
         );
         assert!(
@@ -4278,6 +4841,204 @@ mod tests {
             report.evidence_lost(),
             "container removed with no evidence saved is the one state a caller must be able to \
              SEE, rather than infer from two fields"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A self-probe's container is REMOVED, and nothing is written.
+    //
+    // The probe is the most frequent run on the node — every harness at boot, up to three attempts,
+    // and again on every re-probe — and `seller_node::run::mint_probe_identity` stamps the clock into
+    // its directory label, so every one of them is a NEW job id. Capturing each would add a directory
+    // under `seller-diagnostics/` that nothing ever prunes: the probe's own cleanup removes its
+    // WORKDIR, and the diagnostics directory is a deliberate sibling of that, out of the container's
+    // reach.
+    //
+    // What is NOT given up is the removal. The leak this module exists to close — a driver shutdown
+    // kills the `docker run` client while the container keeps running — is not specific to awarded
+    // jobs, and an abandoned probe container leaks in exactly the same way.
+    #[test]
+    fn a_probe_is_removed_without_capture_and_writes_nothing() {
+        assert_eq!(
+            cleanup_policy(AgentRunTimeout::HarnessProbe(Duration::from_secs(120))),
+            CleanupPolicy::RemoveOnly,
+            "a self-probe's diagnostics are not worth a directory per run in a tree nothing prunes"
+        );
+
+        let dir = capture_dir("probe");
+        let mut cli = RecordingDocker::new(&dir);
+        let report = remove_only(&mut cli, "maxplayer-job-probe-0-0-1700000000", CAPTURE_SKIPPED_PROBE);
+
+        assert!(
+            report.removal.is_ok(),
+            "the container must still be removed: {:?}",
+            report.removal
+        );
+        assert_eq!(
+            cli.verbs,
+            vec!["rm".to_string()],
+            "remove-only must issue the removal and NOTHING else — an inspect or a logs read here is \
+             the capture this policy exists to skip: {:?}",
+            cli.verbs
+        );
+        match &report.capture {
+            CaptureOutcome::SkippedByPolicy(reason) => assert_eq!(
+                *reason, CAPTURE_SKIPPED_PROBE,
+                "the skip must carry the probe marker — it is what an operator greps for when a run \
+                 has no diagnostics"
+            ),
+            other => panic!("a probe must report a deliberate skip, not {other:?}"),
+        }
+        assert!(
+            !report.evidence_lost(),
+            "a deliberate skip must not fire the one alarm that means real evidence was destroyed: \
+             an alarm that fires on every probe is one nobody still reads when it matters"
+        );
+        assert!(
+            !dir.exists(),
+            "remove-only must create no diagnostics directory at all, because an empty directory per \
+             probe accumulates exactly as fast as a full one: {}",
+            dir.display()
+        );
+        assert_ne!(
+            CAPTURE_SKIPPED_PROBE, CAPTURE_SKIPPED_MARKER,
+            "a policy skip and a Drop fallback firing are opposite findings and must stay greppable \
+             apart"
+        );
+    }
+
+    // An AWARDED job captures on both exits — the failing one and the passing one.
+    //
+    // The failing exit is the one everybody remembers to test. The passing one is where this path has
+    // been wrong before: a container that has exited is still inspectable and its logs are still
+    // readable, so a successful job's evidence IS available — unless something deletes the container
+    // the moment it exits, which is what `--rm` did and why
+    // `docker_policy_keeps_the_container_alive_for_its_own_diagnostics` now forbids it.
+    #[test]
+    fn an_awarded_job_captures_on_both_a_successful_and_a_failed_exit() {
+        assert_eq!(
+            cleanup_policy(AgentRunTimeout::JobDeadline(Duration::from_secs(60))),
+            CleanupPolicy::CaptureThenRemove,
+            "an awarded job's diagnostics are the ones a refund argument gets made from"
+        );
+
+        for (label, state) in [
+            ("passed", "status=exited exit_code=0 oom_killed=false"),
+            ("failed", "status=exited exit_code=137 oom_killed=true"),
+        ] {
+            let dir = capture_dir(&format!("awarded-{label}"));
+            let mut cli = RecordingDocker::new(&dir);
+            cli.inspect_output = state.into();
+            let report = capture_then_remove(&mut cli, "maxplayer-job-a1", &dir, None, &[]);
+
+            match &report.capture {
+                CaptureOutcome::Written(at) => assert_eq!(at, &dir),
+                other => panic!("an awarded job must capture on the {label} exit, got {other:?}"),
+            }
+            let inspect = std::fs::read_to_string(dir.join("inspect.txt")).expect("inspect.txt");
+            assert_eq!(
+                inspect, state,
+                "the captured state must be THIS run's, not a constant the fake returns whatever it \
+                 is asked"
+            );
+            assert!(
+                dir.join("logs.txt").exists(),
+                "the container's own output is the other half of the evidence"
+            );
+            assert!(report.removal.is_ok(), "removal: {:?}", report.removal);
+            assert!(
+                !report.evidence_lost(),
+                "captured and removed is the good pair, on the {label} exit as much as the other"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    // Repeated probes leave the diagnostics tree EMPTY — with a denominator.
+    //
+    // The test above proves one probe writes nothing. This proves the property that matters on a node
+    // that stays up for weeks: it does not ACCUMULATE. The denominator is stated because "no
+    // directories" produced by a loop that silently ran zero times reads identically to the real
+    // thing.
+    #[test]
+    fn repeated_probes_do_not_grow_the_diagnostics_tree() {
+        const PROBES: usize = 25;
+        let root = capture_dir("probe-tree");
+        std::fs::create_dir_all(&root).expect("a tree to watch");
+
+        let mut removed = 0usize;
+        for i in 0..PROBES {
+            // A FRESH job id per probe, exactly as `mint_probe_identity` mints one. Reusing a single
+            // id would collapse the growth mechanism this is here to catch.
+            let job_id = format!("probe-0-0-{}", 1_700_000_000u64 + i as u64);
+            let dir = root.join(&job_id);
+            let name = job_container_name(&job_id);
+            let mut cli = RecordingDocker::new(&dir);
+            // Routed through the POLICY, in the same shape as the production call site, so this
+            // measures the consequence of the decision rather than the behaviour of one branch of it.
+            // Calling `remove_only` directly here would still pass if probes were re-routed to
+            // capture tomorrow.
+            let report = match cleanup_policy(AgentRunTimeout::HarnessProbe(Duration::from_secs(120))) {
+                CleanupPolicy::RemoveOnly => remove_only(&mut cli, &name, CAPTURE_SKIPPED_PROBE),
+                CleanupPolicy::CaptureThenRemove => {
+                    capture_then_remove(&mut cli, &name, &dir, None, &[])
+                }
+            };
+            if report.removal.is_ok() {
+                removed += 1;
+            }
+        }
+
+        assert_eq!(
+            removed, PROBES,
+            "{removed} of {PROBES} probe containers were removed — dropping the capture must not \
+             drop the removal with it"
+        );
+        let left = std::fs::read_dir(&root).expect("the tree").count();
+        assert_eq!(
+            left, 0,
+            "{PROBES} probes left {left} directories behind; each probe mints a new job id, so any \
+             per-probe directory grows without bound on the seller's own disk"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The state a fake that always succeeds cannot reach: docker no longer knows this container.
+    //
+    // ⚠ **This test exists because red-proving does not check fixture fidelity.** An assertion shown
+    // to go red is proven LIVE; it is not proven to be asking about the real world. A capture suite
+    // whose `inspect` always succeeds passes identically whether the container survives to be
+    // inspected or is deleted the instant it exits — which is not hypothetical, it is precisely how
+    // `--rm` stayed invisible through a full red-prove of this module.
+    #[test]
+    fn an_already_gone_container_is_never_reported_as_a_clean_capture() {
+        let dir = capture_dir("gone");
+        let mut cli = RecordingDocker::new(&dir);
+        cli.container_absent = true;
+        let report = capture_then_remove(&mut cli, "maxplayer-job-g1", &dir, None, &[]);
+
+        match &report.capture {
+            CaptureOutcome::Failed(_) => {}
+            other => panic!(
+                "a container docker cannot resolve must report a capture FAILURE, not {other:?}"
+            ),
+        }
+        assert!(
+            !dir.join("inspect.txt").exists() && !dir.join("logs.txt").exists(),
+            "nothing may be written on behalf of a container that does not exist"
+        );
+        // Asserted rather than assumed, because the line after it depends on this: the fake models
+        // `rm --force` against a vanished name as succeeding. If that model ever changes, THIS fires
+        // and names the reason, instead of the next assertion failing without one.
+        assert!(
+            report.removal.is_ok(),
+            "precondition — the modelled removal succeeds: {:?}",
+            report.removal
+        );
+        assert!(
+            report.evidence_lost(),
+            "a gone container plus a failed capture is exactly the pair `evidence_lost` names, and \
+             it must never be reachable without the report saying so"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4427,6 +5188,8 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            dns_servers: Vec::new(),
+            container_delivery: None,
         });
         let launch = default_rt
             .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
@@ -4445,6 +5208,8 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            dns_servers: Vec::new(),
+            container_delivery: None,
         });
         let launch = gvisor
             .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
@@ -4481,6 +5246,8 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            dns_servers: Vec::new(),
+            container_delivery: None,
         });
         let launch = unset
             .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
@@ -4498,6 +5265,8 @@ mod tests {
             network: Some("maxplayer-sbx".into()),
             proxy_ports: None,
             file_credentials: Vec::new(),
+            dns_servers: Vec::new(),
+            container_delivery: None,
         });
         let launch = joined
             .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
@@ -4776,7 +5545,7 @@ mod tests {
         match containment
             .proxy
             .engine()
-            .authorize_request("POST", "/responses", &request_headers)
+            .authorize_request("POST", "/responses", &request_headers, None)
         {
             crate::credential_proxy::Decision::Forward { headers, .. } => {
                 assert!(headers.iter().any(|(name, value)| {
@@ -4810,6 +5579,291 @@ mod tests {
 
         drop(containment);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // The container-delivery switch (Track B). ON by default under `docker` — a docker seat that
+    // never names the key delivers from inside its container — and the two companion keys take
+    // their documented defaults.
+    //
+    // ⛔ THE DEFAULT MOVES ONLY WHERE A CONTAINER EXISTS. `SandboxMode::Launcher` is the `#[default]`
+    // mode, so a blanket "on" would turn every seat that never opted into docker into a seat that
+    // refuses to boot. That is why the field is `Option<bool>`: the absent key means ON under docker
+    // and means nothing at all under launcher.
+    #[test]
+    fn container_delivery_defaults_on_under_docker_and_never_under_launcher() {
+        use crate::home::{ContainerDeliveryToken, SandboxConfig, SandboxMode};
+
+        let fresh_default = Some(ContainerDeliveryPolicy {
+            token: ContainerDeliveryToken::FreshAfterAgent,
+            token_cap_secs: DEFAULT_CONTAINER_DELIVERY_TOKEN_CAP_SECS,
+        });
+
+        // ROW 1 — docker, key ABSENT ⇒ the container path. This is the new default, and it is the
+        // row that every existing docker seat lands on when it upgrades.
+        let defaulted = SandboxConfig { mode: SandboxMode::Docker, ..Default::default() };
+        assert_eq!(defaulted.container_delivery, None, "the fixture must not name the key");
+        let policy = SandboxPolicy::from_config_as(Some(&defaulted), NON_ROOT_UID).expect("docker policy");
+        assert_eq!(
+            policy.container_delivery(),
+            fresh_default,
+            "a docker seat that never named the key delivers from the container"
+        );
+        assert!(defaulted.container_delivery_enabled(NON_ROOT_UID), "and the config helper agrees");
+
+        // ROW 2 — docker, `true` ⇒ the container path, said out loud. Same verdict as row 1.
+        let on = SandboxConfig {
+            mode: SandboxMode::Docker,
+            container_delivery: Some(true),
+            ..Default::default()
+        };
+        let policy = SandboxPolicy::from_config_as(Some(&on), NON_ROOT_UID).expect("docker policy");
+        assert_eq!(
+            policy.container_delivery(),
+            fresh_default,
+            "on ⇒ fresh-after-agent tokens and the 6 h cap"
+        );
+        assert!(on.container_delivery_enabled(NON_ROOT_UID));
+        assert_eq!(DEFAULT_CONTAINER_DELIVERY_TOKEN_CAP_SECS, 6 * 60 * 60);
+
+        // ROW 3 — docker, `false` ⇒ the HOST path. The explicit opt-out, which must keep working:
+        // it is the only way a docker seat stays on the path it had before the default moved.
+        let opted_out = SandboxConfig {
+            mode: SandboxMode::Docker,
+            container_delivery: Some(false),
+            ..Default::default()
+        };
+        let policy = SandboxPolicy::from_config_as(Some(&opted_out), NON_ROOT_UID).expect("docker policy");
+        assert_eq!(
+            policy.container_delivery(),
+            None,
+            "container_delivery = false keeps the host delivery path"
+        );
+        assert!(!opted_out.container_delivery_enabled(NON_ROOT_UID));
+
+        // ROW 4 — launcher, key ABSENT ⇒ the host path, and NO refusal. The most important row of
+        // the seven: this is every seat that never opted into docker.
+        let launcher = SandboxConfig { mode: SandboxMode::Launcher, ..Default::default() };
+        let policy = SandboxPolicy::from_config_as(Some(&launcher), NON_ROOT_UID)
+            .expect("an absent key under launcher must never refuse");
+        assert_eq!(policy.container_delivery(), None);
+        assert!(!launcher.container_delivery_enabled(NON_ROOT_UID), "launcher mode has no container");
+
+        // ROW 6 — launcher, `false` ⇒ the host path, and no refusal: it names the path launcher
+        // mode already takes, so it contradicts nothing.
+        let launcher_off = SandboxConfig {
+            mode: SandboxMode::Launcher,
+            container_delivery: Some(false),
+            ..Default::default()
+        };
+        let policy = SandboxPolicy::from_config_as(Some(&launcher_off), NON_ROOT_UID)
+            .expect("container_delivery = false under launcher must never refuse");
+        assert_eq!(policy.container_delivery(), None);
+        assert!(!launcher_off.container_delivery_enabled(NON_ROOT_UID));
+
+        // The companion keys resolve on top of the default, with no switch named at all.
+        let long_lived = SandboxConfig {
+            mode: SandboxMode::Docker,
+            container_delivery_token: Some(ContainerDeliveryToken::LongLived),
+            container_delivery_token_cap_secs: Some(3_600),
+            ..Default::default()
+        };
+        let policy = SandboxPolicy::from_config_as(Some(&long_lived), NON_ROOT_UID).expect("docker policy");
+        assert_eq!(
+            policy.container_delivery(),
+            Some(ContainerDeliveryPolicy {
+                token: ContainerDeliveryToken::LongLived,
+                token_cap_secs: 3_600,
+            })
+        );
+
+        // ...and they are INERT under the explicit opt-out, rather than an error: an operator may
+        // stage the token mode before dropping `container_delivery = false`.
+        let staged = SandboxConfig {
+            mode: SandboxMode::Docker,
+            container_delivery: Some(false),
+            container_delivery_token: Some(ContainerDeliveryToken::LongLived),
+            ..Default::default()
+        };
+        let policy = SandboxPolicy::from_config_as(Some(&staged), NON_ROOT_UID).expect("docker policy");
+        assert_eq!(policy.container_delivery(), None);
+
+        // A pass-through policy — no `[sandbox]` section at all — has no container to deliver from.
+        assert_eq!(SandboxPolicy::passthrough().container_delivery(), None);
+        assert_eq!(
+            SandboxPolicy::from_config_as(None, NON_ROOT_UID).expect("no section").container_delivery(),
+            None,
+            "a seat with no [sandbox] section keeps the host path"
+        );
+
+        // ROWS 8-10 — the container would run as ROOT (uid 0: a seat whose daemon runs as root).
+        // The job is then root inside the container, where the same-uid boundary between it and the
+        // delivery orchestrator is weakest, so the absent key resolves to the HOST path there; the
+        // container path takes an explicit opt-in; the opt-out is unchanged. RED ON REVERT: the
+        // absent key resolved to the container under every uid.
+        let policy =
+            SandboxPolicy::from_config_as(Some(&defaulted), ROOT_UID).expect("docker policy");
+        assert_eq!(
+            policy.container_delivery(),
+            None,
+            "root + absent ⇒ the host path, not the docker default"
+        );
+        assert!(!defaulted.container_delivery_enabled(ROOT_UID));
+        let policy = SandboxPolicy::from_config_as(Some(&on), ROOT_UID).expect("docker policy");
+        assert_eq!(
+            policy.container_delivery(),
+            fresh_default,
+            "root + true ⇒ the operator chose the container"
+        );
+        assert!(on.container_delivery_enabled(ROOT_UID));
+        let policy =
+            SandboxPolicy::from_config_as(Some(&opted_out), ROOT_UID).expect("docker policy");
+        assert_eq!(policy.container_delivery(), None);
+        assert!(!opted_out.container_delivery_enabled(ROOT_UID));
+
+        // `from_config` resolves for the uid this daemon's container gets — the same read that
+        // `docker run --user` is built from — so a booting seat and this table agree.
+        let for_this_daemon = SandboxPolicy::from_config_as(Some(&defaulted), job_identity().0)
+            .expect("docker policy");
+        assert_eq!(
+            SandboxPolicy::from_config(Some(&defaulted)).expect("docker policy"),
+            for_this_daemon
+        );
+    }
+
+    // ROWS 5 and 7 — refused under `launcher` mode, each key on its own, because launcher mode
+    // creates no container to move the git steps into. `container_delivery = true` is a config that
+    // says two different things about where git runs; the two token keys describe a token only a
+    // container ever asks for.
+    #[test]
+    fn container_delivery_keys_are_refused_outside_docker_mode() {
+        use crate::home::{ContainerDeliveryToken, SandboxConfig, SandboxMode};
+        let cases = [
+            SandboxConfig {
+                mode: SandboxMode::Launcher,
+                container_delivery: Some(true),
+                ..Default::default()
+            },
+            SandboxConfig {
+                mode: SandboxMode::Launcher,
+                container_delivery_token: Some(ContainerDeliveryToken::FreshAfterAgent),
+                ..Default::default()
+            },
+            SandboxConfig {
+                mode: SandboxMode::Launcher,
+                container_delivery_token_cap_secs: Some(60),
+                ..Default::default()
+            },
+            // A token key still refuses even next to the accepted `container_delivery = false`:
+            // the value that is accepted is the switch, never the token keys.
+            SandboxConfig {
+                mode: SandboxMode::Launcher,
+                container_delivery: Some(false),
+                container_delivery_token: Some(ContainerDeliveryToken::LongLived),
+                ..Default::default()
+            },
+        ];
+        for config in cases {
+            let error = SandboxPolicy::from_config(Some(&config))
+                .expect_err("a container-delivery key under launcher mode must be refused");
+            let message = error.to_string();
+            assert!(
+                message.contains("container_delivery") && message.contains("mode = \"docker\""),
+                "the refusal names the keys and the mode they need: {message}"
+            );
+        }
+        // Control: launcher mode with none of the keys resolves as before.
+        SandboxPolicy::from_config(Some(&SandboxConfig {
+            mode: SandboxMode::Launcher,
+            launcher: vec!["env".to_owned()],
+            ..Default::default()
+        }))
+        .expect("launcher mode without the keys is unchanged");
+    }
+
+    // A zero cap is a typo that would refuse every long-lived mint; it is refused at config time.
+    #[test]
+    fn container_delivery_zero_cap_is_refused() {
+        use crate::home::{SandboxConfig, SandboxMode};
+        let error = SandboxPolicy::from_config(Some(&SandboxConfig {
+            mode: SandboxMode::Docker,
+            container_delivery: Some(true),
+            container_delivery_token_cap_secs: Some(0),
+            ..Default::default()
+        }))
+        .expect_err("a zero cap is refused");
+        assert!(error.to_string().contains("container_delivery_token_cap_secs"), "{error}");
+    }
+
+    // The keys parse from the TOML an operator writes, in the documented spelling, and a config
+    // that never names the switch serialises WITHOUT it.
+    //
+    // ⛔ THE WRITE-BACK IS WHAT MAKES THE DEFAULT REACHABLE. `maxplayer` rewrites `config.toml`
+    // whenever it saves; if an absent switch were written back as `container_delivery = false`, the
+    // first save after the upgrade would pin every docker seat to the host path for ever, and the
+    // new default would reach nobody. `skip_serializing_if = "Option::is_none"` is that guarantee,
+    // and this is the test that holds it.
+    #[test]
+    fn container_delivery_keys_parse_from_toml_and_an_unset_switch_stays_unset() {
+        use crate::home::{ContainerDeliveryToken, SandboxConfig, SandboxMode};
+        let parsed: SandboxConfig = toml::from_str(
+            "mode = \"docker\"\n\
+             container_delivery = true\n\
+             container_delivery_token = \"long-lived\"\n\
+             container_delivery_token_cap_secs = 7200\n",
+        )
+        .expect("the documented spelling parses");
+        assert_eq!(parsed.container_delivery, Some(true));
+        assert_eq!(parsed.container_delivery_token, Some(ContainerDeliveryToken::LongLived));
+        assert_eq!(parsed.container_delivery_token_cap_secs, Some(7_200));
+        // The opt-out parses as `Some(false)`, never as "absent": the difference between the two is
+        // the difference between the host path and the new default.
+        let opted_out: SandboxConfig =
+            toml::from_str("mode = \"docker\"\ncontainer_delivery = false\n").expect("parses");
+        assert_eq!(opted_out.container_delivery, Some(false));
+        assert!(!opted_out.container_delivery_enabled(NON_ROOT_UID));
+        // ...and a config that names no switch parses as absent, which resolves to ON under docker.
+        let silent: SandboxConfig = toml::from_str("mode = \"docker\"\n").expect("parses");
+        assert_eq!(silent.container_delivery, None);
+        assert!(silent.container_delivery_enabled(NON_ROOT_UID));
+
+        let fresh: SandboxConfig =
+            toml::from_str("mode = \"docker\"\ncontainer_delivery_token = \"fresh-after-agent\"\n")
+                .expect("parses");
+        assert_eq!(fresh.container_delivery_token, Some(ContainerDeliveryToken::FreshAfterAgent));
+        assert!(
+            toml::from_str::<SandboxConfig>("mode = \"docker\"\ncontainer_delivery_token = \"forever\"\n")
+                .is_err(),
+            "an unknown token mode is refused, never defaulted"
+        );
+
+        // A config that never set the switch does not GAIN it on write-back.
+        let unset = SandboxConfig { mode: SandboxMode::Docker, ..Default::default() };
+        let written = toml::to_string(&unset).expect("serialises");
+        assert!(
+            !written.contains("container_delivery"),
+            "an unset switch leaves no trace in the written config: {written}"
+        );
+        // Round-trip: the written config still resolves to the default, so a save cannot silently
+        // move a seat off the container path.
+        let reread: SandboxConfig = toml::from_str(&written).expect("re-parses");
+        assert_eq!(reread, unset);
+        assert!(reread.container_delivery_enabled(NON_ROOT_UID));
+
+        // The explicit opt-out, by contrast, MUST survive a write-back: an operator who chose the
+        // host path keeps it across every save.
+        let kept = SandboxConfig {
+            mode: SandboxMode::Docker,
+            container_delivery: Some(false),
+            ..Default::default()
+        };
+        let written = toml::to_string(&kept).expect("serialises");
+        assert!(
+            written.contains("container_delivery = false"),
+            "the opt-out must be written back verbatim: {written}"
+        );
+        let reread: SandboxConfig = toml::from_str(&written).expect("re-parses");
+        assert_eq!(reread, kept);
+        assert!(!reread.container_delivery_enabled(NON_ROOT_UID));
     }
 
     // from_config threads the runtime through, and a blank string is treated as unset rather than
@@ -4866,6 +5920,8 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            dns_servers: Vec::new(),
+            container_delivery: None,
         });
         let carried = forwarded_agent_env_from(&docker, daemon_env);
         let names: Vec<&str> = carried.iter().map(|(k, _)| k.as_str()).collect();
@@ -4894,6 +5950,7 @@ mod tests {
             env: "CURSOR_AUTH_TOKEN".into(),
             upstream: "https://api2.cursor.sh".into(),
             endpoint_args: vec!["--endpoint".into()],
+            legs: Vec::new(),
         }
     }
 
@@ -5020,7 +6077,8 @@ mod tests {
         let substitutions = vec![(REAL.to_owned(), placeholder.clone())];
         let mut view = contain_env_values(&forwarded, &substitutions, &[], base_url);
         let (file_env, argv_extra) =
-            file_credential_launch_additions(&[(&cred, placeholder.clone())], base_url);
+            file_credential_launch_additions(&[(&cred, placeholder.clone())], base_url, |_| None)
+                .expect("a credential without legs never consults the leg lookup");
         view.extend(file_env);
 
         assert!(
@@ -5063,6 +6121,8 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: vec![cred],
+            dns_servers: Vec::new(),
+            container_delivery: None,
         });
         let uncontained =
             uncontained_forwarded_credentials(&policy, |_| Some("set-to-something".to_owned()));
@@ -5076,6 +6136,57 @@ mod tests {
             "an unrecognized forwarded variable must still be flagged, or this check has stopped \
              discriminating: {uncontained:?}"
         );
+    }
+
+    // Each leg's flags are emitted pointing at THAT leg's listener URL, never the primary's — the
+    // addressing IS the routing, so getting this pairing wrong recreates the exact wrong-host
+    // failure legs exist to fix.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn a_credential_leg_redirects_by_its_own_flags_to_its_own_listener() {
+        let base_url = "http://host.docker.internal:41111";
+        let leg_url = "http://host.docker.internal:41112";
+        let mut cred = file_cred();
+        cred.legs = vec![crate::home::CredentialLeg {
+            endpoint_args: vec!["--agent-endpoint".into()],
+            upstream: "https://agentn.global.api5.cursor.sh".into(),
+        }];
+        let (_, argv_extra) = file_credential_launch_additions(
+            &[(&cred, "PLACEHOLDER".to_owned())],
+            base_url,
+            |upstream| {
+                assert_eq!(upstream, "https://agentn.global.api5.cursor.sh");
+                Some(leg_url.to_owned())
+            },
+        )
+        .expect("a known leg must resolve");
+        assert_eq!(
+            argv_extra,
+            vec![
+                "--endpoint".to_owned(),
+                base_url.to_owned(),
+                "--agent-endpoint".to_owned(),
+                leg_url.to_owned(),
+            ],
+            "the leg's flag must carry the leg's URL, the primary's flag the primary's"
+        );
+    }
+
+    // A leg whose listener is missing is refused loudly, never silently pointed at the primary.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn a_leg_without_a_listener_is_refused_not_defaulted() {
+        let mut cred = file_cred();
+        cred.legs = vec![crate::home::CredentialLeg {
+            endpoint_args: vec!["--agent-endpoint".into()],
+            upstream: "https://agentn.global.api5.cursor.sh".into(),
+        }];
+        let refused = file_credential_launch_additions(
+            &[(&cred, "PLACEHOLDER".to_owned())],
+            "http://host.docker.internal:41111",
+            |_| None,
+        );
+        assert!(refused.is_err(), "a missing leg listener must refuse the launch");
     }
 
     // Forwarding the same variable the placeholder occupies is refused, not merged. Both would arrive
@@ -5200,6 +6311,8 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            dns_servers: Vec::new(),
+            container_delivery: None,
         });
         let carried = forwarded_agent_env_from(&policy, env);
         let names: Vec<&str> = carried.iter().map(|(k, _)| k.as_str()).collect();
@@ -5222,6 +6335,8 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            dns_servers: Vec::new(),
+            container_delivery: None,
         });
         let env = vec![("ANTHROPIC_API_KEY".to_string(), "sk-ant-xxx".to_string())];
         let launch = policy
@@ -5270,6 +6385,8 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            dns_servers: Vec::new(),
+            container_delivery: None,
         });
         let forwarded: Vec<(String, String)> =
             SYNTHETIC_REALS.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
@@ -5300,6 +6417,8 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            dns_servers: Vec::new(),
+            container_delivery: None,
         });
         // All four credentials, an operator var carrying one of the secrets (must be scrubbed too), and
         // both vendor base URLs (the overrides must replace, not append).
@@ -5390,6 +6509,8 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            dns_servers: Vec::new(),
+            container_delivery: None,
         });
         let launch = policy
             .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
@@ -5414,6 +6535,8 @@ mod tests {
                 network: None,
                 proxy_ports: None,
                 file_credentials: Vec::new(),
+                dns_servers: Vec::new(),
+                container_delivery: None,
             })
         };
         // Operator forwards an unknown var (set), a known credential (contained), and a blank one.
@@ -5526,6 +6649,8 @@ mod tests {
                 network: None,
                 proxy_ports: None,
                 file_credentials: Vec::new(),
+                dns_servers: Vec::new(),
+                container_delivery: None,
             });
         let job = JobLaunch {
             workdir: &workdir,
@@ -5533,6 +6658,7 @@ mod tests {
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
             netns: None,
+            resolv_conf: None,
         };
         let launch = policy.launch(&agent_command, &job).expect("docker launch");
 
@@ -6334,7 +7460,9 @@ mod tests {
         let placeholder = "PLACEHOLDER-VALUE".to_owned();
         let base_url = "http://127.0.0.1:9300";
 
-        let (env, argv) = file_credential_launch_additions(&[(&cred, placeholder.clone())], base_url);
+        let (env, argv) =
+            file_credential_launch_additions(&[(&cred, placeholder.clone())], base_url, |_| None)
+                .expect("a credential without legs never consults the leg lookup");
 
         assert_eq!(env, vec![("CURSOR_AUTH_TOKEN".to_owned(), placeholder)]);
         assert_eq!(
@@ -6356,7 +7484,9 @@ mod tests {
     #[cfg(feature = "acp")]
     #[test]
     fn a_single_endpoint_flag_still_emits_exactly_one_pair() {
-        let (_, argv) = file_credential_launch_additions(&[(&file_cred(), "P".to_owned())], "http://u");
+        let (_, argv) =
+            file_credential_launch_additions(&[(&file_cred(), "P".to_owned())], "http://u", |_| None)
+                .expect("a credential without legs never consults the leg lookup");
         assert_eq!(argv, vec!["--endpoint".to_owned(), "http://u".to_owned()]);
     }
 
