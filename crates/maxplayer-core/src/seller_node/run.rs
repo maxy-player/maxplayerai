@@ -3934,6 +3934,60 @@ const RETRACTION_PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
 /// Cadence of the outbox drain / housekeeping tick.
 const DRAIN_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Cadence of the periodic sweep that removes this seat's job containers whose own cleanup stamp has
+/// passed (`sandbox_netns::sweep_expired`).
+///
+/// **Sixty seconds, and the number is deliberately uninteresting.** What bounds the lifetime of a
+/// leftover is the stamp on the container — the job's own deadline plus an hour — not this interval;
+/// the sweep only decides how soon after that the container actually goes. A minute keeps the worst
+/// case (expiry landing just after a tick) to about a minute of extra life on a container that has
+/// already been dead for an hour, while costing the daemon one cheap `docker ps` a minute on a host
+/// where nothing is ever expired.
+///
+/// `tokio::time::interval` fires immediately on its first poll, so a seat sweeps once at startup and
+/// then on this cadence. That first tick is what recovers the leftovers of a seller that was killed:
+/// nothing in the new process remembers those jobs, and nothing needs to — the stamps are on the
+/// containers.
+const SANDBOX_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Remove this seat's expired job containers, reporting what happened to the operator log.
+///
+/// Never a gate, exactly like the boot reaper: an expired container holds a namespace and no policy,
+/// and the job that owned it is at least an hour past its deadline. A docker daemon that is down
+/// must not stop this seat selling — the same containers are still expired on the next tick, and the
+/// sweep is periodic precisely so a failure costs a retry instead of a restart.
+#[cfg(feature = "acp")]
+async fn sweep_expired_sandbox_containers(seat: &str) {
+    let now = now_unix().max(0) as u64;
+    match crate::sandbox_netns::sweep_expired(seat, now).await {
+        Ok(report) => {
+            if !report.removed.is_empty() {
+                opline!(
+                    "seller node: swept {} expired job container(s) of this seat",
+                    report.removed.len()
+                );
+            }
+            // Reported, not acted on. A removal docker refused is selected again by the next sweep,
+            // so the operator sees it recur rather than seeing it once and wondering.
+            for (container, error) in &report.failed {
+                opline!(
+                    "seller node: could not sweep this seat's expired job container {container} \
+                     ({error}) — harmless to live jobs, and the next sweep will try again"
+                );
+            }
+        }
+        Err(error) => opline!(
+            "seller node: could not sweep this seat's expired job containers ({error}) — harmless \
+             to live jobs, and the next sweep will try again"
+        ),
+    }
+}
+
+/// The `wallet`-without-`acp` build has no docker runner to sweep with, and compiles this instead so
+/// the run loop needs no conditional arm.
+#[cfg(not(feature = "acp"))]
+async fn sweep_expired_sandbox_containers(_seat: &str) {}
+
 /// A booted seller node with its live relay surface.
 pub struct SellerNodeRunner {
     node: SellerNode,
@@ -4853,6 +4907,18 @@ impl SellerNodeRunner {
         }
 
         let mut drain_tick = tokio::time::interval(DRAIN_INTERVAL);
+        // The seat whose expired job containers this loop sweeps, resolved ONCE at loop entry.
+        //
+        // `None` when this seat runs no containment (no sandbox network configured), and the sweep
+        // arm is then disabled outright rather than waking every minute to ask docker about
+        // containers this configuration never creates. Resolved here rather than per tick because
+        // the answer cannot change while the loop runs, and re-deriving it sixty times an hour would
+        // be sixty chances to disagree with the configuration the jobs actually launched under.
+        let sandbox_sweep_seat = SandboxPolicy::from_config(self.node.home().config.sandbox.as_ref())
+            .ok()
+            .filter(|policy| policy.sandbox_network().is_some())
+            .map(|_| self.seller_pubkey.to_hex());
+        let mut sandbox_sweep_tick = tokio::time::interval(SANDBOX_SWEEP_INTERVAL);
         let wrap_backfill_interval_secs = resolve_wrap_backfill_interval_secs();
         let mut wrap_backfill_tick =
             tokio::time::interval(Duration::from_secs(wrap_backfill_interval_secs));
@@ -4948,6 +5014,15 @@ impl SellerNodeRunner {
                     self.reconsider_capacity_skips().await;
                     self.start_due_harness_probes();
                     self.drain().await;
+                    continue;
+                }
+                // The containment sweep, on this loop's clock rather than a thread of its own. It
+                // owns no state, remembers no job, and asks docker the same question every time, so
+                // there is nothing for a dedicated task to hold that this tick does not.
+                _ = sandbox_sweep_tick.tick(), if sandbox_sweep_seat.is_some() => {
+                    if let Some(seat) = sandbox_sweep_seat.as_deref() {
+                        sweep_expired_sandbox_containers(seat).await;
+                    }
                     continue;
                 }
                 // Stage 2a, addendum 2: the remittance retry tick. Disabled while an attempt is in

@@ -64,6 +64,62 @@ pub const HOLDER_LABEL: &str = "ai.maxplayer.netns-holder";
 /// this whole module chooses whenever it has to choose.
 pub const HOLDER_SEAT_LABEL: &str = "ai.maxplayer.netns-holder-seat";
 
+/// The docker label carrying the absolute unix second after which this seat may remove the
+/// container **without consulting anything in this process**.
+///
+/// **Why the expiry is written into the container instead of remembered.** Everything this module
+/// used to rely on to finish a cleanup — a retained owner, a supervisor, a watch on the daemon's
+/// event stream — lives in the process that created the container, and so dies with it. A stamp on
+/// the container itself is the one record that survives a `SIGKILL`, a crash mid-create, and a
+/// container the daemon only materialises after this process is gone. The sweep that reads it needs
+/// no memory of the job at all: it asks docker what exists, and the answer carries its own verdict.
+///
+/// **Why `deadline + grace` and not a fixed cap.** A seat's jobs do not share a lifetime — the
+/// deadline is `--job-timeout-secs`, else the offer's own deadline, else the default, chosen per job
+/// by [`crate::seller::job_deadline_unix`]. A single global age would either strangle a long job
+/// that was legitimately awarded a long deadline, or leave a short one lying around for hours. This
+/// label carries the job's OWN effective deadline plus [`CLEANUP_GRACE_SECS`], so each container is
+/// judged against the lifetime its own job was actually granted.
+///
+/// A container carrying no expiry label, or one that does not parse, is **never** swept on this
+/// path: an unreadable stamp is not an expired one, and the boot reaper remains the backstop for
+/// anything older than this build.
+pub const HOLDER_CLEANUP_AFTER_LABEL: &str = "ai.maxplayer.netns-cleanup-after";
+
+/// The docker label naming what the container was for: the namespace holder, or one of the
+/// short-lived helpers that join its namespace.
+///
+/// Carried so the sweep can report what it removed in terms an operator can act on, and so a future
+/// role can be excluded without having to guess from a container name.
+pub const HOLDER_ROLE_LABEL: &str = "ai.maxplayer.netns-role";
+
+/// The holder that owns the job's network namespace for the whole run.
+pub const ROLE_HOLDER: &str = "holder";
+
+/// A short-lived helper that joins the holder's namespace (plan applier, readback probe).
+pub const ROLE_HELPER: &str = "helper";
+
+/// How long after a job's own effective deadline its containers become sweepable.
+///
+/// **One hour, and the size is the point.** The deadline is when the job must be finished, not when
+/// its containers stop being legitimately in use: delivery, evidence capture and the teardown that
+/// normally removes these containers all happen after it. A grace shorter than that work would have
+/// the sweep racing the ordinary cleanup path for a container still in use — the one outcome worse
+/// than the leak it exists to fix. An hour is far past any of it, and the cost of the margin is a
+/// dead container occupying a name and no policy for at most that long.
+pub const CLEANUP_GRACE_SECS: u64 = 3_600;
+
+/// The value for [`HOLDER_CLEANUP_AFTER_LABEL`]: this job's effective deadline plus the grace.
+///
+/// Saturating, so a deadline near `u64::MAX` yields `u64::MAX` — a container that is never swept on
+/// this path — rather than wrapping to zero and becoming instantly removable while its job runs.
+/// Of the two failures available to arithmetic here, leaking is the one that does not destroy live
+/// work.
+#[must_use]
+pub fn cleanup_after_unix(effective_deadline_unix: u64) -> u64 {
+    effective_deadline_unix.saturating_add(CLEANUP_GRACE_SECS)
+}
+
 /// How long any one `docker` invocation in this module may take before it is killed. A create or a
 /// sidecar that never returns would otherwise hold the launch open indefinitely, and an unbounded
 /// wait is the state in which cancellation leaves work nobody owns.
@@ -1670,6 +1726,13 @@ pub fn holder_name(job_id: &str) -> String {
 /// `seat` is the owning seller's public key hex and goes on as a second label. It is what lets the
 /// boot reaper tell this seat's holders from another daemon's on a shared host; see
 /// [`HOLDER_SEAT_LABEL`].
+///
+/// `cleanup_after` is the absolute unix second from [`cleanup_after_unix`] — this job's own
+/// effective deadline plus the grace. It goes on as a third label so the periodic sweep can judge
+/// this container **without knowing anything about the job**, including after the process that
+/// created it is gone. It is derived by the seller from the deadline it is itself enforcing; no part
+/// of it comes from the buyer's payload, which is why a request cannot ask for a container that
+/// never expires.
 pub fn holder_argv(
     name: &str,
     network: &str,
@@ -1678,6 +1741,7 @@ pub fn holder_argv(
     gid: u32,
     job_id: &str,
     seat: &str,
+    cleanup_after: u64,
 ) -> Vec<String> {
     [
         "docker",
@@ -1691,6 +1755,10 @@ pub fn holder_argv(
         &format!("{HOLDER_LABEL}={job_id}"),
         "--label",
         &format!("{HOLDER_SEAT_LABEL}={seat}"),
+        "--label",
+        &format!("{HOLDER_CLEANUP_AFTER_LABEL}={cleanup_after}"),
+        "--label",
+        &format!("{HOLDER_ROLE_LABEL}={ROLE_HOLDER}"),
         "--read-only",
         "--cap-drop",
         "ALL",
@@ -1896,6 +1964,113 @@ pub fn parse_holder_listing(stdout: &str) -> Vec<HolderRecord> {
         .collect()
 }
 
+/// `docker` argv listing the containers **this seat owns**, with the metadata the expiry sweep
+/// judges them by: full id, owning seat, cleanup-after stamp, and role.
+///
+/// The `label=<seat>` filter is narrowing, exactly as in [`list_holders_argv`], and exactly as
+/// there it is **not** the guard: [`expired_owned`] re-checks the seat in Rust with an exact string
+/// comparison, because a filter that silently matched too much would be indistinguishable from one
+/// that worked. The filter's only failure that matters is matching too little, which leaks a
+/// container instead of removing a stranger's.
+///
+/// `--all` because an expired container is usually not running: a holder whose job died is
+/// `Exited`, and a helper that finished is `Exited` too. Listing only running containers would miss
+/// precisely the leftovers this sweep exists to remove.
+pub fn list_owned_argv(seat: &str) -> Vec<String> {
+    [
+        "docker",
+        "ps",
+        "--all",
+        "--no-trunc",
+        "--filter",
+        &format!("label={HOLDER_SEAT_LABEL}={seat}"),
+        "--format",
+        &format!(
+            "{{{{.ID}}}}\t{{{{.Label \"{HOLDER_SEAT_LABEL}\"}}}}\t{{{{.Label \"{HOLDER_CLEANUP_AFTER_LABEL}\"}}}}\t{{{{.Label \"{HOLDER_ROLE_LABEL}\"}}}}"
+        ),
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+/// One container as the expiry sweep sees it.
+///
+/// Every field after `id` is an `Option` because every one of them can be absent on a real host: a
+/// container from a build older than these labels, a container whose labels were not applied
+/// because the create died between docker accepting the argv and recording it, or simply a
+/// container belonging to something else that happens to carry the seat label. Absence is never
+/// read as a permission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedContainer {
+    /// Full container id, as the sweep will name it to `docker rm`.
+    pub id: String,
+    /// Owning seat from [`HOLDER_SEAT_LABEL`]; `None` when the label is absent or empty.
+    pub seat: Option<String>,
+    /// Parsed [`HOLDER_CLEANUP_AFTER_LABEL`]; `None` when absent, empty, or not a unix second.
+    pub cleanup_after: Option<u64>,
+    /// Parsed [`HOLDER_ROLE_LABEL`]; reported, never a removal criterion on its own.
+    pub role: Option<String>,
+}
+
+/// Parse `docker ps --format '{{.ID}}\t{{.Label …}}…'` output into one record per container.
+///
+/// **A malformed stamp parses to `None`, not to zero.** An absent label arrives from docker as an
+/// empty field, and a corrupted one as arbitrary text; reading either as the number 0 would date the
+/// container to 1970 and make it instantly sweepable. Every unreadable stamp therefore becomes
+/// `None`, which [`expired_owned`] refuses to act on. The failure mode is a leak the operator can
+/// see, never a removal nobody authorised.
+pub fn parse_owned_listing(stdout: &str) -> Vec<OwnedContainer> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let mut fields = line.split('\t');
+            let id = fields.next().unwrap_or_default().trim().to_owned();
+            let field = |fields: &mut std::str::Split<'_, char>| {
+                fields.next().map(str::trim).filter(|value| !value.is_empty()).map(str::to_owned)
+            };
+            let seat = field(&mut fields);
+            let cleanup_after = field(&mut fields).and_then(|value| value.parse::<u64>().ok());
+            let role = field(&mut fields);
+            OwnedContainer { id, seat, cleanup_after, role }
+        })
+        .filter(|container| !container.id.is_empty())
+        .collect()
+}
+
+/// The containers `seat` may remove right now: **owned by `seat`** and carrying a **readable**
+/// cleanup stamp that `now_unix` has passed.
+///
+/// **Both legs are required and neither is sufficient**, for the same reason the boot reaper needs
+/// two. Ownership alone would remove a container whose job is still inside its deadline. Expiry
+/// alone would remove a co-tenant seat's container on a shared docker socket — the exact accident
+/// [`HOLDER_SEAT_LABEL`] was added to prevent.
+///
+/// **Attachment is deliberately NOT consulted here**, and that is the one place this predicate
+/// differs from [`reapable_holders`]. The boot reaper must not touch an attached holder, because a
+/// live job is joined to it and `unattached` is its only evidence the job is gone. This sweep has
+/// better evidence: the container's own stamp says its job's deadline passed more than
+/// [`CLEANUP_GRACE_SECS`] ago. A container still attached at that point is attached to something
+/// that outlived its own deadline by an hour, which is the leak — refusing to remove it would leave
+/// precisely the case this exists for. The grace is sized so that ordinary post-deadline work has
+/// long finished.
+///
+/// An empty `seat` selects nothing: a caller that cannot name itself owns nothing to remove.
+#[must_use]
+pub fn expired_owned(containers: &[OwnedContainer], seat: &str, now_unix: u64) -> Vec<String> {
+    if seat.trim().is_empty() {
+        return Vec::new();
+    }
+    containers
+        .iter()
+        .filter(|container| container.seat.as_deref() == Some(seat))
+        .filter(|container| container.cleanup_after.is_some_and(|after| now_unix >= after))
+        .map(|container| container.id.clone())
+        .collect()
+}
+
 /// `docker` argv listing every container on the host by full id.
 pub fn list_all_containers_argv() -> Vec<String> {
     ["docker", "ps", "--all", "--no-trunc", "--quiet"]
@@ -2066,6 +2241,92 @@ pub async fn reap_orphans(seat: &str) -> Result<ReapReport, String> {
             // carries on. What it must not do is DROP the failure: the loop continuing is a
             // scheduling decision, not a verdict that the removal was unimportant.
             Err(error) => report.failed.push((holder, error)),
+        }
+    }
+    Ok(report)
+}
+
+/// Per-command bound for the periodic sweep's docker calls.
+///
+/// Shorter than [`DOCKER_DEADLINE`] on purpose. That bound sizes the calls a *job launch* depends
+/// on, where waiting two minutes beats failing the job. The sweep depends on nothing and is retried
+/// every tick, so a docker daemon that has stopped answering should cost this loop twenty seconds
+/// and be tried again later, not hold the seller's cadence for two minutes to reach the same
+/// conclusion.
+#[cfg(feature = "acp")]
+pub const SWEEP_DOCKER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How many expired containers a single sweep will remove before leaving the rest to the next one.
+///
+/// **Bounded work, so the leak cannot become the outage.** A host that accumulated hundreds of
+/// leftovers — a crash loop, a docker daemon down for a day — would otherwise hand this loop an
+/// unbounded queue of removals on one tick, and the seller stops answering offers while it drains.
+/// The remainder is not lost: it is still expired on the next tick, and the sweep is periodic. A
+/// backlog clears across several minutes instead of blocking one.
+#[cfg(feature = "acp")]
+pub const MAX_SWEEP_REMOVALS: usize = 32;
+
+/// Remove this seat's containers whose own cleanup stamp `now_unix` has passed, and report what
+/// happened to each.
+///
+/// This is the replacement for keeping an owner alive in memory until every container is confirmed
+/// gone. Nothing here remembers a job: the stamp written at create time is the whole record, so a
+/// container that appeared **after** the process that asked for it had exited is discovered by the
+/// next sweep exactly like any other, and a seller that was `SIGKILL`ed mid-job cleans up after its
+/// own restart.
+///
+/// **A failed listing is never an empty one.** Both reads return `Err` rather than an empty
+/// selection, because "docker did not answer" and "nothing is expired" are the same value to a
+/// caller that only counts removals — and treating the first as the second is how a sweep reports
+/// success for a host it never looked at.
+///
+/// **A failed removal is retried by the NEXT sweep, not here.** The container stays expired, so the
+/// following tick selects it again. Retrying in place would spend this tick's bounded budget on a
+/// container docker has already refused once.
+#[cfg(feature = "acp")]
+pub async fn sweep_expired(seat: &str, now_unix: u64) -> Result<ReapReport, String> {
+    sweep_expired_with(&DockerCli::system(), seat, now_unix).await
+}
+
+/// [`sweep_expired`], with the docker client supplied by the caller.
+///
+/// Private for the same reason [`establish_with`] is: a test hands in a stand-in as an ARGUMENT, so
+/// the substitution is confined to the call under test and two such tests can run in parallel
+/// without sharing any global.
+#[cfg(feature = "acp")]
+async fn sweep_expired_with(
+    client: &DockerCli,
+    seat: &str,
+    now_unix: u64,
+) -> Result<ReapReport, String> {
+    // Refused rather than run on an identity we do not have: an empty seat would match every
+    // container whose seat label failed to parse. Same refusal, same reason, as
+    // `reapable_holders_live`.
+    if seat.trim().is_empty() {
+        return Err("refusing to sweep: no owning seat was named".to_owned());
+    }
+    let mut report = ReapReport::default();
+    let (listing, _) = run_bounded(client, list_owned_argv(seat), None, SWEEP_DOCKER_DEADLINE)
+        .await
+        .map_err(|error| format!("could not list this seat's containers — {error}"))?;
+    let expired = expired_owned(&parse_owned_listing(&listing), seat, now_unix);
+    for id in expired.into_iter().take(MAX_SWEEP_REMOVALS) {
+        match run_bounded(
+            client,
+            ["docker", "rm", "--force", "--volumes", id.as_str()]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            None,
+            SWEEP_DOCKER_DEADLINE,
+        )
+        .await
+        {
+            Ok(_) => report.removed.push(id),
+            // Collected and carried past, exactly as the boot reaper does: one container docker
+            // refuses must not stop the rest, and the failure is returned rather than dropped so
+            // the caller can say so in its log.
+            Err(error) => report.failed.push((id, error)),
         }
     }
     Ok(report)
@@ -2899,6 +3160,7 @@ pub async fn establish(
     proxy_ports: Option<crate::sandbox_net::PortRange>,
     log_connections: bool,
     dns_resolvers: Vec<String>,
+    cleanup_after: u64,
 ) -> Result<Containment, String> {
     // The production client is named here, once, and threaded down. This is the ONLY constructor a
     // shipped build can reach, and it takes no input: no environment variable, no config field, no
@@ -2917,6 +3179,7 @@ pub async fn establish(
         proxy_ports,
         log_connections,
         dns_resolvers,
+        cleanup_after,
     )
     .await
 }
@@ -2943,6 +3206,7 @@ async fn establish_with(
     proxy_ports: Option<crate::sandbox_net::PortRange>,
     log_connections: bool,
     dns_resolvers: Vec<String>,
+    cleanup_after: u64,
 ) -> Result<Containment, String> {
     // Measured BEFORE the holder exists, so a probe failure needs no cleanup.
     let (probe_stdout, _) =
@@ -2965,7 +3229,7 @@ async fn establish_with(
     let ticket = holder.fence_creation();
     run_docker_fenced(
         client,
-        holder_argv(&name, network, holder_image, uid, gid, job_id, seat),
+        holder_argv(&name, network, holder_image, uid, gid, job_id, seat, cleanup_after),
         None,
         ticket,
     )
@@ -3229,7 +3493,7 @@ mod tests {
 
     #[test]
     fn the_holder_runs_sleep_in_exec_form_with_no_shell() {
-        let argv = holder_argv("h", "net", "img", 1000, 1000, "abc", &seat_b());
+        let argv = holder_argv("h", "net", "img", 1000, 1000, "abc", &seat_b(), 2_000_000_000);
         let tail = &argv[argv.len() - 4..];
         assert_eq!(tail, ["--entrypoint", "sleep", "img", "infinity"]);
         // A shell anywhere in the argv would mean the holder runs something that parses a string.
@@ -3238,7 +3502,7 @@ mod tests {
 
     #[test]
     fn the_holder_is_locked_down_and_labelled_for_reaping() {
-        let argv = holder_argv("h", "net", "img", 1000, 1000, "abc", &seat_b());
+        let argv = holder_argv("h", "net", "img", 1000, 1000, "abc", &seat_b(), 2_000_000_000);
         for expected in ["--read-only", "--cap-drop", "ALL", "no-new-privileges"] {
             assert!(argv.iter().any(|a| a == expected), "missing {expected} in {argv:?}");
         }
@@ -3252,7 +3516,7 @@ mod tests {
     /// nothing to match and every holder is unattributable — a reaper that correctly reaps nothing.
     #[test]
     fn the_holder_carries_the_seat_that_created_it() {
-        let argv = holder_argv("h", "net", "img", 1000, 1000, "abc", &seat_b());
+        let argv = holder_argv("h", "net", "img", 1000, 1000, "abc", &seat_b(), 2_000_000_000);
         assert!(
             argv.iter().any(|a| a == &format!("{HOLDER_SEAT_LABEL}={}", seat_b())),
             "{argv:?}"
@@ -3273,7 +3537,7 @@ mod tests {
         // …and it still drops everything else first, so the grant is exactly one capability.
         assert!(sidecar.windows(2).any(|w| w == ["--cap-drop", "ALL"]), "{sidecar:?}");
         // The holder must never carry it: it shares its namespace with the job.
-        let holder_argv = holder_argv("h", "net", "img", 1000, 1000, "abc", &seat_b());
+        let holder_argv = holder_argv("h", "net", "img", 1000, 1000, "abc", &seat_b(), 2_000_000_000);
         assert!(!holder_argv.iter().any(|a| a == "NET_ADMIN"), "{holder_argv:?}");
     }
 
@@ -5862,6 +6126,7 @@ exit 0
             Some(crate::sandbox_net::PortRange::new(9000, 9002).expect("valid range")),
             false,
             vec!["10.0.0.53".to_owned()],
+            2_000_000_000,
         )
         .await;
 
@@ -5914,6 +6179,7 @@ exit 0
             None,
             false,
             vec!["10.0.0.53".to_owned()],
+            2_000_000_000,
         ));
 
         // Cancel on the CREATE ITSELF, not on a stopwatch. A fixed deadline raced the probe and
@@ -5993,6 +6259,7 @@ exit 0
             None,
             false,
             vec!["10.0.0.53".to_owned()],
+            2_000_000_000,
         ));
 
         // Cancel on the create itself, so the drop below always lands while it is in flight.
@@ -6156,4 +6423,383 @@ exit 0
         );
         creating.join().expect("the create thread");
     }
+
+    // -----------------------------------------------------------------------------------------
+    // Deadline-stamped cleanup: the container carries its own expiry, and a periodic sweep is the
+    // only thing that has to be alive to act on it. These gates assert the CONTAINER's fate and the
+    // argv production actually sends — never a flag this module sets about itself.
+    // -----------------------------------------------------------------------------------------
+
+    /// A stand-in `docker` answering the two commands the sweep issues, from files a test controls.
+    ///
+    /// A successful `rm` deletes the row from the listing, exactly as the daemon would, so a test
+    /// asserts the container is GONE rather than that a removal was attempted.
+    #[cfg(feature = "acp")]
+    fn stand_in_sweep_docker(work: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let script = work.join("docker");
+        let body = r#"#!/bin/sh
+WORK="__WORK__"
+# An unreachable daemon fails EVERY command. No answer here may be read as "nothing is there".
+if [ -f "$WORK/daemon-down" ]; then
+  echo "Cannot connect to the Docker daemon at unix:///var/run/docker.sock." >&2
+  exit 1
+fi
+case "$*" in
+  *"ps --all"*)
+    if [ -f "$WORK/ps.txt" ]; then cat "$WORK/ps.txt"; fi
+    exit 0
+    ;;
+  *"rm --force --volumes"*)
+    for a in "$@"; do last="$a"; done
+    echo "$last" >> "$WORK/rm.log"
+    if [ -f "$WORK/rmfail-$last" ]; then
+      echo "Error response from daemon: cannot remove container $last" >&2
+      exit 1
+    fi
+    if [ -f "$WORK/ps.txt" ]; then
+      awk -v id="$last" '$1 != id' "$WORK/ps.txt" > "$WORK/ps.next" && mv "$WORK/ps.next" "$WORK/ps.txt"
+    fi
+    exit 0
+    ;;
+esac
+exit 0
+"#;
+        std::fs::write(&script, body.replace("__WORK__", &work.to_string_lossy()))
+            .expect("write the stand-in docker");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("make the stand-in docker executable");
+        script
+    }
+
+    /// One `docker ps` row in the exact four-field shape [`list_owned_argv`] asks for.
+    #[cfg(feature = "acp")]
+    fn listing_row(id: &str, seat: &str, cleanup_after: &str, role: &str) -> String {
+        format!("{id}\t{seat}\t{cleanup_after}\t{role}\n")
+    }
+
+    #[cfg(feature = "acp")]
+    fn rm_log(work: &std::path::Path) -> String {
+        std::fs::read_to_string(work.join("rm.log")).unwrap_or_default()
+    }
+
+
+    /// [`listing_row`] for the pure tests, which are not gated on the docker feature.
+    fn plain_row(id: &str, seat: &str, cleanup_after: &str, role: &str) -> String {
+        format!("{id}\t{seat}\t{cleanup_after}\t{role}\n")
+    }
+
+    fn owned_holder(id: &str, seat: &str, cleanup_after: Option<u64>) -> OwnedContainer {
+        OwnedContainer {
+            id: id.to_owned(),
+            seat: Some(seat.to_owned()),
+            cleanup_after,
+            role: Some(ROLE_HOLDER.to_owned()),
+        }
+    }
+
+    #[test]
+    fn the_cleanup_stamp_is_the_jobs_own_deadline_plus_exactly_one_hour() {
+        assert_eq!(CLEANUP_GRACE_SECS, 3_600, "the agreed grace is one hour");
+        assert_eq!(cleanup_after_unix(1_700_000_000), 1_700_000_000 + 3_600);
+    }
+
+    /// The arithmetic must fail toward LEAKING, never toward removing.
+    ///
+    /// A wrapping add on a deadline near the end of time would date the container to 1970 and make
+    /// a **live** job's holder instantly sweepable. Saturating turns that into a container this path
+    /// never removes, which costs one container and destroys nothing.
+    #[test]
+    fn a_deadline_near_the_end_of_time_saturates_instead_of_wrapping_into_the_past() {
+        assert_eq!(cleanup_after_unix(u64::MAX), u64::MAX);
+        assert_eq!(cleanup_after_unix(u64::MAX - 10), u64::MAX);
+    }
+
+    #[test]
+    fn a_container_still_inside_its_own_deadline_is_not_swept() {
+        let containers = [owned_holder("live", "seat-a", Some(2_000))];
+        assert!(expired_owned(&containers, "seat-a", 1_999).is_empty());
+    }
+
+    /// The boundary is inclusive: at the stamp itself the container is removable.
+    #[test]
+    fn a_container_is_swept_from_the_instant_its_stamp_is_reached() {
+        let containers = [owned_holder("done", "seat-a", Some(2_000))];
+        assert_eq!(expired_owned(&containers, "seat-a", 2_000), vec!["done".to_owned()]);
+        assert_eq!(expired_owned(&containers, "seat-a", 9_999), vec!["done".to_owned()]);
+    }
+
+    /// Per-job deadlines, which is the whole reason the expiry is written per container rather than
+    /// applied as one global age. A short job and a long job are judged at different moments.
+    #[test]
+    fn two_jobs_with_different_deadlines_expire_at_their_own_times() {
+        let containers = [
+            owned_holder("short", "seat-a", Some(1_000)),
+            owned_holder("long", "seat-a", Some(50_000)),
+        ];
+        assert!(expired_owned(&containers, "seat-a", 999).is_empty());
+        assert_eq!(expired_owned(&containers, "seat-a", 1_000), vec!["short".to_owned()]);
+        assert_eq!(
+            expired_owned(&containers, "seat-a", 50_000),
+            vec!["short".to_owned(), "long".to_owned()]
+        );
+    }
+
+    /// An unreadable stamp is not an expired one.
+    ///
+    /// The failure this forbids is parsing a missing or corrupt label as the number 0, which dates
+    /// every such container to 1970 and sweeps the lot.
+    #[test]
+    fn a_container_with_no_readable_stamp_is_never_swept() {
+        let containers = [
+            owned_holder("nostamp", "seat-a", None),
+            owned_holder("stamped", "seat-a", Some(10)),
+        ];
+        assert_eq!(expired_owned(&containers, "seat-a", u64::MAX), vec!["stamped".to_owned()]);
+    }
+
+    #[test]
+    fn a_malformed_stamp_parses_to_none_rather_than_to_the_epoch() {
+        let listing = format!(
+            "{}{}{}",
+            plain_row("garbage", "seat-a", "not-a-number", ROLE_HOLDER),
+            plain_row("empty", "seat-a", "", ROLE_HOLDER),
+            plain_row("good", "seat-a", "500", ROLE_HOLDER),
+        );
+        let parsed = parse_owned_listing(&listing);
+        assert_eq!(parsed[0].cleanup_after, None, "garbage must not become 0: {parsed:?}");
+        assert_eq!(parsed[1].cleanup_after, None, "absent must not become 0: {parsed:?}");
+        assert_eq!(parsed[2].cleanup_after, Some(500));
+        // And the selection agrees: only the readable one is ever chosen, at any clock.
+        assert_eq!(expired_owned(&parsed, "seat-a", u64::MAX), vec!["good".to_owned()]);
+    }
+
+    /// Another seat's container is never this seat's to remove, however long expired.
+    #[test]
+    fn a_co_tenant_seats_container_is_never_swept_even_when_long_expired() {
+        let containers = [
+            owned_holder("theirs", "seat-b", Some(1)),
+            OwnedContainer {
+                id: "unlabelled".to_owned(),
+                seat: None,
+                cleanup_after: Some(1),
+                role: None,
+            },
+            owned_holder("mine", "seat-a", Some(1)),
+        ];
+        assert_eq!(expired_owned(&containers, "seat-a", u64::MAX), vec!["mine".to_owned()]);
+    }
+
+    #[test]
+    fn a_caller_that_cannot_name_its_seat_selects_nothing() {
+        let containers = [owned_holder("mine", "seat-a", Some(1))];
+        assert!(expired_owned(&containers, "", u64::MAX).is_empty());
+        assert!(expired_owned(&containers, "   ", u64::MAX).is_empty());
+    }
+
+    #[test]
+    fn the_holder_create_stamps_the_expiry_and_the_role_on_the_container() {
+        let argv = holder_argv("h", "net", "img", 1000, 1000, "job-7", "seat-a", 1_700_003_600);
+        let labels: Vec<&String> = argv.iter().collect();
+        assert!(
+            labels.iter().any(|a| a.as_str() == format!("{HOLDER_CLEANUP_AFTER_LABEL}=1700003600")),
+            "the create must carry the expiry stamp: {argv:?}"
+        );
+        assert!(
+            labels.iter().any(|a| a.as_str() == format!("{HOLDER_ROLE_LABEL}={ROLE_HOLDER}")),
+            "the create must name the role: {argv:?}"
+        );
+    }
+
+    /// The end-to-end metadata contract: a production deadline becomes a label, docker reports that
+    /// label back, and the sweep reaches the right verdict on both sides of the threshold.
+    ///
+    /// This is the leg that a change to either side alone would break — a create that stops writing
+    /// the stamp, or a parser that stops reading it — and neither is visible in a test that only
+    /// exercises one of them.
+    #[test]
+    fn a_production_deadline_reaches_the_sweep_through_the_container_label() {
+        let deadline = 1_700_000_000_u64;
+        let argv = holder_argv("h", "net", "img", 1000, 1000, "job-7", "seat-a", cleanup_after_unix(deadline));
+        let stamp = argv
+            .iter()
+            .find_map(|a| a.strip_prefix(&format!("{HOLDER_CLEANUP_AFTER_LABEL}=")))
+            .expect("the create carries the stamp")
+            .to_owned();
+        let parsed = parse_owned_listing(&plain_row("cid", "seat-a", &stamp, ROLE_HOLDER));
+
+        assert!(
+            expired_owned(&parsed, "seat-a", deadline).is_empty(),
+            "at its deadline the job is still inside its window"
+        );
+        assert!(
+            expired_owned(&parsed, "seat-a", deadline + CLEANUP_GRACE_SECS - 1).is_empty(),
+            "a second before the grace expires the container is still not ours to remove"
+        );
+        assert_eq!(
+            expired_owned(&parsed, "seat-a", deadline + CLEANUP_GRACE_SECS),
+            vec!["cid".to_owned()],
+            "one hour past the job's own deadline the container is sweepable"
+        );
+    }
+
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_sweep_removes_the_expired_container_and_leaves_the_live_one() {
+        let work = stand_in_work_dir("sweep-basic");
+        let script = stand_in_sweep_docker(&work);
+        std::fs::write(
+            work.join("ps.txt"),
+            format!(
+                "{}{}",
+                listing_row("expired-one", "seat-a", "1000", ROLE_HOLDER),
+                listing_row("live-one", "seat-a", "9000", ROLE_HOLDER),
+            ),
+        )
+        .expect("listing");
+
+        let report = sweep_expired_with(&DockerCli::stand_in(&script), "seat-a", 5_000)
+            .await
+            .expect("the sweep ran");
+
+        assert_eq!(report.removed, vec!["expired-one".to_owned()]);
+        assert!(report.failed.is_empty(), "{report:?}");
+        let removed = rm_log(&work);
+        assert!(removed.contains("expired-one"), "the expired container was removed: {removed:?}");
+        assert!(
+            !removed.contains("live-one"),
+            "a container still inside its deadline must not be touched: {removed:?}"
+        );
+        // And the daemon's own view agrees: the live one is all that is left.
+        let left = std::fs::read_to_string(work.join("ps.txt")).expect("listing");
+        assert!(left.contains("live-one") && !left.contains("expired-one"), "{left:?}");
+    }
+
+    /// The late-landing container: the thing continuous in-process custody existed to catch.
+    ///
+    /// The first sweep sees an empty host. The container appears afterwards — as a create the daemon
+    /// only materialised later would — and the NEXT sweep removes it. Nothing in between remembered
+    /// it, which is the point: the record is on the container.
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_container_that_appears_after_an_earlier_sweep_is_removed_by_the_next_one() {
+        let work = stand_in_work_dir("sweep-late");
+        let script = stand_in_sweep_docker(&work);
+        let client = DockerCli::stand_in(&script);
+        std::fs::write(work.join("ps.txt"), "").expect("empty listing");
+
+        let first = sweep_expired_with(&client, "seat-a", 5_000).await.expect("first sweep");
+        assert!(first.removed.is_empty(), "nothing existed yet: {first:?}");
+
+        std::fs::write(work.join("ps.txt"), listing_row("late-lander", "seat-a", "1000", ROLE_HOLDER))
+            .expect("the container lands after the first sweep");
+
+        let second = sweep_expired_with(&client, "seat-a", 5_000).await.expect("second sweep");
+        assert_eq!(second.removed, vec!["late-lander".to_owned()]);
+        assert!(rm_log(&work).contains("late-lander"));
+    }
+
+    /// Restart rediscovery: a fresh process with no memory of the job cleans up after the dead one.
+    ///
+    /// The sweep is called exactly as a restarted seller's first tick calls it, against a host still
+    /// holding the previous process's leftovers. Nothing is carried over but the stamp.
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_restarted_seller_sweeps_what_the_killed_process_left_behind() {
+        let work = stand_in_work_dir("sweep-restart");
+        let script = stand_in_sweep_docker(&work);
+        std::fs::write(
+            work.join("ps.txt"),
+            format!(
+                "{}{}",
+                listing_row("orphan-of-dead-process", "seat-a", "1000", ROLE_HOLDER),
+                listing_row("helper-of-dead-process", "seat-a", "1000", ROLE_HELPER),
+            ),
+        )
+        .expect("listing");
+
+        let report = sweep_expired_with(&DockerCli::stand_in(&script), "seat-a", 5_000)
+            .await
+            .expect("the sweep ran");
+
+        assert_eq!(report.removed.len(), 2, "both roles are swept: {report:?}");
+        let removed = rm_log(&work);
+        assert!(removed.contains("orphan-of-dead-process") && removed.contains("helper-of-dead-process"));
+    }
+
+    /// A removal docker refuses is not abandoned: the container stays expired and the next sweep
+    /// selects it again. The retry is the schedule, not a loop inside one tick.
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_removal_docker_refuses_is_retried_by_the_next_sweep() {
+        let work = stand_in_work_dir("sweep-retry");
+        let script = stand_in_sweep_docker(&work);
+        let client = DockerCli::stand_in(&script);
+        std::fs::write(work.join("ps.txt"), listing_row("stuck", "seat-a", "1000", ROLE_HOLDER))
+            .expect("listing");
+        std::fs::write(work.join("rmfail-stuck"), "").expect("arm the refusal");
+
+        let first = sweep_expired_with(&client, "seat-a", 5_000).await.expect("first sweep");
+        assert!(first.removed.is_empty(), "docker refused: {first:?}");
+        assert_eq!(first.failed.len(), 1, "and the failure is REPORTED, not dropped: {first:?}");
+
+        // The refusal clears; nothing re-registers the container, and nothing had to.
+        std::fs::remove_file(work.join("rmfail-stuck")).expect("clear the refusal");
+        let second = sweep_expired_with(&client, "seat-a", 5_000).await.expect("second sweep");
+        assert_eq!(second.removed, vec!["stuck".to_owned()], "the next sweep finished it: {second:?}");
+    }
+
+    /// Query failure is never absence.
+    ///
+    /// A docker that cannot be reached must produce an ERROR, not an empty selection that a caller
+    /// counting removals cannot tell from a clean host.
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_listing_failure_is_an_error_and_never_an_empty_sweep() {
+        let work = stand_in_work_dir("sweep-down");
+        let script = stand_in_sweep_docker(&work);
+        std::fs::write(work.join("ps.txt"), listing_row("expired", "seat-a", "1000", ROLE_HOLDER))
+            .expect("listing");
+        std::fs::write(work.join("daemon-down"), "").expect("take the daemon down");
+
+        let outcome = sweep_expired_with(&DockerCli::stand_in(&script), "seat-a", 5_000).await;
+        let error = outcome.expect_err("an unreachable daemon must not report a successful sweep");
+        assert!(error.contains("could not list"), "{error}");
+        assert!(rm_log(&work).is_empty(), "nothing may be removed on an answer we never got");
+    }
+
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_sweep_without_a_seat_refuses_rather_than_matching_everything() {
+        let work = stand_in_work_dir("sweep-noseat");
+        let script = stand_in_sweep_docker(&work);
+        std::fs::write(work.join("ps.txt"), listing_row("anything", "", "1", ROLE_HOLDER))
+            .expect("listing");
+
+        let outcome = sweep_expired_with(&DockerCli::stand_in(&script), "  ", 5_000).await;
+        assert!(outcome.is_err(), "an unnamed seat owns nothing to sweep");
+        assert!(rm_log(&work).is_empty());
+    }
+
+    /// Bounded work: a backlog is drained across ticks instead of blocking one.
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_sweep_removes_at_most_its_bounded_share_of_a_backlog() {
+        let work = stand_in_work_dir("sweep-bounded");
+        let script = stand_in_sweep_docker(&work);
+        let mut listing = String::new();
+        for index in 0..(MAX_SWEEP_REMOVALS + 7) {
+            listing.push_str(&listing_row(&format!("backlog{index}"), "seat-a", "1000", ROLE_HOLDER));
+        }
+        std::fs::write(work.join("ps.txt"), listing).expect("listing");
+
+        let client = DockerCli::stand_in(&script);
+        let first = sweep_expired_with(&client, "seat-a", 5_000).await.expect("first sweep");
+        assert_eq!(first.removed.len(), MAX_SWEEP_REMOVALS, "one tick is bounded: {first:?}");
+
+        let second = sweep_expired_with(&client, "seat-a", 5_000).await.expect("second sweep");
+        assert_eq!(second.removed.len(), 7, "and the remainder is not lost: {second:?}");
+    }
+
 }
