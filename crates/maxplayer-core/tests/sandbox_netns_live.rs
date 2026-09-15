@@ -998,6 +998,163 @@ fn establish_contains_a_namespace_and_tears_it_down_on_drop() {
     );
 }
 
+/// The expiry stamp is on the **real** container, read back off the daemon.
+///
+/// The unit gates prove `holder_argv` contains the label. That is an argument vector, not a
+/// container: it cannot show that docker accepted the label, stored it, and will hand it back to a
+/// later sweep in a different process. This asks the daemon.
+#[test]
+#[ignore = "needs docker and the netfilter image"]
+fn a_real_holder_carries_its_own_expiry_stamp_on_the_daemon() {
+    use maxplayer_core::sandbox_netns::{
+        HOLDER_CLEANUP_AFTER_LABEL, HOLDER_ROLE_LABEL, HOLDER_SEAT_LABEL, ROLE_HOLDER,
+    };
+
+    let network = owned_name("net-stamp");
+    let network = network.as_str();
+    let (ok, _, err) = docker(&["network", "create", "--label", &owner_label(), network], None);
+    assert!(ok, "could not create the test network: {err}");
+
+    // A seat unique to this run. The sweep selects by seat, and a shared seat would let this test
+    // reach containers belonging to another test or another seat entirely.
+    let seat = format!("{:0<64}", format!("stamp{}", owner_token()));
+    let stamp: u64 = 2_000_000_000;
+
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+    let outcome = runtime.block_on(maxplayer_core::sandbox_netns::establish(
+        network,
+        &holder_image(),
+        &netfilter_image(),
+        "host.docker.internal",
+        "live-stamp",
+        &seat,
+        1000,
+        1000,
+        Some(PortRange::new(49300, 49399).expect("valid range")),
+        true,
+        Vec::new(),
+        stamp,
+    ));
+
+    let containment = match outcome {
+        Ok(containment) => containment,
+        Err(error) => {
+            remove_owned_network(network);
+            panic!("establish failed: {error}");
+        }
+    };
+    let holder_name = containment.holder.name().to_owned();
+
+    let label_of = |key: &str| -> String {
+        let format = format!("{{{{index .Config.Labels \"{key}\"}}}}");
+        let (ok, out, err) = docker(&["inspect", "-f", &format, &holder_name], None);
+        assert!(ok, "docker inspect failed for {holder_name}: {err}");
+        out.trim().to_owned()
+    };
+
+    let seen_stamp = label_of(HOLDER_CLEANUP_AFTER_LABEL);
+    let seen_role = label_of(HOLDER_ROLE_LABEL);
+    let seen_seat = label_of(HOLDER_SEAT_LABEL);
+
+    drop(containment);
+    remove_owned_network(network);
+
+    assert_eq!(
+        seen_stamp,
+        stamp.to_string(),
+        "the daemon must hand back the exact expiry the job was stamped with"
+    );
+    assert_eq!(seen_role, ROLE_HOLDER, "the holder must be stamped with its role");
+    assert_eq!(seen_seat, seat, "the holder must be stamped with the seat that owns it");
+}
+
+/// A real sweep against a real daemon: the expired holder goes, the live one stays.
+///
+/// This is the leg the whole redesign rests on, and no unit test can reach it: the stand-in docker
+/// in the unit gates returns listings I wrote. Here the listing, the label filter, the parse and the
+/// removal all go through docker itself.
+///
+/// Both holders are deliberately left un-dropped until after the sweep. The sweep removing a
+/// container out from under a live guard is exactly the production situation -- a previous process's
+/// holder -- and the guard's own drop is best-effort, so the double removal is harmless.
+#[test]
+#[ignore = "needs docker and the netfilter image"]
+fn the_sweep_removes_an_expired_holder_and_leaves_one_inside_its_deadline() {
+    let network = owned_name("net-sweep");
+    let network = network.as_str();
+    let (ok, _, err) = docker(&["network", "create", "--label", &owner_label(), network], None);
+    assert!(ok, "could not create the test network: {err}");
+
+    let seat = format!("{:0<64}", format!("sweep{}", owner_token()));
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+
+    let establish_one = |job: &str, port_lo: u16, cleanup_after: u64| {
+        runtime.block_on(maxplayer_core::sandbox_netns::establish(
+            network,
+            &holder_image(),
+            &netfilter_image(),
+            "host.docker.internal",
+            job,
+            &seat,
+            1000,
+            1000,
+            Some(PortRange::new(port_lo, port_lo + 99).expect("valid range")),
+            true,
+            Vec::new(),
+            cleanup_after,
+        ))
+    };
+
+    // One whose deadline plus its grace is long past, one still far inside it.
+    let expired = establish_one("live-sweep-expired", 49400, 1);
+    let live = establish_one("live-sweep-live", 49500, 2_000_000_000);
+
+    let (expired, live) = match (expired, live) {
+        (Ok(a), Ok(b)) => (a, b),
+        (a, b) => {
+            remove_owned_network(network);
+            panic!("establish failed: expired={:?} live={:?}", a.err(), b.err());
+        }
+    };
+    let expired_name = expired.holder.name().to_owned();
+    let live_name = live.holder.name().to_owned();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock after 1970")
+        .as_secs();
+    let report = runtime
+        .block_on(maxplayer_core::sandbox_netns::sweep_expired(&seat, now))
+        .expect("the sweep must reach the daemon");
+
+    // Ask the daemon what survived, rather than trusting the report.
+    let still_listed = |name: &str| -> bool {
+        let (_, out, _) = docker(&["ps", "--all", "--quiet", "--filter", &format!("name={name}")], None);
+        !out.trim().is_empty()
+    };
+    let expired_survived = still_listed(&expired_name);
+    let live_survived = still_listed(&live_name);
+
+    drop(expired);
+    drop(live);
+    remove_owned_network(network);
+
+    assert!(
+        !expired_survived,
+        "the sweep must remove the holder whose stamp has passed, but {expired_name} is still listed"
+    );
+    assert!(
+        live_survived,
+        "the sweep must leave the holder still inside its deadline, but {live_name} was removed"
+    );
+    assert_eq!(
+        report.selected(),
+        1,
+        "the sweep must select exactly the expired holder, not the live one: {report:?}"
+    );
+    assert!(report.failed.is_empty(), "docker refused a removal: {:?}", report.failed);
+}
+
 // ---------------------------------------------------------------------------------------------
 // The interface layer: the filters on the veth the packets actually leave by
 // ---------------------------------------------------------------------------------------------
