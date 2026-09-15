@@ -4199,11 +4199,41 @@ exit 0
         assert_eq!(expired_owned(&containers, "seat-a", u64::MAX), vec!["mine".to_owned()]);
     }
 
+    /// A caller that cannot name its seat selects nothing — including against a container whose
+    /// own seat label is empty.
+    ///
+    /// The empty-labelled container is what makes this gate bite, and it was missing on the first
+    /// attempt: with only a normally-labelled container present, deleting the guard changed nothing,
+    /// because `"" != "seat-a"` rejects it anyway. The gate passed with the protection removed, which
+    /// is a gate that proves nothing. `parse_owned_listing` cannot produce `Some("")` today — it maps
+    /// empty fields to `None` — but [`OwnedContainer`] is public and a future caller can build one,
+    /// and an empty seat matching an empty label is precisely how one seat starts removing another's
+    /// containers. Constructed directly here for that reason.
     #[test]
     fn a_caller_that_cannot_name_its_seat_selects_nothing() {
-        let containers = [owned_holder("mine", "seat-a", Some(1))];
-        assert!(expired_owned(&containers, "", u64::MAX).is_empty());
-        assert!(expired_owned(&containers, "   ", u64::MAX).is_empty());
+        let containers = [
+            owned_holder("mine", "seat-a", Some(1)),
+            OwnedContainer {
+                id: "blank-seat".to_owned(),
+                seat: Some(String::new()),
+                cleanup_after: Some(1),
+                role: Some(ROLE_HOLDER.to_owned()),
+            },
+            OwnedContainer {
+                id: "whitespace-seat".to_owned(),
+                seat: Some("   ".to_owned()),
+                cleanup_after: Some(1),
+                role: Some(ROLE_HOLDER.to_owned()),
+            },
+        ];
+        assert!(
+            expired_owned(&containers, "", u64::MAX).is_empty(),
+            "an unnamed seat owns nothing — not even a container whose own seat label is empty"
+        );
+        assert!(
+            expired_owned(&containers, "   ", u64::MAX).is_empty(),
+            "and a whitespace seat is not an identity either"
+        );
     }
 
     #[test]
